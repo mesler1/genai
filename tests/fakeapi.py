@@ -20,13 +20,14 @@ def calls(*pairs):
 class FakeAPI:
     """Serves the scripted turns in order. Each turn is reply(...) or call(...)."""
 
-    def __init__(self, turns, stream=True, usage=None, status=200, redirect=None):
+    def __init__(self, turns, stream=True, usage=None, status=200, redirect=None, error_message="nope"):
         self.turns = list(turns)
         self.requests = []
         self.stream = stream
         self.usage = usage
         self.status = status
         self.redirect = redirect
+        self.error_message = error_message
         api = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -47,7 +48,7 @@ class FakeAPI:
                     self.end_headers()
                     return
                 if api.status != 200:
-                    self._json(api.status, {"error": {"message": "nope"}})
+                    self._json(api.status, {"error": {"message": api.error_message}})
                     return
                 turn = api.turns.pop(0) if api.turns else reply("(script exhausted)")
                 if body.get("stream"):

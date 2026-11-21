@@ -17,12 +17,15 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
 import ssl
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -34,10 +37,12 @@ READ_CAP = 256 * 1024          # bytes per read_file
 WRITE_CAP = 1024 * 1024        # bytes per write_file / edit result
 ATTACH_CAP = 256 * 1024        # bytes per -f file
 OUTPUT_CAP = 32 * 1024         # chars of command output before head/tail cut
+REPLY_CAP = 8 * 1024 * 1024    # bytes of one endpoint reply (and of one streamed line)
 LIST_CAP = 500                 # entries per list_dir
 WARN_FRACTION = 0.8
 KEEP_TURNS = 2                 # user turns kept word for word by :compact
 SUMMARY_WORDS = 300
+HOOK_TIMEOUT = 10              # seconds a notify hook may run before it is killed
 
 EXIT_OK, EXIT_ERROR, EXIT_USAGE, EXIT_PROFILE, EXIT_API, EXIT_CONTEXT = 0, 1, 2, 3, 4, 5
 EXIT_INTERRUPT = 130
@@ -128,6 +133,25 @@ def parse_json_bytes(raw, path):
 
 _BIDI = set(range(0x202A, 0x202F)) | set(range(0x2066, 0x206A)) | {0x200E, 0x200F, 0x061C}
 _INVISIBLE = {0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF, 0x00AD}
+# Everything in these categories is escaped: controls (but \n and \t), format characters (bidi, zero-width,
+# tags, invisible operators), private use, surrogates, line and paragraph separators.
+_HIDDEN_CATS = {"Cc", "Cf", "Co", "Cs", "Zl", "Zp"}
+# Invisible or empty-looking characters outside those categories. U+FE0F is deliberately not here: it follows
+# ordinary emoji, and escaping it would mangle them.
+_HIDDEN_EXTRA = (_BIDI | _INVISIBLE | set(range(0xE0000, 0xE0080)) | set(range(0xFE00, 0xFE0F)) |
+                 set(range(0xE0100, 0xE01F0)) | {0x034F, 0x115F, 0x1160, 0x3164, 0xFFA0, 0x180E})
+
+
+def _hidden(ch):
+    """True if exact() escapes this character (not counting \\n and \\t)."""
+    o = ord(ch)
+    return (unicodedata.category(ch) in _HIDDEN_CATS or o in _HIDDEN_EXTRA or 0xFDD0 <= o <= 0xFDEF
+            or o & 0xFFFE == 0xFFFE) and ch not in "\n\t"
+
+
+def _escape(ch):
+    o = ord(ch)
+    return f"\\x{o:02x}" if o < 0x100 else f"\\u{o:04x}" if o < 0x10000 else f"\\U{o:08x}"
 
 
 def exact(text):
@@ -135,14 +159,29 @@ def exact(text):
     invisible characters. Returns (display_text, flagged)."""
     out, flagged = [], False
     for ch in text:
-        o = ord(ch)
-        if ch in "\n\t":
-            out.append(ch)
-        elif o < 0x20 or o == 0x7F or 0x80 <= o < 0xA0 or o in _BIDI or o in _INVISIBLE:
+        if _hidden(ch):
             flagged = True
-            out.append(f"\\x{o:02x}" if o < 0x100 else f"\\u{o:04x}")
+            out.append(_escape(ch))
         else:
             out.append(ch)
+    return "".join(out), flagged
+
+
+_LINE_ESCAPES = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
+
+
+def one_line(text):
+    """Like exact(), for a value that must stay on one line: newlines, returns and tabs are shown as \\n, \\r,
+    \\t and count as flagged. Returns (display_text, flagged)."""
+    out, flagged = [], False
+    for ch in text:
+        if ch in _LINE_ESCAPES:
+            out.append(_LINE_ESCAPES[ch])
+            flagged = True
+        else:
+            d, f = exact(ch)
+            out.append(d)
+            flagged = flagged or f
     return "".join(out), flagged
 
 
@@ -153,26 +192,62 @@ def show_exact(text):
     return disp
 
 
+def hidden_found(text, cap=8):
+    """The distinct hidden characters in text as 'U+E0049 x3, ...', or '' if there are none."""
+    counts = {}
+    for ch in text:
+        if _hidden(ch):
+            counts[ch] = counts.get(ch, 0) + 1
+    items = [f"U+{ord(c):04X} x{n}" for c, n in sorted(counts.items())]
+    return ", ".join(items[:cap]) + (f" and {len(items) - cap} more" if len(items) > cap else "")
+
+
+def non_ascii_chars(text):
+    """The distinct non-ASCII characters of text that exact() does not already escape, in order."""
+    seen = []
+    for ch in text:
+        if ord(ch) > 127 and not _hidden(ch) and ch not in seen:
+            seen.append(ch)
+    return seen
+
+
+def non_ascii_line(text, cap=8):
+    """One line naming the non-ASCII characters in text (so look-alike letters show), or ''."""
+    chars = non_ascii_chars(text)
+    if not chars:
+        return ""
+    names = ", ".join(f"U+{ord(c):04X} {unicodedata.name(c, 'unnamed')}" for c in chars[:cap])
+    return f"    non-ASCII: {names}" + (f" and {len(chars) - cap} more" if len(chars) > cap else "")
+
+
 # --------------------------------------------------------------------------
 # Redaction (for output shared with the model; never for -f or read_file)
 
+_NAME = r"(?=([\w.-]{0,64}))\%d"      # the rest of a variable name: bounded, and never re-scanned on backtracking
 _REDACTIONS = [
     ("private key", re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----", re.S)),
     ("aws key id", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
     ("github token", re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,})\b")),
     ("slack token", re.compile(r"\bxox[abposr]-[A-Za-z0-9-]{10,}\b")),
     ("api key", re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b")),
-    ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")),
+    ("jwt", re.compile(r"(?<![\w-])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")),
     ("bearer token", re.compile(r"(?i)(\bbearer\s+)[A-Za-z0-9._~+/=-]{16,}")),
-    ("url password", re.compile(r"(\b[a-z][a-z0-9+.-]*://[^\s:/@]+:)[^\s@/]+(@)")),
+    ("url password", re.compile(r"(\b[a-z][a-z0-9+.-]{0,31}://[^\s:/@]+:)[^\s@/]+(@)")),
     ("secret assignment", re.compile(
-        r"(?i)(\b[\w.-]*(?:password|passwd|secret|token|api[_-]?key|access[_-]?key)[\w.-]*\s*[:=]\s*[\"']?)([^\s\"']{4,})")),
+        r"(?i)((?:password|passwd|secret|token|api[_-]?key|access[_-]?key)" + _NAME % 2
+        + r"\s*[:=]\s*[\"']?)([^\s\"']{4,})")),
 ]
+_KEY_END = re.compile(r"-----END [A-Z0-9 ]*PRIVATE KEY-----")
 
 
-def redact(text):
-    """Mask common secret patterns. Returns (text, {kind: count})."""
+def redact(text, secrets=()):
+    """Mask exact secret values, then common secret patterns. Returns (text, {kind: count}).
+    Values under 8 characters are not masked by value."""
     counts = {}
+    for value in sorted({v for v in secrets if isinstance(v, str) and len(v) >= 8}, key=len, reverse=True):
+        if value in text:
+            counts["endpoint key"] = counts.get("endpoint key", 0) + text.count(value)
+            text = text.replace(value, "[REDACTED endpoint key]")
     for kind, rx in _REDACTIONS:
         def sub(m, kind=kind):
             counts[kind] = counts.get(kind, 0) + 1
@@ -181,7 +256,11 @@ def redact(text):
             if kind == "url password":
                 return m.group(1) + "[REDACTED]" + m.group(2)
             return f"[REDACTED {kind}]"
-        text = rx.sub(sub, text)
+        tail = ""
+        if kind == "private key":      # a BEGIN with no END after it cannot match; don't rescan to the end for each
+            end = max((m.end() for m in _KEY_END.finditer(text)), default=0)
+            text, tail = text[:end], text[end:]
+        text = rx.sub(sub, text) + tail
     return text, counts
 
 
@@ -501,11 +580,14 @@ class Endpoint:
         return cls(parse_json_bytes(raw, path), os.path.abspath(path))
 
     def key_source(self):
+        """Where the key comes from, escaped for one line. Returns (text, flagged)."""
         if self.key_env:
-            return f"environment variable ${self.key_env}"
+            d, f = one_line(self.key_env)
+            return f"environment variable ${d}", f
         if self.key_file:
-            return f"file {self.key_file} (must be mode 0600)"
-        return "none (no Authorization header is sent)"
+            d, f = one_line(self.key_file)
+            return f"file {d} (must be mode 0600)", f
+        return "none (no Authorization header is sent)", False
 
     def key(self):
         if self.key_env:
@@ -530,19 +612,36 @@ class Endpoint:
         return None
 
     def summary(self):
-        lines = [f"  endpoint: {self.name}", f"  url:      {self.base_url}", f"  model:    {self.model}",
-                 f"  key from: {self.key_source()}", f"  context:  {self.context_limit} tokens"]
+        """The review screen, every field escaped to one line. Returns (text, flagged)."""
+        flags = []
+
+        def one(v):
+            d, f = one_line(str(v))
+            flags.append(f)
+            return d
+
+        url = one(self.base_url)
+        host = urllib.parse.urlsplit(self.base_url).hostname or ""
+        if not host.isascii():
+            try:
+                url += f"  (punycode: {host.encode('idna').decode('ascii')})"
+            except UnicodeError:
+                url += "  (this host name cannot be converted to punycode)"
+        key, kflag = self.key_source()
+        lines = [f"  endpoint: {one(self.name)}", f"  url:      {url}", f"  model:    {one(self.model)}",
+                 f"  key from: {key}", f"  context:  {self.context_limit} tokens"]
+        flags.append(kflag)
         if self.allow_http:
             lines.append("  [!] allow_http: prompts, files and the key may travel unencrypted")
         if self.proxy:
-            lines.append(f"  proxy:    {self.proxy}")
+            lines.append(f"  proxy:    {one(self.proxy)}")
         if self.ca_bundle:
-            lines.append(f"  CA:       {self.ca_bundle}")
+            lines.append(f"  CA:       {one(self.ca_bundle)}")
         if self.headers:
-            lines.append(f"  headers:  {', '.join(sorted(self.headers))}")
+            lines.append(f"  headers:  {', '.join(one(k) for k in sorted(self.headers))}")
         if self.params:
             lines.append(f"  params:   {json.dumps(self.params, sort_keys=True)}")
-        return "\n".join(lines)
+        return "\n".join(lines), any(flags)
 
     def info(self):
         return {"name": self.name, "base_url": self.base_url, "model": self.model}
@@ -591,14 +690,23 @@ class Profile:
         return cls(parse_json_bytes(raw, path), os.path.abspath(path))
 
     def summary(self):
-        lines = [f"  profile:  {self.name}"]
+        """The review screen. One-line fields are escaped; the persona carries its own warning.
+        Returns (text, flagged), where flagged covers the one-line fields."""
+        flags = []
+
+        def one(v):
+            d, f = one_line(str(v))
+            flags.append(f)
+            return d
+
+        lines = [f"  profile:  {one(self.name)}"]
         if self.description:
-            lines.append(f"  about:    {exact(self.description)[0]}")
-        lines.append(f"  endpoint: {self.endpoint or '(none; -e or default_endpoint decides)'}")
+            lines.append(f"  about:    {one(self.description)}")
+        lines.append(f"  endpoint: {one(self.endpoint) if self.endpoint else '(none; -e or default_endpoint decides)'}")
         if self.skills is None:
             lines.append("  skills:   (not set; default_skills apply)")
         else:
-            lines.append(f"  skills:   {', '.join(self.skills) or 'none'}")
+            lines.append(f"  skills:   {', '.join(one(k) for k in self.skills) or 'none'}")
         if self.params:
             lines.append(f"  params:   {json.dumps(self.params, sort_keys=True)}")
         if self.coding:
@@ -609,7 +717,7 @@ class Profile:
             lines += ["    | " + ln for ln in show_exact(self.persona).splitlines()]
         else:
             lines.append("  persona:  (none)")
-        return "\n".join(lines)
+        return "\n".join(lines), any(flags)
 
 
 KINDS = {"endpoint": Endpoint, "profile": Profile}
@@ -708,7 +816,7 @@ def list_named(cfg, kind):
             if kind == "endpoint":
                 desc = f"{obj.model} at {obj.base_url}"
             else:
-                desc = (f"[{obj.endpoint}] " if obj.endpoint else "") + exact(obj.description)[0] + \
+                desc = (f"[{obj.endpoint}] " if obj.endpoint else "") + obj.description + \
                        (" (grants coding mode)" if obj.coding else "")
         except GenaiError as e:
             desc, st = str(e), "invalid"
@@ -719,15 +827,28 @@ def list_named(cfg, kind):
 def bless(cfg, path, ask):
     """Show what is being blessed and record its hash if the user confirms."""
     path = os.path.abspath(os.path.expanduser(path))
+    if is_hook_path(cfg, path):
+        return bless_hook(cfg, ask)
     if os.path.isdir(path):
         files = snapshot_skill(path)
         if "SKILL.md" not in files:
             raise GenaiError(f"{path}: a skill needs a SKILL.md")
         h = hash_snapshot(files)
-        print(f"Skill {os.path.basename(path)} at {path}")
+        print(f"Skill {one_line(os.path.basename(path))[0]} at {one_line(path)[0]}")
         for f in sorted(files):
-            print(f"  {f} ({len(files[f])} bytes)")
+            print(f"  {one_line(f)[0]} ({len(files[f])} bytes)")
         print(f"  hash: {h}")
+        for f in sorted(files):
+            try:
+                text = files[f].decode("utf-8")
+            except UnicodeDecodeError:
+                print(f"  {one_line(f)[0]}: binary (not UTF-8); it cannot be shown or checked for hidden characters")
+                continue
+            found = hidden_found(text)
+            if found:
+                print(f"  [!] {one_line(f)[0]} has hidden or control characters: {found}")
+        if any(one_line(x)[1] for x in [path, *files]):
+            print("  [!] the name or a file name above had characters that were escaped; read carefully")
         entry = {"kind": "skill", "name": os.path.basename(path), "hash": h}
         question = "Have you read every file above, and do you want to use this skill?"
     else:
@@ -736,13 +857,21 @@ def bless(cfg, path, ask):
         data = parse_json_bytes(raw, path)
         if isinstance(data, dict) and "base_url" in data:
             ep = Endpoint(data, path)
-            print(f"Endpoint at {path}\n{ep.summary()}\n  hash:     {h}")
+            text, flagged = ep.summary()
+            print(f"Endpoint at {one_line(path)[0]}\n{text}\n  hash:     {h}")
             print("Everything you send to this endpoint (prompts, files, the key) goes to the URL above.")
+            if flagged:
+                print("  [!] some fields above had control or hidden characters that were escaped; "
+                      "this file may be trying to mislead you")
             entry = {"kind": "endpoint", "name": ep.name, "hash": h}
             question = "Send your prompts, files and key to this endpoint?"
         else:
             prof = Profile(data, path)
-            print(f"Profile at {path}\n{prof.summary()}\n  hash:     {h}")
+            text, flagged = prof.summary()
+            print(f"Profile at {one_line(path)[0]}\n{text}\n  hash:     {h}")
+            if flagged:
+                print("  [!] some fields above had control or hidden characters that were escaped; "
+                      "this file may be trying to mislead you")
             print("The persona is sent to the model as instructions. The endpoint and skills it names "
                   "must be blessed on their own.")
             entry = {"kind": "profile", "name": prof.name, "hash": h}
@@ -756,6 +885,147 @@ def bless(cfg, path, ask):
     cfg.audit.log("bless", path=path, kind=entry["kind"], hash=h)
     print("Blessed.")
     return True
+
+
+# --------------------------------------------------------------------------
+# The notify hook: a program of yours, run when genai waits for you (see HOOKS.md)
+
+def hook_path(cfg):
+    return os.path.abspath(os.path.join(cfg.home, "hooks", "notify"))
+
+
+def is_hook_path(cfg, path):
+    """Is this the config home's hooks/notify? Judged by where it is, not by what it holds."""
+    want = hook_path(cfg)
+    return (os.path.basename(path) == "notify"
+            and os.path.realpath(os.path.dirname(path)) == os.path.realpath(os.path.dirname(want)))
+
+
+def hook_mode_problem(path):
+    """Why this file may not be a hook (not a regular file, not yours, writable by others), or None."""
+    try:
+        st = os.lstat(path)
+    except OSError as e:
+        return e.strerror
+    if not stat.S_ISREG(st.st_mode):
+        return "is not a regular file (a symlink is not allowed)"
+    if st.st_uid != os.getuid():
+        return "is not owned by you"
+    if st.st_mode & 0o022:
+        return "is writable by group or others"
+    return None
+
+
+def hook_problem(cfg, path):
+    """Why the notify hook must not run right now, or None. The bytes are read once and hashed."""
+    why = hook_mode_problem(path)
+    if why:
+        return why
+    try:
+        if not os.lstat(path).st_mode & 0o100:
+            return "is not executable (chmod u+x)"
+        h = hash_file(path)
+    except (GenaiError, OSError):
+        return "cannot be read"
+    entry = cfg.blessed().get(path)
+    if not entry or entry.get("kind") != "hook":
+        return "is not blessed"
+    return None if h == entry.get("hash") else "changed since it was blessed"
+
+
+def bless_hook(cfg, ask):
+    """Show the notify hook, whole, and record its hash if the user confirms."""
+    path = hook_path(cfg)
+    why = hook_mode_problem(path)
+    if why:
+        raise GenaiError(f"{path}: a hook {why}; it cannot be blessed")
+    raw = read_regular(path)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise GenaiError(f"{path}: a hook must be a UTF-8 text file, so that it can be shown; it cannot be blessed")
+    h = hash_bytes(raw)
+    print(f"Hook at {one_line(path)[0]}\n  a hook: a program genai will run as you when it is waiting for you\n"
+          f"  size:     {len(raw)} bytes\n  hash:     {h}\n{margin(text)}")
+    found = hidden_found(text)
+    if found:
+        print(f"  [!] the hook has hidden or control characters: {found}")
+    if not os.lstat(path).st_mode & 0o100:
+        print("  note: it is not executable, so it will not run until you: chmod u+x " + shlex.quote(path))
+    if not ask("Have you read the whole hook above, and do you want genai to run it as you?"):
+        print("Not blessed.")
+        return False
+    cfg.set_blessed(path, {"kind": "hook", "name": "notify", "hash": h, "blessed_at": now()})
+    cfg.audit.log("bless", path=path, kind="hook", hash=h)
+    print("Blessed.")
+    return True
+
+
+def short_path(path):
+    home = os.path.expanduser("~")
+    shown = "~" + path[len(home):] if home != "/" and path.startswith(home + "/") else path
+    return one_line(shown)[0]
+
+
+class Notifier:
+    """Runs the notify hook. It only observes: genai never waits for it and never reads its answer."""
+
+    def __init__(self, engine):
+        self.e, self.path, self.dead = engine, hook_path(engine.cfg), False
+
+    @classmethod
+    def start(cls, engine):
+        """The notifier for this run, or None. A hook that is present but not usable is reported once."""
+        path = hook_path(engine.cfg)
+        if not os.path.lexists(path):
+            return None
+        why = hook_problem(engine.cfg, path)
+        if why:
+            engine.ui.notice(f"the notify hook {short_path(path)} {why}, so it will not run. "
+                             f"Review it, then: genai --bless {shlex.quote(path)}")
+            return None
+        return cls(engine)
+
+    def fire(self, event, **fields):
+        if self.dead:
+            return
+        why = hook_problem(self.e.cfg, self.path)
+        if why:
+            self.dead = True
+            self.e.ui.notice(f"the notify hook {why}; it is not run for the rest of this session")
+            return
+        e = self.e
+        line = json.dumps({"event": event, **fields, "session": e.session.id, "cwd": os.getcwd(),
+                           "endpoint": e.endpoint.name, "sandbox": e.sandbox, "version": VERSION},
+                          ensure_ascii=True)
+        env = {k: v for k, v in os.environ.items() if k != e.endpoint.key_env}
+        try:
+            proc = subprocess.Popen([self.path], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, env=env, cwd=e.cfg.home if os.path.isdir(e.cfg.home)
+                                    else "/", start_new_session=True, close_fds=True)
+        except OSError as err:
+            self.dead = True
+            e.ui.notice(f"the notify hook could not be started ({err.strerror}); it is ignored")
+            return
+        try:        # a short line into an empty pipe does not block; done here so a quick exit still delivers it
+            proc.stdin.write(line.encode() + b"\n")
+            proc.stdin.close()
+        except OSError:
+            pass
+        threading.Thread(target=self._reap, args=(proc,), daemon=True).start()
+        e.audit.log("hook", hook="notify", when=event, **fields)
+
+    @staticmethod
+    def _reap(proc):
+        """Wait for the hook; past the time limit kill its whole process group. Nothing here may raise."""
+        try:
+            try:
+                proc.wait(HOOK_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+        except Exception:
+            pass
 
 
 # --------------------------------------------------------------------------
@@ -775,6 +1045,10 @@ def split_rel(path):
 
 def is_hidden(parts):
     return any(p.startswith(".") for p in parts)
+
+
+class DiskError(ValueError):
+    """A failure that reveals something about what is on disk (a symlink, a file where a directory was expected)."""
 
 
 class Workdir:
@@ -797,7 +1071,7 @@ class Workdir:
                     nfd = os.open(p, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
                 except OSError as e:
                     if e.errno in (20, 40):  # ENOTDIR, ELOOP (symlink)
-                        raise ValueError(f"'{p}' is a symlink or not a directory")
+                        raise DiskError(f"'{p}' is a symlink or not a directory")
                     raise
                 os.close(fd)
                 fd = nfd
@@ -981,6 +1255,11 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
                          "followed. Nothing more was sent.", EXIT_API, "api")
 
 
+def too_big():
+    return GenaiError(f"the endpoint's reply exceeded the {REPLY_CAP // (1024 * 1024)} MB limit; "
+                      "nothing was performed", EXIT_API, "api")
+
+
 class Client:
     def __init__(self, endpoint, params=None):
         self.p = endpoint
@@ -1026,7 +1305,10 @@ class Client:
             body["max_tokens"] = max_tokens
         with self._request("/chat/completions", body) as r:
             if not stream:
-                data = json.load(r)
+                raw = r.read(REPLY_CAP + 1)
+                if len(raw) > REPLY_CAP:
+                    raise too_big()
+                data = json.loads(raw)
                 if "choices" not in data or not data["choices"]:
                     raise GenaiError(f"unexpected reply from endpoint: {str(data)[:300]}", EXIT_API, "api")
                 msg = data["choices"][0].get("message", {})
@@ -1036,8 +1318,14 @@ class Client:
             return self._stream(r, on_text)
 
     def _stream(self, r, on_text):
-        content, calls, usage = [], {}, None
-        for raw in r:
+        content, calls, usage, size = [], {}, None, 0
+        while True:
+            raw = r.readline(REPLY_CAP + 1)
+            size += len(raw)
+            if size > REPLY_CAP or len(raw) > REPLY_CAP:
+                raise too_big()
+            if not raw:
+                break
             line = raw.decode("utf-8", "replace").strip()
             if not line.startswith("data:"):
                 continue
@@ -1212,11 +1500,44 @@ class Proposal:
         return ev
 
 
+CODING_REFUSED_UNDER_HOME = (".ssh", ".gnupg", ".aws", ".kube", ".docker", ".password-store", ".config/gcloud")
+
+
+CODING_RISKS = {     # what --coding-anywhere exposes, by the kind of place; shown when it is used
+    "home": "every file under your home directory that is not hidden (documents, downloads, every project)",
+    "above": "every file under here that is not hidden: your whole home directory, and other people's and the "
+             "system's files where you can read them",
+    "config": "your endpoint files, every saved session and the audit log; a key file here is read like any other",
+    "credentials": "the credentials kept here; only the ones genai recognises as secrets will still ask",
+}
+
+
+def coding_refusal(cwd):
+    """Why coding mode is refused in this directory, as (phrase, kind of place), or None. A project directory
+    under your home is fine; these are the places that hold much more than one project. Real paths, compared
+    by component."""
+    def inside(path, root):
+        return path == root or path.startswith(root.rstrip("/") + "/")
+    here = os.path.realpath(cwd)
+    home = os.path.realpath(os.path.expanduser("~"))
+    if here == home:
+        return "your home directory", "home"
+    if inside(home, here):
+        return "a directory that contains your home directory", "above"
+    if inside(here, os.path.realpath(config_home())):
+        return "genai's own config directory", "config"
+    for d in CODING_REFUSED_UNDER_HOME:
+        if inside(here, os.path.join(home, d)):
+            return f"~/{d}, which holds credentials", "credentials"
+    return None
+
+
 class Engine:
     """The loop: send, turn tool calls into proposals, collect decisions, send again."""
 
-    def __init__(self, cfg, endpoint, session, ui, client=None, coding=None, profile=None):
-        """coding: None, or where the request for coding mode came from ("--coding", "profile NAME")."""
+    def __init__(self, cfg, endpoint, session, ui, client=None, coding=None, profile=None, anywhere=False):
+        """coding: None, or where the request for coding mode came from ("--coding", "profile NAME").
+        anywhere: the user passed --coding-anywhere, which allows coding mode where it is normally refused."""
         self.cfg, self.endpoint, self.session, self.ui = cfg, endpoint, session, ui
         self.profile = profile
         self.client = client or Client(endpoint, profile.params if profile else None)
@@ -1226,10 +1547,17 @@ class Engine:
         self.counter = 0
         self.warned = False
         self.sandbox = sandbox_info()
+        self.notifier = None     # the notify hook, set by main() when a person is at the terminal
         self.commands = []       # command proposals shown in this process, newest last
         self.skills = []
         self.reload_skills()
+        self.anywhere = anywhere
+        self.coding_override = None     # the refused place coding mode is on in, when --coding-anywhere allowed it
         self.coding_from = "session" if session.coding else None
+        refused = coding_refusal(os.getcwd()) if session.coding else None
+        if refused and not anywhere:    # an override is per run: a resumed session needs the flag again
+            session.coding, self.coding_from = False, None
+            ui.notice(f"coding mode was on for this session, but is refused in {refused[0]}; it is off")
         if coding:
             try:
                 self.set_coding(True)
@@ -1245,15 +1573,21 @@ class Engine:
         self.skills = load_skills(self.cfg, self.session.skills, self.ui.notice)
 
     def set_coding(self, on):
-        if on:
-            here = os.path.realpath(os.getcwd())
-            if here in (os.path.realpath(os.path.expanduser("~")), "/"):
-                raise GenaiError("coding mode is refused in your home directory or /; cd into a project first",
-                                 EXIT_USAGE)
+        refused = coding_refusal(os.getcwd()) if on else None
+        if refused and not self.anywhere:
+            raise GenaiError(f"coding mode is refused in {refused[0]}; cd into a project first "
+                             "(--coding-anywhere overrides this, and says what that exposes)", EXIT_USAGE)
+        self.coding_override = refused[0] if refused else None
+        if refused:
+            self.ui.notice(f"[!] --coding-anywhere: coding mode is ON in {refused[0]}, where it is normally "
+                           f"refused. Without asking you, the model can now read {CODING_RISKS[refused[1]]}. "
+                           f"All of it goes to {self.endpoint.base_url}. Something the model reads can tell it "
+                           "what to read next. Hidden files, files that look like secrets, and every write "
+                           "still ask.")
         self.session.coding = on
         self.session.cwd = os.getcwd()
         self.coding_from = ":coding" if on else None
-        self.audit.log("coding", on=on, cwd=os.getcwd())
+        self.audit.log("coding", on=on, cwd=os.getcwd(), override=self.coding_override)
 
     def register(self, tools):
         added = []
@@ -1331,7 +1665,10 @@ class Engine:
             self.session.drop_last()
             raise
         try:
-            return self.loop(checked=True)
+            ended = self.loop(checked=True)
+            if ended != "command":      # a proposed command has already said so
+                self.notify("reply")    # the turn is over: genai now waits for the person
+            return ended
         finally:
             self.session.save()
 
@@ -1395,6 +1732,16 @@ class Engine:
                     p.fields["size"] = st.st_size if st else None
                 if self.read_allowed(parts):
                     p.auto = True
+                    if kind == "read":
+                        try:
+                            secret = looks_secret(self.wd.read(path))
+                        except (ValueError, OSError):
+                            secret = False
+                        if secret:
+                            p.auto = False
+                            p.fields["secret"] = True
+                            self.ui.notice(f"{path} looks like it contains secrets, "
+                                           "so reading it needs your OK even in coding mode")
                 return p
             if name == "write_file":
                 path, content = args.get("path"), args.get("content")
@@ -1409,7 +1756,9 @@ class Engine:
                     try:
                         fields["diff"] = unified_diff(self.wd.read(path, WRITE_CAP), content, path)
                     except (ValueError, OSError) as e:
-                        fields["diff"] = f"(cannot diff the existing file: {e})"
+                        st = self.wd.stat(path)
+                        fields.update(diff=f"(cannot diff the existing file: {e})", undiffable=str(e),
+                                      mode=f"{stat.S_IMODE(st.st_mode):04o}" if st else None)
                 return Proposal(pid, "write", tc["id"], **fields)
             if name == "edit_file":
                 path, old, new = args.get("path"), args.get("old_text"), args.get("new_text")
@@ -1439,6 +1788,15 @@ class Engine:
         except (ValueError, OSError) as e:
             p = Proposal(pid, "invalid", tc["id"], tool=name)
             p.error = str(e)
+            if isinstance(e, (DiskError, OSError)):
+                try:
+                    parts = split_rel(args.get("path", "."))
+                except ValueError:
+                    parts = [".hidden"]
+                if not self.read_allowed(parts):    # on-disk facts are for the user, not the model
+                    p.error = f"{name} of {show_exact(str(args.get('path')))} failed, and the model was only told " \
+                              f"it was declined: {e}"
+                    p.reply = "declined by the user"
             return p
 
     def read_allowed(self, parts):
@@ -1464,13 +1822,21 @@ class Engine:
             elif p.auto:
                 p.decision = "accept"
                 self.ui.show_auto(p)
+        if any(p.kind == "command" for p in live):
+            self.notify("command")      # once, however many commands were shown
         pending = [p for p in live if p.kind != "command" and not p.auto]
         if pending:
+            self.notify("approval", count=len(pending), kinds=sorted({p.kind for p in pending}))
             self.ui.decide(pending)
         for p in pending:
             if p.kind != "external":
                 p.decision = p.decision if p.decision in ("accept", "decline") else "decline"
                 self.audit.log("decision", id=p.id, decision=p.decision)
+
+    def notify(self, event, **fields):
+        """Tell the notify hook, if there is one, that genai is now waiting for the person."""
+        if self.notifier:
+            self.notifier.fire(event, **fields)
 
     def perform(self, p):
         if p.error:
@@ -1479,7 +1845,7 @@ class Engine:
             return "shown to the user, not run. If they run it, they may send you the output."
         if p.kind == "external":
             status = p.decision if p.decision in ("ok", "declined", "error") else "declined"
-            out, counts = redact(str(p.result or ""))
+            out, counts = redact(str(p.result or ""), self.secrets())
             self.audit.log("external_result", id=p.id, tool=p.fields["tool"], status=status,
                            chars=len(out), redacted=counts)
             return f"{status}" + (f":\n{clip(out)}" if out else "")
@@ -1530,6 +1896,10 @@ class Engine:
     def share(self, source, text, ref=None):
         """Record that reviewed output is being sent to the model."""
         self.audit.log("shared", source=source, ref=ref, chars=len(text))
+
+    def secrets(self):
+        """Exact values to mask in text bound for the model: the endpoint key."""
+        return [getattr(self.client, "_key", None)]
 
     def compact(self, edit_summary=None):
         """Prune old bulk, then summarize older turns only if still over the warning line."""
@@ -1608,13 +1978,17 @@ class PlainUI:
             self._flagged = False
 
     def notice(self, msg):
-        eprint(f"genai: {exact(msg)[0]}")
+        eprint(f"genai: {one_line(msg)[0]}")
 
     def context(self, used, limit):
         pass
 
     def show_command(self, p):
-        self.out.write(f"\n[proposed command {p.id}] {show_exact(p.fields['reason'])}\n    {show_exact(p.fields['command'])}\n")
+        self.out.write(f"\n[proposed command {p.id}] {one_line(p.fields['reason'])[0]}\n"
+                       f"    {show_exact(p.fields['command'])}\n")
+        note = non_ascii_line(p.fields["command"])
+        if note:
+            self.out.write(note + "\n")
         self.out.flush()
 
     def show_auto(self, p):
@@ -1623,11 +1997,16 @@ class PlainUI:
     def decide(self, pending):
         for p in pending:
             p.decision = "decline" if p.kind != "external" else "declined"
-            self.notice(f"{p.kind} proposal {p.id} ({exact(str(p.fields.get('path') or p.fields.get('tool')))[0]}) declined: "
-                        "no terminal")
+            self.notice(f"{p.kind} proposal {p.id} ({one_line(str(p.fields.get('path') or p.fields.get('tool')))[0]}) "
+                        "declined: no terminal")
 
     def result(self, p, status, note):
         pass
+
+
+def margin(text):
+    """Escape a multi-line body and put a margin on every line, so it can't pass for genai's own prompts."""
+    return "\n".join("    | " + ln for ln in show_exact(text).splitlines() or [""])
 
 
 class TtyUI(PlainUI):
@@ -1639,37 +2018,45 @@ class TtyUI(PlainUI):
 
     def show_command(self, p):
         cmd = show_exact(p.fields["command"])
-        self.out.write(f"\n\033[1mProposed command [{p.id}]\033[0m: {show_exact(p.fields['reason'])}\n\n    {cmd}\n\n"
-                       "Paste it into your shell, or type :run to review and run it.\n")
+        note = non_ascii_line(p.fields["command"])
+        self.out.write(f"\n\033[1mProposed command [{p.id}]\033[0m: {one_line(p.fields['reason'])[0]}\n\n    {cmd}\n"
+                       + (note + "\n" if note else "") +
+                       "\nPaste it into your shell, or type :run to review and run it.\n")
         self.out.flush()
 
     def show_auto(self, p):
-        eprint(f"  (coding mode) {p.kind} {exact(p.fields['path'])[0]}")
+        eprint(f"  (coding mode) {p.kind} {one_line(p.fields['path'])[0]}")
 
     def decide(self, pending):
         for p in pending:
             f = p.fields
+            path = one_line(str(f.get("path", "")))[0]
             if p.kind == "read":
                 size = "missing" if f.get("size") is None else f"{f['size']} bytes"
-                head = f"Read {show_exact(f['path'])} ({size})?"
+                head = f"Read {path} ({size})?"
             elif p.kind == "list":
-                head = f"List directory {show_exact(f['path'])}?"
+                head = f"List directory {path}?"
             elif p.kind == "write":
-                if f["exists"]:
-                    body = f.get("diff") or "(no changes)"
-                    head = f"Overwrite {show_exact(f['path'])}:\n{show_exact(body)}"
+                if f["exists"] and f.get("undiffable"):
+                    mode = f.get("mode")
+                    keep = f"keeps mode {mode} (executable)" if mode and int(mode, 8) & 0o111 else "keeps its mode"
+                    head = (f"Overwrite {path}:\n  the existing file can't be diffed: {one_line(f['undiffable'])[0]}\n"
+                            f"  it will be replaced entirely, and {keep}\n"
+                            f"  the new content, {f['lines']} lines:\n{margin(f['content'])}")
+                elif f["exists"]:
+                    head = f"Overwrite {path}:\n{margin(f.get('diff') or '(no changes)')}"
                 else:
-                    head = f"New file {show_exact(f['path'])}, {f['lines']} lines:\n{show_exact(f['content'])}"
+                    head = f"New file {path}, {f['lines']} lines:\n{margin(f['content'])}"
             elif p.kind == "edit":
-                head = f"Edit {show_exact(f['path'])}:\n{show_exact(f['diff'])}"
+                head = f"Edit {path}:\n{margin(f['diff'])}"
             else:
                 head = f"Call {p.kind}?"
-            self.out.write(f"\n\033[1m[{p.id}] {p.kind}\033[0m — {show_exact(f.get('reason', ''))}\n{head}\n")
+            self.out.write(f"\n\033[1m[{p.id}] {p.kind}\033[0m — {one_line(f.get('reason', ''))[0]}\n{head}\n")
             self.out.flush()
             p.decision = "accept" if ask_yes(f"Accept {p.id}?") else "decline"
 
     def result(self, p, status, note):
-        eprint(f"  [{p.id}] {status}: {exact(note)[0]}")
+        eprint(f"  [{p.id}] {status}: {one_line(note)[0]}")
 
 
 def ask_yes(question):
@@ -1716,6 +2103,8 @@ class JsonUI:
         disp, flagged = exact(p.fields["command"])
         if flagged:
             ev["display"], ev["flagged"] = disp, True
+        if non_ascii_chars(p.fields["command"]):
+            ev["non_ascii"] = [f"U+{ord(c):04X}" for c in non_ascii_chars(p.fields["command"])]
         self.emit(ev)
 
     def show_auto(self, p):
@@ -1726,7 +2115,7 @@ class JsonUI:
         No answer, EOF, or an unknown ID means decline."""
         for p in pending:
             ev = p.event()
-            for key in ("content", "diff", "path"):
+            for key in ("content", "diff", "path", "undiffable"):
                 if isinstance(ev.get(key), str):
                     disp, flagged = exact(ev[key])
                     if flagged:
@@ -1761,7 +2150,7 @@ class JsonUI:
         if not isinstance(text, str):
             self.error("attach needs 'text'", "bad_message")
             return
-        red, counts = redact(text)
+        red, counts = redact(text, self.engine.secrets() if self.engine else ())
         red = clip(red)
         label = str(msg.get("label") or "attachment")
         self.queue.append((label, red, msg.get("ref")))
@@ -1829,10 +2218,13 @@ def edit_text(text, title, what, cancel):
 def review_output(engine, source, lead, text, title):
     """Redact, clip and open output in the editor, with `lead` lines above it in the same buffer.
     Returns exactly what the user saved, which is exactly what is sent; nothing is added afterwards."""
-    red, counts = redact(text)
-    buf = "\n".join(lead) + "\n```\n" + clip(red) + "\n```"
+    red, counts = redact(text, getattr(engine, "secrets", lambda: ())())
+    buf, flagged = exact("\n".join(lead) + "\n```\n" + clip(red) + "\n```")
     if counts:
         title += f"\n# Masked in the output: {redaction_note(counts)}"
+    if flagged:
+        title += ("\n# Hidden or control characters were found; they are shown as \\x.. or \\u.... escapes"
+                  " and are sent that way.")
     title += ("\n# EVERYTHING below is sent to the model as saved, the command included."
               "\n# Remove anything you don't want it to see, such as a secret in the command.")
     kept = edit_text(buf, title, "sent to the model exactly as saved; nothing is added", "send nothing")
@@ -1858,6 +2250,9 @@ Commands (on an empty buffer):
   :help           this text            :quit         leave"""
 
 
+HOOK_BANNER = "hook: notify (runs {} when genai waits for you)"
+
+
 class Repl:
     def __init__(self, engine):
         self.e = engine
@@ -1866,17 +2261,21 @@ class Repl:
 
     def banner(self):
         p = self.e.endpoint
-        print(f"genai {VERSION} — {p.name}: {p.model} at {p.base_url}")
+        print(f"genai {VERSION} — {one_line(p.name)[0]}: {one_line(p.model)[0]} at {one_line(p.base_url)[0]}")
         if self.e.profile:
             d = self.e.profile.description
-            print(f"profile {self.e.profile.name}" + (f": {exact(d)[0]}" if d else ""))
+            print(f"profile {one_line(self.e.profile.name)[0]}" + (f": {one_line(d)[0]}" if d else ""))
         s = self.e.session
         if s.id:
             print(f"session {s.id}" + (" (resumed)" if s.resumed else ""))
         if s.coding:
             print(f"coding mode is ON ({self.e.coding_from or 'session'}): "
                   "the model can read and list files here without asking")
+            if self.e.coding_override:
+                print(f"  [!] this is {self.e.coding_override}; --coding-anywhere allowed it")
         print(f"sandbox: commands you :run or :sh execute {where_runs(self.e.sandbox)}")
+        if self.e.notifier:
+            print("  " + HOOK_BANNER.format(short_path(self.e.notifier.path)))
         print("Type :help for commands. A line with only '..' sends.")
 
     def run(self):
@@ -1919,7 +2318,7 @@ class Repl:
         except KeyboardInterrupt:
             print("\n(interrupted)")
         except GenaiError as err:
-            print(f"genai: {err}")
+            print(f"genai: {exact(str(err))[0]}")
 
     def command(self, line):
         cmd, _, arg = line[1:].partition(" ")
@@ -1948,19 +2347,19 @@ class Repl:
                 print(f"context: {self.e.used()}/{self.e.endpoint.context_limit} tokens (estimated)")
             elif cmd == "skills":
                 for name, s in sorted(find_skills(self.e.cfg).items()):
-                    print(f"  {name:20} {skill_status(self.e.cfg, s):10} {s.description()}")
+                    print(f"  {one_line(name)[0]:20} {skill_status(self.e.cfg, s):10} {one_line(s.description())[0]}")
             elif cmd == "bless":
                 if bless(self.e.cfg, arg, ask_yes):
                     self.e.reload_skills()
             else:
                 print(f"unknown command :{cmd} (try :help)")
         except GenaiError as err:
-            print(f"genai: {err}")
+            print(f"genai: {exact(str(err))[0]}")
 
     def do_attach(self, path):
         data = read_attachment(path)
         self.attachments.append((f"file {path}", data))
-        print(f"attached {path} ({len(data)} characters) to your next message")
+        print(f"attached {one_line(path)[0]} ({len(data)} characters) to your next message")
 
     def do_run(self, pid):
         props = [p for p in self.e.commands if not pid or p.id == pid]
@@ -1998,7 +2397,7 @@ class Repl:
             rc = proc.wait()
         self.e.audit.log("run_exit", id=p.id, exit=rc, sandbox=self.e.sandbox)
         print(f"\n[exit {rc}; ran {where}]")
-        out = b"".join(captured).decode("utf-8", "replace")
+        out = strip_ansi(b"".join(captured).decode("utf-8", "replace"))
         kept = review_output(self.e, "run", [f"I ran this command {where} (exit {rc}):", "```", edited, "```", "Output:"],
                              out, f"Output of: {' '.join(exact(edited)[0].split())} (exit {rc})")
         if kept:
@@ -2059,7 +2458,8 @@ def read_attachment(path):
         raise GenaiError(f"{path} looks binary; refused", EXIT_USAGE)
     text = data.decode("utf-8", "replace")
     if looks_secret(text):
-        eprint(f"genai: warning: {path} looks like it contains secrets; it is sent as is (files are not redacted)")
+        eprint(f"genai: warning: {one_line(path)[0]} looks like it contains secrets; it is sent as is "
+               "(files are not redacted)")
     return text
 
 
@@ -2075,7 +2475,8 @@ def run_json(engine, ui, first_prompt, attachments):
              if engine.profile else None,
              "session": engine.session.id,
              "resumed": engine.session.resumed, "coding": engine.session.coding,
-             "coding_from": engine.coding_from if engine.session.coding else None, "cwd": os.getcwd(),
+             "coding_from": engine.coding_from if engine.session.coding else None,
+             "coding_override": engine.coding_override if engine.session.coding else None, "cwd": os.getcwd(),
              "sandbox": engine.sandbox,
              "tools": list(INTRINSICS)})
     engine.audit.log("start", mode="json", endpoint=engine.endpoint.info(),
@@ -2140,6 +2541,9 @@ def parse_args(argv):
     ap.add_argument("-k", "--skill", action="append", default=[], help="use a blessed skill (repeatable)")
     ap.add_argument("-S", "--session", help="keep the conversation in a named session (created or resumed)")
     ap.add_argument("--coding", action="store_true", help="let the model read and list files here without asking")
+    ap.add_argument("--coding-anywhere", action="store_true",
+                    help="--coding, also where it is normally refused (your home directory, credential "
+                         "directories); prints what that exposes")
     ap.add_argument("--json", action="store_true", help="JSON Lines over stdio, for wrappers")
     ap.add_argument("--bless", metavar="PATH", help="review and bless a skill directory, endpoint or profile file")
     ap.add_argument("--list-skills", action="store_true", help="list skills (with --json: as JSON)")
@@ -2166,7 +2570,7 @@ def main(argv=None):
                 print(json.dumps({"type": "skills", "skills": rows}))
             else:
                 for r in rows:
-                    print(f"{r['name']:20} {r['status']:10} {r['description']}")
+                    print(f"{one_line(r['name'])[0]:20} {r['status']:10} {one_line(r['description'])[0]}")
             return EXIT_OK
         for kind, wanted in (("endpoint", args.list_endpoints), ("profile", args.list_profiles)):
             if wanted:
@@ -2175,7 +2579,7 @@ def main(argv=None):
                     print(json.dumps({"type": kind + "s", kind + "s": rows}))
                 else:
                     for r in rows:
-                        print(f"{r['name']:20} {r['status']:10} {r['description']}")
+                        print(f"{one_line(r['name'])[0]:20} {r['status']:10} {one_line(r['description'])[0]}")
                 return EXIT_OK
         if args.list_sessions:
             rows = list_sessions(cfg)
@@ -2183,8 +2587,9 @@ def main(argv=None):
                 print(json.dumps({"type": "sessions", "sessions": rows}))
             else:
                 for r in rows:
-                    print(f"{r['id']:28} {r['endpoint'] or '-':12} {r['profile'] or '-':12} "
-                          f"{r['updated'] or '':26} {r['first']}")
+                    print(f"{one_line(r['id'])[0]:28} {one_line(r['endpoint'] or '-')[0]:12} "
+                          f"{one_line(r['profile'] or '-')[0]:12} {one_line(r['updated'] or '')[0]:26} "
+                          f"{one_line(r['first'])[0]}")
             return EXIT_OK
 
         session = Session.open(cfg, args.session)
@@ -2219,8 +2624,11 @@ def main(argv=None):
         else:
             ui = PlainUI()
         attachments = [(f"file {f}", read_attachment(f)) for f in args.file]
-        coding = "--coding" if args.coding else (f"profile {persona.name}" if persona and persona.coding else None)
-        engine = Engine(cfg, endpoint, session, ui, coding=coding, profile=persona)
+        coding = ("--coding-anywhere" if args.coding_anywhere else "--coding" if args.coding else
+                  f"profile {persona.name}" if persona and persona.coding else None)
+        engine = Engine(cfg, endpoint, session, ui, coding=coding, profile=persona, anywhere=args.coding_anywhere)
+        if isinstance(ui, TtyUI):       # hooks only run for a person at the terminal, the UI chosen above
+            engine.notifier = Notifier.start(engine)
         for n in notices:
             ui.notice(n)
         if session.resumed and session.coding and engine.coding_from == "session":
@@ -2238,16 +2646,18 @@ def main(argv=None):
             repl.attachments = attachments
             return repl.run()
         if isinstance(ui, TtyUI):
-            eprint(f"genai: {(persona.name + ' on ') if persona else ''}{endpoint.name} "
-                   f"({endpoint.model} at {endpoint.base_url}); "
+            eprint(f"genai: {(one_line(persona.name)[0] + ' on ') if persona else ''}{one_line(endpoint.name)[0]} "
+                   f"({one_line(endpoint.model)[0]} at {one_line(endpoint.base_url)[0]}); "
                    f"commands run {where_runs(engine.sandbox)}")
+            if engine.notifier:
+                eprint("genai: " + HOOK_BANNER.format(short_path(engine.notifier.path)))
         engine.user_turn(prompt, attachments)
         return EXIT_OK
     except GenaiError as err:
         if args.json:
             print(json.dumps({"type": "error", "code": err.kind, "message": str(err)}), flush=True)
         else:
-            eprint(f"genai: {err}")
+            eprint(f"genai: {exact(str(err))[0]}")
         return err.code
     except KeyboardInterrupt:
         eprint("\ngenai: interrupted")

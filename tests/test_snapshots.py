@@ -212,8 +212,10 @@ class TestSandboxRun(Tmp):
         self.evil = f"a[$(touch {self.marker})]"
 
     def run_sandbox(self, *args, key_env=None):
-        env = dict(os.environ, PATH=self.bin + os.pathsep + os.environ["PATH"])
+        env = dict(os.environ, PATH=self.bin + os.pathsep + os.environ["PATH"],
+                   GENAI_SANDBOX_STATE=self.path("state"))   # hooks run in every mode; use none
         env.pop("GENAI_KEY_ENV", None)
+        env.pop("GENAI_SANDBOX_HOOKS", None)
         if key_env is not None:
             env["GENAI_KEY_ENV"] = key_env
         return subprocess.run(["bash", RUN, *args], env=env, capture_output=True, text=True, timeout=60)

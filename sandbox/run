@@ -1,27 +1,42 @@
 #!/usr/bin/env bash
-# Run genai, or its tests, inside a rootless podman sandbox.
+# Run genai, or its tests, inside a rootless podman sandbox made from this machine's own OS.
 #
 #   sandbox/run tests            offline test suite, no network
 #   sandbox/run live ENDPOINT.json  live test against a real endpoint (needs its key variable set)
 #   sandbox/run genai [ARGS...]  genai itself, interactive, in ./sandbox-work by default
 #   sandbox/run selfcheck        the live test's harness against a fake endpoint, no network
 #
+# There is no image to build or pull. The sandbox's root is an empty directory tree made here, and
+# this machine's /usr and /etc are mounted into it read-only. So the sandbox has the host's Python,
+# editor and CA certificates, and nothing from /home, /root, /var, /run, /mnt, /media, /srv or /opt.
+# Whatever your user can read under /usr and /etc can be read inside it.
+#
 # This is the podman implementation of a small contract, so another sandbox can replace it:
 #   - the repo is mounted read-only at /opt/genai
 #   - one working directory is mounted read-write at /work, and is the only host path genai can write
+#     (besides its own config directory, below)
 #   - genai's config lives in a sandbox-only directory, never the user's real ~/.config/genai
 #   - GENAI_SANDBOX=<name> is set, so genai reports that commands run inside a sandbox
 #   - only the key variable the endpoint names is passed in, by name (its value is never on a command line)
 #
 # Environment:
-#   GENAI_SANDBOX_IMAGE   image tag (default localhost/genai-sandbox:py3.10)
-#   GENAI_SANDBOX_STATE   host dir for the sandbox's genai config (default ~/.local/share/genai-sandbox)
+#   GENAI_SANDBOX_STATE   host dir for the sandbox's genai config and root tree (default ~/.local/share/genai-sandbox)
 #   GENAI_SANDBOX_WORK    host dir mounted at /work for "genai" (default ./sandbox-work)
+#   GENAI_SANDBOX_PYTHON  the Python to run inside (default python3); it must live under a mounted directory
+#   GENAI_SANDBOX_RO      more host directories to mount read-only at the same path, colon-separated
+#                         (for a Python or editor outside /usr, for example /opt/python-3.12)
+#   GENAI_SANDBOX_HOOKS   directory of sandbox hooks (default $GENAI_SANDBOX_STATE/hooks); see below
 #   GENAI_KEY_ENV         key variable to pass through (for "live", default: the endpoint's key_env)
+#
+# Hooks: every executable file in the hooks directory is run, in name order, before the sandbox
+# starts, with the mode as its argument. Each prints requests (ro DIR, path NAME, env NAME) to add
+# read-only mounts and pass variables by name. The directory and files must be yours and closed to
+# group and others. A hook that fails stops the sandbox. See HOOKS.md.
 set -euo pipefail
 
+die() { echo "sandbox/run: $1" >&2; exit "${2:-1}"; }
+
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-image=${GENAI_SANDBOX_IMAGE:-localhost/genai-sandbox:py3.10}
 state=${GENAI_SANDBOX_STATE:-$HOME/.local/share/genai-sandbox}
 key_env=${GENAI_KEY_ENV:-}
 
@@ -35,25 +50,258 @@ check_key_env() {  # $1 = where the name came from
 }
 check_key_env GENAI_KEY_ENV
 
-command -v podman >/dev/null || { echo "sandbox/run: podman is required" >&2; exit 1; }
+# Absolute paths, so a filtered PATH handed to podman (see hooks below) cannot change which ones run.
+podman=$(command -v podman) || die "podman is required"
+rm_bin=$(command -v rm) || die "rm is required"
 
-build() {
-  if ! podman image exists "$image"; then
-    echo "sandbox/run: building $image" >&2
-    podman build -q -t "$image" -f "$repo/sandbox/Containerfile" "$repo/sandbox" >/dev/null
+# Host directories the sandbox sees, read-only, each at its own path.
+ro_dirs=(/usr /etc)
+inside() { [[ "$1" == "$2" || "$1" == "${2%/}"/* ]]; }   # is path $1 at or under directory $2?
+
+# Can $1 be mounted read-only? Sets ro_dir (resolved when it exists) and, on failure, ro_reason.
+# Used for GENAI_SANDBOX_RO and for hooks' "ro" requests, so the rules are the same.
+ro_dir=
+ro_reason=
+ro_check() {
+  local d=$1 own
+  ro_dir=$d
+  if ! [[ "$d" == /* && -d "$d" && "$d" != *[[:space:],]* ]]; then
+    ro_reason="is not an absolute path to a directory (or has a space or comma)"
+    return 1
+  fi
+  d=$(realpath "$d")
+  ro_dir=$d
+  if inside "$HOME" "$d" || inside "$(realpath -m "$HOME")" "$d"; then
+    ro_reason="is or contains your home directory; refusing"
+    return 1
+  fi
+  for own in /proc /sys /dev /run /tmp /var/tmp /work /opt/genai /opt/genai-live /home/genai /usr /etc; do
+    if inside "$own" "$d"; then
+      ro_reason="would cover the sandbox's own $own; name a deeper directory"
+      return 1
+    fi
+  done
+  for own in /proc /sys /dev /run; do   # sockets and devices work through a read-only mount, so none of these
+    if inside "$d" "$own"; then
+      ro_reason="is under $own, which is never mounted from the host"
+      return 1
+    fi
+  done
+}
+ro_add() {  # add $ro_dir to ro_dirs unless it is already listed
+  local x
+  for x in "${ro_dirs[@]}"; do
+    if [[ "$x" == "$ro_dir" ]]; then return 0; fi
+  done
+  ro_dirs+=("$ro_dir")
+}
+
+IFS=: read -r -a extra_ro <<<"${GENAI_SANDBOX_RO:-}"
+for d in "${extra_ro[@]}"; do
+  [[ -n "$d" ]] || continue
+  ro_check "$d" || die "GENAI_SANDBOX_RO: '$ro_dir' $ro_reason" 2
+  ro_add
+done
+
+# Sandbox hooks. run_hooks collects requests; apply_hook_ro adds the mounts (before make_root);
+# apply_hook_vars filters search paths against the final mounts (after make_root); export_hook_vars
+# hands the filtered values to podman through its environment, last, so they never reach a command line.
+declare -A env0=()   # names in the environment the launcher was started with
+while IFS= read -r v; do env0[$v]=1; done < <(compgen -e)
+hook_names=() req_hook=() req_verb=() req_arg=()
+rep_ro=() rep_path=() rep_env=() rep_skip=()
+hook_flags=() hook_path_names=() hook_path_vals=()
+
+mine_only() {  # is $1 owned by this user and not writable by group or others?
+  local perm
+  [[ -O "$1" ]] || return 1
+  perm=$(stat -c %a "$1") || return 1
+  (( (8#$perm & 8#022) == 0 ))
+}
+
+hook_name_ok() {  # $1 = variable name from a hook, $2 = request, $3 = hook; die unless it may be passed
+  local n=$1
+  [[ "$n" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "hook $3: '$2' names a variable that is not a plain identifier" 2
+  case "$n" in
+    HOME|XDG_CONFIG_HOME|GENAI_SANDBOX) die "hook $3: '$2' names $n, which the sandbox sets itself" 2 ;;
+    LD_LIBRARY_PATH) ;;
+    LD_*) die "hook $3: '$2' names $n; loader variables are not passed" 2 ;;
+  esac
+}
+
+run_hooks() {  # $1 = mode
+  local dir=${GENAI_SANDBOX_HOOKS:-$state/hooks} real f name resolved out rc line idx verb arg
+  [[ -e "$dir" ]] || return 0
+  real=$(realpath "$dir")
+  if ! [[ -d "$real" ]] || ! mine_only "$real"; then
+    die "hooks directory $real is not a directory owned by you and closed to group and others; refusing" 2
+  fi
+  while IFS= read -r -d '' f; do
+    name=${f##*/}
+    if ! [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]]; then
+      echo "sandbox/run: hook $(printf %q "$name") skipped: a hook name is letters, digits, . _ and - only" >&2
+      continue
+    fi
+    resolved=$(realpath -e "$f") || die "hook $name: cannot resolve $f" 2
+    [[ -f "$resolved" ]] || die "hook $name: $resolved is not a regular file" 2
+    mine_only "$resolved" || die "hook $name: $resolved is not owned by you or is writable by group or others; refusing" 2
+    if ! [[ -x "$resolved" ]]; then
+      echo "sandbox/run: hook $name ignored: not executable" >&2
+      continue
+    fi
+    rc=0
+    out=$("$resolved" "$1" </dev/null) || rc=$?
+    [[ $rc == 0 ]] || die "hook $name failed (exit status $rc); the sandbox does not start" 2
+    hook_names+=("$name")
+    idx=$((${#hook_names[@]} - 1))
+    rep_ro[idx]= rep_path[idx]= rep_env[idx]= rep_skip[idx]=
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      [[ "$line" =~ ^[[:space:]]*$ || "$line" == '#'* ]] && continue
+      if [[ "$line" != *[[:cntrl:]]* && "$line" =~ ^(ro|path|env)\ ([^[:space:]]+)$ ]]; then
+        verb=${BASH_REMATCH[1]} arg=${BASH_REMATCH[2]}
+        if [[ "$verb" != ro ]]; then hook_name_ok "$arg" "$line" "$name"; fi
+        if [[ "$verb" == env ]]; then
+          case "$arg" in
+            PATH|PYTHONPATH|LD_*) die "hook $name: '$line' is refused; search paths go through 'path'" 2 ;;
+          esac
+        fi
+        req_hook+=("$idx") req_verb+=("$verb") req_arg+=("$arg")
+      else
+        die "hook $name: unknown request $(printf %q "${line:0:200}"); the sandbox does not start" 2
+      fi
+    done <<<"$out"
+  done < <(find "$real" -mindepth 1 -maxdepth 1 -print0 | LC_ALL=C sort -z)
+}
+
+apply_hook_ro() {
+  local i d covered
+  for i in "${!req_verb[@]}"; do
+    [[ "${req_verb[i]}" == ro ]] || continue
+    if ! ro_check "${req_arg[i]}"; then
+      rep_skip[${req_hook[i]}]+="${rep_skip[${req_hook[i]}]:+; }skipped ro ${req_arg[i]} (${ro_reason%%;*})"
+      continue
+    fi
+    covered=0
+    for d in "${ro_dirs[@]}"; do
+      if inside "$ro_dir" "$d"; then covered=1; fi
+    done
+    if [[ $covered == 1 ]]; then
+      rep_skip[${req_hook[i]}]+="${rep_skip[${req_hook[i]}]:+; }skipped ro ${req_arg[i]} (already mounted)"
+      continue
+    fi
+    ro_add
+    rep_ro[${req_hook[i]}]+=" $ro_dir"
+  done
+}
+
+apply_hook_vars() {
+  local i h arg val rest e rp d k ok dup new line
+  local -A seen=()
+  for i in "${!req_verb[@]}"; do
+    h=${req_hook[i]} arg=${req_arg[i]}
+    case "${req_verb[i]}" in
+      path)
+        [[ -z "${seen[$arg]:-}" && -n "${env0[$arg]:-}" ]] || continue
+        val=${!arg:-}
+        [[ -n "$val" ]] || continue
+        local -a kept=()
+        rest="$val:"
+        while [[ -n "$rest" ]]; do
+          e=${rest%%:*}
+          rest=${rest#*:}
+          [[ "$e" == /* && -e "$e" ]] || continue
+          rp=$(realpath -e "$e" 2>/dev/null) || continue
+          [[ "$rp" != *[:$'\n']* ]] || continue   # it would read as two entries inside
+          ok=0
+          for d in "${ro_dirs[@]}"; do
+            if inside "$rp" "$d"; then ok=1; fi
+          done
+          [[ $ok == 1 ]] || continue
+          dup=0
+          for k in "${kept[@]}"; do
+            if [[ "$k" == "$rp" ]]; then dup=1; fi
+          done
+          if [[ $dup == 0 ]]; then kept+=("$rp"); fi
+        done
+        if [[ ${#kept[@]} == 0 ]]; then
+          rep_skip[h]+="${rep_skip[h]:+; }skipped path $arg (no entry under a mounted directory)"
+          continue
+        fi
+        printf -v new '%s:' "${kept[@]}"
+        seen[$arg]=1
+        hook_path_names+=("$arg") hook_path_vals+=("${new%:}") hook_flags+=(-e "$arg")
+        rep_path[h]+=" $arg"
+        ;;
+      env)
+        [[ -z "${seen[$arg]:-}" && -n "${env0[$arg]:-}" ]] || continue
+        seen[$arg]=1
+        hook_flags+=(-e "$arg")
+        rep_env[h]+=" $arg"
+        ;;
+    esac
+  done
+  for i in "${!hook_names[@]}"; do
+    local -a parts=()
+    if [[ -n "${rep_ro[i]:-}" ]]; then parts+=("ro${rep_ro[i]}"); fi
+    if [[ -n "${rep_path[i]:-}" ]]; then parts+=("path${rep_path[i]}"); fi
+    if [[ -n "${rep_env[i]:-}" ]]; then parts+=("env${rep_env[i]}"); fi
+    if [[ -n "${rep_skip[i]:-}" ]]; then parts+=("${rep_skip[i]}"); fi
+    if [[ ${#parts[@]} == 0 ]]; then parts+=("no requests"); fi
+    line=
+    for k in "${parts[@]}"; do line+="${line:+; }$k"; done
+    echo "sandbox/run: hook ${hook_names[i]}: $line" >&2
+  done
+}
+
+export_hook_vars() {  # last step before podman run: the values go in podman's environment, by name
+  local i
+  for i in "${!hook_path_names[@]}"; do
+    export "${hook_path_names[i]}=${hook_path_vals[i]}"
+  done
+}
+
+# The Python that runs inside is the host's, by its real path, so it has to be under a mounted directory.
+py=${GENAI_SANDBOX_PYTHON:-python3}
+pybin=$(command -v "$py") || die "$py was not found on this machine"
+pybin=$(realpath "$pybin")
+"$pybin" -c 'import sys; raise SystemExit(sys.version_info < (3, 10))' || die "$pybin is older than Python 3.10"
+
+make_root() {  # $1 = directory to hold the sandbox's root: mount points and the host's top-level links, no files
+  local root=$1 d
+  mkdir -p "$root"/{proc,sys,dev,run,tmp,var/tmp,work,opt/genai,opt/genai-live,home/genai/.config/genai}
+  : >"$root/opt/genai-live/endpoint.json"
+  for d in /bin /sbin /lib /lib32 /lib64 /libx32; do   # /bin -> usr/bin and friends, as on the host
+    if [[ -L "$d" ]]; then
+      ln -sfn "$(readlink "$d")" "$root$d"
+    elif [[ -d "$d" ]]; then
+      ro_dirs+=("$d")
+    fi
+  done
+  mounts=()
+  for d in "${ro_dirs[@]}"; do
+    mkdir -p "$root$d"
+    mounts+=(-v "$d:$d:ro")
+  done
+  local ok=0
+  for d in "${ro_dirs[@]}"; do if inside "$pybin" "$d"; then ok=1; fi; done
+  if [[ $ok == 0 ]]; then
+    die "$pybin is outside what the sandbox mounts (${ro_dirs[*]}); set GENAI_SANDBOX_PYTHON to one under /usr, or add its directory to GENAI_SANDBOX_RO"
   fi
 }
 
-# Hardened defaults shared by every mode.
+# Hardened defaults shared by every mode. --rootfs and the host mounts are added once the root exists.
 common=(
-  --rm --init
+  --rm --init --sdnotify=ignore
   --userns=keep-id
   --read-only --tmpfs /tmp:rw,mode=1777,size=64m
   --cap-drop=ALL --security-opt=no-new-privileges
   --pids-limit=256 --memory=1g
   -v "$repo:/opt/genai:ro"
+  -e HOME=/home/genai -e XDG_CONFIG_HOME=/home/genai/.config
+  -e PYTHONDONTWRITEBYTECODE=1
   -e GENAI_SANDBOX=podman
 )
+for v in LANG EDITOR VISUAL; do if [[ -n "${!v:-}" ]]; then common+=(-e "$v"); fi; done
 
 tty_flags=()
 [[ -t 0 && -t 1 ]] && tty_flags=(-it)
@@ -70,18 +318,27 @@ seed_config() {  # $1 = host config dir mounted at ~/.config/genai
   fi
 }
 
+scratch_root() {  # a throwaway root and /work for the test modes
+  scratch=$(mktemp -d "${TMPDIR:-/tmp}/genai-sbx-XXXXXX")
+  trap '"$rm_bin" -rf "$scratch"' EXIT
+  mkdir "$scratch/work"
+  make_root "$scratch/root"
+  apply_hook_vars
+}
+
 mode=${1:-genai}
 shift || true
-build
+
+case "$mode" in tests|live|selfcheck|genai) run_hooks "$mode"; apply_hook_ro ;; esac
 
 case "$mode" in
   tests)
-    scratch=$(mktemp -d "${TMPDIR:-/tmp}/genai-sbx-XXXXXX")
-    trap 'rm -rf "$scratch"' EXIT
+    scratch_root
     rc=0
-    podman run "${common[@]}" --network=none \
-      -v "$scratch:/work" -w /opt/genai \
-      "$image" python3 -W ignore::ResourceWarning -m unittest discover -s tests "$@" || rc=$?
+    export_hook_vars
+    "$podman" run "${common[@]}" "${mounts[@]}" "${hook_flags[@]}" --network=none \
+      -v "$scratch/work:/work" -w /opt/genai \
+      --rootfs "$scratch/root" "$pybin" -W ignore::ResourceWarning -m unittest discover -s tests "$@" || rc=$?
     exit "$rc"
     ;;
   live)
@@ -90,40 +347,43 @@ case "$mode" in
     shift
     endpoint=$(cd "$(dirname "$endpoint")" && pwd)/$(basename "$endpoint")
     if [[ -z "$key_env" ]]; then
-      key_env=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("key_env") or "")' "$endpoint")
+      key_env=$("$pybin" -c 'import json,sys; print(json.load(open(sys.argv[1])).get("key_env") or "")' "$endpoint")
     fi
     check_key_env "the endpoint's key_env"
     [[ -n "$key_env" ]] || { echo "sandbox/run: the endpoint has no key_env; set GENAI_KEY_ENV" >&2; exit 2; }
     [[ -n "${!key_env:-}" ]] || { echo "sandbox/run: \$$key_env is not set; the live test needs it" >&2; exit 2; }
     set_keyflag
-    scratch=$(mktemp -d "${TMPDIR:-/tmp}/genai-sbx-XXXXXX")
-    trap 'rm -rf "$scratch"' EXIT
+    scratch_root
     rc=0
-    podman run "${common[@]}" "${keyflag[@]}" \
-      -v "$scratch:/work" -v "$endpoint:/etc/genai-live/endpoint.json:ro" -w /work \
-      "$image" python3 /opt/genai/tests/live_endpoint.py --endpoint /etc/genai-live/endpoint.json "$@" || rc=$?
+    export_hook_vars
+    "$podman" run "${common[@]}" "${mounts[@]}" "${keyflag[@]}" "${hook_flags[@]}" \
+      -v "$scratch/work:/work" -v "$endpoint:/opt/genai-live/endpoint.json:ro" -w /work \
+      --rootfs "$scratch/root" "$pybin" /opt/genai/tests/live_endpoint.py --endpoint /opt/genai-live/endpoint.json "$@" || rc=$?
     exit "$rc"
     ;;
   selfcheck)
-    scratch=$(mktemp -d "${TMPDIR:-/tmp}/genai-sbx-XXXXXX")
-    trap 'rm -rf "$scratch"' EXIT
+    scratch_root
     rc=0
-    podman run "${common[@]}" --network=none \
-      -v "$scratch:/work" -w /work \
-      "$image" python3 /opt/genai/tests/selfcheck_live.py "$@" || rc=$?
+    export_hook_vars
+    "$podman" run "${common[@]}" "${mounts[@]}" "${hook_flags[@]}" --network=none \
+      -v "$scratch/work:/work" -w /work \
+      --rootfs "$scratch/root" "$pybin" /opt/genai/tests/selfcheck_live.py "$@" || rc=$?
     exit "$rc"
     ;;
   genai)
     work=${GENAI_SANDBOX_WORK:-$PWD/sandbox-work}
     mkdir -p "$work"
     seed_config "$state/config"
-    echo "sandbox/run: genai in podman; /work = $work; config = $state/config" >&2
-    exec podman run "${common[@]}" "${tty_flags[@]}" "${keyflag[@]}" \
+    make_root "$state/root"
+    apply_hook_vars
+    echo "sandbox/run: genai in podman on this machine's OS; /work = $work; config = $state/config" >&2
+    export_hook_vars
+    exec "$podman" run "${common[@]}" "${mounts[@]}" "${tty_flags[@]}" "${keyflag[@]}" "${hook_flags[@]}" \
       -v "$work:/work" -v "$state/config:/home/genai/.config/genai" -w /work \
-      "$image" python3 /opt/genai/genai "$@"
+      --rootfs "$state/root" "$pybin" /opt/genai/genai "$@"
     ;;
   *)
-    sed -n '2,9p' "$0" >&2
+    sed -n '2,7p' "$0" >&2
     exit 2
     ;;
 esac

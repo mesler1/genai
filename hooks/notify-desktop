@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+# notify-desktop: an example genai notify hook. When genai starts waiting for you it
+# sends a desktop notification with notify-send. It reads the one JSON line genai
+# writes on standard input, builds a short message from the event fields only, and
+# exits quietly if notify-send is not installed.
+#
+# To use it:
+#   1. cp hooks/notify-desktop ~/.config/genai/hooks/notify
+#      (make the directory first if needed; chmod u+x the copy)
+#   2. read it
+#   3. genai --bless ~/.config/genai/hooks/notify
+#
+# See HOOKS.md ("The notify hook") for what a hook receives and may do.
+
+import json
+import shutil
+import subprocess
+import sys
+
+
+def message(ev):
+    kind = ev.get("event")
+    if kind == "approval":
+        n = ev.get("count")
+        kinds = ", ".join(str(k) for k in ev.get("kinds") or [])
+        n = n if isinstance(n, int) else 0
+        return f"{n} proposal{'' if n == 1 else 's'} waiting ({kinds})"
+    if kind == "command":
+        return "a command was proposed"
+    if kind == "reply":
+        return "reply ready"
+    return None
+
+
+def main():
+    try:
+        ev = json.loads(sys.stdin.readline())
+    except ValueError:
+        return
+    text = message(ev) if isinstance(ev, dict) else None
+    exe = shutil.which("notify-send")
+    if not text or not exe:
+        return
+    subprocess.run([exe, "--", "genai", text], stdin=subprocess.DEVNULL, check=False)
+
+
+if __name__ == "__main__":
+    main()
