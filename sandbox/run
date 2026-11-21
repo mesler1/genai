@@ -25,6 +25,16 @@ image=${GENAI_SANDBOX_IMAGE:-localhost/genai-sandbox:py3.10}
 state=${GENAI_SANDBOX_STATE:-$HOME/.local/share/genai-sandbox}
 key_env=${GENAI_KEY_ENV:-}
 
+# The key variable name is used in ${!name} below, which bash would evaluate as an expression
+# (array subscripts can run commands). Only a plain identifier is ever looked up.
+check_key_env() {  # $1 = where the name came from
+  [[ -z "$key_env" || "$key_env" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || {
+    echo "sandbox/run: $1 is not a plain variable name (letters, digits, underscore); refusing" >&2
+    exit 2
+  }
+}
+check_key_env GENAI_KEY_ENV
+
 command -v podman >/dev/null || { echo "sandbox/run: podman is required" >&2; exit 1; }
 
 build() {
@@ -49,7 +59,7 @@ tty_flags=()
 [[ -t 0 && -t 1 ]] && tty_flags=(-it)
 
 keyflag=()
-set_keyflag() { keyflag=(); if [[ -n "$key_env" && -n "${!key_env:-}" ]]; then keyflag=(-e "$key_env"); fi; }
+set_keyflag() { check_key_env "the key variable name"; keyflag=(); if [[ -n "$key_env" && -n "${!key_env:-}" ]]; then keyflag=(-e "$key_env"); fi; }
 set_keyflag
 
 seed_config() {  # $1 = host config dir mounted at ~/.config/genai
@@ -82,6 +92,7 @@ case "$mode" in
     if [[ -z "$key_env" ]]; then
       key_env=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("key_env") or "")' "$endpoint")
     fi
+    check_key_env "the endpoint's key_env"
     [[ -n "$key_env" ]] || { echo "sandbox/run: the endpoint has no key_env; set GENAI_KEY_ENV" >&2; exit 2; }
     [[ -n "${!key_env:-}" ]] || { echo "sandbox/run: \$$key_env is not set; the live test needs it" >&2; exit 2; }
     set_keyflag

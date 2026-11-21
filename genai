@@ -47,6 +47,7 @@ ENDPOINT_KEYS = {"name", "base_url", "model", "key_env", "key_file", "context_li
                  "ca_bundle", "headers", "params", "allow_http", "proxy", "description"}
 PROFILE_KEYS = {"name", "description", "endpoint", "persona", "skills", "params", "coding"}
 NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
+ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 class GenaiError(Exception):
@@ -106,6 +107,19 @@ def read_json(path, default=None):
     except FileNotFoundError:
         return default
     except (OSError, ValueError) as e:
+        raise GenaiError(f"cannot read {path}: {e}")
+
+
+def read_bytes_or_missing(path, what):
+    if not os.path.exists(path):
+        raise GenaiError(f"{what} {path} not found", EXIT_PROFILE)
+    return read_regular(path)
+
+
+def parse_json_bytes(raw, path):
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except ValueError as e:
         raise GenaiError(f"cannot read {path}: {e}")
 
 
@@ -308,11 +322,23 @@ def _hash_bytes(h, label, data):
     h.update(label.encode() + b"\0" + str(len(data)).encode() + b"\0" + data)
 
 
-def hash_skill(path):
-    """Hash a skill directory: sorted relative paths plus contents. Symlinks are refused."""
+def read_regular(path):
+    """Read a regular file once, refusing symlinks and special files, and return its bytes."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+    except OSError as e:
+        raise GenaiError(f"{path}: must be a regular file (not a symlink): {e.strerror}")
+    with os.fdopen(fd, "rb") as f:
+        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+            raise GenaiError(f"{path}: must be a regular file (not a symlink)")
+        return f.read()
+
+
+def snapshot_skill(path):
+    """Read every file of a skill directory once: {relative path: bytes}. Symlinks are refused."""
     if os.path.islink(path) or not os.path.isdir(path):
         raise GenaiError(f"{path}: a skill must be a real directory (not a symlink)")
-    files = []
+    files = {}
     for root, dirs, names in os.walk(path, followlinks=False):
         for n in dirs + names:
             full = os.path.join(root, n)
@@ -322,37 +348,50 @@ def hash_skill(path):
             full = os.path.join(root, n)
             if not stat.S_ISREG(os.lstat(full).st_mode):
                 raise GenaiError(f"{full}: only regular files are allowed inside a skill")
-            files.append(os.path.relpath(full, path))
+            files[os.path.relpath(full, path)] = read_regular(full)
+    return files
+
+
+def hash_snapshot(files):
+    """The skill hash, computed from a snapshot's bytes: sorted relative paths plus contents."""
     h = hashlib.sha256()
     for rel in sorted(files):
-        with open(os.path.join(path, rel), "rb") as f:
-            _hash_bytes(h, rel, f.read())
-    return "sha256:" + h.hexdigest(), sorted(files)
+        _hash_bytes(h, rel, files[rel])
+    return "sha256:" + h.hexdigest()
+
+
+def hash_skill(path):
+    files = snapshot_skill(path)
+    return hash_snapshot(files), sorted(files)
+
+
+def hash_bytes(data):
+    return "sha256:" + hashlib.sha256(data).hexdigest()
 
 
 def hash_file(path):
-    if os.path.islink(path) or not os.path.isfile(path):
-        raise GenaiError(f"{path}: must be a regular file (not a symlink)")
-    with open(path, "rb") as f:
-        return "sha256:" + hashlib.sha256(f.read()).hexdigest()
+    return hash_bytes(read_regular(path))
 
 
 class Skill:
+    """A skill, read once. Its hash and every byte used later come from this one snapshot;
+    nothing reopens the files, so editing them afterwards changes nothing until the next load."""
+
     def __init__(self, name, path):
         self.name, self.path = name, path
-        self.main = os.path.join(path, "SKILL.md")
+        try:
+            self.files = snapshot_skill(path)
+            self.hash = hash_snapshot(self.files)
+        except (GenaiError, OSError):
+            self.files, self.hash = {}, None
 
     def text(self):
-        with open(self.main, encoding="utf-8") as f:
-            return f.read()
+        return self.files.get("SKILL.md", b"").decode("utf-8", "replace")
 
     def description(self):
-        try:
-            for line in self.text().splitlines():
-                if line.strip():
-                    return line.strip().lstrip("#").strip()
-        except OSError:
-            pass
+        for line in self.text().splitlines():
+            if line.strip():
+                return line.strip().lstrip("#").strip()
         return ""
 
 
@@ -371,7 +410,7 @@ def find_skills(cfg):
 
 
 def skill_status(cfg, skill):
-    return bless_status(cfg, "skill", skill.path)
+    return bless_status(cfg, "skill", skill.path, skill.hash)
 
 
 def load_skills(cfg, names, notice):
@@ -418,6 +457,9 @@ class Endpoint:
         if "key_env" in data and "key_file" in data:
             raise GenaiError(f"{path}: give key_env or key_file, not both", EXIT_PROFILE)
         self.key_env, self.key_file = data.get("key_env"), data.get("key_file")
+        if self.key_env is not None and not (isinstance(self.key_env, str) and ENV_NAME_RE.fullmatch(self.key_env)):
+            raise GenaiError(f"{path}: 'key_env' must be a plain variable name (letters, digits, underscore)",
+                             EXIT_PROFILE)
         self.context_limit = int(data.get("context_limit", 32000))
         self.timeout = float(data.get("timeout", 120))
         self.ca_bundle = data.get("ca_bundle")
@@ -447,10 +489,11 @@ class Endpoint:
 
     @classmethod
     def load(cls, path):
-        data = read_json(path)
-        if data is None:
-            raise GenaiError(f"endpoint {path} not found", EXIT_PROFILE)
-        return cls(data, os.path.abspath(path))
+        return cls.parse(read_bytes_or_missing(path, "endpoint"), path)
+
+    @classmethod
+    def parse(cls, raw, path):
+        return cls(parse_json_bytes(raw, path), os.path.abspath(path))
 
     def key_source(self):
         if self.key_env:
@@ -536,10 +579,11 @@ class Profile:
 
     @classmethod
     def load(cls, path):
-        data = read_json(path)
-        if data is None:
-            raise GenaiError(f"profile {path} not found", EXIT_PROFILE)
-        return cls(data, os.path.abspath(path))
+        return cls.parse(read_bytes_or_missing(path, "profile"), path)
+
+    @classmethod
+    def parse(cls, raw, path):
+        return cls(parse_json_bytes(raw, path), os.path.abspath(path))
 
     def summary(self):
         lines = [f"  profile:  {self.name}"]
@@ -597,22 +641,31 @@ def find_named(cfg, kind, name):
     raise GenaiError(f"no {kind} named '{name}'. Nothing was sent.{hint}", EXIT_PROFILE)
 
 
-def bless_status(cfg, kind, path):
+def bless_status(cfg, kind, path, h=None):
+    """Compare a hash with the blessed one. For a skill, pass the hash of the snapshot in use;
+    for a file, pass the hash of the bytes in use (or None to hash the file now)."""
     entry = cfg.blessed().get(path)
     if not entry or entry.get("kind") != kind:
         return "unblessed"
     try:
-        h = hash_skill(path)[0] if kind == "skill" else hash_file(path)
+        if h is None:
+            h = hash_skill(path)[0] if kind == "skill" else hash_file(path)
     except (GenaiError, OSError):
         return "invalid"
     return "blessed" if h == entry.get("hash") else "changed"
 
 
+def load_named(cfg, kind, path):
+    """Read an endpoint or profile file once; return the parsed object and its status.
+    The hash and the parse both come from the same bytes."""
+    raw = read_bytes_or_missing(path, kind)
+    return KINDS[kind].parse(raw, path), bless_status(cfg, kind, path, hash_bytes(raw))
+
+
 def select_named(cfg, kind, name):
     """Load and check a blessed endpoint or profile."""
     path = find_named(cfg, kind, name)
-    obj = KINDS[kind].load(path)
-    st = bless_status(cfg, kind, path)
+    obj, st = load_named(cfg, kind, path)
     if st == "unblessed":
         raise GenaiError(f"{kind} '{name}' ({path}) is not blessed. Nothing was sent.\n"
                          f"  Review it, then: genai --bless {path}", EXIT_PROFILE)
@@ -646,13 +699,12 @@ def list_named(cfg, kind):
     rows = []
     for name, path in sorted(found.items()):
         try:
-            obj = KINDS[kind].load(path)
+            obj, st = load_named(cfg, kind, path)
             if kind == "endpoint":
                 desc = f"{obj.model} at {obj.base_url}"
             else:
                 desc = (f"[{obj.endpoint}] " if obj.endpoint else "") + exact(obj.description)[0] + \
                        (" (grants coding mode)" if obj.coding else "")
-            st = bless_status(cfg, kind, path)
         except GenaiError as e:
             desc, st = str(e), "invalid"
         rows.append({"name": name, "path": path, "status": st, "description": desc})
@@ -663,18 +715,20 @@ def bless(cfg, path, ask):
     """Show what is being blessed and record its hash if the user confirms."""
     path = os.path.abspath(os.path.expanduser(path))
     if os.path.isdir(path):
-        h, files = hash_skill(path)
+        files = snapshot_skill(path)
         if "SKILL.md" not in files:
             raise GenaiError(f"{path}: a skill needs a SKILL.md")
+        h = hash_snapshot(files)
         print(f"Skill {os.path.basename(path)} at {path}")
-        for f in files:
-            print(f"  {f} ({os.path.getsize(os.path.join(path, f))} bytes)")
+        for f in sorted(files):
+            print(f"  {f} ({len(files[f])} bytes)")
         print(f"  hash: {h}")
         entry = {"kind": "skill", "name": os.path.basename(path), "hash": h}
         question = "Have you read every file above, and do you want to use this skill?"
     else:
-        data = read_json(path)
-        h = hash_file(path)
+        raw = read_regular(path)
+        h = hash_bytes(raw)
+        data = parse_json_bytes(raw, path)
         if isinstance(data, dict) and "base_url" in data:
             ep = Endpoint(data, path)
             print(f"Endpoint at {path}\n{ep.summary()}\n  hash:     {h}")
@@ -682,7 +736,7 @@ def bless(cfg, path, ask):
             entry = {"kind": "endpoint", "name": ep.name, "hash": h}
             question = "Send your prompts, files and key to this endpoint?"
         else:
-            prof = Profile.load(path)
+            prof = Profile(data, path)
             print(f"Profile at {path}\n{prof.summary()}\n  hash:     {h}")
             print("The persona is sent to the model as instructions. The endpoint and skills it names "
                   "must be blessed on their own.")
