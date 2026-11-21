@@ -1,0 +1,2134 @@
+#!/usr/bin/env python3
+"""genai: a small client for OpenAI-compatible APIs.
+
+The model never executes anything. It proposes a command or a file operation,
+the scaffold (this REPL, or a wrapper speaking JSON Lines) presents it, and a
+human decides. Standard library only; Python 3.10 or newer.
+"""
+
+import argparse
+import datetime
+import difflib
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import secrets
+import shlex
+import shutil
+import ssl
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+VERSION = "1.0.0"
+PROTOCOL = 1
+STEP_LIMIT = 10
+READ_CAP = 256 * 1024          # bytes per read_file
+WRITE_CAP = 1024 * 1024        # bytes per write_file / edit result
+ATTACH_CAP = 256 * 1024        # bytes per -f file
+OUTPUT_CAP = 32 * 1024         # chars of command output before head/tail cut
+LIST_CAP = 500                 # entries per list_dir
+WARN_FRACTION = 0.8
+KEEP_TURNS = 2                 # user turns kept word for word by :compact
+SUMMARY_WORDS = 300
+
+EXIT_OK, EXIT_ERROR, EXIT_USAGE, EXIT_PROFILE, EXIT_API, EXIT_CONTEXT = 0, 1, 2, 3, 4, 5
+EXIT_INTERRUPT = 130
+
+INTRINSICS = ("propose_command", "read_file", "list_dir", "write_file", "edit_file")
+ENDPOINT_KEYS = {"name", "base_url", "model", "key_env", "key_file", "context_limit", "timeout",
+                 "ca_bundle", "headers", "params", "allow_http", "proxy", "description"}
+PROFILE_KEYS = {"name", "description", "endpoint", "persona", "skills", "params", "coding"}
+NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
+
+
+class GenaiError(Exception):
+    """An error reported to the user with an exit code."""
+
+    def __init__(self, message, code=EXIT_ERROR, kind="error"):
+        super().__init__(message)
+        self.code = code
+        self.kind = kind
+
+
+def now():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+
+
+def eprint(*a):
+    print(*a, file=sys.stderr, flush=True)
+
+
+# --------------------------------------------------------------------------
+# Paths and private files
+
+def config_home():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "genai")
+
+
+def ensure_dir(path, mode=0o700):
+    os.makedirs(path, mode=mode, exist_ok=True)
+    return path
+
+
+def write_private(path, data):
+    """Atomically write text to path with mode 0600."""
+    d = os.path.dirname(path) or "."
+    ensure_dir(d)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def read_json(path, default=None):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return default
+    except (OSError, ValueError) as e:
+        raise GenaiError(f"cannot read {path}: {e}")
+
+
+# --------------------------------------------------------------------------
+# Exact display: what the user sees is what will run
+
+_BIDI = set(range(0x202A, 0x202F)) | set(range(0x2066, 0x206A)) | {0x200E, 0x200F, 0x061C}
+_INVISIBLE = {0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF, 0x00AD}
+
+
+def exact(text):
+    """Escape control characters, escape sequences, direction overrides and
+    invisible characters. Returns (display_text, flagged)."""
+    out, flagged = [], False
+    for ch in text:
+        o = ord(ch)
+        if ch in "\n\t":
+            out.append(ch)
+        elif o < 0x20 or o == 0x7F or 0x80 <= o < 0xA0 or o in _BIDI or o in _INVISIBLE:
+            flagged = True
+            out.append(f"\\x{o:02x}" if o < 0x100 else f"\\u{o:04x}")
+        else:
+            out.append(ch)
+    return "".join(out), flagged
+
+
+def show_exact(text):
+    disp, flagged = exact(text)
+    if flagged:
+        disp += "\n  [!] hidden or control characters were escaped above; read carefully"
+    return disp
+
+
+# --------------------------------------------------------------------------
+# Redaction (for output shared with the model; never for -f or read_file)
+
+_REDACTIONS = [
+    ("private key", re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----", re.S)),
+    ("aws key id", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
+    ("github token", re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,})\b")),
+    ("slack token", re.compile(r"\bxox[abposr]-[A-Za-z0-9-]{10,}\b")),
+    ("api key", re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b")),
+    ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")),
+    ("bearer token", re.compile(r"(?i)(\bbearer\s+)[A-Za-z0-9._~+/=-]{16,}")),
+    ("url password", re.compile(r"(\b[a-z][a-z0-9+.-]*://[^\s:/@]+:)[^\s@/]+(@)")),
+    ("secret assignment", re.compile(
+        r"(?i)(\b[\w.-]*(?:password|passwd|secret|token|api[_-]?key|access[_-]?key)[\w.-]*\s*[:=]\s*[\"']?)([^\s\"']{4,})")),
+]
+
+
+def redact(text):
+    """Mask common secret patterns. Returns (text, {kind: count})."""
+    counts = {}
+    for kind, rx in _REDACTIONS:
+        def sub(m, kind=kind):
+            counts[kind] = counts.get(kind, 0) + 1
+            if kind in ("bearer token", "secret assignment"):
+                return m.group(1) + "[REDACTED]"
+            if kind == "url password":
+                return m.group(1) + "[REDACTED]" + m.group(2)
+            return f"[REDACTED {kind}]"
+        text = rx.sub(sub, text)
+    return text, counts
+
+
+def looks_secret(text):
+    return bool(redact(text)[1])
+
+
+def clip(text, cap=OUTPUT_CAP):
+    """Keep the first and last parts of long output, with a marker between."""
+    if len(text) <= cap:
+        return text
+    head, tail = text[: cap * 2 // 3], text[-(cap // 3):]
+    return f"{head}\n[... {len(text) - len(head) - len(tail)} characters cut ...]\n{tail}"
+
+
+def redaction_note(counts):
+    return ", ".join(f"{n} {k}" for k, n in sorted(counts.items()))
+
+
+# --------------------------------------------------------------------------
+# Sandbox indicator
+
+def sandbox_info():
+    """Where a command the user runs from genai will execute. An indicator, not a guarantee:
+    a sandbox declares itself with GENAI_SANDBOX=<name>; podman and docker leave marker files."""
+    name = os.environ.get("GENAI_SANDBOX", "").strip()
+    if name and name.lower() not in ("0", "none", "no"):
+        return {"name": name, "source": "GENAI_SANDBOX"}
+    if os.path.exists("/run/.containerenv"):
+        return {"name": "podman", "source": "/run/.containerenv"}
+    if os.path.exists("/.dockerenv"):
+        return {"name": "docker", "source": "/.dockerenv"}
+    return None
+
+
+def where_runs(sb):
+    return f"inside the {sb['name']} sandbox" if sb else "OUTSIDE any sandbox, directly on this host"
+
+
+# --------------------------------------------------------------------------
+# Audit log
+
+class Audit:
+    def __init__(self, path):
+        self.path = path
+
+    def log(self, event, **fields):
+        if not self.path:
+            return
+        rec = {"ts": now(), "event": event, "pid": os.getpid()}
+        rec.update(fields)
+        try:
+            ensure_dir(os.path.dirname(self.path))
+            fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            with os.fdopen(fd, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except OSError as e:
+            eprint(f"genai: warning: cannot write audit log: {e}")
+
+
+# --------------------------------------------------------------------------
+# Config, blessing, skills, endpoints and profiles
+
+# Every setting genai reads from config.json, with its default. Keys starting with "_" are comments.
+STARTER_CONFIG = {
+    "_help": "default_profile: profile (persona) used when -p is not given. "
+             "default_endpoint: endpoint used when neither -e nor the profile names one. "
+             "default_skills: skills used when the profile doesn't list its own (-k adds more). "
+             "endpoint_dirs, profile_dirs, skill_dirs: extra directories to search, after the ones here. "
+             "Endpoints, profiles and skills must be blessed: genai --bless PATH",
+    "default_profile": None,
+    "default_endpoint": None,
+    "default_skills": [],
+    "endpoint_dirs": [],
+    "profile_dirs": [],
+    "skill_dirs": [],
+}
+
+
+class Config:
+    def __init__(self, home=None):
+        self.home = home or config_home()
+        data = read_json(os.path.join(self.home, "config.json"), {}) or {}
+        if not isinstance(data, dict):
+            raise GenaiError("config.json must be a JSON object")
+        unknown = sorted(k for k in data if k not in STARTER_CONFIG and not k.startswith("_"))
+        if unknown:
+            eprint(f"genai: warning: config.json: unknown setting(s) ignored: {', '.join(unknown)} "
+                   f"(known: {', '.join(k for k in STARTER_CONFIG if not k.startswith('_'))})")
+        for k in ("default_profile", "default_endpoint"):
+            v = data.get(k)
+            if v is not None and not (isinstance(v, str) and NAME_RE.fullmatch(v)):
+                raise GenaiError(f"config.json: {k} must be a name or null")
+        for k in ("default_skills", "endpoint_dirs", "profile_dirs", "skill_dirs"):
+            v = data.get(k, [])
+            if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+                raise GenaiError(f"config.json: {k} must be a list of strings")
+        self.default_profile = data.get("default_profile")
+        self.default_endpoint = data.get("default_endpoint")
+        self.default_skills = list(data.get("default_skills", []))
+
+        def dirs(name):
+            return [os.path.join(self.home, name)] + [os.path.expanduser(p) for p in data.get(name[:-1] + "_dirs", [])]
+        self.endpoint_dirs, self.profile_dirs, self.skill_dirs = dirs("endpoints"), dirs("profiles"), dirs("skills")
+        self.blessed_path = os.path.join(self.home, "blessed.json")
+        self.sessions = os.path.join(self.home, "sessions")
+        self.audit = Audit(os.path.join(self.home, "audit.log"))
+
+    def ensure(self):
+        """First run: create the config tree (0700) and a starter config.json. Existing
+        directories and files are left as they are; a failure is a warning, not an error."""
+        fresh = not os.path.exists(self.home)
+        try:
+            os.makedirs(self.home, 0o700, exist_ok=True)       # parents like ~/.config get the default mode
+            for d in (self.endpoint_dirs[0], self.profile_dirs[0], self.skill_dirs[0], self.sessions):
+                if not os.path.isdir(d):
+                    os.mkdir(d, 0o700)
+            conf = os.path.join(self.home, "config.json")
+            if not os.path.exists(conf):
+                write_private(conf, json.dumps(STARTER_CONFIG, indent=2) + "\n")
+        except OSError as e:
+            eprint(f"genai: warning: cannot create {self.home}: {e}")
+            return
+        if fresh:
+            eprint(f"genai: created {self.home} (config.json, endpoints/, profiles/, skills/, sessions/)")
+
+    def blessed(self):
+        b = read_json(self.blessed_path, {}) or {}
+        return b if isinstance(b, dict) else {}
+
+    def set_blessed(self, path, entry):
+        b = self.blessed()
+        b[path] = entry
+        write_private(self.blessed_path, json.dumps(b, indent=2, sort_keys=True) + "\n")
+
+
+def _hash_bytes(h, label, data):
+    h.update(label.encode() + b"\0" + str(len(data)).encode() + b"\0" + data)
+
+
+def hash_skill(path):
+    """Hash a skill directory: sorted relative paths plus contents. Symlinks are refused."""
+    if os.path.islink(path) or not os.path.isdir(path):
+        raise GenaiError(f"{path}: a skill must be a real directory (not a symlink)")
+    files = []
+    for root, dirs, names in os.walk(path, followlinks=False):
+        for n in dirs + names:
+            full = os.path.join(root, n)
+            if os.path.islink(full):
+                raise GenaiError(f"{full}: symlinks are not allowed inside a skill")
+        for n in names:
+            full = os.path.join(root, n)
+            if not stat.S_ISREG(os.lstat(full).st_mode):
+                raise GenaiError(f"{full}: only regular files are allowed inside a skill")
+            files.append(os.path.relpath(full, path))
+    h = hashlib.sha256()
+    for rel in sorted(files):
+        with open(os.path.join(path, rel), "rb") as f:
+            _hash_bytes(h, rel, f.read())
+    return "sha256:" + h.hexdigest(), sorted(files)
+
+
+def hash_file(path):
+    if os.path.islink(path) or not os.path.isfile(path):
+        raise GenaiError(f"{path}: must be a regular file (not a symlink)")
+    with open(path, "rb") as f:
+        return "sha256:" + hashlib.sha256(f.read()).hexdigest()
+
+
+class Skill:
+    def __init__(self, name, path):
+        self.name, self.path = name, path
+        self.main = os.path.join(path, "SKILL.md")
+
+    def text(self):
+        with open(self.main, encoding="utf-8") as f:
+            return f.read()
+
+    def description(self):
+        try:
+            for line in self.text().splitlines():
+                if line.strip():
+                    return line.strip().lstrip("#").strip()
+        except OSError:
+            pass
+        return ""
+
+
+def find_skills(cfg):
+    seen = {}
+    for d in cfg.skill_dirs:
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            continue
+        for n in names:
+            p = os.path.join(d, n)
+            if n not in seen and os.path.isfile(os.path.join(p, "SKILL.md")):
+                seen[n] = Skill(n, os.path.abspath(p))
+    return seen
+
+
+def skill_status(cfg, skill):
+    return bless_status(cfg, "skill", skill.path)
+
+
+def load_skills(cfg, names, notice):
+    """Return the usable skills among names; skip and report the rest."""
+    found, out = find_skills(cfg), []
+    for n in names:
+        s = found.get(n)
+        if not s:
+            notice(f"skill '{n}' not found; skipped")
+            continue
+        st = skill_status(cfg, s)
+        if st != "blessed":
+            notice(f"skill '{n}' is {st}; skipped (read it, then: genai --bless {s.path})")
+            continue
+        out.append(s)
+    return out
+
+
+def _is_loopback(host):
+    if host in ("localhost", "localhost.localdomain") or host.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host.strip("[]")).is_loopback
+    except ValueError:
+        return False
+
+
+class Endpoint:
+    """Where requests go and how they are authenticated."""
+
+    def __init__(self, data, path):
+        self.path = path
+        self.data = data
+        if not isinstance(data, dict):
+            raise GenaiError(f"{path}: an endpoint must be a JSON object", EXIT_PROFILE)
+        unknown = set(data) - ENDPOINT_KEYS
+        if unknown:
+            hint = " (persona fields belong in a profile, under profiles/)" if unknown & PROFILE_KEYS else ""
+            raise GenaiError(f"{path}: unknown endpoint fields: {', '.join(sorted(unknown))}{hint}", EXIT_PROFILE)
+        for k in ("name", "base_url", "model"):
+            if not isinstance(data.get(k), str) or not data[k]:
+                raise GenaiError(f"{path}: '{k}' is required", EXIT_PROFILE)
+        self.name, self.base_url, self.model = data["name"], data["base_url"].rstrip("/"), data["model"]
+        if "key_env" in data and "key_file" in data:
+            raise GenaiError(f"{path}: give key_env or key_file, not both", EXIT_PROFILE)
+        self.key_env, self.key_file = data.get("key_env"), data.get("key_file")
+        self.context_limit = int(data.get("context_limit", 32000))
+        self.timeout = float(data.get("timeout", 120))
+        self.ca_bundle = data.get("ca_bundle")
+        self.headers = data.get("headers", {}) or {}
+        self.params = dict(data.get("params", {}) or {})
+        self.allow_http = bool(data.get("allow_http", False))
+        self.proxy = data.get("proxy")
+        if not isinstance(self.headers, dict) or not all(isinstance(v, str) for v in self.headers.values()):
+            raise GenaiError(f"{path}: 'headers' must map names to strings", EXIT_PROFILE)
+        if any(k.lower() in ("authorization", "proxy-authorization", "cookie") for k in self.headers):
+            raise GenaiError(f"{path}: credentials don't belong in an endpoint's headers; use key_env or key_file",
+                             EXIT_PROFILE)
+        for k in ("model", "messages", "tools"):
+            if k in self.params:
+                raise GenaiError(f"{path}: params may not set '{k}'", EXIT_PROFILE)
+        u = urllib.parse.urlsplit(self.base_url)
+        if u.scheme not in ("https", "http") or not u.hostname:
+            raise GenaiError(f"{path}: base_url must be an http(s) URL", EXIT_PROFILE)
+        if u.username or u.password:
+            raise GenaiError(f"{path}: base_url must not contain credentials", EXIT_PROFILE)
+        if u.scheme == "http" and not (_is_loopback(u.hostname) or self.allow_http):
+            raise GenaiError(f"{path}: plain HTTP to {u.hostname} needs \"allow_http\": true", EXIT_PROFILE)
+        if self.proxy is not None:
+            pu = urllib.parse.urlsplit(str(self.proxy))
+            if pu.scheme not in ("http", "https") or not pu.hostname:
+                raise GenaiError(f"{path}: 'proxy' must be an http(s) URL", EXIT_PROFILE)
+
+    @classmethod
+    def load(cls, path):
+        data = read_json(path)
+        if data is None:
+            raise GenaiError(f"endpoint {path} not found", EXIT_PROFILE)
+        return cls(data, os.path.abspath(path))
+
+    def key_source(self):
+        if self.key_env:
+            return f"environment variable ${self.key_env}"
+        if self.key_file:
+            return f"file {self.key_file} (must be mode 0600)"
+        return "none (no Authorization header is sent)"
+
+    def key(self):
+        if self.key_env:
+            v = os.environ.get(self.key_env)
+            if not v:
+                raise GenaiError(f"endpoint '{self.name}' reads its key from ${self.key_env}, which is not set",
+                                 EXIT_PROFILE)
+            return v.strip()
+        if self.key_file:
+            p = os.path.expanduser(self.key_file)
+            try:
+                st = os.stat(p)
+            except OSError as e:
+                raise GenaiError(f"key file {p}: {e.strerror}", EXIT_PROFILE)
+            if st.st_mode & 0o077:
+                raise GenaiError(f"key file {p} must be mode 0600 (it is {stat.S_IMODE(st.st_mode):04o})",
+                                 EXIT_PROFILE)
+            if st.st_uid != os.getuid():
+                raise GenaiError(f"key file {p} is not owned by you", EXIT_PROFILE)
+            with open(p, encoding="utf-8") as f:
+                return f.read().strip()
+        return None
+
+    def summary(self):
+        lines = [f"  endpoint: {self.name}", f"  url:      {self.base_url}", f"  model:    {self.model}",
+                 f"  key from: {self.key_source()}", f"  context:  {self.context_limit} tokens"]
+        if self.allow_http:
+            lines.append("  [!] allow_http: prompts, files and the key may travel unencrypted")
+        if self.proxy:
+            lines.append(f"  proxy:    {self.proxy}")
+        if self.ca_bundle:
+            lines.append(f"  CA:       {self.ca_bundle}")
+        if self.headers:
+            lines.append(f"  headers:  {', '.join(sorted(self.headers))}")
+        if self.params:
+            lines.append(f"  params:   {json.dumps(self.params, sort_keys=True)}")
+        return "\n".join(lines)
+
+    def info(self):
+        return {"name": self.name, "base_url": self.base_url, "model": self.model}
+
+
+class Profile:
+    """A persona: which endpoint, what to tell the model, which skills, sampling params, coding mode."""
+
+    def __init__(self, data, path):
+        self.path, self.data = path, data
+        if not isinstance(data, dict):
+            raise GenaiError(f"{path}: a profile must be a JSON object", EXIT_PROFILE)
+        unknown = set(data) - PROFILE_KEYS
+        if unknown:
+            hint = " (this looks like an endpoint; endpoints go under endpoints/)" if "base_url" in data else ""
+            raise GenaiError(f"{path}: unknown profile fields: {', '.join(sorted(unknown))}{hint}", EXIT_PROFILE)
+        if not isinstance(data.get("name"), str) or not NAME_RE.fullmatch(data["name"]):
+            raise GenaiError(f"{path}: 'name' is required (letters, digits, '.', '_', '-')", EXIT_PROFILE)
+        self.name = data["name"]
+        self.description = data.get("description", "")
+        self.endpoint = data.get("endpoint")
+        self.persona = data.get("persona", "")
+        self.skills = data.get("skills")          # None: the profile leaves skills to default_skills
+        self.params = data.get("params", {})
+        self.coding = data.get("coding", False)
+        if self.endpoint is not None and not (isinstance(self.endpoint, str) and NAME_RE.fullmatch(self.endpoint)):
+            raise GenaiError(f"{path}: 'endpoint' must be an endpoint name", EXIT_PROFILE)
+        if not isinstance(self.description, str) or not isinstance(self.persona, str):
+            raise GenaiError(f"{path}: 'description' and 'persona' must be text", EXIT_PROFILE)
+        if self.skills is not None and not (isinstance(self.skills, list) and all(isinstance(x, str) for x in self.skills)):
+            raise GenaiError(f"{path}: 'skills' must be a list of skill names", EXIT_PROFILE)
+        if not isinstance(self.params, dict):
+            raise GenaiError(f"{path}: 'params' must be an object", EXIT_PROFILE)
+        for k in ("model", "messages", "tools"):
+            if k in self.params:
+                raise GenaiError(f"{path}: params may not set '{k}'", EXIT_PROFILE)
+        if not isinstance(self.coding, bool):
+            raise GenaiError(f"{path}: 'coding' must be true or false", EXIT_PROFILE)
+
+    @classmethod
+    def load(cls, path):
+        data = read_json(path)
+        if data is None:
+            raise GenaiError(f"profile {path} not found", EXIT_PROFILE)
+        return cls(data, os.path.abspath(path))
+
+    def summary(self):
+        lines = [f"  profile:  {self.name}"]
+        if self.description:
+            lines.append(f"  about:    {exact(self.description)[0]}")
+        lines.append(f"  endpoint: {self.endpoint or '(none; -e or default_endpoint decides)'}")
+        if self.skills is None:
+            lines.append("  skills:   (not set; default_skills apply)")
+        else:
+            lines.append(f"  skills:   {', '.join(self.skills) or 'none'}")
+        if self.params:
+            lines.append(f"  params:   {json.dumps(self.params, sort_keys=True)}")
+        if self.coding:
+            lines.append("  [!] grants coding mode: the model reads and lists files in your working directory "
+                         "without asking (writes still ask)")
+        if self.persona:
+            lines.append("  persona (sent to the model with every request):")
+            lines += ["    | " + ln for ln in show_exact(self.persona).splitlines()]
+        else:
+            lines.append("  persona:  (none)")
+        return "\n".join(lines)
+
+
+KINDS = {"endpoint": Endpoint, "profile": Profile}
+
+
+def kind_dirs(cfg, kind):
+    return cfg.endpoint_dirs if kind == "endpoint" else cfg.profile_dirs
+
+
+def _locate(cfg, kind, name):
+    for d in kind_dirs(cfg, kind):
+        p = os.path.join(d, name + ".json")
+        if os.path.exists(p):
+            return os.path.abspath(p)
+    for path, entry in sorted(cfg.blessed().items()):
+        if entry.get("kind") == kind and entry.get("name") == name and os.path.exists(path):
+            return path
+    return None
+
+
+def find_named(cfg, kind, name):
+    """Find an endpoint or profile by name: in its directories first, then wherever one was blessed."""
+    if not isinstance(name, str) or not NAME_RE.fullmatch(name):
+        raise GenaiError(f"bad {kind} name '{name}'", EXIT_PROFILE)
+    path = _locate(cfg, kind, name)
+    if path:
+        return path
+    other = "profile" if kind == "endpoint" else "endpoint"
+    hint = ""
+    if _locate(cfg, other, name):
+        flag = "-p" if other == "profile" else "-e"
+        hint = f"\n  There is {'an' if other == 'endpoint' else 'a'} {other} by that name: use {flag} {name} " \
+               f"(or default_{other} in config.json)."
+    raise GenaiError(f"no {kind} named '{name}'. Nothing was sent.{hint}", EXIT_PROFILE)
+
+
+def bless_status(cfg, kind, path):
+    entry = cfg.blessed().get(path)
+    if not entry or entry.get("kind") != kind:
+        return "unblessed"
+    try:
+        h = hash_skill(path)[0] if kind == "skill" else hash_file(path)
+    except (GenaiError, OSError):
+        return "invalid"
+    return "blessed" if h == entry.get("hash") else "changed"
+
+
+def select_named(cfg, kind, name):
+    """Load and check a blessed endpoint or profile."""
+    path = find_named(cfg, kind, name)
+    obj = KINDS[kind].load(path)
+    st = bless_status(cfg, kind, path)
+    if st == "unblessed":
+        raise GenaiError(f"{kind} '{name}' ({path}) is not blessed. Nothing was sent.\n"
+                         f"  Review it, then: genai --bless {path}", EXIT_PROFILE)
+    if st != "blessed":
+        raise GenaiError(f"{kind} '{name}' ({path}) changed since it was blessed. Nothing was sent.\n"
+                         f"  Review it again, then: genai --bless {path}", EXIT_PROFILE)
+    return obj
+
+
+def select_endpoint(cfg, name):
+    if not name:
+        raise GenaiError("no endpoint is configured. Nothing was sent.\n"
+                         "  Add one to ~/.config/genai/endpoints/ and bless it, then use -e NAME, a profile that "
+                         "names it, or default_endpoint in config.json.", EXIT_PROFILE)
+    return select_named(cfg, "endpoint", name)
+
+
+def list_named(cfg, kind):
+    found = {}
+    for d in kind_dirs(cfg, kind):
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            continue
+        for n in names:
+            if n.endswith(".json") and n[:-5] not in found:
+                found[n[:-5]] = os.path.abspath(os.path.join(d, n))
+    for path, entry in sorted(cfg.blessed().items()):
+        if entry.get("kind") == kind and entry.get("name") not in found and os.path.exists(path):
+            found[entry.get("name")] = path
+    rows = []
+    for name, path in sorted(found.items()):
+        try:
+            obj = KINDS[kind].load(path)
+            if kind == "endpoint":
+                desc = f"{obj.model} at {obj.base_url}"
+            else:
+                desc = (f"[{obj.endpoint}] " if obj.endpoint else "") + exact(obj.description)[0] + \
+                       (" (grants coding mode)" if obj.coding else "")
+            st = bless_status(cfg, kind, path)
+        except GenaiError as e:
+            desc, st = str(e), "invalid"
+        rows.append({"name": name, "path": path, "status": st, "description": desc})
+    return rows
+
+
+def bless(cfg, path, ask):
+    """Show what is being blessed and record its hash if the user confirms."""
+    path = os.path.abspath(os.path.expanduser(path))
+    if os.path.isdir(path):
+        h, files = hash_skill(path)
+        if "SKILL.md" not in files:
+            raise GenaiError(f"{path}: a skill needs a SKILL.md")
+        print(f"Skill {os.path.basename(path)} at {path}")
+        for f in files:
+            print(f"  {f} ({os.path.getsize(os.path.join(path, f))} bytes)")
+        print(f"  hash: {h}")
+        entry = {"kind": "skill", "name": os.path.basename(path), "hash": h}
+        question = "Have you read every file above, and do you want to use this skill?"
+    else:
+        data = read_json(path)
+        h = hash_file(path)
+        if isinstance(data, dict) and "base_url" in data:
+            ep = Endpoint(data, path)
+            print(f"Endpoint at {path}\n{ep.summary()}\n  hash:     {h}")
+            print("Everything you send to this endpoint (prompts, files, the key) goes to the URL above.")
+            entry = {"kind": "endpoint", "name": ep.name, "hash": h}
+            question = "Send your prompts, files and key to this endpoint?"
+        else:
+            prof = Profile.load(path)
+            print(f"Profile at {path}\n{prof.summary()}\n  hash:     {h}")
+            print("The persona is sent to the model as instructions. The endpoint and skills it names "
+                  "must be blessed on their own.")
+            entry = {"kind": "profile", "name": prof.name, "hash": h}
+            question = "Have you read the persona above, and do you want to use this profile" + \
+                       (", including the coding mode it grants?" if prof.coding else "?")
+    if not ask(question):
+        print("Not blessed.")
+        return False
+    entry["blessed_at"] = now()
+    cfg.set_blessed(path, entry)
+    cfg.audit.log("bless", path=path, kind=entry["kind"], hash=h)
+    print("Blessed.")
+    return True
+
+
+# --------------------------------------------------------------------------
+# File tools, confined to the working directory
+
+def split_rel(path):
+    """Split a model-supplied path into components, or raise ValueError."""
+    if not isinstance(path, str) or not path or "\0" in path:
+        raise ValueError("path must be a non-empty string")
+    if path.startswith("/") or path.startswith("~"):
+        raise ValueError("absolute paths are not allowed; use a path relative to the working directory")
+    parts = [p for p in path.split("/") if p not in ("", ".")]
+    if any(p == ".." for p in parts):
+        raise ValueError("'..' is not allowed in paths")
+    return parts
+
+
+def is_hidden(parts):
+    return any(p.startswith(".") for p in parts)
+
+
+class Workdir:
+    """Every operation walks the path one component at a time with O_NOFOLLOW,
+    relative to a directory fd for the working directory."""
+
+    def __init__(self, root):
+        self.root = os.path.abspath(root)
+
+    def _open_dir(self, parts, create=False):
+        fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for p in parts:
+                try:
+                    nfd = os.open(p, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                except FileNotFoundError:
+                    if not create:
+                        raise
+                    os.mkdir(p, 0o777, dir_fd=fd)
+                    nfd = os.open(p, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                except OSError as e:
+                    if e.errno in (20, 40):  # ENOTDIR, ELOOP (symlink)
+                        raise ValueError(f"'{p}' is a symlink or not a directory")
+                    raise
+                os.close(fd)
+                fd = nfd
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def stat(self, path):
+        """lstat of a confined path, or None if it doesn't exist."""
+        parts = split_rel(path)
+        if not parts:
+            return os.stat(self.root)
+        try:
+            dfd = self._open_dir(parts[:-1])
+        except FileNotFoundError:
+            return None
+        try:
+            return os.stat(parts[-1], dir_fd=dfd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        finally:
+            os.close(dfd)
+
+    def read(self, path, cap=READ_CAP):
+        parts = split_rel(path)
+        if not parts:
+            raise ValueError("that is a directory")
+        dfd = self._open_dir(parts[:-1])
+        try:
+            try:
+                fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+            except OSError as e:
+                if e.errno == 40:
+                    raise ValueError("symlinks are not followed")
+                raise
+        finally:
+            os.close(dfd)
+        with os.fdopen(fd, "rb") as f:
+            st = os.fstat(f.fileno())
+            if not stat.S_ISREG(st.st_mode):
+                raise ValueError("not a regular file")
+            if st.st_size > cap:
+                raise ValueError(f"file is {st.st_size} bytes; the limit is {cap}")
+            data = f.read(cap + 1)
+        if b"\0" in data[:8192]:
+            raise ValueError("binary files are refused")
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ValueError("binary (non UTF-8) files are refused")
+
+    def list(self, path):
+        parts = split_rel(path) if path not in ("", ".", "./") else []
+        dfd = self._open_dir(parts)
+        out = []
+        try:
+            with os.scandir(dfd) as it:
+                for e in it:
+                    st = e.stat(follow_symlinks=False)
+                    kind = ("dir" if stat.S_ISDIR(st.st_mode) else "file" if stat.S_ISREG(st.st_mode)
+                            else "symlink" if stat.S_ISLNK(st.st_mode) else "other")
+                    out.append((e.name, kind, st.st_size if kind == "file" else None))
+        finally:
+            os.close(dfd)
+        return sorted(out)
+
+    def write(self, path, content):
+        data = content.encode("utf-8")
+        if len(data) > WRITE_CAP:
+            raise ValueError(f"content is {len(data)} bytes; the limit is {WRITE_CAP}")
+        parts = split_rel(path)
+        if not parts:
+            raise ValueError("a file name is required")
+        dfd = self._open_dir(parts[:-1], create=True)
+        name, tmp = parts[-1], f".genai-tmp-{secrets.token_hex(6)}"
+        try:
+            mode = None
+            try:
+                st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+                if not stat.S_ISREG(st.st_mode):
+                    raise ValueError("the target exists and is not a regular file")
+                mode = stat.S_IMODE(st.st_mode)
+            except FileNotFoundError:
+                pass
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o666, dir_fd=dfd)
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(data)
+                    f.flush()
+                    if mode is not None:
+                        os.fchmod(f.fileno(), mode)
+                    os.fsync(f.fileno())
+                os.rename(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+            except BaseException:
+                try:
+                    os.unlink(tmp, dir_fd=dfd)
+                except OSError:
+                    pass
+                raise
+        finally:
+            os.close(dfd)
+        return len(data)
+
+
+def unified_diff(old, new, path):
+    d = difflib.unified_diff(old.splitlines(True), new.splitlines(True), f"a/{path}", f"b/{path}")
+    return "".join(x if x.endswith("\n") else x + "\n\\ No newline at end of file\n" for x in d)
+
+
+# --------------------------------------------------------------------------
+# Tool schemas
+
+def _tool(name, desc, props, required):
+    return {"type": "function", "function": {"name": name, "description": desc, "parameters": {
+        "type": "object", "properties": props, "required": required, "additionalProperties": False}}}
+
+
+_REASON = {"type": "string", "description": "One line: why this is needed."}
+_PATH = {"type": "string", "description": "Path relative to the working directory."}
+TOOLS = [
+    _tool("propose_command", "Propose ONE plain shell command for the user to run themselves. "
+          "It is shown to the user and NOT run; your turn ends. If the user runs it and chooses to, "
+          "they will send you the output.",
+          {"command": {"type": "string"}, "reason": _REASON}, ["command", "reason"]),
+    _tool("read_file", "Ask to read a text file in the working directory.",
+          {"path": _PATH, "reason": _REASON}, ["path", "reason"]),
+    _tool("list_dir", "Ask to list a directory in the working directory. Use '.' for the directory itself.",
+          {"path": _PATH, "reason": _REASON}, ["path", "reason"]),
+    _tool("write_file", "Ask to create or overwrite a file in the working directory with the given content.",
+          {"path": _PATH, "content": {"type": "string"}, "reason": _REASON}, ["path", "content", "reason"]),
+    _tool("edit_file", "Ask to replace old_text with new_text in a file. old_text must appear exactly once.",
+          {"path": _PATH, "old_text": {"type": "string"}, "new_text": {"type": "string"}, "reason": _REASON},
+          ["path", "old_text", "new_text", "reason"]),
+]
+
+SYSTEM_PROMPT = """You are genai, an assistant working alongside a human in their terminal.
+
+Rules you work under:
+- You never execute anything. To get a command run, call propose_command with ONE plain, readable command and a one-line reason. The user decides whether to run it. Your turn ends after a command proposal; the user may send you its output later.
+- Never pack a large script into a one-liner. To create a script, use write_file, then propose a command that runs it.
+- File tools work only inside the working directory, with relative paths. Every write and edit is shown to the user, who may decline it. Reads may also need approval.
+- If an operation is declined, accept that and continue or ask the user what they want.
+- You hold no privileges. If a step needs root or another host, say so; the user escalates themselves.
+- Be concise."""
+
+
+# --------------------------------------------------------------------------
+# HTTP client
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise GenaiError(f"the endpoint answered with a redirect ({code}) to {newurl}; redirects are not "
+                         "followed. Nothing more was sent.", EXIT_API, "api")
+
+
+class Client:
+    def __init__(self, endpoint, params=None):
+        self.p = endpoint
+        self.params = {**endpoint.params, **(params or {})}    # a profile's params override the endpoint's
+        self._key = endpoint.key()
+        ctx = ssl.create_default_context(cafile=os.path.expanduser(endpoint.ca_bundle) if endpoint.ca_bundle else None)
+        proxies = {"http": endpoint.proxy, "https": endpoint.proxy} if endpoint.proxy else {}
+        self.opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler(proxies),  # environment proxies are ignored
+            urllib.request.HTTPSHandler(context=ctx), NoRedirect())
+
+    def _request(self, path, body=None):
+        headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream",
+                   "User-Agent": f"genai/{VERSION}"}
+        headers.update(self.p.headers)
+        if self._key:
+            headers["Authorization"] = f"Bearer {self._key}"
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(self.p.base_url + path, data=data, headers=headers,
+                                     method="POST" if data is not None else "GET")
+        try:
+            return self.opener.open(req, timeout=self.p.timeout)
+        except urllib.error.HTTPError as e:
+            detail = e.read(2000).decode("utf-8", "replace").strip()
+            raise GenaiError(f"endpoint returned HTTP {e.code}: {detail[:500]}", EXIT_API, "api")
+        except (urllib.error.URLError, OSError) as e:
+            reason = getattr(e, "reason", e)
+            raise GenaiError(f"cannot reach {self.p.base_url}: {reason}", EXIT_API, "api")
+
+    def models(self):
+        with self._request("/models") as r:
+            return json.load(r)
+
+    def chat(self, messages, tools, on_text, max_tokens=None):
+        """Send one request. Returns (message, usage)."""
+        params = dict(self.params)
+        stream = bool(params.pop("stream", True))
+        body = {"model": self.p.model, "messages": messages, "stream": stream}
+        body.update(params)
+        if tools:
+            body["tools"] = tools
+        if max_tokens:
+            body["max_tokens"] = max_tokens
+        with self._request("/chat/completions", body) as r:
+            if not stream:
+                data = json.load(r)
+                if "choices" not in data or not data["choices"]:
+                    raise GenaiError(f"unexpected reply from endpoint: {str(data)[:300]}", EXIT_API, "api")
+                msg = data["choices"][0].get("message", {})
+                if msg.get("content"):
+                    on_text(msg["content"])
+                return self._clean(msg.get("content"), msg.get("tool_calls") or []), data.get("usage")
+            return self._stream(r, on_text)
+
+    def _stream(self, r, on_text):
+        content, calls, usage = [], {}, None
+        for raw in r:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if payload == "[DONE]":
+                break
+            try:
+                chunk = json.loads(payload)
+            except ValueError:
+                continue
+            if chunk.get("error"):
+                raise GenaiError(f"endpoint error: {chunk['error']}", EXIT_API, "api")
+            if chunk.get("usage"):
+                usage = chunk["usage"]
+            for ch in chunk.get("choices") or []:
+                delta = ch.get("delta") or {}
+                if delta.get("content"):
+                    content.append(delta["content"])
+                    on_text(delta["content"])
+                for tc in delta.get("tool_calls") or []:
+                    slot = calls.setdefault(tc.get("index", 0), {"id": None, "name": "", "args": []})
+                    if tc.get("id"):
+                        slot["id"] = tc["id"]
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        slot["name"] += fn["name"]
+                    if fn.get("arguments"):
+                        slot["args"].append(fn["arguments"])
+        tool_calls = [{"id": s["id"] or f"call_{i}", "type": "function",
+                       "function": {"name": s["name"], "arguments": "".join(s["args"])}}
+                      for i, s in sorted(calls.items())]
+        return self._clean("".join(content) or None, tool_calls), usage
+
+    @staticmethod
+    def _clean(content, tool_calls):
+        msg = {"role": "assistant", "content": content}
+        if tool_calls:
+            msg["tool_calls"] = [{"id": tc.get("id") or f"call_{i}", "type": "function",
+                                  "function": {"name": tc["function"]["name"],
+                                               "arguments": tc["function"].get("arguments") or "{}"}}
+                                 for i, tc in enumerate(tool_calls)]
+        return msg
+
+
+# --------------------------------------------------------------------------
+# Sessions
+
+def new_session_id():
+    return datetime.datetime.now().strftime("%Y%m%d-%H%M%S-") + secrets.token_hex(2)
+
+
+class Session:
+    def __init__(self, cfg, sid=None):
+        self.cfg = cfg
+        self.id = sid
+        self.path = os.path.join(cfg.sessions, f"{sid}.json") if sid else None
+        self.endpoint = None
+        self.profile = None      # persona profile name, or None
+        self.coding = False
+        self.cwd = os.getcwd()
+        self.skills = []
+        self.messages = []   # what is sent (compaction rewrites this)
+        self.history = []    # the full original conversation
+        self.usage = None    # (total_tokens, len(messages) when measured)
+        self.created = now()
+        self.resumed = False
+
+    @classmethod
+    def open(cls, cfg, sid):
+        if sid is None:
+            return cls(cfg)
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", sid):
+            raise GenaiError(f"bad session name '{sid}'", EXIT_USAGE)
+        s = cls(cfg, sid)
+        data = read_json(s.path)
+        if data:
+            s.resumed = True
+            if "endpoint" in data:
+                s.endpoint, s.profile = data.get("endpoint"), data.get("profile")
+            else:                # sessions from before the split stored the endpoint as "profile"
+                s.endpoint = data.get("profile")
+            s.coding = bool(data.get("coding"))
+            s.cwd = data.get("cwd", s.cwd)
+            s.skills = data.get("skills", [])
+            s.messages = data.get("messages", [])
+            s.history = data.get("history", list(s.messages))
+            s.created = data.get("created", s.created)
+            s.close_dangling()
+        return s
+
+    def close_dangling(self):
+        """Pending proposals never survive a resume: answer any unanswered tool call as declined."""
+        for msgs in (self.messages, self.history):
+            if not msgs:
+                continue
+            last_calls = None
+            for i in range(len(msgs) - 1, -1, -1):
+                if msgs[i].get("role") == "assistant" and msgs[i].get("tool_calls"):
+                    last_calls = i
+                    break
+                if msgs[i].get("role") in ("user",):
+                    break
+            if last_calls is None:
+                continue
+            answered = {m.get("tool_call_id") for m in msgs[last_calls + 1:] if m.get("role") == "tool"}
+            for tc in msgs[last_calls]["tool_calls"]:
+                if tc["id"] not in answered:
+                    msgs.append({"role": "tool", "tool_call_id": tc["id"],
+                                 "content": "declined: the session ended before the user decided"})
+
+    def add(self, msg):
+        self.messages.append(msg)
+        self.history.append(dict(msg))
+
+    def drop_last(self):
+        self.messages.pop()
+        self.history.pop()
+
+    def save(self):
+        if not self.path:
+            return
+        data = {"id": self.id, "endpoint": self.endpoint, "profile": self.profile, "coding": self.coding, "cwd": self.cwd,
+                "skills": self.skills, "created": self.created, "updated": now(),
+                "messages": self.messages, "history": self.history}
+        write_private(self.path, json.dumps(data, ensure_ascii=False) + "\n")
+
+
+def list_sessions(cfg):
+    out = []
+    try:
+        names = os.listdir(cfg.sessions)
+    except OSError:
+        return out
+    for n in sorted(names):
+        if n.endswith(".json"):
+            d = read_json(os.path.join(cfg.sessions, n), {}) or {}
+            first = next((m.get("content") for m in d.get("history", []) if m.get("role") == "user"), "") or ""
+            ep, prof = (d.get("endpoint"), d.get("profile")) if "endpoint" in d else (d.get("profile"), None)
+            out.append({"id": n[:-5], "endpoint": ep, "profile": prof, "updated": d.get("updated"),
+                        "coding": d.get("coding", False), "messages": len(d.get("history", [])),
+                        "first": first.strip().splitlines()[0][:80] if first.strip() else ""})
+    return out
+
+
+def wire(messages):
+    """Strip genai's private keys (those starting with '_') before sending."""
+    return [{k: v for k, v in m.items() if not k.startswith("_")} for m in messages]
+
+
+def estimate_tokens(obj):
+    return len(json.dumps(obj, ensure_ascii=False)) // 4
+
+
+# --------------------------------------------------------------------------
+# Proposals
+
+class Proposal:
+    def __init__(self, pid, kind, call_id, **fields):
+        self.id, self.kind, self.call_id = pid, kind, call_id
+        self.fields = fields
+        self.auto = False
+        self.decision = None
+        self.result = None
+        self.error = None          # set when the request is invalid and never shown for a decision
+
+    def event(self):
+        ev = {"type": "proposal", "id": self.id, "kind": self.kind}
+        ev.update({k: v for k, v in self.fields.items() if not k.startswith("_")})
+        if self.auto:
+            ev["auto"] = True
+        return ev
+
+
+class Engine:
+    """The loop: send, turn tool calls into proposals, collect decisions, send again."""
+
+    def __init__(self, cfg, endpoint, session, ui, client=None, coding=None, profile=None):
+        """coding: None, or where the request for coding mode came from ("--coding", "profile NAME")."""
+        self.cfg, self.endpoint, self.session, self.ui = cfg, endpoint, session, ui
+        self.profile = profile
+        self.client = client or Client(endpoint, profile.params if profile else None)
+        self.audit = cfg.audit
+        self.wd = Workdir(os.getcwd())
+        self.external = {}       # name -> tool schema registered by a wrapper
+        self.counter = 0
+        self.warned = False
+        self.sandbox = sandbox_info()
+        self.commands = []       # command proposals shown in this process, newest last
+        self.skills = []
+        self.reload_skills()
+        self.coding_from = "session" if session.coding else None
+        if coding:
+            try:
+                self.set_coding(True)
+                self.coding_from = coding
+            except GenaiError as e:
+                if not coding.startswith("profile"):
+                    raise
+                ui.notice(f"{coding} asks for coding mode, but {e}; it is off")
+
+    # -- setup
+
+    def reload_skills(self):
+        self.skills = load_skills(self.cfg, self.session.skills, self.ui.notice)
+
+    def set_coding(self, on):
+        if on:
+            here = os.path.realpath(os.getcwd())
+            if here in (os.path.realpath(os.path.expanduser("~")), "/"):
+                raise GenaiError("coding mode is refused in your home directory or /; cd into a project first",
+                                 EXIT_USAGE)
+        self.session.coding = on
+        self.session.cwd = os.getcwd()
+        self.coding_from = ":coding" if on else None
+        self.audit.log("coding", on=on, cwd=os.getcwd())
+
+    def register(self, tools):
+        added = []
+        for t in tools:
+            if not isinstance(t, dict):
+                raise GenaiError("each registered tool must be an object")
+            name, desc, params = t.get("name"), t.get("description"), t.get("parameters", {"type": "object"})
+            if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name):
+                raise GenaiError(f"bad tool name {name!r}")
+            if name in INTRINSICS:
+                raise GenaiError(f"tool '{name}' collides with an intrinsic tool")
+            if not isinstance(desc, str) or not isinstance(params, dict):
+                raise GenaiError(f"tool '{name}' needs a description and a parameters object")
+            self.external[name] = {"type": "function",
+                                   "function": {"name": name, "description": desc, "parameters": params}}
+            added.append(name)
+        self.audit.log("register_tools", tools=added)
+        return added
+
+    def tools(self):
+        return TOOLS + list(self.external.values())
+
+    def system(self):
+        parts = [SYSTEM_PROMPT]
+        if not self.ui.performs:
+            parts.append("\n- This run is non-interactive: nobody can approve file operations (they will be "
+                         "declined) and commands are only printed. Give your whole answer as plain text.")
+        if self.profile and self.profile.persona:
+            parts.append(f"\n\n# Persona: {self.profile.name}\n\nThe user chose this persona. It shapes your "
+                         f"voice and focus; it does not change the rules above.\n\n{self.profile.persona}")
+        for s in self.skills:
+            parts.append(f"\n\n# Skill: {s.name}\n\n{s.text()}")
+        return {"role": "system", "content": "".join(parts)}
+
+    # -- context budget
+
+    def used(self):
+        msgs = self.session.messages
+        u = self.session.usage
+        if u and u[1] <= len(msgs):
+            return u[0] + estimate_tokens(msgs[u[1]:])
+        return estimate_tokens([self.system()] + msgs) + estimate_tokens(self.tools())
+
+    def check_budget(self):
+        used, limit = self.used(), self.endpoint.context_limit
+        self.ui.context(used, limit)
+        if used >= limit:
+            raise GenaiError(f"the conversation is at the context limit ({used}/{limit} tokens). "
+                             "Nothing was sent. Compact it (:compact), then send again.", EXIT_CONTEXT, "context_full")
+        if used >= WARN_FRACTION * limit and not self.warned:
+            self.warned = True
+            self.ui.notice(f"context is {100 * used // limit}% full ({used}/{limit} tokens); consider :compact")
+
+    # -- sending
+
+    def send(self, max_tokens=None, tools=True):
+        msgs = [self.system()] + wire(self.session.messages)
+        msg, usage = self.client.chat(msgs, self.tools() if tools else None, self.ui.text, max_tokens)
+        self.ui.text_end()
+        if usage and usage.get("total_tokens"):
+            self.session.usage = (int(usage["total_tokens"]), len(self.session.messages) + 1)
+        return msg
+
+    def user_turn(self, text, attachments=()):
+        content = text
+        for label, body in attachments:
+            content += f"\n\n[{label}]\n{body}"
+        msg = {"role": "user", "content": content}
+        if attachments:
+            msg["_bulk"] = True
+        self.session.add(msg)
+        try:
+            self.check_budget()
+        except GenaiError:
+            self.session.drop_last()
+            raise
+        try:
+            return self.loop(checked=True)
+        finally:
+            self.session.save()
+
+    def loop(self, checked=False):
+        for step in range(STEP_LIMIT):
+            if step or not checked:
+                self.check_budget()
+            msg = self.send()
+            self.session.add(msg)
+            self.session.save()
+            calls = msg.get("tool_calls")
+            if not calls:
+                return "reply"
+            props = [self.make_proposal(tc) for tc in calls]
+            self.decide(props)
+            ended = False
+            for p in props:
+                result = self.perform(p)
+                tool_msg = {"role": "tool", "tool_call_id": p.call_id, "content": result}
+                if p.kind in ("read", "list", "external") and p.decision == "accept":
+                    tool_msg["_bulk"] = True
+                self.session.add(tool_msg)
+                if p.kind == "command" and not p.error:
+                    ended = True
+            self.session.save()
+            if ended:
+                return "command"
+        self.ui.notice(f"step limit ({STEP_LIMIT}) reached; send a message to continue")
+        return "step_limit"
+
+    # -- proposals
+
+    def make_proposal(self, tc):
+        self.counter += 1
+        pid = f"p{self.counter}"
+        name = tc["function"]["name"]
+        try:
+            args = json.loads(tc["function"].get("arguments") or "{}")
+            if not isinstance(args, dict):
+                raise ValueError
+        except ValueError:
+            p = Proposal(pid, "invalid", tc["id"], tool=name)
+            p.error = "arguments were not a JSON object"
+            return p
+        reason = str(args.get("reason", ""))
+        try:
+            if name == "propose_command":
+                cmd = args.get("command")
+                if not isinstance(cmd, str) or not cmd.strip():
+                    raise ValueError("command is required")
+                p = Proposal(pid, "command", tc["id"], command=cmd, reason=reason)
+                self.commands.append(p)
+                return p
+            if name in ("read_file", "list_dir"):
+                path = args.get("path", ".")
+                parts = split_rel(path) if not (name == "list_dir" and path in (".", "./", "")) else []
+                kind = "read" if name == "read_file" else "list"
+                p = Proposal(pid, kind, tc["id"], path=path, reason=reason)
+                if kind == "read":
+                    st = self.wd.stat(path)
+                    p.fields["size"] = st.st_size if st else None
+                if self.session.coding and not is_hidden(parts) and self.ui.performs:
+                    p.auto = True
+                return p
+            if name == "write_file":
+                path, content = args.get("path"), args.get("content")
+                split_rel(path)
+                if not isinstance(content, str):
+                    raise ValueError("content must be a string")
+                st = self.wd.stat(path)
+                exists = st is not None
+                fields = {"path": path, "exists": exists, "content": content, "reason": reason,
+                          "lines": content.count("\n") + (0 if content.endswith("\n") or not content else 1)}
+                if exists:
+                    try:
+                        fields["diff"] = unified_diff(self.wd.read(path, WRITE_CAP), content, path)
+                    except (ValueError, OSError) as e:
+                        fields["diff"] = f"(cannot diff the existing file: {e})"
+                return Proposal(pid, "write", tc["id"], **fields)
+            if name == "edit_file":
+                path, old, new = args.get("path"), args.get("old_text"), args.get("new_text")
+                if not isinstance(old, str) or not isinstance(new, str) or not old:
+                    raise ValueError("old_text and new_text are required")
+                current = self.wd.read(path, WRITE_CAP)
+                n = current.count(old)
+                if n != 1:
+                    raise ValueError(f"old_text appears {n} times in {path}; it must appear exactly once")
+                updated = current.replace(old, new, 1)
+                return Proposal(pid, "edit", tc["id"], path=path, diff=unified_diff(current, updated, path),
+                                reason=reason, _old=old, _new=new)
+            if name in self.external:
+                return Proposal(pid, "external", tc["id"], tool=name, args=args)
+            raise ValueError(f"unknown tool '{name}'")
+        except (ValueError, OSError) as e:
+            p = Proposal(pid, "invalid", tc["id"], tool=name)
+            p.error = str(e)
+            return p
+
+    def decide(self, props):
+        for p in props:
+            p.decision = None
+            if p.error:
+                self.audit.log("invalid_call", id=p.id, tool=p.fields.get("tool"), error=p.error)
+                continue
+            self.audit.log("proposal", **{k: v for k, v in p.event().items()
+                                          if k not in ("type", "content", "diff")})
+        live = [p for p in props if not p.error]
+        for p in live:
+            if p.kind == "command":
+                self.ui.show_command(p)
+            elif p.auto:
+                p.decision = "accept"
+                self.ui.show_auto(p)
+        pending = [p for p in live if p.kind != "command" and not p.auto]
+        if pending:
+            self.ui.decide(pending)
+        for p in pending:
+            if p.kind != "external":
+                p.decision = p.decision if p.decision in ("accept", "decline") else "decline"
+                self.audit.log("decision", id=p.id, decision=p.decision)
+
+    def perform(self, p):
+        if p.error:
+            return f"error: {p.error}"
+        if p.kind == "command":
+            return "shown to the user, not run. If they run it, they may send you the output."
+        if p.kind == "external":
+            status = p.decision if p.decision in ("ok", "declined", "error") else "declined"
+            out, counts = redact(str(p.result or ""))
+            self.audit.log("external_result", id=p.id, tool=p.fields["tool"], status=status,
+                           chars=len(out), redacted=counts)
+            return f"{status}" + (f":\n{clip(out)}" if out else "")
+        if p.decision != "accept":
+            return "declined by the user"
+        try:
+            if p.kind == "read":
+                text = self.wd.read(p.fields["path"])
+                result = text
+                note = f"read {len(text)} characters"
+                if looks_secret(text):
+                    self.ui.notice(f"warning: {p.fields['path']} looks like it contains secrets; it was sent as is")
+            elif p.kind == "list":
+                rows = self.wd.list(p.fields["path"])
+                lines = [f"{n}/" if k == "dir" else f"{n}  ({s} bytes)" if k == "file" else f"{n}  [{k}]"
+                         for n, k, s in rows[:LIST_CAP]]
+                if len(rows) > LIST_CAP:
+                    lines.append(f"... {len(rows) - LIST_CAP} more entries")
+                result = "\n".join(lines) or "(empty directory)"
+                note = f"listed {len(rows)} entries"
+            elif p.kind == "write":
+                n = self.wd.write(p.fields["path"], p.fields["content"])
+                result = note = f"wrote {p.fields['path']} ({n} bytes)"
+            elif p.kind == "edit":
+                current = self.wd.read(p.fields["path"], WRITE_CAP)
+                if current.count(p.fields["_old"]) != 1:
+                    raise ValueError("the file changed before the edit was applied; old_text no longer matches once")
+                self.wd.write(p.fields["path"], current.replace(p.fields["_old"], p.fields["_new"], 1))
+                result = note = f"edited {p.fields['path']}"
+            else:
+                return "error: unknown proposal"
+        except (ValueError, OSError) as e:
+            self.audit.log("file_op", id=p.id, kind=p.kind, path=p.fields.get("path"), status="error", error=str(e))
+            self.ui.result(p, "error", str(e))
+            return f"error: {e}"
+        self.audit.log("file_op", id=p.id, kind=p.kind, path=p.fields.get("path"), status="ok", auto=p.auto)
+        self.ui.result(p, "ok", note)
+        return result
+
+    # -- sharing output and compaction
+
+    def share(self, source, text, ref=None):
+        """Record that reviewed output is being sent to the model."""
+        self.audit.log("shared", source=source, ref=ref, chars=len(text))
+
+    def compact(self, edit_summary=None):
+        """Prune old bulk, then summarize older turns only if still over the warning line."""
+        msgs = self.session.messages
+        user_idx = [i for i, m in enumerate(msgs) if m.get("role") == "user"]
+        keep_from = user_idx[-KEEP_TURNS] if len(user_idx) >= KEEP_TURNS else 0
+        before = self.used()
+        pruned = 0
+        for i in range(keep_from):
+            m = msgs[i]
+            if m.get("_bulk") and not m.get("_pruned"):
+                if m.get("role") == "tool":
+                    m["content"] = "[contents dropped by compaction; read again if needed]"
+                else:
+                    first = (m.get("content") or "").split("\n\n[", 1)[0]
+                    m["content"] = first + "\n\n[attached contents dropped by compaction; ask for them again if needed]"
+                m["_pruned"] = True
+                pruned += 1
+        self.session.usage = None
+        after = self.used()
+        report = {"pruned": pruned, "before": before, "after": after, "summary": None}
+        if after >= WARN_FRACTION * self.endpoint.context_limit and keep_from > 0:
+            older, tail = msgs[:keep_from], msgs[keep_from:]
+            req = wire(older) + [{"role": "user", "content":
+                   f"Summarize the conversation so far in at most {SUMMARY_WORDS} words for your own later use: "
+                   "facts learned, decisions made, files touched, and open questions. Plain text only."}]
+            saved_msgs = self.session.messages
+            self.session.messages = req
+            try:
+                summary = (self.send(max_tokens=SUMMARY_WORDS * 3, tools=False).get("content") or "").strip()
+            finally:
+                self.session.messages = saved_msgs
+                self.session.usage = None
+            if edit_summary:
+                summary = edit_summary(summary)
+            if summary:
+                first = dict(tail[0])
+                first["content"] = f"[Summary of the earlier conversation]\n{summary}\n\n[Next message]\n{first['content']}"
+                self.session.messages = [first] + tail[1:]
+                self.session.usage = None
+                report["summary"] = summary
+                report["after"] = self.used()
+        self.audit.log("compact", **{k: v for k, v in report.items() if k != "summary"},
+                       summarized=bool(report["summary"]))
+        self.session.save()
+        return report
+
+
+# --------------------------------------------------------------------------
+# Front ends
+
+class PlainUI:
+    """No terminal, not JSON: print text and command proposals; perform nothing."""
+    performs = False
+
+    def __init__(self, out=sys.stdout):
+        self.out = out
+        self._open = False
+
+    def text(self, chunk):
+        self.out.write(chunk)
+        self.out.flush()
+        self._open = True
+
+    def text_end(self):
+        if self._open:
+            self.out.write("\n")
+            self.out.flush()
+            self._open = False
+
+    def notice(self, msg):
+        eprint(f"genai: {msg}")
+
+    def context(self, used, limit):
+        pass
+
+    def show_command(self, p):
+        self.out.write(f"\n[proposed command {p.id}] {p.fields['reason']}\n    {show_exact(p.fields['command'])}\n")
+        self.out.flush()
+
+    def show_auto(self, p):
+        pass
+
+    def decide(self, pending):
+        for p in pending:
+            p.decision = "decline" if p.kind != "external" else "declined"
+            self.notice(f"{p.kind} proposal {p.id} ({p.fields.get('path') or p.fields.get('tool')}) declined: "
+                        "no terminal")
+
+    def result(self, p, status, note):
+        pass
+
+
+class TtyUI(PlainUI):
+    """A human at a terminal: ask about each file proposal."""
+    performs = True
+
+    def __init__(self, out=sys.stdout):
+        super().__init__(out)
+
+    def show_command(self, p):
+        cmd = show_exact(p.fields["command"])
+        self.out.write(f"\n\033[1mProposed command [{p.id}]\033[0m: {p.fields['reason']}\n\n    {cmd}\n\n"
+                       "Paste it into your shell, or type :run to review and run it.\n")
+        self.out.flush()
+
+    def show_auto(self, p):
+        eprint(f"  (coding mode) {p.kind} {p.fields['path']}")
+
+    def decide(self, pending):
+        for p in pending:
+            f = p.fields
+            if p.kind == "read":
+                size = "missing" if f.get("size") is None else f"{f['size']} bytes"
+                head = f"Read {show_exact(f['path'])} ({size})?"
+            elif p.kind == "list":
+                head = f"List directory {show_exact(f['path'])}?"
+            elif p.kind == "write":
+                if f["exists"]:
+                    body = f.get("diff") or "(no changes)"
+                    head = f"Overwrite {show_exact(f['path'])}:\n{show_exact(body)}"
+                else:
+                    head = f"New file {show_exact(f['path'])}, {f['lines']} lines:\n{show_exact(f['content'])}"
+            elif p.kind == "edit":
+                head = f"Edit {show_exact(f['path'])}:\n{show_exact(f['diff'])}"
+            else:
+                head = f"Call {p.kind}?"
+            self.out.write(f"\n\033[1m[{p.id}] {p.kind}\033[0m — {show_exact(f.get('reason', ''))}\n{head}\n")
+            self.out.flush()
+            p.decision = "accept" if ask_yes(f"Accept {p.id}?") else "decline"
+
+    def result(self, p, status, note):
+        eprint(f"  [{p.id}] {status}: {note}")
+
+
+def ask_yes(question):
+    try:
+        ans = input(f"{question} [y/N] ")
+    except EOFError:
+        return False
+    return ans.strip().lower() in ("y", "yes")
+
+
+class JsonUI:
+    """JSON Lines over stdio for wrappers and TUIs."""
+    performs = True
+
+    def __init__(self, inp=sys.stdin, out=sys.stdout):
+        self.inp, self.out = inp, out
+        self.queue = []          # attachments waiting for the next user message
+        self.engine = None
+
+    def emit(self, ev):
+        self.out.write(json.dumps(ev, ensure_ascii=False) + "\n")
+        self.out.flush()
+
+    def error(self, message, code="error", **extra):
+        ev = {"type": "error", "code": code, "message": message}
+        ev.update(extra)
+        self.emit(ev)
+
+    def text(self, chunk):
+        self.emit({"type": "text", "text": chunk})
+
+    def text_end(self):
+        pass
+
+    def notice(self, msg):
+        self.emit({"type": "notice", "message": msg})
+
+    def context(self, used, limit):
+        if used >= WARN_FRACTION * limit:
+            self.emit({"type": "context", "used": used, "limit": limit})
+
+    def show_command(self, p):
+        ev = p.event()
+        disp, flagged = exact(p.fields["command"])
+        if flagged:
+            ev["display"], ev["flagged"] = disp, True
+        self.emit(ev)
+
+    def show_auto(self, p):
+        self.emit(p.event())
+
+    def decide(self, pending):
+        """Emit every blocking proposal, then wait for decisions in any order.
+        No answer, EOF, or an unknown ID means decline."""
+        for p in pending:
+            ev = p.event()
+            for key in ("content", "diff", "path"):
+                if isinstance(ev.get(key), str):
+                    disp, flagged = exact(ev[key])
+                    if flagged:
+                        ev.setdefault("flagged", []).append(key)
+            self.emit(ev)
+        waiting = {p.id: p for p in pending}
+        while waiting:
+            msg = self.read()
+            if msg is None:
+                break
+            t = msg.get("type")
+            pid = msg.get("id")
+            if t == "decision" and pid in waiting and waiting[pid].kind != "external":
+                waiting.pop(pid).decision = msg.get("decision") if msg.get("decision") in ("accept", "decline") \
+                    else "decline"
+            elif t == "result" and pid in waiting and waiting[pid].kind == "external":
+                p = waiting.pop(pid)
+                p.decision = msg.get("status") if msg.get("status") in ("ok", "declined", "error") else "declined"
+                p.result = msg.get("output", "")
+            elif t in ("decision", "result"):
+                self.error(f"no pending proposal {pid!r} of that kind", "unknown_id")
+            elif t == "attach":
+                self.queue_attach(msg)
+            else:
+                self.error(f"'{t}' is not allowed while proposals are pending", "busy")
+        for p in waiting.values():
+            p.decision = "declined" if p.kind == "external" else "decline"
+            p.result = ""
+
+    def queue_attach(self, msg):
+        text = msg.get("text")
+        if not isinstance(text, str):
+            self.error("attach needs 'text'", "bad_message")
+            return
+        red, counts = redact(text)
+        red = clip(red)
+        label = str(msg.get("label") or "attachment")
+        self.queue.append((label, red, msg.get("ref")))
+        self.emit({"type": "attached", "label": label, "chars": len(red), "redacted": counts})
+
+    def result(self, p, status, note):
+        self.emit({"type": "result", "id": p.id, "status": status, "detail": note})
+
+    def read(self):
+        while True:
+            line = self.inp.readline()
+            if not line:
+                return None
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+                if not isinstance(msg, dict) or not isinstance(msg.get("type"), str):
+                    raise ValueError("a message must be an object with a 'type'")
+                return msg
+            except ValueError as e:
+                self.error(f"bad message: {e}", "bad_message")
+
+
+# --------------------------------------------------------------------------
+# Editor review
+
+EDITOR_HEADER = """# {title}
+# Lines starting with '#' are removed. What is left is {what}.
+# Save an empty file to {cancel}.
+"""
+
+
+def editor_cmd():
+    ed = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+    argv = shlex.split(ed)
+    base = os.path.basename(argv[0])
+    if base in ("vi", "vim", "nvim", "gvim"):
+        argv += ["-n", "-i", "NONE", "--cmd", "set nobackup nowritebackup noundofile"] if base != "vi" else ["-n"]
+    return argv
+
+
+def edit_text(text, title, what, cancel):
+    """Open text in $EDITOR in a private temp file; return what the user saved, minus # lines."""
+    fd, path = tempfile.mkstemp(prefix="genai-", suffix=".txt")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(EDITOR_HEADER.format(title=title, what=what, cancel=cancel) + text)
+        rc = subprocess.call(editor_cmd() + [path])
+        if rc != 0:
+            eprint(f"genai: editor exited with {rc}; cancelled")
+            return ""
+        with open(path, encoding="utf-8", errors="replace") as f:
+            kept = [ln for ln in f.read().splitlines() if not ln.startswith("#")]
+        return "\n".join(kept).strip("\n")
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def review_output(engine, source, cmd, text, rc=None):
+    """Redact, clip and open output in the editor; send what the user keeps."""
+    red, counts = redact(text)
+    red = clip(red)
+    title = f"Output of: {cmd}" + (f" (exit {rc})" if rc is not None else "")
+    if counts:
+        title += f"\n# Masked: {redaction_note(counts)}"
+    kept = edit_text(red, title, "sent to the model; you may add a note above the output",
+                     "send nothing")
+    if not kept.strip():
+        print("Nothing sent.")
+        return None
+    engine.share(source, kept)
+    return kept
+
+
+# --------------------------------------------------------------------------
+# REPL
+
+HELP = """Type a message; a line with only '..' sends it (Ctrl-D also sends).
+Commands (on an empty buffer):
+  :run [ID]       review, confirm and run a proposed command (latest by default)
+  :sh             open a subshell; :capture on|off to share its output afterwards
+  :attach PATH    attach a file to your next message
+  :coding on|off  let the model read and list files here without asking
+  :compact [-e]   prune old file contents and output; summarize if still large
+  :context        show how full the context is
+  :skills         list skills          :bless PATH   bless a skill, endpoint or profile
+  :help           this text            :quit         leave"""
+
+
+class Repl:
+    def __init__(self, engine):
+        self.e = engine
+        self.capture = False
+        self.attachments = []
+
+    def banner(self):
+        p = self.e.endpoint
+        print(f"genai {VERSION} — {p.name}: {p.model} at {p.base_url}")
+        if self.e.profile:
+            d = self.e.profile.description
+            print(f"profile {self.e.profile.name}" + (f": {exact(d)[0]}" if d else ""))
+        s = self.e.session
+        if s.id:
+            print(f"session {s.id}" + (" (resumed)" if s.resumed else ""))
+        if s.coding:
+            print(f"coding mode is ON ({self.e.coding_from or 'session'}): "
+                  "the model can read and list files here without asking")
+        print(f"sandbox: commands you :run or :sh execute {where_runs(self.e.sandbox)}")
+        print("Type :help for commands. A line with only '..' sends.")
+
+    def run(self):
+        try:
+            import readline  # noqa: F401  (line editing and in-memory history)
+        except ImportError:
+            pass
+        self.banner()
+        buf = []
+        while True:
+            try:
+                line = input("> " if not buf else ". ")
+            except EOFError:
+                print()
+                if buf:
+                    self.send("\n".join(buf))
+                    buf = []
+                    continue
+                return EXIT_OK
+            except KeyboardInterrupt:
+                print("^C (buffer cleared)" if buf else "^C (:quit to leave)")
+                buf = []
+                continue
+            if not buf and line.startswith(":"):
+                if self.command(line) == "quit":
+                    return EXIT_OK
+                continue
+            if line.strip() == "..":
+                if buf:
+                    self.send("\n".join(buf))
+                buf = []
+                continue
+            buf.append(line)
+
+    def send(self, text, attachments=None):
+        att = attachments if attachments is not None else self.attachments
+        self.attachments = []
+        try:
+            self.e.user_turn(text, att)
+        except KeyboardInterrupt:
+            print("\n(interrupted)")
+        except GenaiError as err:
+            print(f"genai: {err}")
+
+    def command(self, line):
+        cmd, _, arg = line[1:].partition(" ")
+        arg = arg.strip()
+        try:
+            if cmd in ("q", "quit", "exit"):
+                return "quit"
+            elif cmd == "help":
+                print(HELP)
+            elif cmd == "run":
+                self.do_run(arg)
+            elif cmd == "sh":
+                self.do_sh()
+            elif cmd == "capture":
+                self.capture = arg == "on"
+                print(f":sh capture is {'on' if self.capture else 'off'}")
+            elif cmd == "attach":
+                self.do_attach(arg)
+            elif cmd == "coding":
+                self.e.set_coding(arg == "on")
+                self.e.session.save()
+                print(f"coding mode is {'ON' if self.e.session.coding else 'off'}")
+            elif cmd == "compact":
+                self.do_compact(arg == "-e")
+            elif cmd == "context":
+                print(f"context: {self.e.used()}/{self.e.endpoint.context_limit} tokens (estimated)")
+            elif cmd == "skills":
+                for name, s in sorted(find_skills(self.e.cfg).items()):
+                    print(f"  {name:20} {skill_status(self.e.cfg, s):10} {s.description()}")
+            elif cmd == "bless":
+                if bless(self.e.cfg, arg, ask_yes):
+                    self.e.reload_skills()
+            else:
+                print(f"unknown command :{cmd} (try :help)")
+        except GenaiError as err:
+            print(f"genai: {err}")
+
+    def do_attach(self, path):
+        data = read_attachment(path)
+        self.attachments.append((f"file {path}", data))
+        print(f"attached {path} ({len(data)} characters) to your next message")
+
+    def do_run(self, pid):
+        props = [p for p in self.e.commands if not pid or p.id == pid]
+        if not props:
+            print("no command proposal to run" + (f" with id {pid}" if pid else ""))
+            return
+        p = props[-1]
+        edited = edit_text(p.fields["command"], f"Proposed command [{p.id}]: {p.fields['reason']}",
+                           "the command that will run, as you", "cancel")
+        if not edited.strip():
+            print("Cancelled.")
+            return
+        where = where_runs(self.e.sandbox)
+        print(f"\nThis will run {where}, in your shell, as you:\n\n    {show_exact(edited)}\n")
+        if not ask_yes("Run it?"):
+            print("Cancelled.")
+            return
+        shell = os.environ.get("SHELL") or "/bin/sh"
+        self.e.audit.log("run", id=p.id, command=edited, edited=edited != p.fields["command"], sandbox=self.e.sandbox)
+        captured, proc = [], None
+        try:
+            proc = subprocess.Popen([shell, "-c", edited], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            for chunk in iter(lambda: proc.stdout.read1(4096), b""):
+                sys.stdout.buffer.write(chunk)
+                sys.stdout.flush()
+                if sum(len(c) for c in captured) < OUTPUT_CAP * 8:
+                    captured.append(chunk)
+            rc = proc.wait()
+        except KeyboardInterrupt:
+            if proc is None:
+                return
+            proc.kill()
+            rc = proc.wait()
+        self.e.audit.log("run_exit", id=p.id, exit=rc, sandbox=self.e.sandbox)
+        print(f"\n[exit {rc}; ran {where}]")
+        out = b"".join(captured).decode("utf-8", "replace")
+        kept = review_output(self.e, "run", edited, out, rc)
+        if kept:
+            self.send(f"I ran `{edited}` {where} (exit {rc}). Output, as I chose to share it:\n```\n{kept}\n```")
+
+    def do_sh(self):
+        shell = os.environ.get("SHELL") or "/bin/sh"
+        self.e.audit.log("sh", capture=self.capture, sandbox=self.e.sandbox)
+        print(f"[subshell runs {where_runs(self.e.sandbox)}]")
+        if not self.capture:
+            print("Subshell; exit to come back. Output is not captured (:capture on to share it).")
+            subprocess.call([shell])
+            return
+        if not shutil.which("script"):
+            print("capture needs the 'script' program; opening the subshell without capture")
+            subprocess.call([shell])
+            return
+        fd, log = tempfile.mkstemp(prefix="genai-sh-")
+        os.close(fd)
+        os.chmod(log, 0o600)
+        try:
+            print("Subshell with capture; exit to come back and review what to share.")
+            subprocess.call(["script", "-q", "-c", shell, log])
+            with open(log, encoding="utf-8", errors="replace") as f:
+                text = strip_ansi(f.read())
+        finally:
+            os.unlink(log)
+        kept = review_output(self.e, "sh", ":sh session", text)
+        if kept:
+            self.send(f"Output from my shell session, as I chose to share it:\n```\n{kept}\n```")
+
+    def do_compact(self, edit):
+        report = self.e.compact(
+            edit_summary=(lambda s: edit_text(s, "Compaction summary", "what the model keeps of older turns",
+                                              "drop the summary")) if edit else None)
+        print(f"pruned {report['pruned']} items: {report['before']} -> {report['after']} tokens (estimated)")
+        if report["summary"]:
+            print(f"\nSummary of older turns (sent instead of them):\n{report['summary']}\n")
+
+
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]|\r")
+
+
+def strip_ansi(text):
+    return _ANSI.sub("", text)
+
+
+def read_attachment(path):
+    try:
+        with open(os.path.expanduser(path), "rb") as f:
+            data = f.read(ATTACH_CAP + 1)
+    except OSError as e:
+        raise GenaiError(f"cannot read {path}: {e.strerror}", EXIT_USAGE)
+    if len(data) > ATTACH_CAP:
+        raise GenaiError(f"{path} is larger than {ATTACH_CAP} bytes", EXIT_USAGE)
+    if b"\0" in data[:8192]:
+        raise GenaiError(f"{path} looks binary; refused", EXIT_USAGE)
+    text = data.decode("utf-8", "replace")
+    if looks_secret(text):
+        eprint(f"genai: warning: {path} looks like it contains secrets; it is sent as is (files are not redacted)")
+    return text
+
+
+# --------------------------------------------------------------------------
+# JSON mode driver
+
+def run_json(engine, ui, first_prompt, attachments):
+    ui.engine = engine
+    ui.emit({"type": "hello", "protocol": PROTOCOL, "version": VERSION,
+             "features": ["proposals", "decisions", "attach", "register_tools", "compact", "context", "coding"],
+             "endpoint": engine.endpoint.info(),
+             "profile": {"name": engine.profile.name, "description": engine.profile.description}
+             if engine.profile else None,
+             "session": engine.session.id,
+             "resumed": engine.session.resumed, "coding": engine.session.coding,
+             "coding_from": engine.coding_from if engine.session.coding else None, "cwd": os.getcwd(),
+             "sandbox": engine.sandbox,
+             "tools": list(INTRINSICS)})
+    engine.audit.log("start", mode="json", endpoint=engine.endpoint.info(),
+                     profile=engine.profile.name if engine.profile else None, session=engine.session.id,
+                     sandbox=engine.sandbox)
+
+    def turn(text, att):
+        try:
+            reason = engine.user_turn(text, att)
+            ui.emit({"type": "done", "reason": reason, "context": {"used": engine.used(),
+                                                                    "limit": engine.endpoint.context_limit}})
+        except GenaiError as err:
+            ui.error(str(err), err.kind)
+
+    if first_prompt is not None:
+        turn(first_prompt, attachments)
+    while True:
+        msg = ui.read()
+        if msg is None:
+            return EXIT_OK
+        t = msg.get("type")
+        if t == "user":
+            text = msg.get("text")
+            if not isinstance(text, str):
+                ui.error("user message needs 'text'", "bad_message")
+                continue
+            att = [(f"{lbl}" + (f" (re {ref})" if ref else ""), body) for lbl, body, ref in ui.queue]
+            for lbl, body, ref in ui.queue:
+                engine.share("attach", body, ref)
+            ui.queue = []
+            turn(text, att)
+        elif t == "attach":
+            ui.queue_attach(msg)
+        elif t == "register_tools":
+            try:
+                names = engine.register(msg.get("tools") or [])
+                ui.emit({"type": "registered", "tools": names})
+            except GenaiError as err:
+                ui.error(str(err), "bad_tools")
+        elif t == "compact":
+            try:
+                r = engine.compact()
+                ui.emit({"type": "compacted", "pruned": r["pruned"], "before": r["before"], "after": r["after"],
+                         "summary": r["summary"]})
+            except GenaiError as err:
+                ui.error(str(err), err.kind)
+        elif t in ("decision", "result"):
+            ui.error(f"no pending proposal {msg.get('id')!r}", "unknown_id")
+        else:
+            ui.error(f"unknown message type '{t}'", "unknown_type")
+
+
+# --------------------------------------------------------------------------
+# Main
+
+def parse_args(argv):
+    ap = argparse.ArgumentParser(prog="genai", description="Ask a model; it proposes, you act.")
+    ap.add_argument("prompt", nargs="*", help="question (omit for the interactive REPL)")
+    ap.add_argument("-p", "--profile", help="profile (persona) name")
+    ap.add_argument("-e", "--endpoint", help="endpoint name (overrides the profile's)")
+    ap.add_argument("-f", "--file", action="append", default=[], help="attach a file (repeatable)")
+    ap.add_argument("-k", "--skill", action="append", default=[], help="use a blessed skill (repeatable)")
+    ap.add_argument("-S", "--session", help="keep the conversation in a named session (created or resumed)")
+    ap.add_argument("--coding", action="store_true", help="let the model read and list files here without asking")
+    ap.add_argument("--json", action="store_true", help="JSON Lines over stdio, for wrappers")
+    ap.add_argument("--bless", metavar="PATH", help="review and bless a skill directory, endpoint or profile file")
+    ap.add_argument("--list-skills", action="store_true", help="list skills (with --json: as JSON)")
+    ap.add_argument("--list-endpoints", action="store_true", help="list endpoints (with --json: as JSON)")
+    ap.add_argument("--list-profiles", action="store_true", help="list profiles (with --json: as JSON)")
+    ap.add_argument("--list-sessions", action="store_true", help="list saved sessions (with --json: as JSON)")
+    ap.add_argument("--version", action="version", version=f"genai {VERSION} (protocol {PROTOCOL})")
+    return ap.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    try:
+        cfg = Config()
+        cfg.ensure()
+        if args.bless:
+            if not sys.stdin.isatty():
+                raise GenaiError("blessing needs a terminal: it asks you to confirm you have read it", EXIT_USAGE)
+            return EXIT_OK if bless(cfg, args.bless, ask_yes) else EXIT_ERROR
+        if args.list_skills:
+            rows = [{"name": n, "path": s.path, "description": s.description(), "status": skill_status(cfg, s)}
+                    for n, s in sorted(find_skills(cfg).items())]
+            if args.json:
+                print(json.dumps({"type": "skills", "skills": rows}))
+            else:
+                for r in rows:
+                    print(f"{r['name']:20} {r['status']:10} {r['description']}")
+            return EXIT_OK
+        for kind, wanted in (("endpoint", args.list_endpoints), ("profile", args.list_profiles)):
+            if wanted:
+                rows = list_named(cfg, kind)
+                if args.json:
+                    print(json.dumps({"type": kind + "s", kind + "s": rows}))
+                else:
+                    for r in rows:
+                        print(f"{r['name']:20} {r['status']:10} {r['description']}")
+                return EXIT_OK
+        if args.list_sessions:
+            rows = list_sessions(cfg)
+            if args.json:
+                print(json.dumps({"type": "sessions", "sessions": rows}))
+            else:
+                for r in rows:
+                    print(f"{r['id']:28} {r['endpoint'] or '-':12} {r['profile'] or '-':12} "
+                          f"{r['updated'] or '':26} {r['first']}")
+            return EXIT_OK
+
+        session = Session.open(cfg, args.session)
+        notices = []
+        pname = args.profile or (session.profile if session.resumed else cfg.default_profile)
+        persona = select_named(cfg, "profile", pname) if pname else None
+        endpoint = select_endpoint(cfg, args.endpoint or (persona.endpoint if persona else None)
+                                   or session.endpoint or cfg.default_endpoint)
+        if session.resumed and session.endpoint and session.endpoint != endpoint.name:
+            notices.append(f"warning: session '{session.id}' was used with endpoint '{session.endpoint}', "
+                           f"now '{endpoint.name}'")
+        if session.resumed and args.profile and session.profile != args.profile:
+            notices.append(f"session '{session.id}' was used with profile '{session.profile or '-'}', "
+                           f"now '{args.profile}'")
+        if not session.resumed:
+            base = persona.skills if persona and persona.skills is not None else cfg.default_skills
+        else:
+            base = persona.skills if args.profile and persona and persona.skills else []
+        session.endpoint, session.profile = endpoint.name, persona.name if persona else None
+        if session.coding and os.path.realpath(session.cwd) != os.path.realpath(os.getcwd()):
+            session.coding = False
+            notices.append(f"coding mode was on for {session.cwd}, not here; it is now off")
+        for k in base + args.skill:
+            if k not in session.skills:
+                session.skills.append(k)
+
+        prompt = " ".join(args.prompt) if args.prompt else None
+        if args.json:
+            ui = JsonUI()
+        elif sys.stdin.isatty() and sys.stdout.isatty():
+            ui = TtyUI()
+        else:
+            ui = PlainUI()
+        attachments = [(f"file {f}", read_attachment(f)) for f in args.file]
+        coding = "--coding" if args.coding else (f"profile {persona.name}" if persona and persona.coding else None)
+        engine = Engine(cfg, endpoint, session, ui, coding=coding, profile=persona)
+        for n in notices:
+            ui.notice(n)
+        if session.resumed and session.coding and engine.coding_from == "session":
+            ui.notice("coding mode is on for this session")
+
+        if args.json:
+            return run_json(engine, ui, prompt, attachments)
+        cfg.audit.log("start", mode="repl" if prompt is None else "oneshot", endpoint=endpoint.info(),
+                      profile=persona.name if persona else None,
+                      session=session.id, sandbox=engine.sandbox)
+        if prompt is None:
+            if not isinstance(ui, TtyUI):
+                raise GenaiError("no prompt given and no terminal for the REPL", EXIT_USAGE)
+            repl = Repl(engine)
+            repl.attachments = attachments
+            return repl.run()
+        if isinstance(ui, TtyUI):
+            eprint(f"genai: {(persona.name + ' on ') if persona else ''}{endpoint.name} "
+                   f"({endpoint.model} at {endpoint.base_url}); "
+                   f"commands run {where_runs(engine.sandbox)}")
+        engine.user_turn(prompt, attachments)
+        return EXIT_OK
+    except GenaiError as err:
+        if args.json:
+            print(json.dumps({"type": "error", "code": err.kind, "message": str(err)}), flush=True)
+        else:
+            eprint(f"genai: {err}")
+        return err.code
+    except KeyboardInterrupt:
+        eprint("\ngenai: interrupted")
+        return EXIT_INTERRUPT
+
+
+if __name__ == "__main__":
+    sys.exit(main())

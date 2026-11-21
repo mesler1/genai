@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# Run genai, or its tests, inside a rootless podman sandbox.
+#
+#   sandbox/run tests            offline test suite, no network
+#   sandbox/run live ENDPOINT.json  live test against a real endpoint (needs its key variable set)
+#   sandbox/run genai [ARGS...]  genai itself, interactive, in ./sandbox-work by default
+#   sandbox/run selfcheck        the live test's harness against a fake endpoint, no network
+#
+# This is the podman implementation of a small contract, so another sandbox can replace it:
+#   - the repo is mounted read-only at /opt/genai
+#   - one working directory is mounted read-write at /work, and is the only host path genai can write
+#   - genai's config lives in a sandbox-only directory, never the user's real ~/.config/genai
+#   - GENAI_SANDBOX=<name> is set, so genai reports that commands run inside a sandbox
+#   - only the key variable the endpoint names is passed in, by name (its value is never on a command line)
+#
+# Environment:
+#   GENAI_SANDBOX_IMAGE   image tag (default localhost/genai-sandbox:py3.10)
+#   GENAI_SANDBOX_STATE   host dir for the sandbox's genai config (default ~/.local/share/genai-sandbox)
+#   GENAI_SANDBOX_WORK    host dir mounted at /work for "genai" (default ./sandbox-work)
+#   GENAI_KEY_ENV         key variable to pass through (for "live", default: the endpoint's key_env)
+set -euo pipefail
+
+repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+image=${GENAI_SANDBOX_IMAGE:-localhost/genai-sandbox:py3.10}
+state=${GENAI_SANDBOX_STATE:-$HOME/.local/share/genai-sandbox}
+key_env=${GENAI_KEY_ENV:-}
+
+command -v podman >/dev/null || { echo "sandbox/run: podman is required" >&2; exit 1; }
+
+build() {
+  if ! podman image exists "$image"; then
+    echo "sandbox/run: building $image" >&2
+    podman build -q -t "$image" -f "$repo/sandbox/Containerfile" "$repo/sandbox" >/dev/null
+  fi
+}
+
+# Hardened defaults shared by every mode.
+common=(
+  --rm --init
+  --userns=keep-id
+  --read-only --tmpfs /tmp:rw,mode=1777,size=64m
+  --cap-drop=ALL --security-opt=no-new-privileges
+  --pids-limit=256 --memory=1g
+  -v "$repo:/opt/genai:ro"
+  -e GENAI_SANDBOX=podman
+)
+
+tty_flags=()
+[[ -t 0 && -t 1 ]] && tty_flags=(-it)
+
+keyflag=()
+set_keyflag() { keyflag=(); if [[ -n "$key_env" && -n "${!key_env:-}" ]]; then keyflag=(-e "$key_env"); fi; }
+set_keyflag
+
+seed_config() {  # $1 = host config dir mounted at ~/.config/genai
+  mkdir -p "$1"
+  chmod 700 "$1"
+  if [[ ! -f "$1/config.json" ]]; then
+    printf '{\n  "default_profile": null,\n  "default_endpoint": null,\n  "default_skills": [],\n  "endpoint_dirs": ["/opt/genai/endpoints"],\n  "profile_dirs": ["/opt/genai/profiles"],\n  "skill_dirs": ["/opt/genai/skills"]\n}\n' >"$1/config.json"
+  fi
+}
+
+mode=${1:-genai}
+shift || true
+build
+
+case "$mode" in
+  tests)
+    scratch=$(mktemp -d "${TMPDIR:-/tmp}/genai-sbx-XXXXXX")
+    trap 'rm -rf "$scratch"' EXIT
+    rc=0
+    podman run "${common[@]}" --network=none \
+      -v "$scratch:/work" -w /opt/genai \
+      "$image" python3 -W ignore::ResourceWarning -m unittest discover -s tests "$@" || rc=$?
+    exit "$rc"
+    ;;
+  live)
+    endpoint=${1:-}
+    [[ -n "$endpoint" && -f "$endpoint" ]] || { echo "usage: sandbox/run live ENDPOINT.json" >&2; exit 2; }
+    shift
+    endpoint=$(cd "$(dirname "$endpoint")" && pwd)/$(basename "$endpoint")
+    if [[ -z "$key_env" ]]; then
+      key_env=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("key_env") or "")' "$endpoint")
+    fi
+    [[ -n "$key_env" ]] || { echo "sandbox/run: the endpoint has no key_env; set GENAI_KEY_ENV" >&2; exit 2; }
+    [[ -n "${!key_env:-}" ]] || { echo "sandbox/run: \$$key_env is not set; the live test needs it" >&2; exit 2; }
+    set_keyflag
+    scratch=$(mktemp -d "${TMPDIR:-/tmp}/genai-sbx-XXXXXX")
+    trap 'rm -rf "$scratch"' EXIT
+    rc=0
+    podman run "${common[@]}" "${keyflag[@]}" \
+      -v "$scratch:/work" -v "$endpoint:/etc/genai-live/endpoint.json:ro" -w /work \
+      "$image" python3 /opt/genai/tests/live_endpoint.py --endpoint /etc/genai-live/endpoint.json "$@" || rc=$?
+    exit "$rc"
+    ;;
+  selfcheck)
+    scratch=$(mktemp -d "${TMPDIR:-/tmp}/genai-sbx-XXXXXX")
+    trap 'rm -rf "$scratch"' EXIT
+    rc=0
+    podman run "${common[@]}" --network=none \
+      -v "$scratch:/work" -w /work \
+      "$image" python3 /opt/genai/tests/selfcheck_live.py "$@" || rc=$?
+    exit "$rc"
+    ;;
+  genai)
+    work=${GENAI_SANDBOX_WORK:-$PWD/sandbox-work}
+    mkdir -p "$work"
+    seed_config "$state/config"
+    echo "sandbox/run: genai in podman; /work = $work; config = $state/config" >&2
+    exec podman run "${common[@]}" "${tty_flags[@]}" "${keyflag[@]}" \
+      -v "$work:/work" -v "$state/config:/home/genai/.config/genai" -w /work \
+      "$image" python3 /opt/genai/genai "$@"
+    ;;
+  *)
+    sed -n '2,9p' "$0" >&2
+    exit 2
+    ;;
+esac
