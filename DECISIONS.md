@@ -25,7 +25,13 @@ tests:
 | Shared endpoints | A blessed endpoint, profile or skill can be found by its `name` wherever it lives. |
 | Endpoint fields | Unknown fields are errors. Credentials in `headers` are refused. `params` may not override `model`, `messages` or `tools`. |
 | REPL input | `..` on a line by itself sends, and so does Ctrl-D. A `:` command works on an empty buffer. |
-| `:run` output | After you review it in your editor, it is sent at once as a message, with any note you added above it. |
+| `:run` and `:sh` output | One editor buffer holds everything that will be sent: where it ran, the command as run, and the output (redacted and clipped). What you save is sent exactly, with nothing added, so you can remove a secret from the command as well as from the output. An empty buffer sends nothing. |
+| Edits the model may not read | If an edit can't be previewed (text not found or ambiguous, file missing or binary) and the model isn't allowed to read the file without asking, you see why locally. The model only gets "declined by the user", so it learns nothing about the file's contents. |
+| Approval and the file's state | Each write or edit is bound to the target's state when you reviewed it: its sha256, or that it didn't exist. If the file changed before it's applied, nothing is written and the model is told to propose again. In a batch of two writes to one file, the second is refused. |
+| Blessed files are read once | An endpoint or profile is hashed and parsed from the same bytes. A skill is read into memory when it's loaded, and only that copy is used, so editing it mid-session changes nothing until it's reloaded. `--bless` records the hash of exactly what it showed you. |
+| Model text on the terminal | Streamed replies, reasons, paths, notes and summaries have control, bidi and invisible characters escaped before display, with a warning on stderr. JSON mode is JSON-encoded instead. |
+| Commands in the audit log | Recorded as `command_sha256` and `command_len`, never as text, since a command you edited may hold a secret. |
+| `key_env` | Must be a plain variable name (`[A-Za-z_][A-Za-z0-9_]*`), in genai and in `sandbox/run`, which uses it in bash indirect expansion. |
 | Context full | The new message is not kept. Compact, then send again. |
 | Compaction | Prunes bulk older than the last 2 user turns, and summarizes only if still above 80%. The summary goes in front of the first kept message. The full history stays in the session file. |
 | JSON while proposals are pending | `attach` is queued. Anything else gets an error with code `busy`. |
@@ -80,5 +86,7 @@ not a guarantee.
    so a flagged command also prints a warning. The editor itself could still render hidden characters.
 5. **SELinux.** `sandbox/run` doesn't relabel mounts. On SELinux hosts such as RHEL, it may need `:z`
    or a label policy.
-6. **Live test keys.** `sandbox/run live` passes in only a `key_env` variable. It can't test an
+6. **Apply-time race.** The state check runs just before the write's rename. An editor saving in
+   that instant can still be overwritten; closing that fully would need file locking.
+7. **Live test keys.** `sandbox/run live` passes in only a `key_env` variable. It can't test an
    endpoint that uses `key_file`.

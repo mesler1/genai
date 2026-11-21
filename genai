@@ -1601,9 +1601,9 @@ class PlainUI:
     def text_end(self):
         if self._open:
             self.out.write("\n")
-            if self._flagged:
-                self.out.write("  [!] hidden or control characters were escaped above\n")
             self.out.flush()
+            if self._flagged:      # stderr, so `genai ... > file` keeps only the reply
+                eprint("  [!] hidden or control characters were escaped above")
             self._open = False
             self._flagged = False
 
