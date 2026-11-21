@@ -845,6 +845,33 @@ class Workdir:
         except UnicodeDecodeError:
             raise ValueError("binary (non UTF-8) files are refused")
 
+    def state(self, path):
+        """What a path holds right now: None if missing, else the sha256 of a regular file's
+        bytes, or a label for anything else. Used to bind an approval to what was reviewed."""
+        parts = split_rel(path)
+        if not parts:
+            raise ValueError("that is a directory")
+        try:
+            dfd = self._open_dir(parts[:-1])
+        except FileNotFoundError:
+            return None
+        try:
+            try:
+                fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+            except FileNotFoundError:
+                return None
+            except OSError as e:
+                return "symlink" if e.errno == 40 else f"unreadable:{e.errno}"
+        finally:
+            os.close(dfd)
+        with os.fdopen(fd, "rb") as f:
+            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                return "not a regular file"
+            h = hashlib.sha256()
+            for block in iter(lambda: f.read(1 << 16), b""):
+                h.update(block)
+        return "sha256:" + h.hexdigest()
+
     def list(self, path):
         parts = split_rel(path) if path not in ("", ".", "./") else []
         dfd = self._open_dir(parts)
@@ -1170,6 +1197,7 @@ class Proposal:
         self.decision = None
         self.result = None
         self.error = None          # set when the request is invalid and never shown for a decision
+        self.reply = None          # what the model is told instead of "error: ..." (the user still sees error)
 
     def event(self):
         ev = {"type": "proposal", "id": self.id, "kind": self.kind}
@@ -1360,7 +1388,7 @@ class Engine:
                 if kind == "read":
                     st = self.wd.stat(path)
                     p.fields["size"] = st.st_size if st else None
-                if self.session.coding and not is_hidden(parts) and self.ui.performs:
+                if self.read_allowed(parts):
                     p.auto = True
                 return p
             if name == "write_file":
@@ -1368,9 +1396,9 @@ class Engine:
                 split_rel(path)
                 if not isinstance(content, str):
                     raise ValueError("content must be a string")
-                st = self.wd.stat(path)
-                exists = st is not None
-                fields = {"path": path, "exists": exists, "content": content, "reason": reason,
+                state = self.wd.state(path)
+                exists = state is not None
+                fields = {"path": path, "exists": exists, "content": content, "reason": reason, "_state": state,
                           "lines": content.count("\n") + (0 if content.endswith("\n") or not content else 1)}
                 if exists:
                     try:
@@ -1382,13 +1410,24 @@ class Engine:
                 path, old, new = args.get("path"), args.get("old_text"), args.get("new_text")
                 if not isinstance(old, str) or not isinstance(new, str) or not old:
                     raise ValueError("old_text and new_text are required")
-                current = self.wd.read(path, WRITE_CAP)
-                n = current.count(old)
-                if n != 1:
-                    raise ValueError(f"old_text appears {n} times in {path}; it must appear exactly once")
+                parts = split_rel(path)
+                try:
+                    current = self.wd.read(path, WRITE_CAP)
+                    n = current.count(old)
+                    if n != 1:
+                        raise ValueError(f"old_text appears {n} times in {path}; it must appear exactly once")
+                except (ValueError, OSError) as e:
+                    if self.read_allowed(parts):
+                        raise
+                    # The model may not learn anything about this file, so it only hears "declined".
+                    p = Proposal(pid, "invalid", tc["id"], tool=name)
+                    p.error = f"edit of {show_exact(path)} not applied, and the model was only told it was declined: {e}"
+                    p.reply = "declined by the user"
+                    return p
                 updated = current.replace(old, new, 1)
                 return Proposal(pid, "edit", tc["id"], path=path, diff=unified_diff(current, updated, path),
-                                reason=reason, _old=old, _new=new)
+                                reason=reason, _old=old, _new=new,
+                                _state="sha256:" + hashlib.sha256(current.encode()).hexdigest())
             if name in self.external:
                 return Proposal(pid, "external", tc["id"], tool=name, args=args)
             raise ValueError(f"unknown tool '{name}'")
@@ -1397,11 +1436,17 @@ class Engine:
             p.error = str(e)
             return p
 
+    def read_allowed(self, parts):
+        """Would reading this path be allowed without asking? (coding mode, not hidden)"""
+        return bool(self.session.coding and not is_hidden(parts) and self.ui.performs)
+
     def decide(self, props):
         for p in props:
             p.decision = None
             if p.error:
                 self.audit.log("invalid_call", id=p.id, tool=p.fields.get("tool"), error=p.error)
+                if p.reply:
+                    self.ui.notice(f"[{p.id}] {p.error}")
                 continue
             self.audit.log("proposal", **{k: v for k, v in p.event().items()
                                           if k not in ("type", "content", "diff")})
@@ -1422,7 +1467,7 @@ class Engine:
 
     def perform(self, p):
         if p.error:
-            return f"error: {p.error}"
+            return p.reply or f"error: {p.error}"
         if p.kind == "command":
             return "shown to the user, not run. If they run it, they may send you the output."
         if p.kind == "external":
@@ -1448,13 +1493,19 @@ class Engine:
                     lines.append(f"... {len(rows) - LIST_CAP} more entries")
                 result = "\n".join(lines) or "(empty directory)"
                 note = f"listed {len(rows)} entries"
+            elif p.kind in ("write", "edit") and self.wd.state(p.fields["path"]) != p.fields["_state"]:
+                self.audit.log("file_op", id=p.id, kind=p.kind, path=p.fields["path"], status="stale")
+                self.ui.result(p, "error", f"{p.fields['path']} changed after you reviewed it "
+                                           "(another proposal or an editor), so nothing was written")
+                return (f"not applied: {p.fields['path']} changed since the user reviewed your proposal; "
+                        "propose the change again")
             elif p.kind == "write":
                 n = self.wd.write(p.fields["path"], p.fields["content"])
                 result = note = f"wrote {p.fields['path']} ({n} bytes)"
             elif p.kind == "edit":
                 current = self.wd.read(p.fields["path"], WRITE_CAP)
                 if current.count(p.fields["_old"]) != 1:
-                    raise ValueError("the file changed before the edit was applied; old_text no longer matches once")
+                    raise ValueError("the file changed before the edit was applied")
                 self.wd.write(p.fields["path"], current.replace(p.fields["_old"], p.fields["_new"], 1))
                 result = note = f"edited {p.fields['path']}"
             else:
