@@ -217,6 +217,11 @@ def sandbox_info():
     return None
 
 
+def command_fingerprint(cmd):
+    """What the audit log keeps of a command: its hash and length, never its text, which may hold secrets."""
+    return {"command_sha256": hashlib.sha256(cmd.encode("utf-8", "replace")).hexdigest(), "command_len": len(cmd)}
+
+
 def where_runs(sb):
     return f"inside the {sb['name']} sandbox" if sb else "OUTSIDE any sandbox, directly on this host"
 
@@ -1448,8 +1453,10 @@ class Engine:
                 if p.reply:
                     self.ui.notice(f"[{p.id}] {p.error}")
                 continue
-            self.audit.log("proposal", **{k: v for k, v in p.event().items()
-                                          if k not in ("type", "content", "diff")})
+            rec = {k: v for k, v in p.event().items() if k not in ("type", "content", "diff", "command")}
+            if p.kind == "command":
+                rec.update(command_fingerprint(p.fields["command"]))
+            self.audit.log("proposal", **rec)
         live = [p for p in props if not p.error]
         for p in live:
             if p.kind == "command":
@@ -1581,26 +1588,33 @@ class PlainUI:
     def __init__(self, out=sys.stdout):
         self.out = out
         self._open = False
+        self._flagged = False
 
     def text(self, chunk):
-        self.out.write(chunk)
+        # Escaping is per character, so a chunk boundary can't split or hide anything.
+        disp, flagged = exact(chunk)
+        self._flagged = self._flagged or flagged
+        self.out.write(disp)
         self.out.flush()
         self._open = True
 
     def text_end(self):
         if self._open:
             self.out.write("\n")
+            if self._flagged:
+                self.out.write("  [!] hidden or control characters were escaped above\n")
             self.out.flush()
             self._open = False
+            self._flagged = False
 
     def notice(self, msg):
-        eprint(f"genai: {msg}")
+        eprint(f"genai: {exact(msg)[0]}")
 
     def context(self, used, limit):
         pass
 
     def show_command(self, p):
-        self.out.write(f"\n[proposed command {p.id}] {p.fields['reason']}\n    {show_exact(p.fields['command'])}\n")
+        self.out.write(f"\n[proposed command {p.id}] {show_exact(p.fields['reason'])}\n    {show_exact(p.fields['command'])}\n")
         self.out.flush()
 
     def show_auto(self, p):
@@ -1609,7 +1623,7 @@ class PlainUI:
     def decide(self, pending):
         for p in pending:
             p.decision = "decline" if p.kind != "external" else "declined"
-            self.notice(f"{p.kind} proposal {p.id} ({p.fields.get('path') or p.fields.get('tool')}) declined: "
+            self.notice(f"{p.kind} proposal {p.id} ({exact(str(p.fields.get('path') or p.fields.get('tool')))[0]}) declined: "
                         "no terminal")
 
     def result(self, p, status, note):
@@ -1625,12 +1639,12 @@ class TtyUI(PlainUI):
 
     def show_command(self, p):
         cmd = show_exact(p.fields["command"])
-        self.out.write(f"\n\033[1mProposed command [{p.id}]\033[0m: {p.fields['reason']}\n\n    {cmd}\n\n"
+        self.out.write(f"\n\033[1mProposed command [{p.id}]\033[0m: {show_exact(p.fields['reason'])}\n\n    {cmd}\n\n"
                        "Paste it into your shell, or type :run to review and run it.\n")
         self.out.flush()
 
     def show_auto(self, p):
-        eprint(f"  (coding mode) {p.kind} {p.fields['path']}")
+        eprint(f"  (coding mode) {p.kind} {exact(p.fields['path'])[0]}")
 
     def decide(self, pending):
         for p in pending:
@@ -1655,7 +1669,7 @@ class TtyUI(PlainUI):
             p.decision = "accept" if ask_yes(f"Accept {p.id}?") else "decline"
 
     def result(self, p, status, note):
-        eprint(f"  [{p.id}] {status}: {note}")
+        eprint(f"  [{p.id}] {status}: {exact(note)[0]}")
 
 
 def ask_yes(question):
@@ -1812,15 +1826,16 @@ def edit_text(text, title, what, cancel):
             pass
 
 
-def review_output(engine, source, cmd, text, rc=None):
-    """Redact, clip and open output in the editor; send what the user keeps."""
+def review_output(engine, source, lead, text, title):
+    """Redact, clip and open output in the editor, with `lead` lines above it in the same buffer.
+    Returns exactly what the user saved, which is exactly what is sent; nothing is added afterwards."""
     red, counts = redact(text)
-    red = clip(red)
-    title = f"Output of: {cmd}" + (f" (exit {rc})" if rc is not None else "")
+    buf = "\n".join(lead) + "\n```\n" + clip(red) + "\n```"
     if counts:
-        title += f"\n# Masked: {redaction_note(counts)}"
-    kept = edit_text(red, title, "sent to the model; you may add a note above the output",
-                     "send nothing")
+        title += f"\n# Masked in the output: {redaction_note(counts)}"
+    title += ("\n# EVERYTHING below is sent to the model as saved, the command included."
+              "\n# Remove anything you don't want it to see, such as a secret in the command.")
+    kept = edit_text(buf, title, "sent to the model exactly as saved; nothing is added", "send nothing")
     if not kept.strip():
         print("Nothing sent.")
         return None
@@ -1953,7 +1968,8 @@ class Repl:
             print("no command proposal to run" + (f" with id {pid}" if pid else ""))
             return
         p = props[-1]
-        edited = edit_text(p.fields["command"], f"Proposed command [{p.id}]: {p.fields['reason']}",
+        reason = " ".join(exact(p.fields["reason"])[0].split())
+        edited = edit_text(p.fields["command"], f"Proposed command [{p.id}]: {reason}",
                            "the command that will run, as you", "cancel")
         if not edited.strip():
             print("Cancelled.")
@@ -1964,7 +1980,8 @@ class Repl:
             print("Cancelled.")
             return
         shell = os.environ.get("SHELL") or "/bin/sh"
-        self.e.audit.log("run", id=p.id, command=edited, edited=edited != p.fields["command"], sandbox=self.e.sandbox)
+        self.e.audit.log("run", id=p.id, **command_fingerprint(edited), edited=edited != p.fields["command"],
+                         sandbox=self.e.sandbox)
         captured, proc = [], None
         try:
             proc = subprocess.Popen([shell, "-c", edited], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -1982,9 +1999,10 @@ class Repl:
         self.e.audit.log("run_exit", id=p.id, exit=rc, sandbox=self.e.sandbox)
         print(f"\n[exit {rc}; ran {where}]")
         out = b"".join(captured).decode("utf-8", "replace")
-        kept = review_output(self.e, "run", edited, out, rc)
+        kept = review_output(self.e, "run", [f"I ran this command {where} (exit {rc}):", "```", edited, "```", "Output:"],
+                             out, f"Output of: {' '.join(exact(edited)[0].split())} (exit {rc})")
         if kept:
-            self.send(f"I ran `{edited}` {where} (exit {rc}). Output, as I chose to share it:\n```\n{kept}\n```")
+            self.send(kept)
 
     def do_sh(self):
         shell = os.environ.get("SHELL") or "/bin/sh"
@@ -2008,9 +2026,10 @@ class Repl:
                 text = strip_ansi(f.read())
         finally:
             os.unlink(log)
-        kept = review_output(self.e, "sh", ":sh session", text)
+        kept = review_output(self.e, "sh", [f"Output from my shell session, which ran {where_runs(self.e.sandbox)}:"],
+                             text, "Output of: :sh session")
         if kept:
-            self.send(f"Output from my shell session, as I chose to share it:\n```\n{kept}\n```")
+            self.send(kept)
 
     def do_compact(self, edit):
         report = self.e.compact(
@@ -2018,7 +2037,7 @@ class Repl:
                                               "drop the summary")) if edit else None)
         print(f"pruned {report['pruned']} items: {report['before']} -> {report['after']} tokens (estimated)")
         if report["summary"]:
-            print(f"\nSummary of older turns (sent instead of them):\n{report['summary']}\n")
+            print(f"\nSummary of older turns (sent instead of them):\n{show_exact(report['summary'])}\n")
 
 
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]|\r")
