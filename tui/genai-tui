@@ -2,7 +2,7 @@
 # genai-tui: genai in tmux, as one coding agent. The conversation is at the top, your own shell
 # below it, the prompt you type into at the bottom, and an info panel on the right. /run types a
 # proposed command into the shell, /share sends what it printed, right-clicking the shell marks
-# where shell context starts, and ~~ makes the shell fullscreen.
+# where shell context starts, and `` on an empty line makes the shell fullscreen.
 # Usage: genai-tui [-h] [-p PROFILE] [-e ENDPOINT] [-S SESSION] [-k SKILL] [--coding] [--no-panel]
 set -euo pipefail
 here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
@@ -79,7 +79,7 @@ t set -g status-right ' #H │ right-click the shell for context │ Ctrl-b o: o
 t set -g status-right-length 100
 t set -g @genai_prompt_pane "$prompt"
 t set -p -t "$conv" @genai_title 'genai'
-t set -p -t "$shell" @genai_title 'shell · ~~ fullscreen · right-click: shell context'
+t set -p -t "$shell" @genai_title 'shell · `` fullscreen · right-click: shell context'
 t set -p -t "$prompt" @genai_title 'you'
 t set -p -t "$side" @genai_title 'info · /panel hides it'
 
