@@ -473,7 +473,7 @@ class TestGenaiTui(TmuxCase):
             self.assertIn("echo in-context\nin-context", sent)
             self.assertNotIn("before-mark", sent)
 
-    def test_layout_and_double_tilde(self):
+    def test_layout_and_double_backtick(self):
         with FakeAPI([reply("hello")]) as api:
             self.start(api)
             tops = {t.split(" ")[0]: int(top) for top, _, t in
@@ -484,16 +484,26 @@ class TestGenaiTui(TmuxCase):
             self.type("hi")
             self.wait_for("● hello")
             zoomed = lambda: self.tmux("display", "-p", "-t", "genai", "#{window_zoomed_flag}").strip()
-            self.type("~", enter=False)
+            self.type("`", enter=False)
             time.sleep(0.8)                                            # however slowly it is typed
-            self.type("~", enter=False)
+            self.type("`", enter=False)
             time.sleep(0.5)
             self.assertEqual(zoomed(), "1")                            # the shell, fullscreen
-            self.tmux("send-keys", "-t", self.panes()["shell"], "-l", "~~")
+            self.tmux("send-keys", "-t", self.panes()["shell"], "-l", "``")
             time.sleep(1)
             self.assertEqual(zoomed(), "0")
             self.assertEqual(self.tmux("display", "-p", "-t", "genai", "#{@genai_title}").split()[0], "you")
-            self.assertNotIn("~", self.screen("you").splitlines()[0])  # the taps didn't stay in the input
+            self.assertNotIn("`", self.screen("you").splitlines()[0])  # the taps didn't stay in the input
+            self.type("a ``code`` b", enter=False)                     # not on an empty input: just text
+            time.sleep(0.3)
+            self.assertEqual(zoomed(), "0")
+            self.assertIn("a ``code`` b", self.screen("you"))
+            self.tmux("send-keys", "-t", "genai", "C-u")
+            sh = self.panes()["shell"]
+            self.tmux("send-keys", "-t", sh, "-l", "echo ``x")          # mid-command in the shell: typed as is
+            time.sleep(1)
+            self.assertEqual(zoomed(), "0")
+            self.assertIn("echo ``x", self.screen("shell"))
 
     def test_a_key_typed_as_a_question_appears_is_not_an_answer(self):
         with FakeAPI([call("write_file", path="x.txt", content="x\n", reason="r"), reply("done")]) as api:

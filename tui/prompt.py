@@ -4,7 +4,8 @@
 Typing, history, paste and Tab completion happen here. What you send, and your answers to
 approval and run questions, go to the conversation pane through genai-tui's private pipe
 ($GENAI_TUI_STATE/requests); the conversation pane owns genai and decides everything. It tells
-this pane what to show in $GENAI_TUI_STATE/prompt.json. Typing ~~ makes the shell fullscreen.
+this pane what to show in $GENAI_TUI_STATE/prompt.json. Typing `` on an empty input makes the shell
+fullscreen.
 Standard library only; Python 3.10 or newer.
 """
 
@@ -45,7 +46,7 @@ def tmux(*args):
 
 
 def shell_fullscreen():
-    """The shell pane, zoomed to the whole window; ~~ there (or Ctrl-b z) comes back."""
+    """The shell pane, zoomed to the whole window; `` on its empty prompt (or Ctrl-b z) comes back."""
     if SHELL:
         tmux("select-pane", "-t", SHELL)
         tmux("resize-pane", "-Z", "-t", SHELL)
@@ -110,7 +111,7 @@ class Prompt:
                     pass
                 x += width(text)
         v = self.view
-        hints = v.get("hints") or "Enter send · Alt+Enter new line · ↑ earlier · ~~ shell fullscreen · /help"
+        hints = v.get("hints") or "Enter send · Alt+Enter new line · ↑ earlier · `` shell fullscreen · /help"
         if v.get("mode", "input") == "input" and v.get("busy"):
             hints = f"{SPIN[int(time.time() * 10) % len(SPIN)]} genai is replying · type ahead, Enter queues it"
         try:
@@ -172,8 +173,8 @@ class Prompt:
             if isinstance(k, str) and k.isprintable() and time.time() - self.asked_at >= SETTLE:
                 self.answer(k.lower())
             return
-        if k == "~" and ed.text[ed.pos - 1:ed.pos] == "~":     # ~~, typed at any speed (a pasted ~~ stays text)
-            ed.backspace()
+        if k == "`" and ed.text == "`":       # `` on an empty input, at any speed; backticks in a message stay text
+            ed.text, ed.pos = "", 0
             shell_fullscreen()
             return
         if k in ("\n", "\r", curses.KEY_ENTER):

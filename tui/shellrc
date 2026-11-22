@@ -16,10 +16,14 @@ __genai_prompt() {
   return "$rc"
 }
 PROMPT_COMMAND="__genai_prompt${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
-# Double-tap ~ at the prompt: this shell fullscreen, and back again (to the prompt pane). A single ~
-# still types after a moment (readline's keyseq-timeout), so cd ~/x works as always.
+# `` on an empty command line: this shell fullscreen, and back again (to the prompt pane). Anywhere
+# else `` is typed as it is, and a single ` types after a moment (readline's keyseq-timeout).
 __genai_zoom() {
-  [ -n "${TMUX:-}" ] || return
+  if [ -n "$READLINE_LINE" ] || [ -z "${TMUX:-}" ]; then
+    READLINE_LINE="${READLINE_LINE:0:READLINE_POINT}\`\`${READLINE_LINE:READLINE_POINT}"
+    READLINE_POINT=$((READLINE_POINT + 2))
+    return
+  fi
   tmux resize-pane -Z -t "$TMUX_PANE"
   if [ "$(tmux display -p -t "$TMUX_PANE" '#{window_zoomed_flag}')" = 0 ]; then
     local p
@@ -27,4 +31,4 @@ __genai_zoom() {
     [ -n "$p" ] && tmux select-pane -t "$p"
   fi
 }
-bind -x '"~~": __genai_zoom' 2>/dev/null
+bind -x '"``": __genai_zoom' 2>/dev/null
