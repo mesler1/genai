@@ -5,6 +5,8 @@ import importlib.util
 import io
 import json
 import os
+import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -289,6 +291,7 @@ class TestSkills(Tmp):
         self.assertIn("is unblessed", text)
         self.assertRegex(text, r"(?m)^\* slurm +blessed")
         self.assertIn("usage: :skill NAME on|off", text)
+        self.assertRegex(text, r"(?m)^\* slurm .*\n {6}" + re.escape(d) + "$")   # the path, under its line
 
 
 
@@ -329,6 +332,19 @@ class TestFirstRun(Tmp):
         r = self.run_genai("--list-skills")
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("skill_dirs must be a list", r.stderr)
+
+    def test_list_skills_shows_the_path_to_bless(self):
+        self.run_genai("--list-skills")
+        home = self.path("xdg", "genai")
+        for name in ("slurm", "my notes"):
+            os.makedirs(os.path.join(home, "skills", name))
+            with open(os.path.join(home, "skills", name, "SKILL.md"), "w") as f:
+                f.write(f"# {name} help\n")
+        bless_path(home, os.path.join(home, "skills", "slurm"))
+        lines = self.run_genai("--list-skills").stdout.splitlines()
+        self.assertEqual(lines[1], "    to bless: genai --bless " + shlex.quote(os.path.join(home, "skills", "my notes")))
+        self.assertEqual(lines[3], "    " + os.path.join(home, "skills", "slurm"))
+        self.assertTrue(lines[0].startswith("my notes ") and lines[2].startswith("slurm "))
 
     def test_second_run_is_quiet_and_keeps_existing(self):
         self.run_genai("--list-skills")

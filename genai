@@ -508,6 +508,18 @@ def skill_rows(cfg, active=None):
     return rows
 
 
+def skill_lines(rows, mark=False):
+    """A skill listing for people: one line per skill, then its full path, which is what --bless takes.
+    An unblessed or changed skill gets the whole command. mark: start each line with * if it is in use."""
+    out = []
+    for r in rows:
+        lead = ("* " if r.get("active") else "  ") if mark else ""
+        out.append(f"{lead}{one_line(r['name'])[0]:20} {r['status']:10} {one_line(r['description'])[0]}")
+        path = one_line(shlex.quote(r["path"]))[0]
+        out.append(f"{' ' * len(lead)}    " + (path if r["status"] == "blessed" else f"to bless: genai --bless {path}"))
+    return out
+
+
 def load_skills(cfg, names, notice):
     """Return the usable skills among names; skip and report the rest."""
     found, out = find_skills(cfg), []
@@ -2395,9 +2407,7 @@ class Repl:
             elif cmd == "context":
                 print(f"context: {self.e.used()}/{self.e.endpoint.context_limit} tokens (estimated)")
             elif cmd == "skills":
-                for r in skill_rows(self.e.cfg, [s.name for s in self.e.skills]):
-                    print(f"{'*' if r['active'] else ' '} {one_line(r['name'])[0]:20} {r['status']:10} "
-                          f"{one_line(r['description'])[0]}")
+                print("\n".join(skill_lines(skill_rows(self.e.cfg, [s.name for s in self.e.skills]), mark=True)))
             elif cmd == "skill":
                 name, _, state = arg.partition(" ")
                 if not name or state.strip() not in ("on", "off"):
@@ -2663,8 +2673,7 @@ def main(argv=None):
             if args.json:
                 print(json.dumps({"type": "skills", "skills": rows}))
             else:
-                for r in rows:
-                    print(f"{one_line(r['name'])[0]:20} {r['status']:10} {one_line(r['description'])[0]}")
+                print("\n".join(skill_lines(rows)))
             return EXIT_OK
         for kind, wanted in (("endpoint", args.list_endpoints), ("profile", args.list_profiles)):
             if wanted:
