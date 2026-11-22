@@ -484,7 +484,9 @@ class TestGenaiTui(TmuxCase):
             self.type("hi")
             self.wait_for("● hello")
             zoomed = lambda: self.tmux("display", "-p", "-t", "genai", "#{window_zoomed_flag}").strip()
-            self.type("~~", enter=False)
+            self.type("~", enter=False)
+            time.sleep(0.8)                                            # however slowly it is typed
+            self.type("~", enter=False)
             time.sleep(0.5)
             self.assertEqual(zoomed(), "1")                            # the shell, fullscreen
             self.tmux("send-keys", "-t", self.panes()["shell"], "-l", "~~")
