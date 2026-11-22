@@ -614,6 +614,22 @@ class Model:
         self.send({"type": "decision", "id": card.id, "decision": "accept" if accept else "decline"})
 
 
+def edit_key(ed, k):
+    """The editing keys both input boxes share. True if k was one of them."""
+    keys = {"\x7f": ed.backspace, "\b": ed.backspace, curses.KEY_BACKSPACE: ed.backspace, curses.KEY_DC: ed.delete,
+            curses.KEY_LEFT: ed.left, "\x02": ed.left, curses.KEY_RIGHT: ed.right, "\x06": ed.right,
+            curses.KEY_HOME: ed.home, "\x01": ed.home, curses.KEY_END: ed.end, "\x05": ed.end,
+            curses.KEY_UP: ed.up, curses.KEY_DOWN: ed.down, "\x15": ed.kill_back, "\x0b": ed.kill_forward,
+            "\x17": ed.kill_word}
+    if k in keys:
+        keys[k]()
+    elif isinstance(k, str) and (k >= " " or k == "\n"):
+        ed.insert(k)
+    else:
+        return False
+    return True
+
+
 def complete(text):
     """Tab on a partial /command: the completion, or text unchanged when there is none or several."""
     if not text.startswith("/") or " " in text:
@@ -918,6 +934,8 @@ class App:
         self.menu_poll = 0.0
         self.state_dir = os.environ.get("GENAI_TUI_STATE") if shell else None
         self.panel = os.environ.get("GENAI_TUI_PANEL") if shell else None
+        self.prompt = os.environ.get("GENAI_TUI_PROMPT") if shell else None   # input happens in that pane
+        self.last_prompt = None
         self.last_state = None
         self.requests = queue.Queue()
         if self.state_dir and os.path.exists(os.path.join(self.state_dir, "requests")):
@@ -1014,13 +1032,15 @@ class App:
         h, w = self.scr.getmaxyx()
         self.scr.erase()
         lines, cur, hints = self.bottom(w)
+        if self.prompt:
+            lines, cur, hints = [], None, ""
         status = []
         if self.m.coding:
             status.append("coding on")
         if self.m.context and self.m.context[0] is not None and self.m.context[1]:
             used, limit = self.m.context
             status.append(f"ctx {used / 1000:.1f}k/{limit / 1000:.0f}k ({100 * used // limit}%)")
-        area = max(h - len(lines) - 2, 1)
+        area = max(h - len(lines) - 2, 1) if not self.prompt else max(h - (1 if self.scroll else 0), 1)
         body, owners = self.transcript(w)
         if self.scroll and len(body) > self.last_total:
             self.scroll += len(body) - self.last_total       # stay put while scrolled up
@@ -1033,7 +1053,12 @@ class App:
         rule = "─" * w
         if self.scroll:
             rule = fit(f"── ↓ {self.scroll} more lines below (PgDn) ", w) + "─" * w
-        self.put(area, 0, [(rule[:w], Q)], w)
+        if not self.prompt or self.scroll:
+            self.put(area, 0, [(rule[:w], Q)], w)
+        if self.prompt:
+            self.scr.refresh()
+            curses.curs_set(0)
+            return
         for i, segs in enumerate(lines):
             self.put(area + 1 + i, 0, segs, w)
         right = " · ".join(status)
@@ -1074,6 +1099,10 @@ class App:
         if k == curses.KEY_MOUSE:
             self.click()
             return
+        if self.prompt and isinstance(k, str) and k.isprintable() and not (m.pending or m.ask):
+            self.shell.tmux("select-pane", "-t", self.prompt)    # typing belongs in the prompt pane
+            self.shell.tmux("send-keys", "-t", self.prompt, "-l", k)
+            return
         if m.ask and not m.pending:
             if isinstance(k, str):
                 self.answer(k.lower())
@@ -1109,28 +1138,6 @@ class App:
             else:
                 m.note("Ctrl-C again (or Ctrl-D) to quit" + (". genai's reply can't be interrupted yet." if m.busy else ""))
             self.ctrl_c = now
-        elif k in ("\x7f", "\b", curses.KEY_BACKSPACE):
-            ed.backspace()
-        elif k == curses.KEY_DC:
-            ed.delete()
-        elif k in (curses.KEY_LEFT, "\x02"):
-            ed.left()
-        elif k in (curses.KEY_RIGHT, "\x06"):
-            ed.right()
-        elif k in (curses.KEY_HOME, "\x01"):
-            ed.home()
-        elif k in (curses.KEY_END, "\x05"):
-            ed.end()
-        elif k == curses.KEY_UP:
-            ed.up()
-        elif k == curses.KEY_DOWN:
-            ed.down()
-        elif k == "\x15":
-            ed.kill_back()
-        elif k == "\x0b":
-            ed.kill_forward()
-        elif k == "\x17":
-            ed.kill_word()
         elif k == "\t":
             ed.text = complete(ed.text)
             ed.pos = len(ed.text)
@@ -1138,8 +1145,8 @@ class App:
             self.scr.clear()
         elif k in (curses.KEY_PPAGE, curses.KEY_NPAGE):
             self.page(k)
-        elif isinstance(k, str) and (k >= " " or k == "\n"):
-            ed.insert(k)
+        else:
+            edit_key(ed, k)
 
     def read_escape(self):
         """The rest of an escape sequence, read without waiting: '' for a lone Esc."""
@@ -1182,6 +1189,60 @@ class App:
             os.replace(tmp, os.path.join(self.state_dir, "state.json"))
         except OSError:
             pass
+
+    def prompt_view(self):
+        """What the prompt pane shows: the input box, or our question or genai's approval, with hints."""
+        lines, cur, hints = self.bottom(200)
+        status = []
+        if self.m.coding:
+            status.append("coding on")
+        if self.m.context and self.m.context[0] is not None and self.m.context[1]:
+            used, limit = self.m.context
+            status.append(f"context {100 * used // limit}%")
+        mode = "input" if cur is not None else ("approval" if self.m.pending else "ask")
+        if mode != "input":
+            lines = [[(t, "question" if i == 0 and r in (A, W) else ("key" if t.strip() in ("y", "n", "v", "e") else r))
+                      for t, r in segs] for i, segs in enumerate(lines)]
+        return {"mode": mode, "lines": lines if mode != "input" else [], "hints": "" if mode == "input" else hints,
+                "busy": self.m.busy, "status": " · ".join(status), "exited": self.m.exited is not None}
+
+    def write_prompt(self):
+        if not (self.prompt and self.state_dir):
+            return
+        text = json.dumps(self.prompt_view(), ensure_ascii=False)
+        if text == self.last_prompt:
+            return
+        self.last_prompt = text
+        try:
+            fd, tmp = tempfile.mkstemp(dir=self.state_dir, prefix=".prompt-")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+            os.replace(tmp, os.path.join(self.state_dir, "prompt.json"))
+        except OSError:
+            pass
+
+    def from_prompt(self, msg):
+        """What the prompt pane sends: typed messages, answers, scrolling, quitting. False if it isn't one."""
+        t = msg.get("type") if isinstance(msg, dict) else None
+        if t == "input" and isinstance(msg.get("text"), str):
+            self.m.submit(msg["text"])
+            self.scroll = 0
+        elif t == "key" and isinstance(msg.get("key"), str) and len(msg["key"]) <= 3:
+            k = msg["key"]
+            if k == "esc":
+                if self.m.pending:
+                    self.m.decide(False)
+                elif self.m.ask:
+                    self.answer("n")
+            elif self.m.pending or self.m.ask:
+                self.key(k)
+        elif t == "scroll":
+            self.page(curses.KEY_PPAGE if msg.get("up") else curses.KEY_NPAGE)
+        elif t == "quit":
+            self.m.quit = True
+        else:
+            return False
+        return True
 
     def toggle_panel(self):
         if not self.panel:
@@ -1384,7 +1445,7 @@ class App:
             sys.stdout.write("\x1b[?2004l")
             sys.stdout.flush()
             try:
-                rc = subprocess.call(editor_argv(path))
+                rc = self.run_here(editor_argv(path))
             except OSError as e:
                 self.m.note(f"could not start your editor: {e}", R)
                 return None
@@ -1399,6 +1460,14 @@ class App:
             sys.stdout.flush()
             self.scr.refresh()
 
+    def run_here(self, argv):
+        """Run an editor or pager where the user can use it: in a tmux popup when typing happens in the prompt
+        pane, else in this pane. Returns its exit code."""
+        if not self.prompt:
+            return subprocess.call(argv)
+        cmd = shlex.join(argv).replace("#", "##")        # a popup's command is a tmux format
+        return subprocess.call(["tmux", "display-popup", "-E", "-w", "90%", "-h", "85%", cmd])
+
     def page(self, k):
         h, _ = self.scr.getmaxyx()
         step = max(h - 6, 1)
@@ -1411,7 +1480,7 @@ class App:
             path = f.name
         curses.endwin()
         try:
-            subprocess.call(["less", "-S", path] if shutil.which("less") else ["more", path])
+            self.run_here(["less", "-S", path] if shutil.which("less") else ["more", path])
         finally:
             os.unlink(path)
             self.scr.refresh()
@@ -1455,9 +1524,11 @@ class App:
         self.m.actions = []
         while True:
             try:
-                self.m.request(self.requests.get_nowait())
+                msg = self.requests.get_nowait()
             except queue.Empty:
                 break
+            if not self.from_prompt(msg):
+                self.m.request(msg)
         while True:
             try:
                 ev = self.child.events.get_nowait()
@@ -1474,6 +1545,7 @@ class App:
             self.child.send(msg)
         self.m.outbox = []
         self.write_state()
+        self.write_prompt()
 
 
 def parse_args(argv):

@@ -25,6 +25,8 @@ def load(name, path):
 
 
 C = load("conversation", os.path.join(REPO, "tui", "conversation.py"))
+sys.path.insert(0, os.path.join(REPO, "tui"))
+C_PROMPT = load("prompt", os.path.join(REPO, "tui", "prompt.py"))
 G = load("genai_for_tui", os.path.join(REPO, "genai"))
 
 
@@ -339,7 +341,7 @@ class TestGenaiTui(TmuxCase):
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.addCleanup(lambda: (self.tmux("kill-server"), self.proc.wait(10)))
         end = time.time() + 10
-        while time.time() < end and not self.panes():
+        while time.time() < end and not {"genai", "you", "shell"} <= set(self.panes()):
             time.sleep(0.1)
         self.wait_for("Type a message")
 
@@ -347,17 +349,22 @@ class TestGenaiTui(TmuxCase):
         out = self.tmux("list-panes", "-a", "-F", "#{pane_id} #{@genai_title}")
         return {t.split(" ")[0]: p for p, _, t in (ln.partition(" ") for ln in out.splitlines())}
 
-    def screen(self, pane="genai"):
-        return self.tmux("capture-pane", "-p", "-t", self.panes().get(pane, "genai"))
+    def screen(self, pane=None):
+        """One pane, or the conversation and the prompt pane together."""
+        names = [pane] if pane else ["genai", "you"]
+        return "\n".join(self.tmux("capture-pane", "-p", "-t", self.panes()[n]) for n in names)
 
     def type(self, text, enter=True):
-        conv = self.panes()["genai"]
-        self.tmux("send-keys", "-t", conv, "-l", text)
+        you = self.panes()["you"]
+        self.tmux("send-keys", "-t", you, "-l", text)
         if enter:
-            self.tmux("send-keys", "-t", conv, "Enter")
+            self.tmux("send-keys", "-t", you, "Enter")
 
     def key(self, k):
-        self.tmux("send-keys", "-t", self.panes()["genai"], k)
+        """An answer typed in the prompt pane, after the pause it needs (keys right as a question appears are
+        taken as typing)."""
+        time.sleep(C_PROMPT.SETTLE + 0.1)
+        self.tmux("send-keys", "-t", self.panes()["you"], k)
 
     def at_terminal(self, keys):
         """Keys typed at the terminal itself, so they reach tmux (and its menus) first."""
@@ -366,7 +373,7 @@ class TestGenaiTui(TmuxCase):
 
     def click(self, text):
         """A left click (press and release, as a mouse sends them) on the first conversation row showing text."""
-        y = next(i for i, ln in enumerate(self.screen().splitlines()) if text in ln)
+        y = next(i for i, ln in enumerate(self.screen("genai").splitlines()) if text in ln)
         xy = [f"{33 + 4:02x}", f"{33 + y:02x}"]
         self.tmux("send-keys", "-t", self.panes()["genai"], "-H", "1b", "5b", "4d", "20", *xy, "1b", "5b", "4d", "23", *xy)
 
@@ -465,6 +472,39 @@ class TestGenaiTui(TmuxCase):
             sent = self.sent(api)
             self.assertIn("echo in-context\nin-context", sent)
             self.assertNotIn("before-mark", sent)
+
+    def test_layout_and_double_tilde(self):
+        with FakeAPI([reply("hello")]) as api:
+            self.start(api)
+            tops = {t.split(" ")[0]: int(top) for top, _, t in
+                    (ln.partition(" ") for ln in self.tmux("list-panes", "-F", "#{pane_top} #{@genai_title}").splitlines())}
+            self.assertLess(tops["genai"], tops["shell"])
+            self.assertLess(tops["shell"], tops["you"])                # the prompt is below the shell
+            self.assertEqual(self.tmux("display", "-p", "-t", "genai", "#{@genai_title}").split()[0], "you")
+            self.type("hi")
+            self.wait_for("● hello")
+            zoomed = lambda: self.tmux("display", "-p", "-t", "genai", "#{window_zoomed_flag}").strip()
+            self.type("~~", enter=False)
+            time.sleep(0.5)
+            self.assertEqual(zoomed(), "1")                            # the shell, fullscreen
+            self.tmux("send-keys", "-t", self.panes()["shell"], "-l", "~~")
+            time.sleep(1)
+            self.assertEqual(zoomed(), "0")
+            self.assertEqual(self.tmux("display", "-p", "-t", "genai", "#{@genai_title}").split()[0], "you")
+            self.assertNotIn("~", self.screen("you").splitlines()[0])  # the taps didn't stay in the input
+
+    def test_a_key_typed_as_a_question_appears_is_not_an_answer(self):
+        with FakeAPI([call("write_file", path="x.txt", content="x\n", reason="r"), reply("done")]) as api:
+            self.start(api)
+            self.type("go")
+            self.wait_for("Allow p1: create x.txt?")
+            self.tmux("send-keys", "-t", self.panes()["you"], "y")      # at once: typing, not an answer
+            time.sleep(0.5)
+            self.assertFalse(os.path.exists(os.path.join(self.wd, "x.txt")))
+            self.assertIn("Allow p1", self.screen("you"))
+            self.key("y")
+            self.wait_for("● done")
+            self.assertTrue(os.path.exists(os.path.join(self.wd, "x.txt")))
 
     def test_busy_shell_is_never_typed_into(self):
         with FakeAPI([call("propose_command", command="echo should-not-run", reason="r")]) as api:
