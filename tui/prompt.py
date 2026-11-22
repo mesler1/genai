@@ -2,40 +2,27 @@
 """genai-tui prompt pane: where you type, below your shell.
 
 Typing, history, paste and Tab completion happen here. What you send, and your answers to
-approval and run questions, go to the conversation pane through genai-tui's private pipe
-($GENAI_TUI_STATE/requests); the conversation pane owns genai and decides everything. It tells
-this pane what to show in $GENAI_TUI_STATE/prompt.json. Typing `` on an empty input shows your shell
+approval and run questions, go to the conversation pane over genai-tui's private socket (see
+ipc.py); the conversation pane owns genai and decides everything, and pushes back what this pane
+should show. Every answer names the question it answers. Typing `` on an empty input shows your shell
 above the conversation, or hides it again.
 Standard library only; Python 3.10 or newer.
 """
 
 import curses
-import json
 import locale
 import os
+import queue
 import subprocess
 import sys
 import time
 
 from conversation import A, D, Q, R, SPIN, W, Editor, complete, edit_key, fit, width
+from ipc import Client
 
 STATE = os.environ.get("GENAI_TUI_STATE", "")
 SHELL = os.environ.get("GENAI_TUI_SHELL", "")
 SETTLE = 0.3               # keys this soon after a question appears are typing, not an answer
-
-
-def send(msg):
-    try:
-        fd = os.open(os.path.join(STATE, "requests"), os.O_WRONLY | os.O_NONBLOCK)
-    except OSError:
-        return False
-    try:
-        os.write(fd, (json.dumps(msg) + "\n").encode())
-        return True
-    except OSError:
-        return False
-    finally:
-        os.close(fd)
 
 
 def tmux(*args):
@@ -56,9 +43,9 @@ def toggle_shell():
 
 
 class Prompt:
-    def __init__(self, scr):
-        self.scr, self.ed = scr, Editor()
-        self.view, self.mtime, self.height, self.title = {}, None, 0, None
+    def __init__(self, scr, link):
+        self.scr, self.ed, self.link = scr, Editor(), link
+        self.view, self.height, self.title = {}, 0, None
         self.paste, self.ctrl_c = None, 0.0
         self.asked_at = 0.0
         curses.raw()
@@ -77,17 +64,24 @@ class Prompt:
         scr.timeout(50)
 
     def load(self):
-        try:
-            m = os.stat(os.path.join(STATE, "prompt.json")).st_mtime_ns
-            if m == self.mtime:
+        """Take whatever the conversation pane has pushed since the last look."""
+        while True:
+            try:
+                msg = self.link.inbox.get_nowait()
+            except queue.Empty:
                 return
-            with open(os.path.join(STATE, "prompt.json"), encoding="utf-8") as f:
-                view = json.load(f)
+            if msg is None:                    # the conversation pane has gone; genai-tui is closing
+                self.view = dict(self.view, mode="input", hints="the conversation has ended")
+                continue
+            view = msg.get("view") if msg.get("type") == "view" else None
+            if not isinstance(view, dict):
+                continue
             if view.get("mode") in ("approval", "ask") and view.get("lines") != self.view.get("lines"):
                 self.asked_at = time.time()
-            self.view, self.mtime = view, m
-        except (OSError, ValueError):
-            pass
+            self.view = view
+
+    def send(self, msg):
+        return self.link.send(msg)
 
     def lines(self, w):
         """What to draw: content lines, then the hint line, and the cursor (or None)."""
@@ -170,7 +164,7 @@ class Prompt:
                 self.answer("esc")
             return
         if k in (curses.KEY_PPAGE, curses.KEY_NPAGE):
-            send({"type": "scroll", "up": k == curses.KEY_PPAGE})
+            self.send({"type": "scroll", "up": k == curses.KEY_PPAGE})
             return
         if asking:
             if isinstance(k, str) and k.isprintable() and time.time() - self.asked_at >= SETTLE:
@@ -186,18 +180,18 @@ class Prompt:
                 ed.insert("\n")
             elif ed.text.strip():
                 text = ed.take()
-                if not send({"type": "input", "text": text}):
+                if not self.send({"type": "input", "text": text}):
                     ed.insert(text)                 # the conversation pane isn't listening: keep it
             return
         if k == "\x04" and not ed.text:
-            send({"type": "quit"})
+            self.send({"type": "quit"})
             return
         if k == "\x03":
             now = time.time()
             if ed.text:
                 ed.take()
             elif now - self.ctrl_c < 2:
-                send({"type": "quit"})
+                self.send({"type": "quit"})
             self.ctrl_c = now
             return
         if k == "\t":
@@ -209,7 +203,7 @@ class Prompt:
     def answer(self, k):
         """An answer to the question showing. One that settles it puts the input box back at once, so whatever
         is typed next is text, never an answer to the next question before it has been seen."""
-        send({"type": "key", "key": k})
+        self.send({"type": "key", "key": k, "q": self.view.get("q")})
         if k in ("y", "n", "esc"):
             self.view = dict(self.view, mode="input", lines=[], hints="")
 
@@ -235,9 +229,14 @@ def main():
     if not STATE:
         print("prompt.py is started by genai-tui", file=sys.stderr)
         return 2
+    try:
+        link = Client(STATE, "prompt")
+    except OSError as e:
+        print(f"prompt.py: can't reach the conversation pane: {e}", file=sys.stderr)
+        return 1
     locale.setlocale(locale.LC_ALL, "")
     os.environ.setdefault("ESCDELAY", "25")
-    curses.wrapper(lambda scr: Prompt(scr).run())
+    curses.wrapper(lambda scr: Prompt(scr, link).run())
     return 0
 
 
