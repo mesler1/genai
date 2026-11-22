@@ -412,6 +412,7 @@ class TestGenaiTui(TmuxCase):
             self.at_terminal("r")                                  # "Run it in the shell pane"
             self.wait_for("p1 finished (exit 0). Share the output with the model?")
             self.assertIn("via-menu", self.screen("shell"))
+            self.assertEqual(self.window()[0], ["shell", "genai", "you"])     # shown, to watch it run
             self.key("n")
             self.type("again")
             self.wait_for("click it, or /run p2")
@@ -453,6 +454,7 @@ class TestGenaiTui(TmuxCase):
     def test_right_click_marks_shell_context(self):
         with FakeAPI([reply("seen it")]) as api:
             self.start(api)
+            self.show_shell()                                       # it has to be on screen to be clicked
             sh = self.panes()["shell"]
             for c in ("echo before-mark", "echo in-context"):
                 self.tmux("send-keys", "-t", sh, c, "Enter")
@@ -473,36 +475,42 @@ class TestGenaiTui(TmuxCase):
             self.assertIn("echo in-context\nin-context", sent)
             self.assertNotIn("before-mark", sent)
 
-    def test_layout_and_double_backtick(self):
+    def window(self):
+        """Titles of the visible panes, top to bottom, and which one is active."""
+        rows = self.tmux("list-panes", "-t", "genai:0", "-F", "#{pane_top} #{pane_left} #{pane_active} #{@genai_title}")
+        rows = sorted((int(t), int(lf), a, title.split(" ")[0]) for t, lf, a, title in
+                      (ln.split(" ", 3) for ln in rows.splitlines()))
+        return [r[3] for r in rows if r[1] == 0], next(r[3] for r in rows if r[2] == "1")
+
+    def show_shell(self):
+        self.type("`", enter=False)
+        self.type("`", enter=False)
+        time.sleep(0.6)
+
+    def test_shell_hidden_until_backticks(self):
         with FakeAPI([reply("hello")]) as api:
             self.start(api)
-            tops = {t.split(" ")[0]: int(top) for top, _, t in
-                    (ln.partition(" ") for ln in self.tmux("list-panes", "-F", "#{pane_top} #{@genai_title}").splitlines())}
-            self.assertLess(tops["genai"], tops["shell"])
-            self.assertLess(tops["shell"], tops["you"])                # the prompt is below the shell
-            self.assertEqual(self.tmux("display", "-p", "-t", "genai", "#{@genai_title}").split()[0], "you")
+            self.assertEqual(self.window(), (["genai", "you"], "you"))          # the shell starts hidden
             self.type("hi")
             self.wait_for("● hello")
-            zoomed = lambda: self.tmux("display", "-p", "-t", "genai", "#{window_zoomed_flag}").strip()
             self.type("`", enter=False)
-            time.sleep(0.8)                                            # however slowly it is typed
+            time.sleep(0.8)                                                   # however slowly it is typed
             self.type("`", enter=False)
-            time.sleep(0.5)
-            self.assertEqual(zoomed(), "1")                            # the shell, fullscreen
+            time.sleep(0.6)
+            self.assertEqual(self.window(), (["shell", "genai", "you"], "shell"))   # above the conversation
             self.tmux("send-keys", "-t", self.panes()["shell"], "-l", "``")
             time.sleep(1)
-            self.assertEqual(zoomed(), "0")
-            self.assertEqual(self.tmux("display", "-p", "-t", "genai", "#{@genai_title}").split()[0], "you")
-            self.assertNotIn("`", self.screen("you").splitlines()[0])  # the taps didn't stay in the input
-            self.type("a ``code`` b", enter=False)                     # not on an empty input: just text
+            self.assertEqual(self.window(), (["genai", "you"], "you"))
+            self.assertNotIn("`", self.screen("you").splitlines()[0])           # the taps didn't stay in the input
+            self.type("a ``code`` b", enter=False)                             # not on an empty input: just text
             time.sleep(0.3)
-            self.assertEqual(zoomed(), "0")
+            self.assertEqual(self.window()[0], ["genai", "you"])
             self.assertIn("a ``code`` b", self.screen("you"))
-            self.tmux("send-keys", "-t", "genai", "C-u")
-            sh = self.panes()["shell"]
-            self.tmux("send-keys", "-t", sh, "-l", "echo ``x")          # mid-command in the shell: typed as is
+            self.tmux("send-keys", "-t", self.panes()["you"], "C-u")
+            self.show_shell()
+            self.tmux("send-keys", "-t", self.panes()["shell"], "-l", "echo ``x")   # mid-command: typed as is
             time.sleep(1)
-            self.assertEqual(zoomed(), "0")
+            self.assertEqual(self.window()[0], ["shell", "genai", "you"])
             self.assertIn("echo ``x", self.screen("shell"))
 
     def test_a_key_typed_as_a_question_appears_is_not_an_answer(self):

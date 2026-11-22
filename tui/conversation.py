@@ -39,7 +39,7 @@ COMMANDS = {
     "/run": "[ID]: review and run a proposed command in the shell pane (the latest by default)",
     "/share": "[mark|all]: review shell output, then send it: the last command, from the mark, or everything",
     "/mark": "shell context starts at the shell's current prompt (or right-click a line in the shell)",
-    "/shell": "move to the shell pane (Ctrl-b o moves back)",
+    "/shell": "show the shell and move there (`` on its empty prompt hides it again)",
     "/panel": "show or hide the info panel on the right",
     "/compact": "shrink the conversation when the context is getting full",
     "/context": "show how full the context is",
@@ -839,8 +839,16 @@ class Shell:
         return self.tmux("capture-pane", "-p", "-J", "-t", self.pane, "-S", str(start + 1 - hs),
                          "-E", str(end - 1 - hs)).rstrip("\n")
 
+    def show(self, focus=False):
+        """Bring the shell pane into view above the conversation (it runs hidden), and go there if asked."""
+        toggle = os.environ.get("GENAI_TUI_TOGGLE")
+        if toggle:
+            subprocess.run([toggle, "show"] + (["--focus"] if focus else []), capture_output=True, timeout=5)
+        elif focus:
+            self.tmux("select-pane", "-t", self.pane)
+
     def focus(self):
-        self.tmux("select-pane", "-t", self.pane)
+        self.show(focus=True)
 
     def copy(self, text):
         """To tmux's buffer and, through the terminal (OSC 52), the system clipboard where the terminal allows it."""
@@ -1362,6 +1370,7 @@ class App:
         except (OSError, subprocess.SubprocessError) as e:
             self.m.note(f"{card.id} not run: tmux failed ({e})", R)
             return
+        self.shell.show()                                # so the command can be watched as it runs
         card.state, card.detail = "running", "typed into the shell pane"
         card.changed()
         self.running = {"card": card, "command": command, "seq": seq, "start": start}
