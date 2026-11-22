@@ -1,45 +1,22 @@
 #!/usr/bin/env python3
 """genai-tui info panel: the session, context use, skills and proposals, beside the conversation.
 
-It draws the state file the conversation pane writes ($GENAI_TUI_STATE/state.json) and sends
-requests back through a pipe ($GENAI_TUI_STATE/requests). The conversation pane owns genai and
-decides what to do with a request, so this pane can never approve anything or reach genai itself.
+The conversation pane pushes what to show over genai-tui's private socket (see ipc.py), and this
+pane sends requests back the same way. It connects in the "panel" role, which may only switch
+coding mode and skills or ask for the skill list: it can never approve anything or reach genai.
 Standard library only; Python 3.10 or newer.
 """
 
 import curses
-import json
 import locale
 import os
+import queue
 import sys
-import time
 
 from conversation import A, D, Q, R, W, clean, fit, width
+from ipc import Client
 
 STATE = os.environ.get("GENAI_TUI_STATE", "")
-
-
-def load():
-    try:
-        with open(os.path.join(STATE, "state.json"), encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return None
-
-
-def request(msg):
-    """Send a request to the conversation pane. False if it isn't listening."""
-    try:
-        fd = os.open(os.path.join(STATE, "requests"), os.O_WRONLY | os.O_NONBLOCK)
-    except OSError:
-        return False
-    try:
-        os.write(fd, (json.dumps(msg) + "\n").encode())
-        return True
-    except OSError:
-        return False
-    finally:
-        os.close(fd)
 
 
 def bar(used, limit, w):
@@ -112,9 +89,9 @@ def view(st, w, sel):
 
 
 class Panel:
-    def __init__(self, scr):
-        self.scr = scr
-        self.st, self.mtime, self.sel, self.msg = None, None, 0, ""
+    def __init__(self, scr, link):
+        self.scr, self.link = scr, link
+        self.st, self.sel, self.msg = None, 0, ""
         curses.curs_set(0)
         curses.use_default_colors()
         self.roles = {"": 0}
@@ -128,16 +105,22 @@ class Panel:
         curses.mousemask(getattr(curses, "BUTTON1_PRESSED", 0) | getattr(curses, "BUTTON1_CLICKED", 0))
         curses.mouseinterval(0)
         scr.keypad(True)
-        scr.timeout(250)
+        scr.timeout(100)
         self.acts = []
 
     def refresh_state(self):
-        try:
-            m = os.stat(os.path.join(STATE, "state.json")).st_mtime_ns
-        except OSError:
-            return
-        if m != self.mtime:
-            self.mtime, self.st = m, load() or self.st
+        while True:
+            try:
+                msg = self.link.inbox.get_nowait()
+            except queue.Empty:
+                return
+            if msg is None:
+                self.msg = "the conversation has ended"
+            elif msg.get("type") == "view" and isinstance(msg.get("view"), dict):
+                self.st = msg["view"]
+
+    def request(self, msg):
+        return self.link.send(msg)
 
     def draw(self):
         h, w = self.scr.getmaxyx()
@@ -164,13 +147,13 @@ class Panel:
     def act(self, what):
         st = self.st or {}
         if what == "coding":
-            ok = request({"type": "coding", "on": not st.get("coding")})
+            ok = self.request({"type": "coding", "on": not st.get("coding")})
         elif isinstance(what, int) and what < len(self.skills()):
             s = self.skills()[what]
             if s.get("status") != "blessed" and not s.get("active"):
                 self.msg = "bless it first (the command is shown)"
                 return
-            ok = request({"type": "skill", "name": s.get("name", ""), "on": not s.get("active")})
+            ok = self.request({"type": "skill", "name": s.get("name", ""), "on": not s.get("active")})
         else:
             return
         self.msg = "" if ok else "the conversation isn't listening"
@@ -186,7 +169,7 @@ class Panel:
         elif k == "c":
             self.act("coding")
         elif k == "r":
-            self.msg = "" if request({"type": "skills"}) else "the conversation isn't listening"
+            self.msg = "" if self.request({"type": "skills"}) else "the conversation isn't listening"
         elif k == curses.KEY_MOUSE:
             try:
                 _, _, y, _, _ = curses.getmouse()
@@ -215,9 +198,14 @@ def main():
     if not STATE:
         print("panel.py is started by genai-tui", file=sys.stderr)
         return 2
+    try:
+        link = Client(STATE, "panel")
+    except OSError as e:
+        print(f"panel.py: can't reach the conversation pane: {e}", file=sys.stderr)
+        return 1
     locale.setlocale(locale.LC_ALL, "")
     os.environ.setdefault("ESCDELAY", "25")
-    curses.wrapper(lambda scr: Panel(scr).run())
+    curses.wrapper(lambda scr: Panel(scr, link).run())
     return 0
 
 

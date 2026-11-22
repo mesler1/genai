@@ -26,6 +26,9 @@ import threading
 import time
 import unicodedata
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ipc import Hub  # noqa: E402
+
 GENAI = os.environ.get("GENAI_BIN") or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                                     "genai")
 CARD_BODY_LINES = 12
@@ -860,24 +863,20 @@ class Shell:
         if not re.fullmatch(r"p[0-9]{1,9}", pid):
             return
         me = os.environ.get("TMUX_PANE", "")
-        pick = lambda what: f"set -p -t {me} @genai_menu '{what} {pid}'"
-        self.tmux("set", "-p", "-t", me, "-u", "@genai_menu")
-        # display-menu returns only when the menu closes, so don't wait for it: the choice arrives in @genai_menu.
+        helper = os.path.join(os.path.dirname(os.path.abspath(__file__)), "request.py")
+
+        def pick(what):            # a menu item runs request.py, which sends the choice over the socket
+            cmd = shlex.join([sys.executable, helper, "menu", what, pid])
+            return 'run-shell -b "' + cmd.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("#", "##") + '"'
+        # display-menu returns only when the menu closes, so don't wait for it.
         self.menus = [p for p in getattr(self, "menus", []) if p.poll() is None]
         self.menus.append(subprocess.Popen(["tmux", "display-menu", "-t", me, "-x", "M", "-y", "M", "-T", f" {pid}: runs {where} ",
                   "Run it in the shell pane", "r", pick("run"),
                   "Edit it, then run", "e", pick("edit"),
                   "Put it at the shell prompt (you press Enter)", "p", pick("prompt"),
                   "Copy it", "c", pick("copy"),
-                  "", "Cancel", "q", f"set -p -t {me} -u @genai_menu"],
+                  "", "Cancel", "q", ""],
                                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
-
-    def menu_choice(self):
-        me = os.environ.get("TMUX_PANE", "")
-        v = self.tmux("show", "-pqv", "-t", me, "@genai_menu").strip()
-        if v:
-            self.tmux("set", "-p", "-t", me, "-u", "@genai_menu")
-        return v
 
     def title(self, text):
         self.tmux("set", "-p", "-t", os.environ.get("TMUX_PANE", ""), "@genai_title", text)
@@ -938,16 +937,12 @@ class App:
         self.running = None        # a /run command in the shell pane: card, command, prompt count, start mark
         self.next_poll = 0.0
         self.rows = []             # the block drawn on each screen row of the conversation
-        self.menu_until = 0.0      # while a command menu may be open, look for the choice
-        self.menu_poll = 0.0
         self.state_dir = os.environ.get("GENAI_TUI_STATE") if shell else None
         self.panel = os.environ.get("GENAI_TUI_PANEL") if shell else None
         self.prompt = os.environ.get("GENAI_TUI_PROMPT") if shell else None   # input happens in that pane
-        self.last_prompt = None
-        self.last_state = None
-        self.requests = queue.Queue()
-        if self.state_dir and os.path.exists(os.path.join(self.state_dir, "requests")):
-            threading.Thread(target=self.read_requests, daemon=True).start()
+        self.hub = Hub(self.state_dir) if self.state_dir else None   # the other panes connect here
+        self.sent = {}             # the last view sent to each role
+        self.ask_obj, self.ask_serial = None, 0
         self.mouse = 0
         for name in ("BUTTON1_PRESSED", "BUTTON1_CLICKED", "BUTTON3_PRESSED", "BUTTON4_PRESSED", "BUTTON5_PRESSED"):
             self.mouse |= getattr(curses, name, 0)
@@ -1173,31 +1168,6 @@ class App:
             self.scr.timeout(50)
         return seq
 
-    def read_requests(self):
-        """Lines from the info panel. Opened read-write so the pipe never reports end of file."""
-        fd = os.open(os.path.join(self.state_dir, "requests"), os.O_RDWR)
-        with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                try:
-                    self.requests.put(json.loads(line[:4096]))
-                except ValueError:
-                    pass
-
-    def write_state(self):
-        if not self.state_dir:
-            return
-        text = json.dumps(self.m.snapshot(), ensure_ascii=False)
-        if text == self.last_state:
-            return
-        self.last_state = text
-        try:
-            fd, tmp = tempfile.mkstemp(dir=self.state_dir, prefix=".state-")
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(text)
-            os.replace(tmp, os.path.join(self.state_dir, "state.json"))
-        except OSError:
-            pass
-
     def prompt_view(self):
         """What the prompt pane shows: the input box, or our question or genai's approval, with hints."""
         lines, cur, hints = self.bottom(200)
@@ -1208,34 +1178,46 @@ class App:
             used, limit = self.m.context
             status.append(f"context {100 * used // limit}%")
         mode = "input" if cur is not None else ("approval" if self.m.pending else "ask")
+        if self.m.ask is not self.ask_obj:
+            self.ask_obj, self.ask_serial = self.m.ask, self.ask_serial + 1
         if mode != "input":
             lines = [[(t, "question" if i == 0 and r in (A, W) else ("key" if t.strip() in ("y", "n", "v", "e") else r))
                       for t, r in segs] for i, segs in enumerate(lines)]
         return {"mode": mode, "lines": lines if mode != "input" else [], "hints": "" if mode == "input" else hints,
-                "busy": self.m.busy, "status": " · ".join(status), "exited": self.m.exited is not None}
+                "busy": self.m.busy, "status": " · ".join(status), "exited": self.m.exited is not None,
+                "q": self.question()}
 
-    def write_prompt(self):
-        if not (self.prompt and self.state_dir):
+    def question(self):
+        """An id for the question showing in the prompt pane. An answer must name it, so an answer meant for a
+        question that has since gone (or not yet come) is ignored, however late or early it arrives."""
+        if self.m.pending:
+            return f"approve:{self.m.pending[0].id}"
+        if self.m.ask:
+            return f"ask:{self.ask_serial}"
+        return None
+
+    def publish(self):
+        """Send the prompt pane and the info panel what changed, as soon as it changed."""
+        if not self.hub:
             return
-        text = json.dumps(self.prompt_view(), ensure_ascii=False)
-        if text == self.last_prompt:
-            return
-        self.last_prompt = text
-        try:
-            fd, tmp = tempfile.mkstemp(dir=self.state_dir, prefix=".prompt-")
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(text)
-            os.replace(tmp, os.path.join(self.state_dir, "prompt.json"))
-        except OSError:
-            pass
+        views = {"panel": self.m.snapshot()}
+        if self.prompt:
+            views["prompt"] = self.prompt_view()
+        for role, view in views.items():
+            text = json.dumps(view, ensure_ascii=False, sort_keys=True)
+            if text != self.sent.get(role):
+                self.sent[role] = text
+                self.hub.send(role, {"type": "view", "view": view})
 
     def from_prompt(self, msg):
-        """What the prompt pane sends: typed messages, answers, scrolling, quitting. False if it isn't one."""
+        """What the prompt pane sends: typed messages, answers, scrolling, quitting."""
         t = msg.get("type") if isinstance(msg, dict) else None
         if t == "input" and isinstance(msg.get("text"), str):
             self.m.submit(msg["text"])
             self.scroll = 0
         elif t == "key" and isinstance(msg.get("key"), str) and len(msg["key"]) <= 3:
+            if msg.get("q") != self.question() or self.question() is None:
+                return True                                # an answer to a question that isn't showing
             k = msg["key"]
             if k == "esc":
                 if self.m.pending:
@@ -1283,21 +1265,9 @@ class App:
                     self.m.note(f"{card.id}: start genai with genai-tui to send commands to a shell pane", R)
                     return
                 self.shell.menu(card.id, self.where())
-                self.menu_until = time.time() + 120
 
-    def poll_menu(self):
-        now = time.time()
-        if now > self.menu_until or now < self.menu_poll:
-            return
-        self.menu_poll = now + 0.2
-        try:
-            choice = self.shell.menu_choice()
-        except (OSError, subprocess.SubprocessError):
-            return
-        if not choice:
-            return
-        self.menu_until = 0.0
-        what, _, pid = choice.partition(" ")
+    def menu_action(self, what, pid):
+        """A choice from a command card's menu, sent by request.py."""
         card = self.m.cards.get(pid)
         if not card or card.ev.get("kind") != "command":
             return
@@ -1515,10 +1485,27 @@ class App:
         finally:
             sys.stdout.write("\x1b[?2004l")
             sys.stdout.flush()
+            if self.hub:
+                self.hub.close()
 
     def pump(self):
-        self.poll_menu()
         self.poll_run()
+        while self.hub:
+            try:
+                role, msg = self.hub.inbox.get_nowait()
+            except queue.Empty:
+                break
+            if role == "hello":
+                self.sent.pop(msg, None)                  # a pane (re)connected: send it everything
+            elif role == "prompt":
+                self.from_prompt(msg)
+            elif role == "panel":
+                self.m.request(msg)
+            elif role == "menu" and msg.get("type") == "share":
+                self.m.request(msg)
+            elif role == "menu" and msg.get("type") == "menu" and isinstance(msg.get("id"), str):
+                if msg.get("action") in ("run", "edit", "prompt", "copy"):
+                    self.menu_action(msg["action"], msg["id"])
         for action in self.m.actions:
             if action == ("share", "last"):
                 self.share_last()
@@ -1531,13 +1518,6 @@ class App:
             elif action[0] == "panel":
                 self.toggle_panel()
         self.m.actions = []
-        while True:
-            try:
-                msg = self.requests.get_nowait()
-            except queue.Empty:
-                break
-            if not self.from_prompt(msg):
-                self.m.request(msg)
         while True:
             try:
                 ev = self.child.events.get_nowait()
@@ -1553,8 +1533,7 @@ class App:
         for msg in self.m.outbox:
             self.child.send(msg)
         self.m.outbox = []
-        self.write_state()
-        self.write_prompt()
+        self.publish()
 
 
 def parse_args(argv):

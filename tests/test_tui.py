@@ -27,6 +27,7 @@ def load(name, path):
 C = load("conversation", os.path.join(REPO, "tui", "conversation.py"))
 sys.path.insert(0, os.path.join(REPO, "tui"))
 C_PROMPT = load("prompt", os.path.join(REPO, "tui", "prompt.py"))
+IPC = load("ipc", os.path.join(REPO, "tui", "ipc.py"))
 G = load("genai_for_tui", os.path.join(REPO, "genai"))
 
 
@@ -232,6 +233,64 @@ class TestModel(unittest.TestCase):
         self.assertTrue(m.busy)
 
 
+class TestSocket(unittest.TestCase):
+    """tui/ipc.py: the private socket between the panes."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="genai-ipc-")
+        os.chmod(self.dir, 0o700)
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.hub = IPC.Hub(self.dir)
+        self.addCleanup(self.hub.close)
+
+    def received(self, n, timeout=2):
+        out, end = [], time.time() + timeout
+        while len(out) < n and time.time() < end:
+            try:
+                out.append(self.hub.inbox.get(timeout=0.1))
+            except Exception:
+                pass
+        return out
+
+    def test_socket_is_private(self):
+        self.assertEqual(os.stat(IPC.socket_path(self.dir)).st_mode & 0o777, 0o600)
+
+    def test_each_role_sends_only_its_own_messages(self):
+        panel = IPC.Client(self.dir, "panel")
+        self.addCleanup(panel.close)
+        panel.send({"type": "key", "key": "y", "q": "approve:p1"})        # a panel may not answer
+        panel.send({"type": "input", "text": "hi"})
+        panel.send({"type": "coding", "on": True})
+        self.assertEqual(self.received(2), [("hello", "panel"), ("panel", {"type": "coding", "on": True})])
+        self.assertEqual(self.received(1, timeout=0.3), [])
+
+    def test_unknown_role_and_bad_lines_end_the_connection(self):
+        import socket
+        for first in (b'{"type": "hello", "role": "root"}\n', b"not json\n", b"x" * (IPC.MAX_LINE + 10)):
+            c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            c.connect(IPC.socket_path(self.dir))
+            c.settimeout(3)
+            try:
+                c.sendall(first)
+            except OSError:
+                pass
+            try:
+                self.assertEqual(c.recv(10), b"")                  # closed by the hub
+            except ConnectionResetError:
+                pass
+            c.close()
+        self.assertEqual(self.received(1, timeout=0.3), [])
+
+    def test_views_reach_the_right_role(self):
+        prompt, panel = IPC.Client(self.dir, "prompt"), IPC.Client(self.dir, "panel")
+        self.addCleanup(prompt.close)
+        self.addCleanup(panel.close)
+        self.received(2)
+        self.hub.send("prompt", {"type": "view", "view": {"mode": "input"}})
+        self.assertEqual(prompt.inbox.get(timeout=2), {"type": "view", "view": {"mode": "input"}})
+        self.assertTrue(panel.inbox.empty())
+
+
 class TmuxCase(unittest.TestCase):
     """Helpers for driving a private tmux server; no tests of its own."""
 
@@ -333,8 +392,12 @@ class TestGenaiTui(TmuxCase):
 
     def start(self, api, editor="true"):
         home = self.config(api)
+        self.runtime = tempfile.mkdtemp(prefix="gr-", dir="/tmp")      # short: socket paths are limited
+        os.chmod(self.runtime, 0o700)
+        self.addCleanup(shutil.rmtree, self.runtime, True)
         env = dict(os.environ, XDG_CONFIG_HOME=os.path.dirname(home), HOME=self.tmp, LANG="C.UTF-8",
-                   TERM="xterm-256color", GENAI_TUI_SOCKET=self.sock, EDITOR=editor, VISUAL=editor)
+                   TERM="xterm-256color", GENAI_TUI_SOCKET=self.sock, EDITOR=editor, VISUAL=editor,
+                   XDG_RUNTIME_DIR=self.runtime)
         env.pop("TMUX", None)
         self.proc = subprocess.Popen(["script", "-qfc", f"stty cols 110 rows 40; {REPO}/tui/genai-tui -e test",
                                       "/dev/null"], cwd=self.wd, env=env, stdin=subprocess.PIPE,
@@ -512,6 +575,22 @@ class TestGenaiTui(TmuxCase):
             time.sleep(1)
             self.assertEqual(self.window()[0], ["shell", "genai", "you"])
             self.assertIn("echo ``x", self.screen("shell"))
+
+    def test_an_answer_must_name_the_question_showing(self):
+        with FakeAPI([call("write_file", path="x.txt", content="x\n", reason="r"), reply("done")]) as api:
+            self.start(api)
+            self.type("go")
+            self.wait_for("Allow p1: create x.txt?")
+            state = [d for d in os.listdir(self.runtime) if d.startswith("genai-tui.")][0]
+            c = IPC.Client(os.path.join(self.runtime, state), "prompt")
+            self.addCleanup(c.close)
+            for q in (None, "approve:p2", "ask:1"):                    # stale, early or made up
+                c.send({"type": "key", "key": "y", "q": q})
+            time.sleep(0.5)
+            self.assertFalse(os.path.exists(os.path.join(self.wd, "x.txt")))
+            c.send({"type": "key", "key": "y", "q": "approve:p1"})
+            self.wait_for("● done")
+            self.assertTrue(os.path.exists(os.path.join(self.wd, "x.txt")))
 
     def test_a_key_typed_as_a_question_appears_is_not_an_answer(self):
         with FakeAPI([call("write_file", path="x.txt", content="x\n", reason="r"), reply("done")]) as api:

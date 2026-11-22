@@ -29,6 +29,7 @@ recognised agent-security concerns to those choices.
 | --- | --- | --- |
 | You, your shell environment (`EDITOR`, `SHELL`, variables) and `~/.config/genai` | Trusted | Anything that can change these already acts as you. |
 | A wrapper driving `--json` | Trusted | It is the user interface: it shows proposals and returns decisions. |
+| Programs running as you, including commands you run from genai-tui's shell pane | Trusted, unavoidably | They can reach the TUI's socket and its tmux server as you can. Run genai-tui in the sandbox to keep proposed commands outside that boundary. |
 | Endpoints, profiles, skills | Trusted only as blessed | You reviewed a specific version. Its sha256 is recorded, and any change is refused. |
 | The endpoint's operator | Sees everything you send | That is what an endpoint is. Its replies are still treated as untrusted text. |
 | The model's output: text, tool names, tool arguments | Untrusted | It may be wrong, or steered by something it read. |
@@ -194,6 +195,26 @@ safe and prompts are rare enough to be read.
   and which URL it goes to, and the banner, the `hello` event and the audit log record it.
 - In coding mode a file that looks like it holds secrets is not read automatically. It asks,
   like any read outside coding mode.
+
+The TUI (`tui/genai-tui`) is such a wrapper, split across tmux panes. Only its conversation pane
+talks to genai; the prompt pane, the info panel and tmux menus reach it over a Unix socket in a
+directory only you can open (`mktemp -d`, mode 0700, in `$XDG_RUNTIME_DIR` or `/tmp`, never a
+shared filesystem; never an abstract socket, which has no permissions).
+
+- A connection from another user is closed: the socket's directory keeps them out, and the
+  kernel's peer credentials are checked as well.
+- Each pane connects in a role and may send only that role's messages. The info panel can switch
+  coding mode and blessed skills, as you could by typing; it cannot answer a question.
+- An answer names the question it answers. One meant for a question that has gone, or not yet
+  appeared, is ignored, and keys typed within 0.3 s of a question appearing count as typing.
+- Messages are size-limited; a line that is too long or not JSON ends the connection.
+- No text from the model goes into a tmux menu, pane title or popup command, where tmux would
+  run a `#(...)`.
+
+What this cannot do is keep out a program running as you: it can connect to the socket, or send
+keys through tmux, exactly as you can. The shell pane runs as you, on the host unless genai-tui
+runs in the sandbox, so a harmful command you run there could approve further proposals. The
+TUI says where commands run before each one, in red when it is outside any sandbox.
 
 What remains: for commands, you are the last control. That is the design, and it is why the
 other sections matter. With `--coding-anywhere` in your home directory, everything there that is

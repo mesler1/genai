@@ -35,18 +35,21 @@ if [ -n "${TMUX:-}" ] && [ "${GENAI_TUI_NESTED:-}" != 1 ]; then
 fi
 
 # Private to this run: a tmux server (your own tmux and its config are never touched), and a
-# directory only you can read for the panel's state file and its request pipe.
+# directory only you can open, for the socket the panes talk over (tui/ipc.py). It goes in
+# $XDG_RUNTIME_DIR (per user, in memory, cleared at logout) or else /tmp: never a shared filesystem
+# such as home on a cluster, where a socket can only be reached from one node anyway.
 sock="${GENAI_TUI_SOCKET:-genai-tui-$$}"
 t() { tmux -L "$sock" "$@"; }
-state=$(mktemp -d "${TMPDIR:-/tmp}/genai-tui.XXXXXX")
+base=${XDG_RUNTIME_DIR:-}
+{ [ -n "$base" ] && [ -d "$base" ] && [ -w "$base" ]; } || base=/tmp
+state=$(mktemp -d "$base/genai-tui.XXXXXX")
 chmod 700 "$state"
-mkfifo -m 600 "$state/requests"
 q() { printf '%q' "$1"; }
 
 read -r rows cols < <(stty size 2>/dev/null) || true
 cols=${cols:-120}
 t -f /dev/null new-session -d -s genai -n genai -x "$cols" -y "${rows:-40}" -c "$PWD" \
-  -e "GENAI_TUI_STATE=$state" -e "GENAI_TUI_TOGGLE=$here/shell-toggle" "bash --rcfile $(q "$here/shellrc") -i"
+  -e "GENAI_TUI_TOGGLE=$here/shell-toggle" "bash --rcfile $(q "$here/shellrc") -i"
 shell=$(t display -p -t genai '#{pane_id}')
 side=$(t split-window -d -h -f -l 42 -t "$shell" -e "GENAI_TUI_STATE=$state" -P -F '#{pane_id}' \
   "$(q "$py") $(q "$here/panel.py")")
@@ -90,16 +93,17 @@ t set -p -t "$prompt" @genai_title 'you'
 t set -p -t "$side" @genai_title 'info · /panel hides it'
 
 # Right-click in the shell pane: tmux's own menu for shell context. Each request goes to the
-# conversation pane through the pipe; marking only records a line number in a tmux option.
-req=$(q "$here/request")
+# conversation pane over the socket, through request.py; marking only records a line number in a
+# tmux option.
+req="$(q "$py") $(q "$here/request.py")"
 cat > "$state/menu.conf" <<EOF
 bind -n MouseDown3Pane {
   if -F "#{==:#{pane_id},$shell}" {
     display-menu -t= -x M -y M -T " shell context " \\
       "Mark start of context here" m { set -gF @genai_ctx_mark "#{e|-:#{e|+:#{history_size},#{mouse_y}},#{?scroll_position,#{scroll_position},0}}" ; display-message "genai: shell context starts at this line" } \\
-      "Share from the mark" s { run-shell -b "$req share-mark" } \\
-      "Share all shell history" a { run-shell -b "$req share-all" } \\
-      "Share the last command" l { run-shell -b "$req share-last" } \\
+      "Share from the mark" s { run-shell -b "$req share mark" } \\
+      "Share all shell history" a { run-shell -b "$req share all" } \\
+      "Share the last command" l { run-shell -b "$req share last" } \\
       "" \\
       "Clear the mark" c { set -gu @genai_ctx_mark ; display-message "genai: shell context mark cleared" }
   } {
