@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+"""genai-tui info panel: the session, context use, skills and proposals, beside the conversation.
+
+It draws the state file the conversation pane writes ($GENAI_TUI_STATE/state.json) and sends
+requests back through a pipe ($GENAI_TUI_STATE/requests). The conversation pane owns genai and
+decides what to do with a request, so this pane can never approve anything or reach genai itself.
+Standard library only; Python 3.10 or newer.
+"""
+
+import curses
+import json
+import locale
+import os
+import sys
+import time
+
+from conversation import A, D, Q, R, W, clean, fit, width
+
+STATE = os.environ.get("GENAI_TUI_STATE", "")
+
+
+def load():
+    try:
+        with open(os.path.join(STATE, "state.json"), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def request(msg):
+    """Send a request to the conversation pane. False if it isn't listening."""
+    try:
+        fd = os.open(os.path.join(STATE, "requests"), os.O_WRONLY | os.O_NONBLOCK)
+    except OSError:
+        return False
+    try:
+        os.write(fd, (json.dumps(msg) + "\n").encode())
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def bar(used, limit, w):
+    if not limit:
+        return [("not measured yet", Q)]
+    frac = min(max(used / limit, 0), 1)
+    n = max(w - 18, 4)
+    full = round(frac * n)
+    role = R if frac >= 0.9 else W if frac >= 0.75 else D
+    return [("█" * full, role), ("░" * (n - full), Q), (f" {100 * frac:3.0f}% {used / 1000:.1f}k/{limit / 1000:.0f}k", "")]
+
+
+def view(st, w, sel):
+    """The panel as lines of (text, role) segments, and which skill each line toggles (or "coding")."""
+    lines, acts = [], []
+
+    def add(segs, act=None):
+        lines.append(segs)
+        acts.append(act)
+
+    def head(title):
+        if lines:
+            add([])
+        add([(title, A)])
+
+    if not st:
+        add([("waiting for the conversation…", Q)])
+        return lines, acts
+    h = st.get("session") or {}
+    head("SESSION")
+    for label, value, role in (("endpoint", h.get("endpoint"), ""), ("model", h.get("model"), ""),
+                               ("profile", h.get("profile") or "none", "" if h.get("profile") else Q),
+                               ("session", h.get("session") or "not saved", "" if h.get("session") else Q)):
+        add([(f"{label:9}", Q), (fit(clean(value or "?"), w - 9), role)])
+    sb = h.get("sandbox")
+    add([("commands ", Q), (fit(f"run in {sb}" if sb else "run OUTSIDE any sandbox", w - 9), D if sb else R)])
+    coding = st.get("coding")
+    add([("coding   ", Q), ("[on] " if coding else "[off]", W if coding else ""),
+         (fit("  c switches" if not coding else "  reads without asking", w - 14), Q)], "coding")
+    head("CONTEXT")
+    ctx = st.get("context") or [None, None]
+    add(bar(ctx[0] or 0, ctx[1], w) if ctx[0] is not None else [("not measured yet", Q)])
+    if st.get("busy"):
+        add([("genai is replying", W)])
+    head("SKILLS")
+    skills = st.get("skills")
+    if skills is None:
+        add([("r loads the list", Q)])
+    elif not skills:
+        add([("none found", Q)])
+    for i, s in enumerate(skills or []):
+        mark = ">" if i == sel else " "
+        blessed = s.get("status") == "blessed"
+        box = "[x]" if s.get("active") else "[ ]"
+        add([(mark, A), (box + " ", D if s.get("active") else ("" if blessed else Q)),
+             (fit(clean(s.get("name", "")), w - 16), "" if blessed else Q),
+             (" " + ("" if blessed else s.get("status", "")), R if s.get("status") == "changed" else Q)], i)
+        if i == sel and not blessed:
+            add([(fit(f"  bless: genai --bless {clean(s.get('path', ''))}", w), Q)], i)
+    head("PROPOSALS")
+    props = st.get("proposals") or []
+    if not props:
+        add([("none yet", Q)])
+    for p in props[-12:]:
+        role = {"waiting": W, "error": R, "declined": Q, "done": D, "ran": D, "running": A}.get(p.get("state"), "")
+        title = fit(clean(p.get("title", "")), max(w - 20, 4))
+        status = clean(p.get("state", "") + (f" · {p['detail']}" if p.get("detail") else ""))
+        add([(f"{clean(p.get('id', '?')):4} ", Q), (title, ""), (" ", ""), (fit(status, max(w - 6 - width(title), 1)), role)])
+    return lines, acts
+
+
+class Panel:
+    def __init__(self, scr):
+        self.scr = scr
+        self.st, self.mtime, self.sel, self.msg = None, None, 0, ""
+        curses.curs_set(0)
+        curses.use_default_colors()
+        self.roles = {"": 0}
+        if curses.has_colors():
+            quiet = 8 if curses.COLORS >= 16 else curses.COLOR_WHITE
+            for i, (role, fg) in enumerate([(Q, quiet), (A, curses.COLOR_BLUE), (W, curses.COLOR_YELLOW),
+                                            (D, curses.COLOR_GREEN), (R, curses.COLOR_RED)], 1):
+                curses.init_pair(i, fg, -1)
+                self.roles[role] = curses.color_pair(i)
+        self.roles[A] |= curses.A_BOLD
+        curses.mousemask(getattr(curses, "BUTTON1_PRESSED", 0) | getattr(curses, "BUTTON1_CLICKED", 0))
+        curses.mouseinterval(0)
+        scr.keypad(True)
+        scr.timeout(250)
+        self.acts = []
+
+    def refresh_state(self):
+        try:
+            m = os.stat(os.path.join(STATE, "state.json")).st_mtime_ns
+        except OSError:
+            return
+        if m != self.mtime:
+            self.mtime, self.st = m, load() or self.st
+
+    def draw(self):
+        h, w = self.scr.getmaxyx()
+        self.scr.erase()
+        lines, self.acts = view(self.st, w - 1, self.sel)
+        for y, segs in enumerate(lines[:h - 1]):
+            x = 0
+            for text, role in segs:
+                try:
+                    self.scr.addstr(y, x, fit(text, max(w - 1 - x, 1)), self.roles.get(role, 0))
+                except curses.error:
+                    pass
+                x += width(text)
+        hint = self.msg or "c coding · ↑↓ space skill · r refresh"
+        try:
+            self.scr.addstr(h - 1, 0, fit(hint, w - 1), self.roles[Q])
+        except curses.error:
+            pass
+        self.scr.refresh()
+
+    def skills(self):
+        return (self.st or {}).get("skills") or []
+
+    def act(self, what):
+        st = self.st or {}
+        if what == "coding":
+            ok = request({"type": "coding", "on": not st.get("coding")})
+        elif isinstance(what, int) and what < len(self.skills()):
+            s = self.skills()[what]
+            if s.get("status") != "blessed" and not s.get("active"):
+                self.msg = "bless it first (the command is shown)"
+                return
+            ok = request({"type": "skill", "name": s.get("name", ""), "on": not s.get("active")})
+        else:
+            return
+        self.msg = "" if ok else "the conversation isn't listening"
+
+    def key(self, k):
+        n = len(self.skills())
+        if k in (curses.KEY_UP, "k"):
+            self.sel = max(self.sel - 1, 0)
+        elif k in (curses.KEY_DOWN, "j"):
+            self.sel = min(self.sel + 1, max(n - 1, 0))
+        elif k in (" ", "\n", "\r", curses.KEY_ENTER):
+            self.act(self.sel)
+        elif k == "c":
+            self.act("coding")
+        elif k == "r":
+            self.msg = "" if request({"type": "skills"}) else "the conversation isn't listening"
+        elif k == curses.KEY_MOUSE:
+            try:
+                _, _, y, _, _ = curses.getmouse()
+            except curses.error:
+                return
+            if 0 <= y < len(self.acts) and self.acts[y] is not None:
+                if isinstance(self.acts[y], int):
+                    self.sel = self.acts[y]
+                self.act(self.acts[y])
+
+    def run(self):
+        while True:
+            self.refresh_state()
+            self.draw()
+            try:
+                k = self.scr.get_wch()
+            except curses.error:
+                continue
+            except KeyboardInterrupt:
+                continue
+            if k != curses.KEY_RESIZE:
+                self.key(k)
+
+
+def main():
+    if not STATE:
+        print("panel.py is started by genai-tui", file=sys.stderr)
+        return 2
+    locale.setlocale(locale.LC_ALL, "")
+    os.environ.setdefault("ESCDELAY", "25")
+    curses.wrapper(lambda scr: Panel(scr).run())
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

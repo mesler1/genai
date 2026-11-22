@@ -1,0 +1,18 @@
+# genai-tui's shell pane: your own ~/.bashrc, plus a prompt hook that tells the conversation pane
+# where each prompt starts, the last command and its exit code, so /run and /share can find one
+# command's output. It only records positions and numbers in tmux options; it reads no output.
+[ -f ~/.bashrc ] && . ~/.bashrc
+# A command /run types arrives as one paste, so a multi-line command doesn't run line by line.
+bind 'set enable-bracketed-paste on' 2>/dev/null
+__genai_prompt() {
+  local rc=$? hs cy
+  [ -n "${TMUX:-}" ] || return "$rc"
+  read -r hs cy < <(tmux display -p -t "$TMUX_PANE" '#{history_size} #{cursor_y}')
+  __genai_seq=$(( ${__genai_seq:-0} + 1 ))
+  tmux set -g @genai_rc "$rc" \; set -g @genai_prev_mark "${__genai_mark:-0}" \; \
+       set -g @genai_mark "$((hs + cy))" \; set -g @genai_seq "$__genai_seq" \; \
+       set -g @genai_last_cmd "$(fc -ln -1 2>/dev/null | sed 's/^[[:space:]]*//')"
+  __genai_mark=$((hs + cy))
+  return "$rc"
+}
+PROMPT_COMMAND="__genai_prompt${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
