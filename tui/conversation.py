@@ -10,12 +10,14 @@ Usage: conversation.py [genai options such as -p PROFILE -e ENDPOINT -S SESSION]
 Standard library only; Python 3.10 or newer.
 """
 
+import argparse
 import curses
 import json
 import locale
 import os
 import queue
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -34,6 +36,11 @@ COMMANDS = {
     "/coding": "on|off: let the model read and list files here without asking",
     "/skills": "list skills; * marks the ones in use",
     "/skill": "NAME on|off: use a blessed skill from the next message on, or stop",
+    "/run": "[ID]: review and run a proposed command in the shell pane (the latest by default)",
+    "/share": "[mark|all]: review shell output, then send it: the last command, from the mark, or everything",
+    "/mark": "shell context starts at the shell's current prompt (or right-click a line in the shell)",
+    "/shell": "move to the shell pane (Ctrl-b o moves back)",
+    "/panel": "show or hide the info panel on the right",
     "/compact": "shrink the conversation when the context is getting full",
     "/context": "show how full the context is",
     "/clear": "clear the screen (the conversation itself is kept)",
@@ -228,12 +235,14 @@ class Note(Block):
 
 
 class UserMsg(Block):
-    def __init__(self, text, queued=False):
+    def __init__(self, text, queued=False, attached=None):
         super().__init__()
-        self.text, self.queued = text, queued
+        self.text, self.queued, self.attached = text, queued, attached
 
     def lines(self, w):
         out = [[]] + para(clean(self.text), "", w, "› ", "  ", first_role=A)
+        if self.attached:
+            out.append([("  ", Q), (fit(f"[attached: {clean(self.attached)}]", w - 2), Q)])
         if self.queued:
             out.append([("  queued: sends when the current reply ends", Q)])
         return out
@@ -287,7 +296,8 @@ class Banner(Block):
 
 class Card(Block):
     """A proposal. Its state changes as it is decided and performed."""
-    STATE_ROLE = {"waiting": W, "accepted": D, "done": D, "declined": Q, "error": R, "shown": A, "auto": Q}
+    STATE_ROLE = {"waiting": W, "accepted": D, "done": D, "declined": Q, "error": R, "shown": A, "auto": Q,
+                  "running": A, "ran": D, "cancelled": Q}
 
     def __init__(self, ev):
         super().__init__()
@@ -322,7 +332,7 @@ class Card(Block):
                     continue
                 out.append((ln, D if ln.startswith("+") else R if ln.startswith("-") else Q if ln.startswith("@") else ""))
         elif k == "write":
-            out += [("+" + ln, D) for ln in clean(ev.get("content", "")).split("\n")]
+            out += [("+" + ln, D) for ln in clean(ev.get("content", "")).rstrip("\n").split("\n")]
         elif k == "read" and ev.get("size") is not None:
             out.append((f"{ev['size']} bytes", Q))
         elif k == "external":
@@ -348,7 +358,7 @@ class Card(Block):
         if len(shown) < len(body):
             rows.append((f"… {len(body) - len(shown)} more lines (v views it all)", Q))
         if self.ev.get("kind") == "command" and self.state == "shown":
-            rows.append(("run it in your shell if you want to; genai never runs it", A))
+            rows.append((f"click it, or /run {self.id}, to send it to your shell; genai never runs it", A))
         if self.detail:
             rows.append((fit(clean(self.detail), inner), R if self.state == "error" else Q))
         for t, r in rows:
@@ -374,6 +384,11 @@ class Model:
         self.context = None        # (used, limit)
         self.exited = None         # genai's exit code once it has gone
         self.quit = False
+        self.shell = False         # a shell pane is there (inside genai-tui)
+        self.skills = None         # genai's skill list, once asked for
+        self.show_skills = False   # print the next skill list in the conversation (the user typed /skills)
+        self.ask = None            # a question of ours in place of the input box: run or share
+        self.actions = []          # things for the screen to do: ("share", "last"), ("focus_shell",)
 
     def add(self, block):
         self.blocks.append(block)
@@ -394,6 +409,8 @@ class Model:
         if t == "hello":
             self.hello, self.coding = ev, bool(ev.get("coding"))
             self.add(Banner(ev))
+            if "skills" in (ev.get("features") or []):
+                self.send({"type": "skills"})          # for the info panel; not printed
         elif t == "text":
             if self.reply is None:
                 self.reply = self.add(Reply())
@@ -437,6 +454,10 @@ class Model:
             self.note(f"coding mode is {'on' if self.coding else 'off'}", W if self.coding else Q)
         elif t == "skills":
             rows = ev.get("skills") or []
+            self.skills = rows
+            if not self.show_skills:
+                return
+            self.show_skills = False
             if not rows:
                 self.note("no skills found (genai --list-skills shows where they are looked for)")
             for r in rows:
@@ -447,7 +468,10 @@ class Model:
         elif t == "compacted":
             self.note(f"compacted: {ev.get('before')} → {ev.get('after')} tokens", D)
         elif t == "attached":
-            self.note(f"attached {clean(ev.get('label', ''))} ({ev.get('chars')} characters)")
+            masked = ev.get("redacted") or {}
+            if masked:
+                self.note("genai masked " + ", ".join(f"{n} {clean(k)}" for k, n in masked.items())
+                          + " in what you shared", W)
 
     def exit(self, code, err=""):
         self.exited, self.busy, self.pending = code, False, []
@@ -465,14 +489,22 @@ class Model:
             return
         if text.startswith("//"):
             text = text[1:]
+        self.say(text)
+
+    def say(self, text, attached=None):
         if self.exited is not None:
             self.note("genai is not running", R)
         elif self.busy:
-            self.queued.append(self.add(UserMsg(text, queued=True)))
+            self.queued.append(self.add(UserMsg(text, queued=True, attached=attached)))
         else:
-            self.add(UserMsg(text))
+            self.add(UserMsg(text, attached=attached))
             self.busy = True
             self.send({"type": "user", "text": text})
+
+    def share(self, label, text, message):
+        """Send reviewed output: as an attachment, so genai masks secrets in it, then a message about it."""
+        self.send({"type": "attach", "label": label, "text": text})
+        self.say(message, attached=f"{label}, {text.count(chr(10)) + 1} lines")
 
     def next_queued(self):
         if self.queued and not self.busy:
@@ -501,15 +533,37 @@ class Model:
             else:
                 self.note(f"coding mode is {'on' if self.coding else 'off'} (/coding on|off)")
         elif cmd == "/skills":
+            self.show_skills = True
             self.send({"type": "skills"})
         elif cmd == "/skill":
             name, _, state = arg.rpartition(" ")
             if not name or state not in ("on", "off"):
                 self.note("usage: /skill NAME on|off", R)
             else:
+                self.note(f"skill {clean(name)}: {state} from your next message", Q)
                 self.send({"type": "skill", "name": name, "on": state == "on"})
         elif cmd == "/compact":
             self.send({"type": "compact"})
+        elif cmd in ("/run", "/share", "/shell", "/mark") and not self.shell:
+            self.note(f"{cmd} needs the shell pane: start genai with genai-tui", R)
+        elif cmd == "/run":
+            cards = [c for c in self.cards.values() if c.ev.get("kind") == "command"]
+            card = self.cards.get(arg) if arg else (cards[-1] if cards else None)
+            if not card or card.ev.get("kind") != "command":
+                self.note("no command proposal to run" + (f" with id {arg}" if arg else ""), R)
+            else:
+                self.ask = {"kind": "run", "card": card, "command": card.ev.get("command", ""), "edited": False}
+        elif cmd == "/share":
+            if arg not in ("", "mark", "all"):
+                self.note("usage: /share, /share mark or /share all", R)
+            else:
+                self.actions.append(("share", arg or "last"))
+        elif cmd == "/mark":
+            self.actions.append(("mark",))
+        elif cmd == "/shell":
+            self.actions.append(("focus_shell",))
+        elif cmd == "/panel":
+            self.actions.append(("panel",))
         elif cmd == "/context":
             used, limit = self.context or (None, None)
             self.note(f"context: {used}/{limit} tokens" if used is not None else "context: not measured yet")
@@ -519,6 +573,37 @@ class Model:
             self.quit = True
         else:
             self.note(f"unknown command {cmd} (/help lists them)", R)
+
+    def snapshot(self):
+        """What the info panel shows. Proposal titles and details are escaped here and again where drawn."""
+        h = self.hello or {}
+        ep, sb, prof = h.get("endpoint") or {}, h.get("sandbox"), h.get("profile") or {}
+        return {
+            "session": {"endpoint": ep.get("name"), "model": ep.get("model"), "profile": prof.get("name"),
+                        "session": h.get("session"), "sandbox": sb.get("name") if sb else None},
+            "coding": self.coding, "busy": self.busy, "context": list(self.context or (None, None)),
+            "skills": self.skills,
+            "proposals": [{"id": c.id, "title": c.title(), "state": c.state, "detail": clean(c.detail)}
+                          for c in self.cards.values() if c.state != "auto"],
+        }
+
+    def request(self, msg):
+        """A request from the info panel, checked and turned into the command a user would type."""
+        t = msg.get("type") if isinstance(msg, dict) else None
+        if t == "coding" and isinstance(msg.get("on"), bool):
+            self.command(f"/coding {'on' if msg['on'] else 'off'}")
+        elif t == "skill" and isinstance(msg.get("name"), str) and isinstance(msg.get("on"), bool) \
+                and msg["name"].strip() and "\n" not in msg["name"]:
+            self.command(f"/skill {msg['name']} {'on' if msg['on'] else 'off'}")
+        elif t == "skills" and not self.busy and self.exited is None:
+            self.send({"type": "skills"})
+        elif t == "share" and msg.get("what") in ("mark", "all", "last") and self.shell:
+            self.actions.append(("share", msg["what"]))
+
+    def attach(self, label, text):
+        """Shell context the user reviewed: it goes with their next message, so they can ask about it."""
+        self.send({"type": "attach", "label": label, "text": text})
+        self.note(f"attached {label}; it goes with your next message", D)
 
     def decide(self, accept):
         if not self.pending:
@@ -647,6 +732,134 @@ class Editor:
 
 
 # --------------------------------------------------------------------------
+# Your editor, for reviewing a command or output before it goes anywhere
+
+EDITOR_HEADER = """# {title}
+# Lines starting with '#' are removed. What is left is {what}.
+# Save an empty file to {cancel}.
+"""
+
+
+def editor_argv(path):
+    """The user's editor, with swap, backup and history files off for vim, as genai does: the text may hold secrets."""
+    argv = shlex.split(os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi")
+    base = os.path.basename(argv[0])
+    if base in ("vim", "nvim", "gvim"):
+        argv += ["-n", "-i", "NONE", "--cmd", "set nobackup nowritebackup noundofile"]
+    elif base == "vi":
+        argv += ["-n"]
+    return argv + [path]
+
+
+def strip_comments(text):
+    return "\n".join(ln for ln in text.split("\n") if not ln.startswith("#")).strip("\n")
+
+
+def review_buffer(command, rc, where, output):
+    """What /run and /share open for review: the same layout as genai's own :run."""
+    return ("# EVERYTHING below is sent to the model as saved, the command included.\n"
+            "# Remove anything you don't want it to see, such as a secret in the command.\n"
+            f"I ran this command {where} (exit {rc}):\n```\n{command}\n```\nOutput:\n```\n{output}\n```\n")
+
+
+# --------------------------------------------------------------------------
+# The shell pane, through tmux
+
+class Busy(Exception):
+    pass
+
+
+class Shell:
+    """The shell pane genai-tui opened below the conversation. Its prompt hook (tui/shellrc) keeps a count
+    of prompts, the exit code, the last command and where each prompt starts, in tmux options."""
+
+    def __init__(self, pane):
+        self.pane = pane
+
+    @classmethod
+    def from_env(cls):
+        pane = os.environ.get("GENAI_TUI_SHELL")
+        return cls(pane) if pane and os.environ.get("TMUX") else None
+
+    def tmux(self, *args, data=None):
+        r = subprocess.run(["tmux", *args], input=data, capture_output=True, text=True, timeout=5)
+        return r.stdout
+
+    def opt(self, name):
+        return self.tmux("show", "-gv", name).strip()
+
+    def num(self, name):
+        try:
+            return int(self.opt(name) or 0)
+        except ValueError:
+            return 0
+
+    def at_prompt(self):
+        """None if bash is waiting at its prompt; otherwise what the pane is doing."""
+        state = self.tmux("display", "-p", "-t", self.pane, "#{pane_current_command} #{pane_in_mode}").split()
+        if state == ["bash", "0"]:
+            return None
+        if state[1:] == ["1"]:
+            return "it is in copy mode; press q there"
+        return f"{state[0] if state else 'something'} is running"
+
+    def type(self, command, enter=True):
+        """Type a command at the prompt, and press Enter unless told not to. Only when bash is idle: never into a
+        program."""
+        busy = self.at_prompt()
+        if busy:
+            raise Busy(busy)
+        self.tmux("load-buffer", "-b", "genai-run", "-", data=command)
+        self.tmux("send-keys", "-t", self.pane, "C-e", "C-u")   # anything half-typed goes to bash's kill ring
+        self.tmux("paste-buffer", "-p", "-d", "-b", "genai-run", "-t", self.pane)
+        if enter:
+            self.tmux("send-keys", "-t", self.pane, "Enter")
+
+    def output(self, start, end):
+        """The lines between two prompt marks: one command's output."""
+        hs = int(self.tmux("display", "-p", "-t", self.pane, "#{history_size}").strip() or 0)
+        if end <= start + 1:
+            return ""
+        return self.tmux("capture-pane", "-p", "-J", "-t", self.pane, "-S", str(start + 1 - hs),
+                         "-E", str(end - 1 - hs)).rstrip("\n")
+
+    def focus(self):
+        self.tmux("select-pane", "-t", self.pane)
+
+    def copy(self, text):
+        """To tmux's buffer and, through the terminal (OSC 52), the system clipboard where the terminal allows it."""
+        self.tmux("set-buffer", "-w", "-b", "genai-copy", "--", text)
+
+    def menu(self, pid, where):
+        """tmux's own menu at the mouse, for a command card. Menu titles, names and commands are tmux formats, so
+        none of them carries text from the model: only the proposal id, checked here, and fixed words."""
+        if not re.fullmatch(r"p[0-9]{1,9}", pid):
+            return
+        me = os.environ.get("TMUX_PANE", "")
+        pick = lambda what: f"set -p -t {me} @genai_menu '{what} {pid}'"
+        self.tmux("set", "-p", "-t", me, "-u", "@genai_menu")
+        # display-menu returns only when the menu closes, so don't wait for it: the choice arrives in @genai_menu.
+        self.menus = [p for p in getattr(self, "menus", []) if p.poll() is None]
+        self.menus.append(subprocess.Popen(["tmux", "display-menu", "-t", me, "-x", "M", "-y", "M", "-T", f" {pid}: runs {where} ",
+                  "Run it in the shell pane", "r", pick("run"),
+                  "Edit it, then run", "e", pick("edit"),
+                  "Put it at the shell prompt (you press Enter)", "p", pick("prompt"),
+                  "Copy it", "c", pick("copy"),
+                  "", "Cancel", "q", f"set -p -t {me} -u @genai_menu"],
+                                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+
+    def menu_choice(self):
+        me = os.environ.get("TMUX_PANE", "")
+        v = self.tmux("show", "-pqv", "-t", me, "@genai_menu").strip()
+        if v:
+            self.tmux("set", "-p", "-t", me, "-u", "@genai_menu")
+        return v
+
+    def title(self, text):
+        self.tmux("set", "-p", "-t", os.environ.get("TMUX_PANE", ""), "@genai_title", text)
+
+
+# --------------------------------------------------------------------------
 # genai as a child process
 
 class Child:
@@ -694,9 +907,26 @@ SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 
 class App:
-    def __init__(self, scr, child):
-        self.scr, self.child = scr, child
+    def __init__(self, scr, child, shell=None):
+        self.scr, self.child, self.shell = scr, child, shell
         self.m, self.ed = Model(), Editor()
+        self.m.shell = shell is not None
+        self.running = None        # a /run command in the shell pane: card, command, prompt count, start mark
+        self.next_poll = 0.0
+        self.rows = []             # the block drawn on each screen row of the conversation
+        self.menu_until = 0.0      # while a command menu may be open, look for the choice
+        self.menu_poll = 0.0
+        self.state_dir = os.environ.get("GENAI_TUI_STATE") if shell else None
+        self.panel = os.environ.get("GENAI_TUI_PANEL") if shell else None
+        self.last_state = None
+        self.requests = queue.Queue()
+        if self.state_dir and os.path.exists(os.path.join(self.state_dir, "requests")):
+            threading.Thread(target=self.read_requests, daemon=True).start()
+        self.mouse = 0
+        for name in ("BUTTON1_PRESSED", "BUTTON1_CLICKED", "BUTTON3_PRESSED", "BUTTON4_PRESSED", "BUTTON5_PRESSED"):
+            self.mouse |= getattr(curses, name, 0)
+        curses.mousemask(self.mouse)
+        curses.mouseinterval(0)
         self.scroll = 0            # lines up from the bottom; 0 follows new output
         self.cache = {}
         self.last_total = 0
@@ -720,15 +950,17 @@ class App:
     # -- drawing
 
     def transcript(self, w):
-        out = []
+        """Every line of the conversation, and the block each line belongs to."""
+        out, owners = [], []
         for b in self.m.blocks:
             key = (id(b), b.version, w)
             if key not in self.cache:
                 self.cache[key] = b.lines(w)
             out += self.cache[key]
+            owners += [b] * len(self.cache[key])
         if len(self.cache) > 4 * len(self.m.blocks) + 64:
             self.cache = {}
-        return out
+        return out, owners
 
     def put(self, y, x, segs, w):
         for text, role in segs:
@@ -742,6 +974,20 @@ class App:
 
     def bottom(self, w):
         """The input box or the approval prompt, then the hint line: (lines, cursor or None, hints)."""
+        ask = self.m.ask
+        if ask and not self.m.pending:
+            if ask["kind"] == "run":
+                c = ask["card"]
+                where = self.where()
+                lines = [[(f"Run {c.id}{' (edited)' if ask['edited'] else ''} in the shell pane? ", A),
+                          (f"It runs {where}, in your shell, as you:", R if where.startswith("OUTSIDE") else "")]]
+                lines += [[("    $ " if i == 0 else "      ", Q), (fit(ln, w - 6), "")]
+                          for i, ln in enumerate(clean(ask["command"]).split("\n")[:4])]
+                lines.append([("  y", A), (" run   ", ""), ("e", A), (" edit first   ", ""), ("n", A), (" cancel", "")])
+                return lines, None, "y run it · e edit it first · n or Esc cancel"
+            lines = [[(ask["question"], A)],
+                     [("  y", A), (" review it in your editor, then send   ", ""), ("n", A), (" keep it to yourself", "")]]
+            return lines, None, "y review and send · n or Esc don't share"
         if self.m.pending:
             c = self.m.pending[0]
             more = f"  ({len(self.m.pending)} waiting)" if len(self.m.pending) > 1 else ""
@@ -761,7 +1007,7 @@ class App:
         elif self.m.busy:
             hints = f"{SPIN[int(time.time() * 10) % len(SPIN)]} working · type ahead, Enter queues it"
         else:
-            hints = "Enter send · Alt+Enter new line · ↑ earlier · /help"
+            hints = "Enter send · Alt+Enter new line · ↑ earlier · /help" + (" · /run · /share" if self.shell else "")
         return lines, cur, hints
 
     def draw(self):
@@ -775,12 +1021,13 @@ class App:
             used, limit = self.m.context
             status.append(f"ctx {used / 1000:.1f}k/{limit / 1000:.0f}k ({100 * used // limit}%)")
         area = max(h - len(lines) - 2, 1)
-        body = self.transcript(w)
+        body, owners = self.transcript(w)
         if self.scroll and len(body) > self.last_total:
             self.scroll += len(body) - self.last_total       # stay put while scrolled up
         self.last_total = len(body)
         self.scroll = max(0, min(self.scroll, len(body) - area))
         end = len(body) - self.scroll
+        self.rows = owners[max(end - area, 0):end]
         for i, segs in enumerate(body[max(end - area, 0):end]):
             self.put(i, 0, segs, w)
         rule = "─" * w
@@ -821,6 +1068,15 @@ class App:
                 self.paste = ""
             elif m.pending and seq == "":
                 m.decide(False)
+            elif m.ask and seq == "":
+                self.answer("n")
+            return
+        if k == curses.KEY_MOUSE:
+            self.click()
+            return
+        if m.ask and not m.pending:
+            if isinstance(k, str):
+                self.answer(k.lower())
             return
         if m.pending:
             if k in ("y", "Y"):
@@ -902,6 +1158,247 @@ class App:
             self.scr.timeout(50)
         return seq
 
+    def read_requests(self):
+        """Lines from the info panel. Opened read-write so the pipe never reports end of file."""
+        fd = os.open(os.path.join(self.state_dir, "requests"), os.O_RDWR)
+        with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    self.requests.put(json.loads(line[:4096]))
+                except ValueError:
+                    pass
+
+    def write_state(self):
+        if not self.state_dir:
+            return
+        text = json.dumps(self.m.snapshot(), ensure_ascii=False)
+        if text == self.last_state:
+            return
+        self.last_state = text
+        try:
+            fd, tmp = tempfile.mkstemp(dir=self.state_dir, prefix=".state-")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+            os.replace(tmp, os.path.join(self.state_dir, "state.json"))
+        except OSError:
+            pass
+
+    def toggle_panel(self):
+        if not self.panel:
+            self.m.note("there is no info panel in this session", R)
+            return
+        me = os.environ.get("TMUX_PANE", "")
+        here = self.shell.tmux("display", "-p", "-t", me, "#{window_id}").strip()
+        there = self.shell.tmux("display", "-p", "-t", self.panel, "#{window_id}").strip()
+        if here == there:
+            self.shell.tmux("break-pane", "-d", "-s", self.panel, "-n", "panel")
+        else:
+            self.shell.tmux("join-pane", "-d", "-h", "-f", "-l", "42", "-s", self.panel, "-t", me)
+
+    def click(self):
+        """The wheel scrolls; a click on a command card opens its menu."""
+        try:
+            _, x, y, _, b = curses.getmouse()
+        except curses.error:
+            return
+        if b & getattr(curses, "BUTTON4_PRESSED", 0):
+            self.scroll += 3
+        elif b & getattr(curses, "BUTTON5_PRESSED", 0x200000):
+            self.scroll = max(self.scroll - 3, 0)
+        elif not b & (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED | curses.BUTTON3_PRESSED):
+            return                                  # a release, or a move: only a press opens the menu
+        elif 0 <= y < len(self.rows) and not self.m.pending and not self.m.ask:
+            card = self.rows[y]
+            if isinstance(card, Card) and card.ev.get("kind") == "command":
+                if not self.shell:
+                    self.m.note(f"{card.id}: start genai with genai-tui to send commands to a shell pane", R)
+                    return
+                self.shell.menu(card.id, self.where())
+                self.menu_until = time.time() + 120
+
+    def poll_menu(self):
+        now = time.time()
+        if now > self.menu_until or now < self.menu_poll:
+            return
+        self.menu_poll = now + 0.2
+        try:
+            choice = self.shell.menu_choice()
+        except (OSError, subprocess.SubprocessError):
+            return
+        if not choice:
+            return
+        self.menu_until = 0.0
+        what, _, pid = choice.partition(" ")
+        card = self.m.cards.get(pid)
+        if not card or card.ev.get("kind") != "command":
+            return
+        command = card.ev.get("command", "")
+        if what == "run":
+            self.start_run(card, command)
+        elif what == "edit":
+            self.m.ask = {"kind": "run", "card": card, "command": command, "edited": False}
+            self.answer("e")
+        elif what == "prompt":
+            try:
+                self.shell.type(command, enter=False)
+                self.shell.focus()
+                self.m.note(f"{card.id} is at the shell prompt; press Enter there to run it, then /share")
+            except Busy as e:
+                self.m.note(f"{card.id}: the shell pane is busy ({e})", R)
+        elif what == "copy":
+            self.shell.copy(command)
+            self.m.note(f"{card.id} copied (tmux buffer, and your clipboard if the terminal allows it)")
+
+    def where(self):
+        sb = (self.m.hello or {}).get("sandbox")
+        return f"inside the {sb['name']} sandbox" if sb else "OUTSIDE any sandbox, directly on this host"
+
+    def answer(self, k):
+        """A key while one of our questions (run, share) is showing."""
+        ask, m = self.m.ask, self.m
+        if ask["kind"] == "run":
+            card = ask["card"]
+            if k == "y":
+                m.ask = None
+                self.start_run(card, ask["command"])
+            elif k == "e":
+                reason = " ".join(clean(card.ev.get("reason", "")).split())
+                edited = self.edit(ask["command"], f"Proposed command [{card.id}]: {reason}",
+                                   "the command that will run, as you", "cancel")
+                if edited is None or not edited.strip():
+                    m.ask = None
+                    m.note(f"{card.id}: cancelled")
+                else:
+                    ask["command"], ask["edited"] = edited, edited != card.ev.get("command")
+            elif k in ("n", "\x1b"):
+                m.ask = None
+                m.note(f"{card.id}: not run")
+        else:
+            m.ask = None
+            if k == "y":
+                if ask.get("context"):
+                    text = ("# EVERYTHING below is sent to the model as saved. Remove anything you don't want it to "
+                            f"see.\nMy shell session{ask['from']}:\n```\n{ask['output']}\n```\n")
+                else:
+                    text = review_buffer(ask["command"], ask["rc"], self.where(), ask["output"])
+                kept = self.edit(text, ask["label"], "sent to the model exactly as saved; nothing is added",
+                                 "send nothing")
+                if kept is None or not kept.strip():
+                    m.note("nothing sent")
+                elif ask.get("context"):
+                    m.attach(ask["label"], kept)
+                else:
+                    m.share(f"output of {ask['what']} (exit {ask['rc']})", kept, f"Here is the output of {ask['what']}.")
+
+    def start_run(self, card, command):
+        try:
+            seq, start = self.shell.num("@genai_seq"), self.shell.num("@genai_mark")
+            self.shell.type(command)
+        except Busy as e:
+            self.m.note(f"{card.id} not run: the shell pane is busy ({e}). When it is back at a prompt, /run "
+                        f"{card.id} again.", R)
+            return
+        except (OSError, subprocess.SubprocessError) as e:
+            self.m.note(f"{card.id} not run: tmux failed ({e})", R)
+            return
+        card.state, card.detail = "running", "typed into the shell pane"
+        card.changed()
+        self.running = {"card": card, "command": command, "seq": seq, "start": start}
+
+    def poll_run(self):
+        """Has the command from /run finished? Then offer to share its output."""
+        if not self.running or time.time() < self.next_poll:
+            return
+        self.next_poll = time.time() + 0.3
+        r = self.running
+        try:
+            if self.shell.num("@genai_seq") <= r["seq"]:
+                return
+            rc, out = self.shell.opt("@genai_rc"), self.shell.output(r["start"], self.shell.num("@genai_mark"))
+        except (OSError, subprocess.SubprocessError):
+            return
+        self.running = None
+        card = r["card"]
+        card.state, card.detail = "ran", f"exit {rc}"
+        card.changed()
+        self.m.ask = {"kind": "share", "label": f"{card.id} finished (exit {rc})", "what": card.id,
+                      "question": f"{card.id} finished (exit {rc}). Share the output with the model?",
+                      "command": r["command"], "rc": rc, "output": out}
+
+    def share_last(self):
+        """/share: the last command typed in the shell pane, whoever typed it."""
+        try:
+            cmd, rc = self.shell.opt("@genai_last_cmd"), self.shell.opt("@genai_rc")
+            out = self.shell.output(self.shell.num("@genai_prev_mark"), self.shell.num("@genai_mark"))
+        except (OSError, subprocess.SubprocessError) as e:
+            self.m.note(f"tmux failed ({e})", R)
+            return
+        if not cmd:
+            self.m.note("nothing has run in the shell pane yet", R)
+            return
+        label = f"Last command in the shell pane: {fit(clean(cmd), 40)} (exit {rc})"
+        self.m.ask = {"kind": "share", "label": label, "what": "that command", "command": cmd, "rc": rc,
+                      "output": out, "question": f"{label}. Share the output with the model?"}
+
+    def share_context(self, what):
+        """Shell history for the model to refer to: everything, or from the line the user marked."""
+        try:
+            end = self.shell.num("@genai_mark")            # where the shell's current prompt starts
+            if what == "mark":
+                raw = self.shell.opt("@genai_ctx_mark")
+                if not raw.isdigit():
+                    self.m.note("no mark yet: right-click a line in the shell pane and choose \"Mark start of "
+                                "context here\", or /mark", R)
+                    return
+                start = int(raw) - 1
+            else:
+                start = -1
+            out = self.shell.output(start, end) if end > start + 1 else ""
+        except (OSError, subprocess.SubprocessError) as e:
+            self.m.note(f"tmux failed ({e})", R)
+            return
+        if not out.strip():
+            self.m.note("the shell pane has nothing " + ("after the mark" if what == "mark" else "to share") + " yet", R)
+            return
+        n = out.count("\n") + 1
+        label = f"{n} lines of shell history" + (" from the mark" if what == "mark" else "")
+        self.m.ask = {"kind": "share", "context": True, "label": label, "output": out,
+                      "from": " from the line I marked" if what == "mark" else "",
+                      "question": f"Share {label} with the model? It goes with your next message."}
+
+    def mark_here(self):
+        try:
+            self.shell.tmux("set", "-g", "@genai_ctx_mark", str(self.shell.num("@genai_mark")))
+        except (OSError, subprocess.SubprocessError) as e:
+            self.m.note(f"tmux failed ({e})", R)
+            return
+        self.m.note("shell context starts at the shell's current prompt; /share mark sends it from there")
+
+    def edit(self, text, title, what, cancel):
+        """Open text in the user's editor; what they save, without # lines. None if the editor failed."""
+        fd, path = tempfile.mkstemp(prefix="genai-tui-", suffix=".txt")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(EDITOR_HEADER.format(title=" ".join(title.split()), what=what, cancel=cancel) + text)
+            curses.endwin()
+            sys.stdout.write("\x1b[?2004l")
+            sys.stdout.flush()
+            try:
+                rc = subprocess.call(editor_argv(path))
+            except OSError as e:
+                self.m.note(f"could not start your editor: {e}", R)
+                return None
+            if rc != 0:
+                self.m.note(f"your editor exited with code {rc}; nothing was used", R)
+                return None
+            with open(path, encoding="utf-8", errors="replace") as f:
+                return strip_comments(f.read())
+        finally:
+            os.unlink(path)
+            sys.stdout.write("\x1b[?2004h")
+            sys.stdout.flush()
+            self.scr.refresh()
+
     def page(self, k):
         h, _ = self.scr.getmaxyx()
         step = max(h - 6, 1)
@@ -942,6 +1439,25 @@ class App:
             sys.stdout.flush()
 
     def pump(self):
+        self.poll_menu()
+        self.poll_run()
+        for action in self.m.actions:
+            if action == ("share", "last"):
+                self.share_last()
+            elif action[0] == "share":
+                self.share_context(action[1])
+            elif action[0] == "mark":
+                self.mark_here()
+            elif action[0] == "focus_shell":
+                self.shell.focus()
+            elif action[0] == "panel":
+                self.toggle_panel()
+        self.m.actions = []
+        while True:
+            try:
+                self.m.request(self.requests.get_nowait())
+            except queue.Empty:
+                break
         while True:
             try:
                 ev = self.child.events.get_nowait()
@@ -951,20 +1467,55 @@ class App:
                 self.m.exit(ev["code"], ev.get("err", ""))
             else:
                 self.m.handle(ev)
+                if ev.get("type") == "hello" and self.shell:
+                    epn = (ev.get("endpoint") or {})
+                    self.shell.title(f"genai · {epn.get('name', '?')}: {epn.get('model', '?')}")
         for msg in self.m.outbox:
             self.child.send(msg)
         self.m.outbox = []
+        self.write_state()
+
+
+def parse_args(argv):
+    ap = argparse.ArgumentParser(
+        prog="genai-tui", description="genai as a coding agent in tmux: the conversation, your shell below it and "
+        "an info panel beside it. The model only proposes; you approve, and you run commands in your own shell.")
+    ap.add_argument("-p", "--profile", help="profile (persona) name")
+    ap.add_argument("-e", "--endpoint", help="endpoint name (overrides the profile's)")
+    ap.add_argument("-S", "--session", help="keep the conversation in a named session (created or resumed)")
+    ap.add_argument("-k", "--skill", action="append", default=[], help="use a blessed skill (repeatable)")
+    ap.add_argument("--coding", action="store_true", help="let the model read and list files here without asking")
+    ap.add_argument("--coding-anywhere", action="store_true",
+                    help="--coding, also where it is normally refused; genai says what that exposes")
+    ap.add_argument("--no-panel", action="store_true", help="start without the info panel (/panel shows it)")
+    ap.add_argument("--check", action="store_true", help=argparse.SUPPRESS)
+    return ap.parse_args(argv)
+
+
+def genai_args(a):
+    """The options genai itself gets; everything else is the TUI's."""
+    out = []
+    for flag, value in (("-p", a.profile), ("-e", a.endpoint), ("-S", a.session)):
+        if value:
+            out += [flag, value]
+    for k in a.skill:
+        out += ["-k", k]
+    if a.coding_anywhere:
+        out.append("--coding-anywhere")
+    elif a.coding:
+        out.append("--coding")
+    return out
 
 
 def main(argv):
-    if "--json" in argv:
-        print("conversation.py adds --json itself; pass only genai's other options", file=sys.stderr)
-        return 2
+    args = parse_args(argv)
+    if args.check:
+        return 0
     locale.setlocale(locale.LC_ALL, "")
     os.environ.setdefault("ESCDELAY", "25")
-    child = Child(argv)
+    child = Child(genai_args(args))
     try:
-        curses.wrapper(lambda scr: App(scr, child).run())
+        curses.wrapper(lambda scr: App(scr, child, Shell.from_env()).run())
     finally:
         child.close()
     return 0

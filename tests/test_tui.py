@@ -150,12 +150,76 @@ class TestModel(unittest.TestCase):
         m.submit("//not a command")
         self.assertEqual(m.outbox[:2], [{"type": "coding", "on": True},
                                         {"type": "skill", "name": "my skill", "on": True}])
-        self.assertIn("usage: /skill", text_of(m.blocks[0]))
+        self.assertTrue(any("usage: /skill" in text_of(b) for b in m.blocks))
         self.assertEqual(m.outbox[2], {"type": "user", "text": "/not a command"})
         m.submit("/coding off")                                   # busy now: waits
         self.assertEqual(len(m.outbox), 3)
         m.submit("/quit")
         self.assertTrue(m.quit)
+
+    def test_run_and_share_need_the_shell_pane(self):
+        m = C.Model()
+        m.handle({"type": "proposal", "id": "p1", "kind": "command", "command": "squeue"})
+        m.submit("/run")
+        self.assertIsNone(m.ask)
+        self.assertIn("genai-tui", text_of(m.blocks[-1]))
+        m.shell = True
+        m.submit("/run p9")
+        self.assertIn("no command proposal to run with id p9", text_of(m.blocks[-1]))
+        m.submit("/run")
+        self.assertEqual((m.ask["kind"], m.ask["command"]), ("run", "squeue"))
+        m.submit("/share")
+        self.assertEqual(m.actions, [("share", "last")])
+
+    def test_share_attaches_then_says_so(self):
+        m = C.Model()
+        m.share("output of p1 (exit 0)", "line one\nline two", "Here is the output of p1.")
+        self.assertEqual(m.outbox, [{"type": "attach", "label": "output of p1 (exit 0)", "text": "line one\nline two"},
+                                    {"type": "user", "text": "Here is the output of p1."}])
+        self.assertIn("[attached: output of p1 (exit 0), 2 lines]", text_of(m.blocks[-1]))
+
+    def test_review_buffer_matches_genai(self):
+        buf = C.review_buffer("ls", 2, "OUTSIDE any sandbox, directly on this host", "x")
+        self.assertIn("I ran this command OUTSIDE any sandbox, directly on this host (exit 2):\n```\nls\n```\nOutput:", buf)
+        self.assertEqual(C.strip_comments("# a\nkeep\n#b\n"), "keep")
+
+    def test_options_split_between_the_tui_and_genai(self):
+        a = C.parse_args(["-p", "hpc", "-S", "night", "-k", "slurm", "-k", "draft", "--coding", "--no-panel"])
+        self.assertEqual(C.genai_args(a), ["-p", "hpc", "-S", "night", "-k", "slurm", "-k", "draft", "--coding"])
+        self.assertEqual(C.genai_args(C.parse_args(["--coding", "--coding-anywhere"])), ["--coding-anywhere"])
+        with self.assertRaises(SystemExit):
+            C.parse_args(["--json"])                              # genai's own wrapper flags aren't options here
+
+    def test_panel_snapshot_and_requests(self):
+        m = C.Model()
+        m.handle({"type": "hello", "version": "1", "endpoint": {"name": "e", "model": "m"}, "sandbox": {"name": "podman"},
+                  "features": ["skills"]})
+        self.assertEqual(m.outbox, [{"type": "skills"}])            # asked for quietly, for the panel
+        m.handle({"type": "skills", "skills": [{"name": "slurm", "status": "blessed", "active": False}]})
+        self.assertEqual(len(m.blocks), 1)                         # not printed in the conversation
+        m.handle({"type": "proposal", "id": "p1", "kind": "read", "path": "a\x1b[2Jb"})
+        snap = m.snapshot()
+        self.assertEqual(snap["session"]["sandbox"], "podman")
+        self.assertEqual(snap["skills"][0]["name"], "slurm")
+        self.assertEqual(snap["proposals"][0]["title"], "read a\\x1b[2Jb")
+        m.outbox = []
+        for bad in ({"type": "skill", "name": "x"}, {"type": "skill", "name": "a\nb", "on": True},
+                    {"type": "decision", "id": "p1", "decision": "accept"}, {"type": "coding", "on": "yes"}, "junk"):
+            m.request(bad)
+        self.assertEqual(m.outbox, [])                             # the panel can't approve or send anything odd
+        m.request({"type": "coding", "on": True})
+        m.request({"type": "skill", "name": "slurm", "on": True})
+        self.assertEqual(m.outbox, [{"type": "coding", "on": True}, {"type": "skill", "name": "slurm", "on": True}])
+
+    def test_share_and_mark_commands(self):
+        m = C.Model()
+        m.shell = True
+        for line in ("/share", "/share mark", "/share all", "/mark", "/share bogus"):
+            m.submit(line)
+        self.assertEqual(m.actions, [("share", "last"), ("share", "mark"), ("share", "all"), ("mark",)])
+        self.assertIn("usage: /share", text_of(m.blocks[-1]))
+        m.request({"type": "share", "what": "mark"})
+        self.assertEqual(m.actions[-1], ("share", "mark"))
 
     def test_failed_turn_ends_busy(self):
         m = C.Model()
@@ -166,9 +230,8 @@ class TestModel(unittest.TestCase):
         self.assertTrue(m.busy)
 
 
-@unittest.skipUnless(shutil.which("tmux"), "needs tmux")
-class TestInTmux(unittest.TestCase):
-    """The pane for real: genai --json against the fake endpoint, typed into through tmux."""
+class TmuxCase(unittest.TestCase):
+    """Helpers for driving a private tmux server; no tests of its own."""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="genai-tui-test-")
@@ -182,20 +245,22 @@ class TestInTmux(unittest.TestCase):
     def screen(self):
         return self.tmux("capture-pane", "-p", "-t", "t")
 
-    def wait_for(self, text, timeout=10):
+    def wait_for(self, text, timeout=10, pane=None):
+        look = (lambda: self.screen(pane)) if pane else self.screen
         end = time.time() + timeout
         while time.time() < end:
-            if text in self.screen():
+            if text in look():
                 return
             time.sleep(0.1)
-        self.fail(f"{text!r} never appeared:\n{self.screen()}")
+        self.fail(f"{text!r} never appeared:\n{look()}")
 
     def type(self, text, enter=True):
         self.tmux("send-keys", "-t", "t", "-l", text)
         if enter:
             self.tmux("send-keys", "-t", "t", "Enter")
 
-    def start(self, api):
+    def config(self, api):
+        """A config home with the fake endpoint blessed, and an empty working directory."""
         home = os.path.join(self.tmp, "cfg", "genai")
         os.makedirs(os.path.join(home, "endpoints"))
         ep = os.path.join(home, "endpoints", "test.json")
@@ -206,6 +271,15 @@ class TestInTmux(unittest.TestCase):
         cfg.set_blessed(ep, {"kind": "endpoint", "name": "test", "hash": G.hash_file(ep)})
         self.wd = os.path.join(self.tmp, "wd")
         os.makedirs(self.wd)
+        return home
+
+
+@unittest.skipUnless(shutil.which("tmux"), "needs tmux")
+class TestInTmux(TmuxCase):
+    """The pane for real: genai --json against the fake endpoint, typed into through tmux."""
+
+    def start(self, api):
+        home = self.config(api)
         cmd = (f"env XDG_CONFIG_HOME={os.path.dirname(home)} LANG=C.UTF-8 TERM=xterm-256color "
                f"{sys.executable} {os.path.join(REPO, 'tui', 'conversation.py')} -e test; sleep 30")
         self.tmux("-f", "/dev/null", "new-session", "-d", "-s", "t", "-x", "90", "-y", "30", "-c", self.wd, cmd)
@@ -249,6 +323,188 @@ class TestInTmux(unittest.TestCase):
             self.wait_for("got it")
             sent = [m for m in api.requests[0]["body"]["messages"] if m["role"] == "user"][-1]["content"]
             self.assertIn("first\npasted\nlines", sent)
+
+
+@unittest.skipUnless(shutil.which("tmux") and shutil.which("script"), "needs tmux and script")
+class TestGenaiTui(TmuxCase):
+    """tui/genai-tui itself: the conversation pane above a real bash pane, started through a pseudo-terminal."""
+
+    def start(self, api, editor="true"):
+        home = self.config(api)
+        env = dict(os.environ, XDG_CONFIG_HOME=os.path.dirname(home), HOME=self.tmp, LANG="C.UTF-8",
+                   TERM="xterm-256color", GENAI_TUI_SOCKET=self.sock, EDITOR=editor, VISUAL=editor)
+        env.pop("TMUX", None)
+        self.proc = subprocess.Popen(["script", "-qfc", f"stty cols 110 rows 40; {REPO}/tui/genai-tui -e test",
+                                      "/dev/null"], cwd=self.wd, env=env, stdin=subprocess.PIPE,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(lambda: (self.tmux("kill-server"), self.proc.wait(10)))
+        end = time.time() + 10
+        while time.time() < end and not self.panes():
+            time.sleep(0.1)
+        self.wait_for("Type a message")
+
+    def panes(self):
+        out = self.tmux("list-panes", "-a", "-F", "#{pane_id} #{@genai_title}")
+        return {t.split(" ")[0]: p for p, _, t in (ln.partition(" ") for ln in out.splitlines())}
+
+    def screen(self, pane="genai"):
+        return self.tmux("capture-pane", "-p", "-t", self.panes().get(pane, "genai"))
+
+    def type(self, text, enter=True):
+        conv = self.panes()["genai"]
+        self.tmux("send-keys", "-t", conv, "-l", text)
+        if enter:
+            self.tmux("send-keys", "-t", conv, "Enter")
+
+    def key(self, k):
+        self.tmux("send-keys", "-t", self.panes()["genai"], k)
+
+    def at_terminal(self, keys):
+        """Keys typed at the terminal itself, so they reach tmux (and its menus) first."""
+        self.proc.stdin.write(keys.encode())
+        self.proc.stdin.flush()
+
+    def click(self, text):
+        """A left click (press and release, as a mouse sends them) on the first conversation row showing text."""
+        y = next(i for i, ln in enumerate(self.screen().splitlines()) if text in ln)
+        xy = [f"{33 + 4:02x}", f"{33 + y:02x}"]
+        self.tmux("send-keys", "-t", self.panes()["genai"], "-H", "1b", "5b", "4d", "20", *xy, "1b", "5b", "4d", "23", *xy)
+
+    def sent(self, api):
+        return [m for m in api.requests[-1]["body"]["messages"] if m["role"] == "user"][-1]["content"]
+
+    def test_run_in_the_shell_pane_then_share(self):
+        turns = [call("propose_command", command="echo from-shell; (exit 3)", reason="look"), reply("exit 3, I see.")]
+        with FakeAPI(turns) as api:
+            self.start(api)
+            self.type("look around")
+            self.wait_for("click it, or /run p1")
+            self.type("/run")
+            where = G.where_runs(G.sandbox_info())
+            self.wait_for("Run p1 in the shell pane?")
+            self.assertIn(where[:20], self.screen())
+            self.key("y")
+            self.wait_for("p1 finished (exit 3). Share the output with the model?")
+            self.assertIn("from-shell", self.screen("shell"))
+            self.key("y")                                          # EDITOR=true saves the buffer unchanged
+            self.wait_for("exit 3, I see.")
+            sent = self.sent(api)
+            self.assertIn(f"I ran this command {where} (exit 3):", sent)
+            self.assertIn("Output:\n```\nfrom-shell\n```", sent)
+            self.assertIn("[output of p1 (exit 3)]", sent)
+
+    def test_click_a_command_for_its_menu(self):
+        turns = [call("propose_command", command="echo via-menu", reason="r"),   # a command ends the turn
+                 call("propose_command", command="echo at-prompt", reason="r")]
+        with FakeAPI(turns) as api:
+            self.start(api)
+            self.type("go")
+            self.wait_for("click it, or /run p1")
+            self.click("echo via-menu")
+            time.sleep(0.5)
+            self.at_terminal("r")                                  # "Run it in the shell pane"
+            self.wait_for("p1 finished (exit 0). Share the output with the model?")
+            self.assertIn("via-menu", self.screen("shell"))
+            self.key("n")
+            self.type("again")
+            self.wait_for("click it, or /run p2")
+            self.click("echo at-prompt")
+            time.sleep(0.5)
+            self.at_terminal("c")                                  # "Copy it"
+            self.wait_for("p2 copied")
+            self.assertEqual(self.tmux("show-buffer", "-b", "genai-copy"), "echo at-prompt")
+            self.click("echo at-prompt")
+            time.sleep(0.5)
+            self.at_terminal("p")                                  # "Put it at the shell prompt"
+            self.wait_for("p2 is at the shell prompt")
+            time.sleep(0.3)
+            last = [ln for ln in self.screen("shell").splitlines() if ln.strip()][-1]
+            self.assertTrue(last.endswith("echo at-prompt"), last)   # typed, not run
+
+    def test_info_panel_switches_coding_and_skills(self):
+        with FakeAPI([reply("hi")]) as api:
+            home = os.path.join(self.tmp, "cfg", "genai")
+            os.makedirs(os.path.join(home, "skills", "slurm"))
+            with open(os.path.join(home, "skills", "slurm", "SKILL.md"), "w") as f:
+                f.write("# Slurm help\n")
+            self.start(api)
+            sk = os.path.join(home, "skills", "slurm")
+            G.Config(home).set_blessed(sk, {"kind": "skill", "name": "slurm", "hash": G.hash_skill(sk)[0]})
+            self.tmux("send-keys", "-t", self.panes()["info"], "r")
+            self.wait_for("[ ] slurm", pane="info")
+            self.assertIn("run OUTSIDE any sandbox" if not G.sandbox_info() else "run in", self.screen("info"))
+            self.tmux("send-keys", "-t", self.panes()["info"], "c")
+            self.wait_for("coding mode is on")
+            self.wait_for("[on]", pane="info")
+            self.tmux("send-keys", "-t", self.panes()["info"], " ")
+            self.wait_for("[x] slurm", pane="info")
+            self.type("/panel")
+            time.sleep(0.5)
+            self.assertNotIn("info", [t.split(" ")[0] for t in
+                                      self.tmux("list-panes", "-t", "genai:0", "-F", "#{@genai_title}").split()])
+
+    def test_right_click_marks_shell_context(self):
+        with FakeAPI([reply("seen it")]) as api:
+            self.start(api)
+            sh = self.panes()["shell"]
+            for c in ("echo before-mark", "echo in-context"):
+                self.tmux("send-keys", "-t", sh, c, "Enter")
+                time.sleep(0.3)
+            y = next(i for i, ln in enumerate(self.screen("shell").splitlines()) if ln.endswith("echo in-context"))
+            top = int(self.tmux("display", "-p", "-t", sh, "#{pane_top}"))
+            self.at_terminal(f"\x1b[<2;5;{top + y + 1}M")              # a right-click, as the terminal reports it
+            time.sleep(0.5)
+            self.at_terminal("m")                                   # "Mark start of context here"
+            time.sleep(0.5)
+            self.type("/share mark")
+            self.wait_for("Share 2 lines of shell history from the mark with the model?")
+            self.key("y")
+            self.wait_for("attached 2 lines of shell history")
+            self.type("what happened?")
+            self.wait_for("seen it")
+            sent = self.sent(api)
+            self.assertIn("echo in-context\nin-context", sent)
+            self.assertNotIn("before-mark", sent)
+
+    def test_busy_shell_is_never_typed_into(self):
+        with FakeAPI([call("propose_command", command="echo should-not-run", reason="r")]) as api:
+            self.start(api)
+            self.type("go")
+            self.wait_for("click it, or /run p1")
+            self.tmux("send-keys", "-t", self.panes()["shell"], "sleep 5", "Enter")
+            time.sleep(0.5)
+            self.type("/run p1")
+            self.wait_for("Run p1")
+            self.key("y")
+            self.wait_for("the shell pane is busy (sleep is running)")
+            self.assertNotIn("should-not-run", self.screen("shell"))
+
+    def test_edit_first_and_share_your_own_command(self):
+        editor = os.path.join(tempfile.mkdtemp(prefix="genai-tui-ed-"), "ed")
+        with open(editor, "w") as f:
+            f.write("#!/bin/sh\nsed -i 's/echo original/echo edited/' \"$1\"\n")
+        os.chmod(editor, 0o700)
+        turns = [call("propose_command", command="echo original", reason="r"), reply("thanks")]
+        with FakeAPI(turns) as api:
+            self.start(api, editor=editor)
+            self.type("go")
+            self.wait_for("click it, or /run p1")
+            self.type("/run")
+            self.wait_for("Run p1")
+            self.key("e")
+            self.wait_for("Run p1 (edited)")
+            self.key("y")
+            self.wait_for("Share the output")
+            self.key("n")
+            self.assertIn("edited", self.screen("shell"))
+            self.assertNotIn("original", self.screen("shell"))
+            self.tmux("send-keys", "-t", self.panes()["shell"], "echo by-hand", "Enter")
+            time.sleep(0.5)
+            self.type("/share")
+            self.wait_for("Last command in the shell pane: echo by-hand (exit 0)")
+            self.key("y")
+            self.wait_for("thanks")
+            self.assertIn("```\necho by-hand\n```\nOutput:\n```\nby-hand\n```", self.sent(api))
 
 
 if __name__ == "__main__":
