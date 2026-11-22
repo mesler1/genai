@@ -2,6 +2,7 @@
 
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -11,6 +12,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(os.path.dirname(HERE), "genai")
@@ -260,6 +262,33 @@ class TestSkills(Tmp):
             f.write("edit")
         self.assertEqual(G.load_skills(cfg, ["slurm"], notes.append), [])
         self.assertIn("changed", notes[-1])
+
+    def test_repl_skill_command(self):
+        home = self.path("home", "genai")
+        d = os.path.join(home, "skills", "slurm")
+        os.makedirs(d)
+        with open(os.path.join(d, "SKILL.md"), "w") as f:
+            f.write("# Slurm help\nSLURM-MARKER\n")
+        cfg = G.Config(home)
+        cfg.ensure()
+        ep = G.Endpoint({"name": "t", "base_url": "https://llm.example/v1", "model": "m"}, "t.json")
+        eng = G.Engine(cfg, ep, G.Session(cfg), G.PlainUI())
+        repl, out = G.Repl(eng), io.StringIO()
+        with mock.patch.object(sys, "stdout", out):
+            repl.command(":skill slurm on")
+            self.assertEqual(eng.skills, [])                        # unblessed: refused
+            bless_path(home, d)
+            repl.command(":skill slurm on")
+            self.assertIn("SLURM-MARKER", eng.system()["content"])
+            repl.command(":skills")
+            repl.command(":skill slurm")
+            repl.command(":skill slurm off")
+        self.assertEqual(eng.skills, [])
+        self.assertNotIn("SLURM-MARKER", eng.system()["content"])
+        text = out.getvalue()
+        self.assertIn("is unblessed", text)
+        self.assertRegex(text, r"(?m)^\* slurm +blessed")
+        self.assertIn("usage: :skill NAME on|off", text)
 
 
 
@@ -516,6 +545,105 @@ class TestEndToEnd(Tmp):
                                capture_output=True, text=True, stdin=subprocess.DEVNULL)
             self.assertEqual(r.returncode, G.EXIT_USAGE)
             self.assertIn("coding mode is refused", r.stderr)
+
+    def test_wrapper_turns_coding_on_and_off(self):
+        turns = [call("read_file", path="a.txt", reason="r"), reply("done"),
+                 call("read_file", path="a.txt", reason="r"), reply("done")]
+        with FakeAPI(turns) as api:
+            g = self.start(api)
+            with open(os.path.join(self.wd, "a.txt"), "w") as f:
+                f.write("visible")
+            hello = g.until("hello")
+            self.assertIn("set_coding", hello["features"])
+            g.send({"type": "coding", "on": "yes"})
+            self.assertEqual(g.until("error")["code"], "bad_message")
+            g.send({"type": "coding", "on": True})
+            ev = g.until("coding")
+            self.assertEqual((ev["on"], ev["coding_from"]), (True, "wrapper"))
+            g.send({"type": "user", "text": "x"})
+            self.assertTrue(g.until("proposal").get("auto"))
+            g.until("done")
+            g.send({"type": "coding", "on": False})
+            self.assertEqual((g.until("coding")["on"]), False)
+            g.send({"type": "user", "text": "x"})
+            p = g.until("proposal")
+            self.assertFalse(p.get("auto"))
+            g.send({"type": "decision", "id": p["id"], "decision": "decline"})
+            g.until("done")
+            g.close()
+            coding = [a for a in self.audit() if a["event"] == "coding"]
+            self.assertEqual([(a["on"], a["source"]) for a in coding], [(True, "wrapper"), (False, "wrapper")])
+
+    def test_wrapper_coding_refused_in_home(self):
+        with FakeAPI([]) as api:
+            fake_home = self.path("fakehome")
+            os.makedirs(fake_home)
+            with mock.patch.dict(os.environ, HOME=fake_home):
+                home, path = make_home(self.tmp, api.url)
+                bless_path(home, path)
+                g = Proc(home, fake_home, ["-e", "test"])
+            g.send({"type": "coding", "on": True})
+            err = g.until("error")
+            self.assertEqual(err["code"], "coding_refused")
+            self.assertIn("coding mode is refused", err["message"])
+            self.assertFalse(g.until("coding")["on"])
+            g.close()
+
+    def test_coding_change_refused_while_proposals_pending(self):
+        with FakeAPI([call("write_file", path="x", content="y", reason="r"), reply("ok")]) as api:
+            g = self.start(api)
+            g.send({"type": "user", "text": "go"})
+            p = g.until("proposal")
+            g.send({"type": "coding", "on": True})
+            g.send({"type": "skill", "name": "slurm", "on": True})
+            self.assertEqual(g.until("error")["code"], "busy")
+            self.assertEqual(g.until("error")["code"], "busy")
+            g.send({"type": "decision", "id": p["id"], "decision": "decline"})
+            g.until("done")
+            g.close()
+            self.assertFalse(any(e["type"] == "coding" for e in g.events))
+
+    def test_wrapper_turns_skills_on_and_off(self):
+        with FakeAPI([reply("one"), reply("two")]) as api:
+            g = self.start(api)
+            skills = os.path.join(self.home, "skills")
+            for name in ("slurm", "draft"):
+                os.makedirs(os.path.join(skills, name))
+                with open(os.path.join(skills, name, "SKILL.md"), "w") as f:
+                    f.write(f"# {name} help\n{name.upper()}-MARKER\n")
+            bless_path(self.home, os.path.join(skills, "slurm"))
+            hello = g.until("hello")
+            self.assertEqual(hello["skills"], [])
+            self.assertIn("skills", hello["features"])
+            g.send({"type": "skills"})
+            rows = {r["name"]: r for r in g.until("skills")["skills"]}
+            self.assertEqual({n: (r["status"], r["active"]) for n, r in rows.items()},
+                             {"slurm": ("blessed", False), "draft": ("unblessed", False)})
+            g.send({"type": "skill", "name": "nope", "on": True})
+            self.assertEqual(g.until("error")["code"], "unknown_skill")
+            g.until("skills")
+            g.send({"type": "skill", "name": "draft", "on": True})
+            err = g.until("error")
+            self.assertEqual(err["code"], "not_blessed")
+            self.assertIn("genai --bless", err["message"])
+            self.assertFalse({r["name"]: r["active"] for r in g.until("skills")["skills"]}["draft"])
+            g.send({"type": "skill", "name": "slurm"})
+            self.assertEqual(g.until("error")["code"], "bad_message")
+            g.send({"type": "skill", "name": "slurm", "on": True})
+            self.assertTrue({r["name"]: r["active"] for r in g.until("skills")["skills"]}["slurm"])
+            g.send({"type": "user", "text": "a"})
+            g.until("done")
+            g.send({"type": "skill", "name": "slurm", "on": False})
+            self.assertFalse({r["name"]: r["active"] for r in g.until("skills")["skills"]}["slurm"])
+            g.send({"type": "user", "text": "b"})
+            g.until("done")
+            g.close()
+            systems = [r["body"]["messages"][0]["content"] for r in api.requests if "body" in r]
+            self.assertIn("SLURM-MARKER", systems[0])
+            self.assertNotIn("SLURM-MARKER", systems[1])
+            self.assertFalse(any("DRAFT-MARKER" in s for s in systems))
+            self.assertEqual([(a["name"], a["on"]) for a in self.audit() if a["event"] == "skill"],
+                             [("slurm", True), ("slurm", False)])
 
     def test_register_tools_relay(self):
         turns = [call("job_details", job="48211"), reply("thanks")]

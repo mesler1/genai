@@ -497,6 +497,17 @@ def skill_status(cfg, skill):
     return bless_status(cfg, "skill", skill.path, skill.hash)
 
 
+def skill_rows(cfg, active=None):
+    """Every skill found, for listings. active: names in use, marked when given."""
+    rows = []
+    for n, s in sorted(find_skills(cfg).items()):
+        row = {"name": n, "path": s.path, "description": s.description(), "status": skill_status(cfg, s)}
+        if active is not None:
+            row["active"] = n in active
+        rows.append(row)
+    return rows
+
+
 def load_skills(cfg, names, notice):
     """Return the usable skills among names; skip and report the rest."""
     found, out = find_skills(cfg), []
@@ -1572,7 +1583,7 @@ class Engine:
     def reload_skills(self):
         self.skills = load_skills(self.cfg, self.session.skills, self.ui.notice)
 
-    def set_coding(self, on):
+    def set_coding(self, on, source=":coding"):
         refused = coding_refusal(os.getcwd()) if on else None
         if refused and not self.anywhere:
             raise GenaiError(f"coding mode is refused in {refused[0]}; cd into a project first "
@@ -1586,8 +1597,26 @@ class Engine:
                            "still ask.")
         self.session.coding = on
         self.session.cwd = os.getcwd()
-        self.coding_from = ":coding" if on else None
-        self.audit.log("coding", on=on, cwd=os.getcwd(), override=self.coding_override)
+        self.coding_from = source if on else None
+        self.audit.log("coding", on=on, source=source, cwd=os.getcwd(), override=self.coding_override)
+
+    def set_skill(self, name, on):
+        """Use a skill from the next request on, or stop using it. Only a blessed skill can be turned on."""
+        if on:
+            s = find_skills(self.cfg).get(name)
+            if not s:
+                raise GenaiError(f"skill '{name}' not found", EXIT_USAGE, "unknown_skill")
+            st = skill_status(self.cfg, s)
+            if st != "blessed":
+                raise GenaiError(f"skill '{name}' is {st}; read it, then: genai --bless {s.path}", EXIT_USAGE,
+                                 "not_blessed")
+            if name not in self.session.skills:
+                self.session.skills.append(name)
+        elif name in self.session.skills:
+            self.session.skills.remove(name)
+        self.reload_skills()
+        self.session.usage = None   # the system prompt changed, so the last measured size no longer holds
+        self.audit.log("skill", name=name, on=on)
 
     def register(self, tools):
         added = []
@@ -2246,7 +2275,9 @@ Commands (on an empty buffer):
   :coding on|off  let the model read and list files here without asking
   :compact [-e]   prune old file contents and output; summarize if still large
   :context        show how full the context is
-  :skills         list skills          :bless PATH   bless a skill, endpoint or profile
+  :skills         list skills, marking the ones in use
+  :skill NAME on|off  use a blessed skill from the next message on, or stop using it
+  :bless PATH     bless a skill, endpoint or profile
   :help           this text            :quit         leave"""
 
 
@@ -2346,8 +2377,18 @@ class Repl:
             elif cmd == "context":
                 print(f"context: {self.e.used()}/{self.e.endpoint.context_limit} tokens (estimated)")
             elif cmd == "skills":
-                for name, s in sorted(find_skills(self.e.cfg).items()):
-                    print(f"  {one_line(name)[0]:20} {skill_status(self.e.cfg, s):10} {one_line(s.description())[0]}")
+                for r in skill_rows(self.e.cfg, [s.name for s in self.e.skills]):
+                    print(f"{'*' if r['active'] else ' '} {one_line(r['name'])[0]:20} {r['status']:10} "
+                          f"{one_line(r['description'])[0]}")
+            elif cmd == "skill":
+                name, _, state = arg.partition(" ")
+                if not name or state.strip() not in ("on", "off"):
+                    print("usage: :skill NAME on|off")
+                else:
+                    self.e.set_skill(name, state.strip() == "on")
+                    self.e.session.save()
+                    print(f"skill {one_line(name)[0]} is {'on' if state.strip() == 'on' else 'off'} "
+                          "from your next message")
             elif cmd == "bless":
                 if bless(self.e.cfg, arg, ask_yes):
                     self.e.reload_skills()
@@ -2469,7 +2510,8 @@ def read_attachment(path):
 def run_json(engine, ui, first_prompt, attachments):
     ui.engine = engine
     ui.emit({"type": "hello", "protocol": PROTOCOL, "version": VERSION,
-             "features": ["proposals", "decisions", "attach", "register_tools", "compact", "context", "coding"],
+             "features": ["proposals", "decisions", "attach", "register_tools", "compact", "context", "coding",
+                          "set_coding", "skills"],
              "endpoint": engine.endpoint.info(),
              "profile": {"name": engine.profile.name, "description": engine.profile.description}
              if engine.profile else None,
@@ -2478,6 +2520,7 @@ def run_json(engine, ui, first_prompt, attachments):
              "coding_from": engine.coding_from if engine.session.coding else None,
              "coding_override": engine.coding_override if engine.session.coding else None, "cwd": os.getcwd(),
              "sandbox": engine.sandbox,
+             "skills": [s.name for s in engine.skills],
              "tools": list(INTRINSICS)})
     engine.audit.log("start", mode="json", endpoint=engine.endpoint.info(),
                      profile=engine.profile.name if engine.profile else None, session=engine.session.id,
@@ -2523,6 +2566,31 @@ def run_json(engine, ui, first_prompt, attachments):
                          "summary": r["summary"]})
             except GenaiError as err:
                 ui.error(str(err), err.kind)
+        elif t == "coding":
+            on = msg.get("on")
+            if not isinstance(on, bool):
+                ui.error("coding needs 'on': true or false", "bad_message")
+                continue
+            try:
+                engine.set_coding(on, "wrapper")
+                engine.session.save()
+            except GenaiError as err:
+                ui.error(str(err), "coding_refused")
+            ui.emit({"type": "coding", "on": engine.session.coding, "coding_from": engine.coding_from,
+                     "coding_override": engine.coding_override if engine.session.coding else None})
+        elif t == "skills":
+            ui.emit({"type": "skills", "skills": skill_rows(engine.cfg, [s.name for s in engine.skills])})
+        elif t == "skill":
+            name, on = msg.get("name"), msg.get("on")
+            if not isinstance(name, str) or not isinstance(on, bool):
+                ui.error("skill needs 'name' and 'on': true or false", "bad_message")
+                continue
+            try:
+                engine.set_skill(name, on)
+                engine.session.save()
+            except GenaiError as err:
+                ui.error(str(err), err.kind)
+            ui.emit({"type": "skills", "skills": skill_rows(engine.cfg, [s.name for s in engine.skills])})
         elif t in ("decision", "result"):
             ui.error(f"no pending proposal {msg.get('id')!r}", "unknown_id")
         else:
@@ -2564,8 +2632,7 @@ def main(argv=None):
                 raise GenaiError("blessing needs a terminal: it asks you to confirm you have read it", EXIT_USAGE)
             return EXIT_OK if bless(cfg, args.bless, ask_yes) else EXIT_ERROR
         if args.list_skills:
-            rows = [{"name": n, "path": s.path, "description": s.description(), "status": skill_status(cfg, s)}
-                    for n, s in sorted(find_skills(cfg).items())]
+            rows = skill_rows(cfg)
             if args.json:
                 print(json.dumps({"type": "skills", "skills": rows}))
             else:

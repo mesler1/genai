@@ -176,6 +176,51 @@ genai --bless ~/.config/genai/hooks/notify
 Anything else, such as another front end or automatic decisions, belongs in a wrapper over
 `--json`.
 
+## JSON protocol
+
+`genai --json` speaks JSON Lines over stdin and stdout: one object per line, each with a
+`type`. A wrapper is the user interface. It shows proposals and sends back decisions, and genai
+still enforces its own rules: blessing, coding-mode refusals, masking. Text from the model
+arrives as it is, so the wrapper must escape it before it displays it.
+
+genai's first line is `hello`. It has `protocol` (1), `version`, `features`, `endpoint`,
+`profile`, `session`, `resumed`, `coding`, `coding_from`, `coding_override`, `cwd`, `sandbox`,
+the active `skills`, and the model's `tools`. Check `features` before you use a message added
+later.
+
+**Messages a wrapper sends**
+
+| `type` | Fields | What happens |
+|---|---|---|
+| `user` | `text` | Sends a message to the model, with any queued attachments. |
+| `attach` | `text`, optional `label`, `ref` | Queues text for the next `user` message. Secrets in it are masked. Answered by `attached`. |
+| `decision` | `id`, `decision` (`accept` or `decline`) | Decides a read, list, write or edit proposal. |
+| `result` | `id`, `status` (`ok`, `declined`, `error`), `output` | Answers a proposal for a tool the wrapper registered. |
+| `register_tools` | `tools`: a list of `{name, description, parameters}` | Adds tools the model can call. The wrapper performs them. Answered by `registered`. |
+| `compact` | | Shrinks the conversation. Answered by `compacted`. |
+| `coding` | `on` (true or false) | Turns coding mode on or off. The same places are refused as for `--coding` (error `coding_refused`), and `--coding-anywhere` stays a command-line flag. Always answered by a `coding` event with the state now. |
+| `skills` | | Answered by `skills`: every skill, its blessing `status`, and whether it is `active`. |
+| `skill` | `name`, `on` (true or false) | Uses a skill from the next request on, or stops using it. Only a blessed skill can be turned on (errors `unknown_skill`, `not_blessed`). Always answered by a fresh `skills` list. |
+
+While proposals are waiting for decisions, only `decision`, `result` and `attach` are accepted.
+Anything else gets the error `busy`, so coding mode and skills never change halfway through a
+decision.
+
+**Events genai sends**
+
+| `type` | Meaning |
+|---|---|
+| `text` | A piece of the model's reply. |
+| `proposal` | `id`, `kind` (`read`, `list`, `write`, `edit`, `command`, `external`, `invalid`), and the proposal's fields, such as `path`, `content`, `diff`, `command` and `reason`. `auto: true` means coding mode allowed it without asking. `secret: true` means the file looks like it holds secrets. A command is only shown: the wrapper runs it, if the user wants to, and can share the output with `attach`. |
+| `result` | `id`, `status`, `detail`: what happened to a proposal that was performed. |
+| `done` | The turn ended. `reason` is `reply`, `command` or `step_limit`; `context` gives `used` and `limit`. |
+| `context` | The conversation is getting near the context limit. |
+| `notice` | Something the user should know. |
+| `error` | `code` and `message`. |
+| `attached`, `registered`, `compacted`, `coding`, `skills` | Answers to the messages above. |
+
+When stdin closes, every waiting proposal is declined and genai exits.
+
 ## Live test
 
 The live test takes any endpoint file that uses `key_env`. It checks the endpoint and model list,
