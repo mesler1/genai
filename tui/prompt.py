@@ -4,7 +4,7 @@
 Typing, history, paste and Tab completion happen here. What you send, and your answers to
 approval and run questions, go to the conversation pane through genai-tui's private pipe
 ($GENAI_TUI_STATE/requests); the conversation pane owns genai and decides everything. It tells
-this pane what to show in $GENAI_TUI_STATE/prompt.json. Double-tap ~ for a fullscreen shell.
+this pane what to show in $GENAI_TUI_STATE/prompt.json. Typing ~~ makes the shell fullscreen.
 Standard library only; Python 3.10 or newer.
 """
 
@@ -20,7 +20,6 @@ from conversation import A, D, Q, R, SPIN, W, Editor, complete, edit_key, fit, w
 
 STATE = os.environ.get("GENAI_TUI_STATE", "")
 SHELL = os.environ.get("GENAI_TUI_SHELL", "")
-TILDE_GAP = 0.4            # seconds between the two taps of ~~
 SETTLE = 0.3               # keys this soon after a question appears are typing, not an answer
 
 
@@ -56,7 +55,7 @@ class Prompt:
     def __init__(self, scr):
         self.scr, self.ed = scr, Editor()
         self.view, self.mtime, self.height, self.title = {}, None, 0, None
-        self.paste, self.tilde, self.ctrl_c = None, 0.0, 0.0
+        self.paste, self.ctrl_c = None, 0.0
         self.asked_at = 0.0
         curses.raw()
         curses.use_default_colors()
@@ -173,14 +172,10 @@ class Prompt:
             if isinstance(k, str) and k.isprintable() and time.time() - self.asked_at >= SETTLE:
                 self.answer(k.lower())
             return
-        if k == "~":
-            now = time.time()
-            if now - self.tilde < TILDE_GAP and ed.text[ed.pos - 1:ed.pos] == "~":
-                ed.backspace()
-                self.tilde = 0.0
-                shell_fullscreen()
-                return
-            self.tilde = now
+        if k == "~" and ed.text[ed.pos - 1:ed.pos] == "~":     # ~~, typed at any speed (a pasted ~~ stays text)
+            ed.backspace()
+            shell_fullscreen()
+            return
         if k in ("\n", "\r", curses.KEY_ENTER):
             if ed.text.endswith("\\") and ed.pos == len(ed.text):
                 ed.backspace()
