@@ -645,6 +645,50 @@ class TestEndToEnd(Tmp):
             self.assertEqual([(a["name"], a["on"]) for a in self.audit() if a["event"] == "skill"],
                              [("slurm", True), ("slurm", False)])
 
+    def test_files_marks_secrets_for_the_tree(self):
+        with FakeAPI([]) as api:
+            g = self.start(api)
+            files = {"plain.txt": "hello\n", "notes.txt": "password = hunter2xyz\n", ".env": "TOKEN=abcdefgh\n",
+                     ".hidden.txt": "nothing here\n", "sub/inner.txt": "x\n"}
+            for rel, text in files.items():
+                os.makedirs(os.path.dirname(os.path.join(self.wd, rel)), exist_ok=True)
+                with open(os.path.join(self.wd, rel), "w") as f:
+                    f.write(text)
+            with open(os.path.join(self.wd, "blob.bin"), "wb") as f:
+                f.write(b"\0\1\2")
+            os.symlink("/etc/hostname", os.path.join(self.wd, "link"))
+            self.assertIn("files", g.until("hello")["features"])
+
+            g.send({"type": "files"})
+            ev = g.until("files")
+            rows = {r["name"]: r for r in ev["entries"]}
+            self.assertEqual(ev["path"], ".")
+            self.assertEqual([r["name"] for r in ev["entries"]], sorted(rows))
+            self.assertEqual({n: (r["kind"], r.get("secret"), r["hidden"]) for n, r in rows.items()},
+                             {"plain.txt": ("file", False, False), "notes.txt": ("file", True, False),
+                              ".env": ("file", True, True), ".hidden.txt": ("file", False, True),
+                              "blob.bin": ("file", None, False), "sub": ("dir", None, False),
+                              "link": ("symlink", None, False)})
+            self.assertTrue(all(r["asks"] for r in rows.values() if r["kind"] == "file"))   # coding off
+
+            g.send({"type": "coding", "on": True})
+            g.until("coding")
+            g.send({"type": "files", "path": "."})
+            rows = {r["name"]: r for r in g.until("files")["entries"]}
+            self.assertEqual({n: r["asks"] for n, r in rows.items() if r["kind"] == "file"},
+                             {"plain.txt": False, "notes.txt": True, ".env": True, ".hidden.txt": True,
+                              "blob.bin": True})
+
+            g.send({"type": "files", "path": "sub"})
+            self.assertEqual([r["name"] for r in g.until("files")["entries"]], ["inner.txt"])
+            for bad in ("..", "/etc", "link", "missing"):
+                g.send({"type": "files", "path": bad})
+                self.assertEqual(g.until("error")["code"], "bad_path", bad)
+            g.send({"type": "files", "path": 3})
+            self.assertEqual(g.until("error")["code"], "bad_message")
+            g.close()
+            self.assertEqual(api.requests, [])          # classifying files sends nothing to the endpoint
+
     def test_register_tools_relay(self):
         turns = [call("job_details", job="48211"), reply("thanks")]
         with FakeAPI(turns) as api:

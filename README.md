@@ -201,6 +201,7 @@ later.
 | `coding` | `on` (true or false) | Turns coding mode on or off. The same places are refused as for `--coding` (error `coding_refused`), and `--coding-anywhere` stays a command-line flag. Always answered by a `coding` event with the state now. |
 | `skills` | | Answered by `skills`: every skill, its blessing `status`, and whether it is `active`. |
 | `skill` | `name`, `on` (true or false) | Uses a skill from the next request on, or stops using it. Only a blessed skill can be turned on (errors `unknown_skill`, `not_blessed`). Always answered by a fresh `skills` list. |
+| `files` | optional `path` (default `.`) | Lists one directory under the working directory, for a file tree. Each entry has `name`, `kind` (`file`, `dir`, `symlink`, `other`), `size` and `hidden`. A file also has `secret` (it looks like it holds secrets; `null` if genai would not read it at all, such as a binary or a file over the read limit) and `asks` (reading it would need your OK, even in coding mode). Contents are read only to classify them and never reach the model. Symlinks are listed, not followed; a bad path gets the error `bad_path`. |
 
 While proposals are waiting for decisions, only `decision`, `result` and `attach` are accepted.
 Anything else gets the error `busy`, so coding mode and skills never change halfway through a
@@ -217,7 +218,7 @@ decision.
 | `context` | The conversation is getting near the context limit. |
 | `notice` | Something the user should know. |
 | `error` | `code` and `message`. |
-| `attached`, `registered`, `compacted`, `coding`, `skills` | Answers to the messages above. |
+| `attached`, `registered`, `compacted`, `coding`, `skills`, `files` | Answers to the messages above. |
 
 When stdin closes, every waiting proposal is declined and genai exits.
 

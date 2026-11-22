@@ -1828,6 +1828,24 @@ class Engine:
                     p.reply = "declined by the user"
             return p
 
+    def files(self, path):
+        """One directory as a file tree shows it: each entry, whether it looks like it holds secrets, and
+        whether reading it would ask first. Contents are read only to classify them; none of this reaches
+        the model. secret is None when genai would not read the file at all (too big, binary, unreadable)."""
+        parts = split_rel(path) if path not in ("", ".", "./") else []
+        rows = []
+        for name, kind, size in sorted(self.wd.list(path)):
+            sub = parts + [name]
+            row = {"name": name, "kind": kind, "size": size, "hidden": is_hidden(sub)}
+            if kind == "file":
+                try:
+                    row["secret"] = looks_secret(self.wd.read("/".join(sub)))
+                except (ValueError, OSError):
+                    row["secret"] = None
+                row["asks"] = not self.read_allowed(sub) or row["secret"] is not False
+            rows.append(row)
+        return rows
+
     def read_allowed(self, parts):
         """Would reading this path be allowed without asking? (coding mode, not hidden)"""
         return bool(self.session.coding and not is_hidden(parts) and self.ui.performs)
@@ -2511,7 +2529,7 @@ def run_json(engine, ui, first_prompt, attachments):
     ui.engine = engine
     ui.emit({"type": "hello", "protocol": PROTOCOL, "version": VERSION,
              "features": ["proposals", "decisions", "attach", "register_tools", "compact", "context", "coding",
-                          "set_coding", "skills"],
+                          "set_coding", "skills", "files"],
              "endpoint": engine.endpoint.info(),
              "profile": {"name": engine.profile.name, "description": engine.profile.description}
              if engine.profile else None,
@@ -2591,6 +2609,15 @@ def run_json(engine, ui, first_prompt, attachments):
             except GenaiError as err:
                 ui.error(str(err), err.kind)
             ui.emit({"type": "skills", "skills": skill_rows(engine.cfg, [s.name for s in engine.skills])})
+        elif t == "files":
+            path = msg.get("path", ".")
+            if not isinstance(path, str):
+                ui.error("files needs 'path' as a string", "bad_message")
+                continue
+            try:
+                ui.emit({"type": "files", "path": path, "entries": engine.files(path)})
+            except (ValueError, OSError) as err:
+                ui.error(f"cannot list {path}: {err}", "bad_path")
         elif t in ("decision", "result"):
             ui.error(f"no pending proposal {msg.get('id')!r}", "unknown_id")
         else:
