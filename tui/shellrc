@@ -16,19 +16,14 @@ __genai_prompt() {
   return "$rc"
 }
 PROMPT_COMMAND="__genai_prompt${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
-# `` on an empty command line: this shell fullscreen, and back again (to the prompt pane). Anywhere
-# else `` is typed as it is, and a single ` types after a moment (readline's keyseq-timeout).
-__genai_zoom() {
-  if [ -n "$READLINE_LINE" ] || [ -z "${TMUX:-}" ]; then
+# `` on an empty command line hides this shell again (it keeps running) and goes back to the prompt.
+# Anywhere else `` is typed as it is, and a single ` types after a moment (readline's keyseq-timeout).
+__genai_hide() {
+  if [ -n "$READLINE_LINE" ] || [ -z "${TMUX:-}" ] || [ -z "${GENAI_TUI_TOGGLE:-}" ]; then
     READLINE_LINE="${READLINE_LINE:0:READLINE_POINT}\`\`${READLINE_LINE:READLINE_POINT}"
     READLINE_POINT=$((READLINE_POINT + 2))
     return
   fi
-  tmux resize-pane -Z -t "$TMUX_PANE"
-  if [ "$(tmux display -p -t "$TMUX_PANE" '#{window_zoomed_flag}')" = 0 ]; then
-    local p
-    p=$(tmux show -gqv @genai_prompt_pane)
-    [ -n "$p" ] && tmux select-pane -t "$p"
-  fi
+  "$GENAI_TUI_TOGGLE" hide
 }
-bind -x '"``": __genai_zoom' 2>/dev/null
+bind -x '"``": __genai_hide' 2>/dev/null

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# genai-tui: genai in tmux, as one coding agent. The conversation is at the top, your own shell
-# below it, the prompt you type into at the bottom, and an info panel on the right. /run types a
-# proposed command into the shell, /share sends what it printed, right-clicking the shell marks
-# where shell context starts, and `` on an empty line makes the shell fullscreen.
+# genai-tui: genai in tmux, as one coding agent. The conversation, the prompt you type into below
+# it, and an info panel on the right. Your own shell runs hidden: `` on an empty line shows it above
+# the conversation, or hides it again. /run types a proposed command into that shell, /share sends
+# what it printed, and right-clicking the shell marks where shell context starts.
 # Usage: genai-tui [-h] [-p PROFILE] [-e ENDPOINT] [-S SESSION] [-k SKILL] [--coding] [--no-panel]
 set -euo pipefail
 here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
@@ -46,14 +46,16 @@ q() { printf '%q' "$1"; }
 read -r rows cols < <(stty size 2>/dev/null) || true
 cols=${cols:-120}
 t -f /dev/null new-session -d -s genai -n genai -x "$cols" -y "${rows:-40}" -c "$PWD" \
-  -e "GENAI_TUI_STATE=$state" "bash --rcfile $(q "$here/shellrc") -i"
+  -e "GENAI_TUI_STATE=$state" -e "GENAI_TUI_TOGGLE=$here/shell-toggle" "bash --rcfile $(q "$here/shellrc") -i"
 shell=$(t display -p -t genai '#{pane_id}')
 side=$(t split-window -d -h -f -l 42 -t "$shell" -e "GENAI_TUI_STATE=$state" -P -F '#{pane_id}' \
   "$(q "$py") $(q "$here/panel.py")")
+# Top to bottom: the shell, the conversation, the prompt. The shell is hidden once it all exists.
 prompt=$(t split-window -d -v -l 3 -t "$shell" -e "GENAI_TUI_STATE=$state" -e "GENAI_TUI_SHELL=$shell" \
-  -P -F '#{pane_id}' "$(q "$py") $(q "$here/prompt.py")")
+  -e "GENAI_TUI_TOGGLE=$here/shell-toggle" -P -F '#{pane_id}' "$(q "$py") $(q "$here/prompt.py")")
 conv_cmd="$(q "$py") $(q "$here/conversation.py") $(printf '%q ' "$@")"
-conv=$(t split-window -d -b -v -l 65% -t "$shell" -c "$PWD" -e "GENAI_TUI_SHELL=$shell" -e "GENAI_TUI_PANEL=$side" \
+conv=$(t split-window -d -v -l 60% -t "$shell" -c "$PWD" -e "GENAI_TUI_SHELL=$shell" -e "GENAI_TUI_PANEL=$side" \
+  -e "GENAI_TUI_TOGGLE=$here/shell-toggle" \
   -e "GENAI_TUI_STATE=$state" -e "GENAI_TUI_PROMPT=$prompt" -P -F '#{pane_id}' \
   "$conv_cmd; rc=\$?; if [ \$rc -ne 0 ]; then echo; echo \"genai-tui: the conversation ended with code \$rc. Press Enter.\"; read -r _; fi; tmux kill-server")
 if [ "$panel" = 0 ] || [ "$cols" -lt 100 ]; then
@@ -75,11 +77,15 @@ t set -g pane-active-border-style 'fg=blue,bold'
 t set -g status-style 'bg=default,fg=default'
 t set -g status-left ' genai │ '
 t set -g status-left-length 20
-t set -g status-right ' #H │ right-click the shell for context │ Ctrl-b o: other pane │ Ctrl-b d: detach '
+t set -g status-right ' #H │ `` shows the shell │ Ctrl-b o: other pane │ Ctrl-b d: detach '
+t set -g window-status-format ''          # hidden panes live in other windows; don't list them
+t set -g window-status-current-format ''
 t set -g status-right-length 100
 t set -g @genai_prompt_pane "$prompt"
+t set -g @genai_shell_pane "$shell"
+t set -g @genai_conv_pane "$conv"
 t set -p -t "$conv" @genai_title 'genai'
-t set -p -t "$shell" @genai_title 'shell · `` fullscreen · right-click: shell context'
+t set -p -t "$shell" @genai_title 'shell · `` hides it · right-click: shell context'
 t set -p -t "$prompt" @genai_title 'you'
 t set -p -t "$side" @genai_title 'info · /panel hides it'
 
@@ -103,6 +109,8 @@ bind -n MouseDown3Pane {
 EOF
 t set-environment -g GENAI_TUI_STATE "$state"
 t source-file "$state/menu.conf"
+t set-environment -g GENAI_TUI_TOGGLE "$here/shell-toggle"
+t run-shell "$(q "$here/shell-toggle") hide"
 t select-pane -t "$prompt"
 t attach -t genai || true
 if t has-session 2>/dev/null; then

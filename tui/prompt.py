@@ -4,8 +4,8 @@
 Typing, history, paste and Tab completion happen here. What you send, and your answers to
 approval and run questions, go to the conversation pane through genai-tui's private pipe
 ($GENAI_TUI_STATE/requests); the conversation pane owns genai and decides everything. It tells
-this pane what to show in $GENAI_TUI_STATE/prompt.json. Typing `` on an empty input makes the shell
-fullscreen.
+this pane what to show in $GENAI_TUI_STATE/prompt.json. Typing `` on an empty input shows your shell
+above the conversation, or hides it again.
 Standard library only; Python 3.10 or newer.
 """
 
@@ -45,11 +45,14 @@ def tmux(*args):
         return ""
 
 
-def shell_fullscreen():
-    """The shell pane, zoomed to the whole window; `` on its empty prompt (or Ctrl-b z) comes back."""
-    if SHELL:
-        tmux("select-pane", "-t", SHELL)
-        tmux("resize-pane", "-Z", "-t", SHELL)
+def toggle_shell():
+    """Show the shell above the conversation and go there, or hide it; `` on its empty prompt hides it."""
+    toggle = os.environ.get("GENAI_TUI_TOGGLE")
+    if toggle:
+        try:
+            subprocess.run([toggle, "toggle", "--focus"], capture_output=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            pass
 
 
 class Prompt:
@@ -111,7 +114,7 @@ class Prompt:
                     pass
                 x += width(text)
         v = self.view
-        hints = v.get("hints") or "Enter send · Alt+Enter new line · ↑ earlier · `` shell fullscreen · /help"
+        hints = v.get("hints") or "Enter send · Alt+Enter new line · ↑ earlier · `` shell · /help"
         if v.get("mode", "input") == "input" and v.get("busy"):
             hints = f"{SPIN[int(time.time() * 10) % len(SPIN)]} genai is replying · type ahead, Enter queues it"
         try:
@@ -175,7 +178,7 @@ class Prompt:
             return
         if k == "`" and ed.text == "`":       # `` on an empty input, at any speed; backticks in a message stay text
             ed.text, ed.pos = "", 0
-            shell_fullscreen()
+            toggle_shell()
             return
         if k in ("\n", "\r", curses.KEY_ENTER):
             if ed.text.endswith("\\") and ed.pos == len(ed.text):
