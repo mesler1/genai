@@ -1909,6 +1909,8 @@ def parse_args(argv):
     ap.add_argument("-e", "--endpoint", help="endpoint name (overrides the profile's)")
     ap.add_argument("-S", "--session", help="keep the conversation in a named session (created or resumed)")
     ap.add_argument("-k", "--skill", action="append", default=[], help="use a blessed skill (repeatable)")
+    ap.add_argument("--allow-session-endpoint-change", action="store_true",
+                    help="allow sending saved context to a changed or unrecorded destination")
     ap.add_argument("--coding", action="store_true", help="let the model read and list files here without asking")
     ap.add_argument("--coding-anywhere", action="store_true",
                     help="--coding, also where it is normally refused; genai says what that exposes")
@@ -1925,6 +1927,8 @@ def genai_args(a):
             out += [flag, value]
     for k in a.skill:
         out += ["-k", k]
+    if a.allow_session_endpoint_change:
+        out.append("--allow-session-endpoint-change")
     if a.coding_anywhere:
         out.append("--coding-anywhere")
     elif a.coding:
