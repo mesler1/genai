@@ -6,7 +6,7 @@ Usage: request.py share mark|all|last
        request.py raw N|last|all
        request.py system
        request.py copy N
-       request.py menu run|edit|prompt|copy ID
+       request.py menu run|edit|prompt|copy|decline ID
        request.py menu open N          (Alt+N: the menu of the command proposal showing Alt+N)
 """
 
@@ -29,7 +29,7 @@ def main(argv):
         msg = {"type": "system"}
     elif len(argv) == 1 and argv[0] in ("mark", "unmark"):
         msg = {"type": "mark", "on": argv[0] == "mark"}
-    elif (len(argv) == 3 and argv[0] == "menu" and argv[1] in ("run", "edit", "prompt", "copy")
+    elif (len(argv) == 3 and argv[0] == "menu" and argv[1] in ("run", "edit", "prompt", "copy", "decline")
           and re.fullmatch(r"p[0-9]{1,9}", argv[2])):
         msg = {"type": "menu", "action": argv[1], "id": argv[2]}
     elif len(argv) == 3 and argv[0] == "menu" and argv[1] == "open" and re.fullmatch(r"[1-9]", argv[2]):
