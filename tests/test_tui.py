@@ -189,6 +189,50 @@ class TestModel(unittest.TestCase):
         self.assertEqual(sum(isinstance(b, C.Reply) for b in m.blocks), 1)
         self.assertIn("Hello", text_of(m.blocks[-1]))
 
+    def test_decline_a_command(self):
+        m = C.Model()
+        self.hello(m)
+        m.submit("go")
+        for i in (1, 2):
+            m.handle({"type": "proposal", "id": f"p{i}", "kind": "command", "command": f"rm -rf build{i}"})
+        m.handle({"type": "done", "reason": "command", "context": {"used": 1, "limit": 9}})
+        m.submit("/decline")                                   # the latest
+        self.assertEqual((m.cards["p2"].state, m.cards["p1"].state), ("declined", "shown"))
+        self.assertEqual((m.cards["p2"].key, m.keyed(1).id), (None, "p1"))   # Alt+1 moves to what's still open
+        self.assertIn("p2 · command", text_of(m.cards["p2"]))
+        self.assertNotIn("/run p2", text_of(m.cards["p2"]))
+        m.submit("/decline p2")
+        self.assertIn("p2 is declined", text_of(m.blocks[-1]))
+        m.submit("/decline p1")
+        m.undecline(m.cards["p1"])                             # run after all: the model isn't told
+        m.outbox.clear()
+        m.submit("ok, something else")
+        self.assertEqual([x["type"] for x in m.outbox], ["attach", "user"])
+        self.assertEqual(m.outbox[0]["label"], "declined p2")
+        self.assertIn("did not run it:\nrm -rf build2", m.outbox[0]["text"])
+        self.assertNotIn("decline", m.outbox[0])
+
+    def test_copy_a_message_and_its_reply(self):
+        m = C.Model()
+        self.hello(m)
+        m.shell = object()
+        for text, answer in (("first\nquestion", "one"), ("second", "two\x1b[2J")):
+            m.submit(text)
+            m.handle({"type": "text", "text": "Here is "})
+            m.handle({"type": "text", "text": answer})
+            m.handle({"type": "proposal", "id": f"p{m.turn}", "kind": "read", "path": "x", "auto": True})
+            m.handle({"type": "text", "text": "and more"})
+            m.handle({"type": "done", "reason": "reply", "context": {"used": 1, "limit": 9}})
+        self.assertEqual(m.turn_text(1), "> first\n> question\n\nHere is one\n\nand more\n")
+        self.assertEqual(m.turn_text(2), "> second\n\nHere is two\\x1b[2J\n\nand more\n")   # escaped, as shown
+        self.assertIsNone(m.turn_text(3))
+        m.submit("/copy")
+        self.assertEqual(m.actions[-1][:2], ("copy", 2))
+        m.submit("/copy 1")
+        self.assertEqual(m.actions[-1], ("copy", 1, m.turn_text(1)))
+        m.submit("/copy 7")
+        self.assertIn("turn 7 isn't on screen", text_of(m.blocks[-1]))
+
     def test_newest_commands_get_alt_keys(self):
         m = C.Model()
         self.hello(m)
@@ -1095,6 +1139,37 @@ class TestGenaiTui(TmuxCase):
             self.key("y")
             self.wait_for("genai-ssh [ssh options] HOST")               # refused, and told how
             self.assertNotIn("hostname\n", self.screen("shell"))
+
+    def test_decline_from_the_menu(self):
+        turns = [call("propose_command", command="echo not-wanted", reason="r"), reply("fine, something else")]
+        with FakeAPI(turns) as api:
+            self.start(api)
+            self.type("go")
+            self.wait_for("or /run p1, to send")
+            env = dict(os.environ, GENAI_TUI_STATE=self.runtime_state())
+            subprocess.run([sys.executable, os.path.join(REPO, "tui", "request.py"), "menu", "decline", "p1"],
+                           env=env, check=True)
+            self.wait_for("you declined it")
+            self.type("then what?")
+            self.wait_for("fine, something else")
+            self.assertIn("I declined the command you proposed as p1", self.sent(api))
+            self.assertNotIn("not-wanted", self.screen("shell"))
+
+    def test_copy_a_turn_from_the_menu_and_by_command(self):
+        with FakeAPI([reply("the answer")]) as api:
+            self.start(api)
+            self.type("the question")
+            self.wait_for("the answer")
+            env = dict(os.environ, GENAI_TUI_STATE=self.runtime_state())
+            subprocess.run([sys.executable, os.path.join(REPO, "tui", "request.py"), "copy", "1"], env=env, check=True)
+            self.wait_for("turn 1 copied")
+            self.assertEqual(self.tmux("show-buffer", "-b", "genai-copy"), "> the question\n\nthe answer\n")
+            self.tmux("delete-buffer", "-b", "genai-copy")
+            self.type("/copy")
+            end = time.time() + 5
+            while time.time() < end and not self.tmux("show-buffer", "-b", "genai-copy"):
+                time.sleep(0.1)
+            self.assertIn("the answer", self.tmux("show-buffer", "-b", "genai-copy"))
 
     def test_raw_view_from_the_menu_and_by_command(self):
         bindir = tempfile.mkdtemp(prefix="genai-tui-bin-")
