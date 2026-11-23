@@ -49,7 +49,8 @@ TRACE_KEEP = 30                # exchanges with the endpoint kept in memory, for
 EXIT_OK, EXIT_ERROR, EXIT_USAGE, EXIT_PROFILE, EXIT_API, EXIT_CONTEXT = 0, 1, 2, 3, 4, 5
 EXIT_INTERRUPT = 130
 
-INTRINSICS = ("propose_command", "read_file", "list_dir", "write_file", "edit_file")
+INTRINSICS = ("propose_command", "read_file", "list_dir", "write_file", "edit_file", "propose_plan")
+PLAN_STEPS = 30                # steps one plan may have
 ENDPOINT_KEYS = {"name", "base_url", "model", "key_env", "key_file", "context_limit", "timeout",
                  "ca_bundle", "headers", "params", "allow_http", "proxy", "description"}
 PROFILE_KEYS = {"name", "description", "endpoint", "persona", "skills", "params", "coding"}
@@ -1258,6 +1259,19 @@ TOOLS = [
     _tool("edit_file", "Ask to replace old_text with new_text in a file. old_text must appear exactly once.",
           {"path": _PATH, "old_text": {"type": "string"}, "new_text": {"type": "string"}, "reason": _REASON},
           ["path", "old_text", "new_text", "reason"]),
+    _tool("propose_plan", "Before a task of more than two or three steps, propose the whole plan: the files you will "
+          "read (kind read: a file, or a directory to list), edit or create (edit, write), and the exact shell commands "
+          "you will propose (command). The user approves it, or part of it, before you start. Then planned reads need "
+          "no further approval, and a planned command proposed exactly as approved may run without another question. "
+          "Edits are still shown for approval. Anything outside the plan is asked about and flagged. A new plan "
+          "replaces the old one.",
+          {"goal": {"type": "string", "description": "One line: what the plan achieves."},
+           "steps": {"type": "array", "items": {"type": "object", "properties": {
+               "kind": {"type": "string", "enum": ["read", "edit", "write", "command"]},
+               "path": _PATH, "command": {"type": "string", "description": "For kind command: the exact command."},
+               "why": {"type": "string", "description": "One line: why this step."}},
+               "required": ["kind", "why"], "additionalProperties": False}}},
+          ["goal", "steps"]),
 ]
 
 SYSTEM_PROMPT = """You are genai, an assistant working alongside a human in their terminal.
@@ -1277,7 +1291,8 @@ CODING_RULES = """
 - read_file and list_dir run without asking inside the working directory (hidden and secret-looking files still ask). Look before you change: list and read the files involved before proposing an edit. Never guess at a file's contents or at an API you haven't read.
 - Change an existing file with edit_file, not write_file. old_text must match exactly once, so include a few unchanged lines around the change. Prefer several small edits to one large one.
 - Writes and edits are shown to the user as diffs and may be declined; if one is, ask rather than retrying the same change.
-- You still cannot run anything. When a change is ready, propose ONE command that builds or tests it. That ends your turn, and the user may send you the output."""
+- You still cannot run anything. When a change is ready, propose ONE command that builds or tests it. That ends your turn, and the user may send you the output.
+- For a task of more than two or three steps, call propose_plan first and wait for approval. Then follow the plan: propose planned commands exactly as approved. If you need to go outside it, say why, or propose a new plan."""
 
 
 # --------------------------------------------------------------------------
@@ -1559,6 +1574,51 @@ def estimate_tokens(obj):
 # --------------------------------------------------------------------------
 # Proposals
 
+def parse_plan(args):
+    """propose_plan's arguments, checked: a goal and 1 to PLAN_STEPS numbered steps."""
+    goal, steps = args.get("goal"), args.get("steps")
+    if not isinstance(goal, str) or not goal.strip():
+        raise ValueError("goal is required")
+    if not isinstance(steps, list) or not 1 <= len(steps) <= PLAN_STEPS:
+        raise ValueError(f"steps must be a list of 1 to {PLAN_STEPS} steps")
+    out = []
+    for n, st in enumerate(steps, 1):
+        if not isinstance(st, dict) or st.get("kind") not in ("read", "edit", "write", "command"):
+            raise ValueError(f"step {n}: kind must be read, edit, write or command")
+        step = {"n": n, "kind": st["kind"], "why": str(st.get("why", ""))}
+        if st["kind"] == "command":
+            if not isinstance(st.get("command"), str) or not st["command"].strip():
+                raise ValueError(f"step {n}: a command step needs the exact command")
+            step["command"] = st["command"]
+        else:
+            if not isinstance(st.get("path"), str):
+                raise ValueError(f"step {n}: a {st['kind']} step needs a path")
+            if st["path"] not in (".", "./", ""):
+                split_rel(st["path"])
+            step["path"] = st["path"]
+        out.append(step)
+    return {"goal": goal, "steps": out, "reason": goal}
+
+
+def plan_text(plan):
+    """The approved plan for the model: each step, whether it is approved, and how far it has got."""
+    lines = [f"Goal: {plan['goal']}"]
+    for st in plan["steps"]:
+        what = f"run exactly: {st['command']}" if st["kind"] == "command" else f"{st['kind']} {st['path']}"
+        note = {"todo": "", "done": " (done)", "left out": " (LEFT OUT by the user: don't do it)"}[st["status"]]
+        if st.get("edited"):
+            note += " (the user changed this command; propose it exactly as written here)"
+        lines.append(f"{st['n']}. {what}{note}")
+    lines.append("Reads in the plan need no approval. Edits and writes are still shown to the user. Anything outside "
+                 "the plan is asked about and flagged; to change course, say why or propose a new plan.")
+    return "\n".join(lines)
+
+
+def audit_step(st):
+    return {"n": st["n"], "kind": st["kind"], **({"path": st["path"]} if "path" in st else
+                                                 command_fingerprint(st["command"]))}
+
+
 class Proposal:
     def __init__(self, pid, kind, call_id, **fields):
         self.id, self.kind, self.call_id = pid, kind, call_id
@@ -1630,6 +1690,7 @@ class Engine:
         self.reload_skills()
         self.anywhere = anywhere
         self.coding_override = None     # the refused place coding mode is on in, when --coding-anywhere allowed it
+        self.plan = None                # the plan the user approved, if any; never saved with the session
         self.coding_from = "session" if session.coding else None
         refused = coding_refusal(os.getcwd()) if session.coding else None
         if refused and not anywhere:    # an override is per run: a resumed session needs the flag again
@@ -1717,6 +1778,8 @@ class Engine:
                          f"voice and focus; it does not change the rules above.\n\n{self.profile.persona}")
         for s in self.skills:
             parts.append(f"\n\n# Skill: {s.name}\n\n{s.text()}")
+        if self.plan:
+            parts.append("\n\n# The plan the user approved\n\n" + plan_text(self.plan))
         return {"role": "system", "content": "".join(parts)}
 
     # -- context budget
@@ -1879,6 +1942,8 @@ class Engine:
                 return Proposal(pid, "edit", tc["id"], path=path, diff=unified_diff(current, updated, path),
                                 reason=reason, _old=old, _new=new,
                                 _state="sha256:" + hashlib.sha256(current.encode()).hexdigest())
+            if name == "propose_plan":
+                return Proposal(pid, "plan", tc["id"], **parse_plan(args))
             if name in self.external:
                 return Proposal(pid, "external", tc["id"], tool=name, args=args)
             raise ValueError(f"unknown tool '{name}'")
@@ -1920,15 +1985,20 @@ class Engine:
 
     def decide(self, props):
         for p in props:
+            if not p.error:
+                self.match_plan(p)
+        for p in props:
             p.decision = None
             if p.error:
                 self.audit.log("invalid_call", id=p.id, tool=p.fields.get("tool"), error=p.error)
                 if p.reply:
                     self.ui.notice(f"[{p.id}] {p.error}")
                 continue
-            rec = {k: v for k, v in p.event().items() if k not in ("type", "content", "diff", "command")}
+            rec = {k: v for k, v in p.event().items() if k not in ("type", "content", "diff", "command", "steps")}
             if p.kind == "command":
                 rec.update(command_fingerprint(p.fields["command"]))
+            if p.kind == "plan":
+                rec["steps"] = [audit_step(st) for st in p.fields["steps"]]
             self.audit.log("proposal", **rec)
         live = [p for p in props if not p.error]
         for p in live:
@@ -1947,6 +2017,72 @@ class Engine:
             if p.kind != "external":
                 p.decision = p.decision if p.decision in ("accept", "decline") else "decline"
                 self.audit.log("decision", id=p.id, decision=p.decision)
+            if p.kind == "plan" and p.decision == "accept":
+                self.adopt_plan(p)
+
+    def match_plan(self, p):
+        """Hold a proposal to the approved plan. A planned read needs no approval (unless the file is hidden or
+        looks secret); a planned command, word for word as approved, is marked preapproved, for the wrapper to run
+        without asking again; a planned edit or write is labelled, and still asks. A command, edit or write the
+        plan doesn't name is flagged off_plan. genai still runs nothing itself."""
+        if not self.plan or p.kind not in ("command", "read", "list", "edit", "write"):
+            return
+        steps = [st for st in self.plan["steps"] if st["approved"]]
+        if p.kind == "command":
+            hit = next((st for st in steps if st["kind"] == "command" and st["command"] == p.fields["command"]), None)
+        else:
+            try:
+                where = "/".join(split_rel(p.fields["path"])) if p.fields["path"] not in (".", "./", "") else ""
+            except ValueError:
+                return
+            kinds = ("read",) if p.kind in ("read", "list") else ("edit", "write")
+            hit = next((st for st in steps if st["kind"] in kinds and st["_where"] == where), None)
+        if hit is None:
+            if p.kind in ("command", "edit", "write"):
+                p.fields["off_plan"] = True
+            return
+        p.fields["plan_step"] = hit["n"]
+        if p.kind == "command":
+            p.fields["preapproved"] = True
+            hit["status"] = "done"
+        elif p.kind in ("read", "list") and not p.auto:
+            parts = split_rel(p.fields["path"]) if hit["_where"] else []
+            secret = None
+            if p.kind == "read" and not is_hidden(parts):
+                try:
+                    secret = looks_secret(self.wd.read(p.fields["path"]))
+                except (ValueError, OSError):
+                    secret = False
+            if is_hidden(parts) or secret:
+                if secret:
+                    p.fields["secret"] = True
+                return                                  # in the plan, but still asks
+            p.auto = True
+        self.audit.log("plan_match", id=p.id, step=hit["n"], kind=p.kind)
+        self.ui.plan(self.plan)
+
+    def adopt_plan(self, p):
+        approve = getattr(p, "approve", None)
+        edits = getattr(p, "edits", None) or {}
+        steps = []
+        for st in p.fields["steps"]:
+            st = dict(st)
+            st["approved"] = approve is None or st["n"] in approve
+            if st["kind"] == "command" and st["approved"] and edits.get(st["n"]):
+                st["command"], st["edited"] = edits[st["n"]], True
+            st["status"] = "todo" if st["approved"] else "left out"
+            st["_where"] = "/".join(split_rel(st["path"])) if st.get("path") not in (None, ".", "./", "") else ""
+            steps.append(st)
+        self.plan = {"id": p.id, "goal": p.fields["goal"], "steps": steps}
+        self.audit.log("plan", id=p.id, approved=[st["n"] for st in steps if st["approved"]],
+                       edited=[st["n"] for st in steps if st.get("edited")])
+        self.ui.plan(self.plan)
+
+    def clear_plan(self):
+        if self.plan:
+            self.audit.log("plan_cleared", id=self.plan["id"])
+        self.plan = None
+        self.ui.plan(None)
 
     def notify(self, event, **fields):
         """Tell the notify hook, if there is one, that genai is now waiting for the person."""
@@ -1958,6 +2094,11 @@ class Engine:
             return p.reply or f"error: {p.error}"
         if p.kind == "command":
             return "shown to the user, not run. If they run it, they may send you the output."
+        if p.kind == "plan":
+            if p.decision != "accept" or not self.plan or self.plan["id"] != p.id:
+                return "declined by the user: the plan was not approved. Ask what they want instead."
+            return ("The user approved this plan. Carry it out step by step, without asking first.\n"
+                    + plan_text(self.plan))
         if p.kind == "external":
             status = p.decision if p.decision in ("ok", "declined", "error") else "declined"
             out, counts = redact(str(p.result or ""), self.secrets())
@@ -2004,6 +2145,12 @@ class Engine:
             return f"error: {e}"
         self.audit.log("file_op", id=p.id, kind=p.kind, path=p.fields.get("path"), status="ok", auto=p.auto)
         self.ui.result(p, "ok", note)
+        step = p.fields.get("plan_step")
+        if step and self.plan:
+            for st in self.plan["steps"]:
+                if st["n"] == step:
+                    st["status"] = "done"
+            self.ui.plan(self.plan)
         return result
 
     # -- sharing output and compaction
@@ -2112,10 +2259,13 @@ class PlainUI:
     def decide(self, pending):
         for p in pending:
             p.decision = "decline" if p.kind != "external" else "declined"
-            self.notice(f"{p.kind} proposal {p.id} ({one_line(str(p.fields.get('path') or p.fields.get('tool')))[0]}) "
-                        "declined: no terminal")
+            what = p.fields.get("path") or p.fields.get("tool") or p.fields.get("goal")
+            self.notice(f"{p.kind} proposal {p.id} ({one_line(str(what))[0]}) declined: no terminal")
 
     def result(self, p, status, note):
+        pass
+
+    def plan(self, plan):
         pass
 
 
@@ -2164,6 +2314,13 @@ class TtyUI(PlainUI):
                     head = f"New file {path}, {f['lines']} lines:\n{margin(f['content'])}"
             elif p.kind == "edit":
                 head = f"Edit {path}:\n{margin(f['diff'])}"
+            elif p.kind == "plan":
+                self.out.write(f"\n\033[1m[{p.id}] plan\033[0m — {one_line(f['goal'])[0]}\n{margin(plan_steps(f['steps']))}\n"
+                               "Planned reads won't ask again; a planned command proposed exactly as shown is "
+                               "marked as approved; edits still ask.\n")
+                self.out.flush()
+                p.decision, p.approve = pick_steps(p, f["steps"])
+                continue
             else:
                 head = f"Call {p.kind}?"
             self.out.write(f"\n\033[1m[{p.id}] {p.kind}\033[0m — {one_line(f.get('reason', ''))[0]}\n{head}\n")
@@ -2174,12 +2331,48 @@ class TtyUI(PlainUI):
         eprint(f"  [{p.id}] {status}: {one_line(note)[0]}")
 
 
+def plan_steps(steps):
+    return "\n".join(f"{st['n']:>2}. " + (f"run   {st['command']}" if st["kind"] == "command" else
+                                          f"{st['kind']:5} {st['path']}") + f"\n      {st['why']}" for st in steps)
+
+
+def pick_steps(p, steps):
+    """Ask which steps of a plan to approve: (decision, approved step numbers or None for all)."""
+    try:
+        ans = input(f"Approve {p.id}? [a]ll, n[one], or step numbers such as 1,2,4: ").strip().lower()
+    except EOFError:
+        return "decline", None
+    if ans in ("a", "all", "y", "yes"):
+        return "accept", None
+    nums = {int(x) for x in re.findall(r"[0-9]+", ans)} & {st["n"] for st in steps}
+    return ("accept", sorted(nums)) if nums and re.fullmatch(r"[0-9 ,]+", ans) else ("decline", None)
+
+
 def ask_yes(question):
     try:
         ans = input(f"{question} [y/N] ")
     except EOFError:
         return False
     return ans.strip().lower() in ("y", "yes")
+
+
+def plan_choice(p, msg):
+    """A wrapper's choice of steps (approve: [numbers], default all) and edited commands (edits: {number: command}).
+    False if either is malformed."""
+    numbers = {st["n"]: st for st in p.fields["steps"]}
+    approve, edits = msg.get("approve"), msg.get("edits", {})
+    if approve is not None and (not isinstance(approve, list) or not approve
+                                or not all(type(n) is int and n in numbers for n in approve)):
+        return False
+    if not isinstance(edits, dict):
+        return False
+    p.approve, p.edits = (sorted(set(approve)) if approve is not None else None), {}
+    for key, cmd in edits.items():
+        n = int(key) if str(key).isdigit() else None
+        if n not in numbers or numbers[n]["kind"] != "command" or not isinstance(cmd, str) or not cmd.strip():
+            return False
+        p.edits[n] = cmd
+    return True
 
 
 class JsonUI:
@@ -2225,6 +2418,11 @@ class JsonUI:
     def show_auto(self, p):
         self.emit(p.event())
 
+    def plan(self, plan):
+        self.emit({"type": "plan", "plan": None if plan is None else {
+            "id": plan["id"], "goal": plan["goal"],
+            "steps": [{k: v for k, v in st.items() if not k.startswith("_")} for st in plan["steps"]]}})
+
     def decide(self, pending):
         """Emit every blocking proposal, then wait for decisions in any order.
         No answer, EOF, or an unknown ID means decline."""
@@ -2235,6 +2433,8 @@ class JsonUI:
                     disp, flagged = exact(ev[key])
                     if flagged:
                         ev.setdefault("flagged", []).append(key)
+            if p.kind == "plan" and any(exact(st.get("command") or st.get("path") or "")[1] for st in ev["steps"]):
+                ev.setdefault("flagged", []).append("steps")
             self.emit(ev)
         waiting = {p.id: p for p in pending}
         while waiting:
@@ -2244,8 +2444,12 @@ class JsonUI:
             t = msg.get("type")
             pid = msg.get("id")
             if t == "decision" and pid in waiting and waiting[pid].kind != "external":
-                waiting.pop(pid).decision = msg.get("decision") if msg.get("decision") in ("accept", "decline") \
-                    else "decline"
+                p = waiting.pop(pid)
+                p.decision = msg.get("decision") if msg.get("decision") in ("accept", "decline") else "decline"
+                if p.kind == "plan" and p.decision == "accept" and not plan_choice(p, msg):
+                    p.decision = "decline"
+                    self.error(f"{pid}: approve must list step numbers, and edits map a command step's number to "
+                               "its new command; the plan was declined", "bad_message")
             elif t == "result" and pid in waiting and waiting[pid].kind == "external":
                 p = waiting.pop(pid)
                 p.decision = msg.get("status") if msg.get("status") in ("ok", "declined", "error") else "declined"
@@ -2361,6 +2565,7 @@ Commands (on an empty buffer):
   :sh             open a subshell; :capture on|off to share its output afterwards
   :attach PATH    attach a file to your next message
   :coding on|off  let the model read and list files here without asking
+  :plan [clear]   show the approved plan and how far it has got, or drop it
   :compact [-e]   prune old file contents and output; summarize if still large
   :context        show how full the context is
   :skills         list skills, marking the ones in use
@@ -2456,6 +2661,14 @@ class Repl:
                 print(f":sh capture is {'on' if self.capture else 'off'}")
             elif cmd == "attach":
                 self.do_attach(arg)
+            elif cmd == "plan":
+                if arg == "clear":
+                    self.e.clear_plan()
+                    print("plan dropped: everything asks again")
+                elif not self.e.plan:
+                    print("no plan approved")
+                else:
+                    print(show_exact(plan_text(self.e.plan)))
             elif cmd == "coding":
                 self.e.set_coding(arg == "on")
                 self.e.session.save()
@@ -2612,7 +2825,7 @@ def run_json(engine, ui, first_prompt, attachments):
     ui.engine = engine
     ui.emit({"type": "hello", "protocol": PROTOCOL, "version": VERSION,
              "features": ["proposals", "decisions", "attach", "register_tools", "compact", "context", "coding",
-                          "set_coding", "skills", "files", "trace", "system"],
+                          "set_coding", "skills", "files", "trace", "system", "plan"],
              "endpoint": engine.endpoint.info(),
              "profile": {"name": engine.profile.name, "description": engine.profile.description}
              if engine.profile else None,
@@ -2710,6 +2923,11 @@ def run_json(engine, ui, first_prompt, attachments):
                 ui.error(f"cannot list {path}: {err}", "bad_path")
         elif t in ("trace", "system"):
             inspect(engine, ui, msg)
+        elif t == "plan":
+            if msg.get("clear") is True:
+                engine.clear_plan()
+            else:
+                ui.plan(engine.plan)
         elif t in ("decision", "result"):
             ui.error(f"no pending proposal {msg.get('id')!r}", "unknown_id")
         else:
