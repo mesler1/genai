@@ -497,6 +497,7 @@ class Model:
         self.quit = False
         self.shell = False         # a shell pane is there (inside genai-tui)
         self.shell_where = None
+        self.remote_host = None    # the host of a genai-ssh session in the shell pane, while it is up
         self.skills = None         # genai's skill list, once asked for
         self.show_skills = False   # print the next skill list in the conversation (the user typed /skills)
         self.ask = None            # a question of ours in place of the input box: run or share
@@ -709,6 +710,8 @@ class Model:
                 self.note(f"{c:9} {d}")
             self.note("Enter sends · Alt+Enter or \\ then Enter adds a line · ↑↓ earlier messages · "
                       "PgUp/PgDn scroll · // starts a message with /")
+            self.note("In the shell pane, genai-ssh [ssh options] HOST connects so commands on that host can be "
+                      "followed and /run can send them there (plain ssh can't be)")
             self.note("Alt+1 … Alt+9 open the menu of a command proposal, Alt+1 the newest (as its card says); "
                       "↑↓ and Enter, or the letter shown, choose")
         elif cmd == "/coding":
@@ -822,7 +825,7 @@ class Model:
         return {
             "session": {"endpoint": ep.get("name"), "model": ep.get("model"), "profile": prof.get("name"),
                         "session": h.get("session"), "sandbox": sb.get("name") if sb else None,
-                        "shell_where": self.shell_where},
+                        "shell_where": remote_where(self.remote_host) if self.remote_host else self.shell_where},
             "coding": self.coding, "busy": self.busy, "context": list(self.context or (None, None)),
             "runner": self.runner and {"network": bool(self.runner.get("network")), "problem": self.runner.get("problem"),
                                        "image": self.runner.get("image")},
@@ -1054,6 +1057,10 @@ def strip_comments(text):
     return "\n".join(ln for ln in text.split("\n") if not ln.startswith("#")).strip("\n")
 
 
+def remote_where(host):
+    return f"ON ANOTHER HOST, {host}, over ssh, OUTSIDE any sandbox"
+
+
 def review_buffer(command, rc, where, output):
     """What /run and /share open for review: the same layout as genai's own :run."""
     return ("# EVERYTHING below is sent to the model as saved, the command included.\n"
@@ -1142,6 +1149,7 @@ class Shell:
     def __init__(self, pane):
         self.pane = pane
         self.primary_prompt = None
+        self.remote_prompt = None      # (host, directory) while a genai-ssh shell is at its prompt, from the recorder
 
     @classmethod
     def from_env(cls):
@@ -1186,6 +1194,16 @@ class Shell:
         context, (command, mode, paste) = self.context()
         if mode == "1":
             raise Busy("it is in copy mode; press q there")
+        remote = self.remote_prompt() if self.remote_prompt else None
+        if remote:
+            # A genai-ssh session's shell, at its prompt: its markers carry the key only it was given (recorder.py),
+            # so that is the proof, whatever runs ssh here (ssh itself, or a wrapper).
+            if paste == "0":
+                raise Busy("the shell on the other host has bracketed input turned off")
+            return context[0], f"{remote[0]}:{remote[1]}"
+        if command == "ssh":
+            raise Busy("ssh is running, and genai-tui can't follow it; to send commands to another host, connect "
+                       "with genai-ssh [ssh options] HOST instead")
         if command != "bash":
             raise Busy(f"{command or 'something'} is running")
         # tmux before 3.4 can't report bracketed paste (an empty format). Our shellrc turns it on, and the recorder's
@@ -1339,6 +1357,7 @@ class App:
         self.rec = Recorder(fifo if fifo and os.path.exists(fifo) else None)   # each shell command and its output
         if shell:
             shell.primary_prompt = self.rec.at_primary_prompt
+            shell.remote_prompt = self.rec.remote_prompt
         self.ctx_line = None       # where shell context starts, in logical lines (see Shell.lines)
         self.sent = {}             # the last view sent to each role
         self.ask_obj, self.ask_serial = None, 0
@@ -1404,7 +1423,7 @@ class App:
                 cwd = clean(here[1]) if here else "the shell pane's (it is busy)"
                 verb = "Paste" if ask.get("paste_only") else "Run"
                 lines = [[(f"{verb} {c.id}{' (edited)' if ask['edited'] else ''} in the shell pane? ", A),
-                          (f"It runs {where}, in your shell, as you.", R if where.startswith("OUTSIDE") else "")],
+                          (f"It runs {where}, in your shell, as you.", R if "OUTSIDE" in where else "")],
                          [(f"in {cwd}", Q)]]
                 shown = command_text(ask["command"]).split("\n")
                 lines += [[("    $ " if i == 0 else "      ", Q), (fit(ln, w - 6), "")]
@@ -1431,7 +1450,7 @@ class App:
                       ("v", A), (" view it all", "")]]
             if self.plan_review and self.plan_review[0] == c.id:
                 lines[1][-1] = (" press a again to approve automatic runs", "")
-            if cmds and self.where().startswith("OUTSIDE"):
+            if cmds and "OUTSIDE" in self.where():
                 lines.append([(f"  Commands run {self.where()}, in your shell, as you.", R)])
             return lines, None, "y approve · a review automatic runs · e edit · n or Esc no · v view"
         if self.m.pending:
@@ -1748,7 +1767,13 @@ class App:
             self.m.note(f"{card.id} copied (tmux buffer, and your clipboard if the terminal allows it)")
 
     def where(self):
-        return self.m.shell_where or "OUTSIDE any sandbox, directly on this host"
+        """Where a command typed into the shell pane now runs: here, or on the host of a genai-ssh session."""
+        host = self.rec.remote_host() if self.shell else None
+        return remote_where(host) if host else self.m.shell_where or "OUTSIDE any sandbox, directly on this host"
+
+    def ran_where(self, c):
+        """Where a command the recorder saw ran."""
+        return remote_where(c.host) if c.host else self.m.shell_where or "OUTSIDE any sandbox, directly on this host"
 
     def fits(self, command):
         """Is all of the command visible in the question? Then reading it there is the review."""
@@ -1844,7 +1869,7 @@ class App:
                     text = ("# EVERYTHING below is sent to the model as saved. Remove anything you don't want it to "
                             f"see.\nMy shell session{ask['from']}:\n```\n{ask['output']}\n```\n")
                 else:
-                    text = review_buffer(ask["command"], ask["rc"], self.where(), ask["output"])
+                    text = review_buffer(ask["command"], ask["rc"], ask.get("where") or self.where(), ask["output"])
                 kept = self.edit(text, ask["label"], "sent to the model exactly as saved; nothing is added",
                                  "send nothing")
                 if kept is None or not kept.strip():
@@ -1890,7 +1915,23 @@ class App:
         card.changed()
         self.m.ask = {"kind": "share", "label": f"{card.id} finished (exit {c.rc})", "what": card.id,
                       "question": f"{card.id} finished (exit {c.rc}). Share the output with the model?",
-                      "command": r["command"], "rc": c.rc, "output": self.output_of(c)}
+                      "command": r["command"], "rc": c.rc, "output": self.output_of(c), "where": self.ran_where(c)}
+
+    def poll_handshake(self):
+        """A genai-ssh shell on another host asks for its key: type it in now, once (see recorder.py). Its echo is
+        off, so the key isn't shown; it goes through ssh's encrypted connection, and nowhere else."""
+        self.m.remote_host = self.rec.remote_host()
+        key = self.rec.take_handshake()
+        if key and self.shell:
+            try:
+                self.shell.tmux("send-keys", "-t", self.shell.pane, "-l", key, check=True)
+                self.shell.tmux("send-keys", "-t", self.shell.pane, "Enter", check=True)
+            except (OSError, subprocess.SubprocessError) as e:
+                self.m.note(f"genai-ssh: could not answer the other host ({e}); genai-tui won't follow that session",
+                            R)
+                return
+            self.m.note("genai-ssh: following the shell on the other host. Commands sent there run on that host, "
+                        "and each still asks first.", W)
 
     def output_of(self, c):
         out = trim(c.text())
@@ -1909,7 +1950,8 @@ class App:
         n = c.lines()
         label_ = f"Command {c.n} in the shell pane: {name} (exit {c.rc}, {n} line{'s' if n != 1 else ''})"
         self.m.ask = {"kind": "share", "label": label_, "what": f"command {c.n}", "command": cmd, "rc": c.rc,
-                      "output": self.output_of(c), "question": f"{label_}. Share the output with the model?"}
+                      "output": self.output_of(c), "question": f"{label_}. Share the output with the model?",
+                      "where": self.ran_where(c)}
 
     def list_commands(self):
         cmds = self.rec.finished()
@@ -2107,6 +2149,7 @@ class App:
 
     def pump(self):
         self.poll_run()
+        self.poll_handshake()
         while self.hub:
             try:
                 role, msg = self.hub.inbox.get_nowait()
