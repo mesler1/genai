@@ -52,8 +52,11 @@ def view(st, w, sel):
                                ("profile", h.get("profile") or "none", "" if h.get("profile") else Q),
                                ("session", h.get("session") or "not saved", "" if h.get("session") else Q)):
         add([(f"{label:9}", Q), (fit(clean(value or "?"), w - 9), role)])
-    sb = h.get("sandbox")
-    add([("commands ", Q), (fit(f"run in {sb}" if sb else "run OUTSIDE any sandbox", w - 9), D if sb else R)])
+    where = h.get("shell_where")
+    if where:
+        add([("commands ", Q), (fit("run " + clean(where), w - 9), D if where.startswith("inside") else R)])
+    else:
+        add([("commands ", Q), ("shown for manual execution", Q)])
     coding = st.get("coding")
     add([("coding   ", Q), ("[on] " if coding else "[off]", W if coding else ""),
          (fit("  c switches" if not coding else "  reads without asking", w - 14), Q)], "coding")

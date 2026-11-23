@@ -27,6 +27,8 @@ HISTCONTROL=${HISTCONTROL//erasedups/}
 
 # A command starts: bash prints PS0 after you press Enter and before the command runs.
 [ -n "$__genai_nonce" ] && PS0="${PS0:-}"$'\e]6973;'"$__genai_nonce"$';S\a'
+# Continuation prompts accept bracketed input too, but must not receive a proposed command.
+[ -n "$__genai_nonce" ] && PS2='\['$'\e]6973;'"$__genai_nonce"$';P\a''\]'"${PS2:-}"
 # The next prompt: the exit code, whether a new history entry was made, the command line (base64),
 # and how many lines the prompt takes.
 __genai_prompt() {

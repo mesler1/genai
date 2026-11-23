@@ -236,7 +236,10 @@ shared filesystem; never an abstract socket, which has no permissions).
 What this cannot do is keep out a program running as you: it can connect to the socket, or send
 keys through tmux, exactly as you can. The shell pane runs as you, on the host unless genai-tui
 runs in the sandbox, so a harmful command you run there could approve further proposals. The
-TUI says where commands run before each one, in red when it is outside any sandbox.
+TUI requires a full command preview before execution, and checks that the shell pane
+still matches the reviewed working directory. Automatic plans require a full preview
+and reserve each approved command step for a single dispatch. Shell dispatch uses
+tmux keystrokes, so avoid typing in the shell pane while the TUI is dispatching.
 
 What remains: for commands, you are the last control. That is the design, and it is why the
 other sections matter. With `--coding-anywhere` in your home directory, everything there that is
