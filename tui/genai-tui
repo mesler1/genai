@@ -2,7 +2,8 @@
 # genai-tui: genai in tmux, as one coding agent. The conversation, the prompt you type into below
 # it, and an info panel on the right. Your own shell runs hidden: `` on an empty line shows it above
 # the conversation, or hides it again. /run types a proposed command into that shell, /share sends
-# what it printed, and right-clicking the shell marks where shell context starts.
+# what it printed, and right-clicking the shell marks where shell context starts. Clicking a proposed
+# command, or Alt+1..Alt+9 (Alt+1 the newest), opens its menu: run it, edit it, paste it or copy it.
 # Usage: genai-tui [-h] [-p PROFILE] [-e ENDPOINT] [-S SESSION] [-k SKILL] [--coding] [--no-panel]
 set -euo pipefail
 here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
@@ -97,14 +98,15 @@ t set -p -t "$shell" @genai_title 'shell · `` hides it · right-click: shell co
 t set -p -t "$prompt" @genai_title 'you'
 t set -p -t "$side" @genai_title 'info · /panel hides it'
 
-# Right-click in the shell pane: tmux's own menu for shell context. Each request goes to the
+# Right-click in the shell pane: tmux's own menu for shell context. -O keeps it open when the button is
+# released off an item (tmux 3.2 has it); a click chooses. Each request goes to the
 # conversation pane over the socket, through request.py. Marking records the line clicked, which the
 # conversation pane at once turns into a count of logical lines, one that resizing doesn't change.
 req="$(q "$py") $(q "$here/request.py")"
 cat > "$state/menu.conf" <<EOF
 bind -n MouseDown3Pane {
   if -F "#{==:#{pane_id},$shell}" {
-    display-menu -t= -x M -y M -T " shell context " \\
+    display-menu -O -t= -x M -y M -T " shell context " \\
       "Mark start of context here" m { set -gF @genai_ctx_mark "#{e|-:#{e|+:#{history_size},#{mouse_y}},#{?scroll_position,#{scroll_position},0}}" ; run-shell -b "$req mark" } \\
       "Share from the mark" s { run-shell -b "$req share mark" } \\
       "Share all shell history" a { run-shell -b "$req share all" } \\
@@ -116,6 +118,10 @@ bind -n MouseDown3Pane {
   }
 }
 EOF
+# Alt+1 .. Alt+9: the menu of a command proposal, from the keyboard. In the shell pane they stay the shell's.
+for n in 1 2 3 4 5 6 7 8 9; do
+  echo "bind -n M-$n if -F \"#{==:#{pane_id},$shell}\" { send-keys M-$n } { run-shell -b \"$req menu open $n\" }"
+done >> "$state/menu.conf"
 t set-environment -g GENAI_TUI_STATE "$state"
 t source-file "$state/menu.conf"
 t set-environment -g GENAI_TUI_TOGGLE "$here/shell-toggle"
