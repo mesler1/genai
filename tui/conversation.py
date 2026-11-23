@@ -54,7 +54,7 @@ COMMANDS = {
     "/system": "the system prompt and tool definitions sent with every request",
     "/compact": "shrink the conversation when the context is getting full",
     "/context": "show how full the context is",
-    "/clear": "clear the screen (the conversation itself is kept)",
+    "/clear": "start over: the model forgets this conversation, and the screen clears (the saved session keeps it)",
     "/quit": "leave (also Ctrl-D on an empty input)",
 }
 
@@ -613,6 +613,12 @@ class Model:
                 self.note("genai --list-skills shows the command that blesses each one")
         elif t == "compacted":
             self.note(f"compacted: {ev.get('before')} → {ev.get('after')} tokens", D)
+        elif t == "cleared":
+            self.blocks, self.cards, self.reply = [], {}, None
+            ctx = ev.get("context") or {}
+            if isinstance(ctx.get("used"), int) and isinstance(ctx.get("limit"), int):
+                self.context = (ctx["used"], ctx["limit"])
+            self.note(f"context cleared: the model starts over ({ev.get('dropped', 0)} messages dropped)", D)
         elif t == "attached":
             masked = ev.get("redacted") or {}
             if masked:
@@ -679,7 +685,7 @@ class Model:
     def command(self, line):
         cmd, _, arg = line.partition(" ")
         arg = arg.strip()
-        to_genai = cmd in ("/coding", "/skills", "/skill", "/compact", "/network")
+        to_genai = cmd in ("/coding", "/skills", "/skill", "/compact", "/network", "/clear")
         if to_genai and (self.busy or self.exited is not None):
             self.note(f"{cmd} has to wait until genai finishes this reply", W)
         elif cmd == "/help":
@@ -763,7 +769,11 @@ class Model:
             used, limit = self.context or (None, None)
             self.note(f"context: {used}/{limit} tokens" if used is not None else "context: not measured yet")
         elif cmd == "/clear":
-            self.blocks = []
+            if "clear" in ((self.hello or {}).get("features") or []):
+                self.send({"type": "clear"})
+            else:
+                self.blocks = []
+                self.note("this genai can't clear its context; only the screen was cleared", W)
         elif cmd in ("/quit", "/exit"):
             self.quit = True
         else:

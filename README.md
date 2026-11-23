@@ -63,6 +63,7 @@ model, default skills, sampling settings and coding mode:
 | Coding mode | `genai -e NAME --coding` (reads stop asking, except files that look like secrets; writes still ask) |
 | Coding mode where it is refused | `genai -e NAME --coding-anywhere` (prints what that exposes) |
 | Builds and tests the model runs itself | a profile with `"coding": true` and a `"sandbox"` ([Sandboxed runs](#sandboxed-runs)) |
+| Start over, keeping the session | `:clear` in the REPL, `/clear` in genai-tui (the model forgets the conversation; the saved session keeps it) |
 | Wrappers | `genai -p NAME --json` (JSON Lines over stdio) |
 | Lists | `genai --list-endpoints`, `--list-profiles`, `--list-skills`, `--list-sessions` (each with `--json`) |
 
@@ -256,6 +257,7 @@ later.
 | `result` | `id`, `status` (`ok`, `declined`, `error`), `output` | Answers a proposal for a tool the wrapper registered. |
 | `register_tools` | `tools`: a list of `{name, description, parameters}` | Adds tools the model can call. The wrapper performs them. Answered by `registered`. |
 | `compact` | | Shrinks the conversation. Answered by `compacted`. |
+| `clear` | | Starts the conversation over: the model gets none of it from now on, and an approved plan is dropped. The saved session's history keeps it. Answered by `cleared` (`dropped`: how many messages, `context`). |
 | `coding` | `on` (true or false) | Turns coding mode on or off. The same places are refused as for `--coding` (error `coding_refused`), and `--coding-anywhere` stays a command-line flag. Always answered by a `coding` event with the state now. |
 | `skills` | | Answered by `skills`: every skill, its blessing `status`, and whether it is `active`. |
 | `skill` | `name`, `on` (true or false) | Uses a skill from the next request on, or stops using it. Only a blessed skill can be turned on (errors `unknown_skill`, `not_blessed`). Always answered by a fresh `skills` list. |
@@ -281,7 +283,7 @@ decision.
 | `notice` | Something the user should know. |
 | `error` | `code` and `message`. |
 | `plan` | The approved plan changed: approved, a step done, or dropped. `plan` has `id`, `goal` and `steps`, each with `approved`, `status` (`todo`, `done`, `left out`) and `edited` when the user changed its command; `null` when there is none. A plan is never saved with the session. |
-| `attached`, `registered`, `compacted`, `coding`, `skills`, `files`, `trace`, `system`, `network` | Answers to the messages above. |
+| `attached`, `registered`, `compacted`, `cleared`, `coding`, `skills`, `files`, `trace`, `system`, `network` | Answers to the messages above. |
 
 When stdin closes, every waiting proposal is declined and genai exits.
 
