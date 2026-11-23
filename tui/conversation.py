@@ -33,12 +33,14 @@ from recorder import Recorder, ago, fifo_path, label, trim  # noqa: E402
 GENAI = os.environ.get("GENAI_BIN") or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                                     "genai")
 CARD_BODY_LINES = 12
+OUTPUT_LINES = 8               # last lines of a sandboxed run's output shown in its card
 INPUT_MAX_LINES = 8
 CMD_LINES = 4                  # lines of a command shown in a run question; a longer one is viewed in full first
 
 COMMANDS = {
     "/help": "show this help",
     "/coding": "on|off: let the model read and list files here without asking",
+    "/network": "[on|off]: the sandbox's network, for this session (on: each sandboxed run asks)",
     "/skills": "list skills; * marks the ones in use",
     "/skill": "NAME on|off: use a blessed skill from the next message on, or stop",
     "/run": "[ID]: review and run a proposed command in the shell pane (the latest by default)",
@@ -308,6 +310,13 @@ class Banner(Block):
                          "without asking, except hidden and secret-looking ones", W))
             if h.get("coding_override"):
                 rows.append((f"this is {h['coding_override']}; --coding-anywhere allowed it", R))
+        run = h.get("runner")
+        if run and h.get("coding") and not run.get("problem"):
+            rows.append((f"The model runs builds and tests itself in a podman sandbox ({run.get('image')}), on a "
+                         "throwaway copy of the project, " + ("WITH the network: each run asks first." if
+                                                             run.get("network") else "offline."), W))
+        elif run and run.get("problem"):
+            rows.append((f"The profile's sandbox can't run here: {run['problem']}.", R))
         if self.shell_where:
             rows.append((f"Approved commands run {self.shell_where}.", W))
         else:
@@ -370,6 +379,7 @@ class Card(Block):
     def __init__(self, ev):
         super().__init__()
         self.ev, self.state, self.detail = ev, "waiting", ""
+        self.output = None         # a sandboxed run's output, as the model got it
 
     @property
     def id(self):
@@ -381,10 +391,11 @@ class Card(Block):
         return {"read": f"read {path}", "list": f"list {path or '.'}", "edit": f"edit {path}",
                 "write": f"{'overwrite' if ev.get('exists') else 'create'} {path}",
                 "command": "command", "external": f"tool {clean(ev.get('tool', ''))}",
+                "sandbox": f"sandbox · {'ONLINE' if ev.get('network') else 'offline'}",
                 "plan": f"plan · {len(ev.get('steps') or [])} steps"}.get(k, str(k))
 
-    def body(self):
-        """(text, role) lines inside the card."""
+    def body(self, full=False):
+        """(text, role) lines inside the card. A sandboxed run's output is cut to its last lines unless full."""
         ev, k, out = self.ev, self.ev.get("kind"), []
         if ev.get("preapproved"):
             out.append((f"step {ev.get('plan_step')} of the plan you approved", D))
@@ -400,9 +411,15 @@ class Card(Block):
             out.append(("this file looks like it contains secrets", R))
         if ev.get("flagged"):
             out.append(("hidden or control characters are shown as \\x.. or \\u.... escapes", R))
-        if k == "command":
+        if k in ("command", "sandbox"):
             for i, ln in enumerate(command_text(ev.get("command", "")).split("\n")):
                 out.append((("$ " if i == 0 else "  ") + ln, ""))
+        if k == "sandbox" and self.output is not None:
+            lines = clean(self.output).rstrip("\n").split("\n") if self.output.strip() else ["(no output)"]
+            if not full and len(lines) > OUTPUT_LINES:
+                out.append((f"… {len(lines) - OUTPUT_LINES} earlier lines of output (v views it all)", Q))
+                lines = lines[-OUTPUT_LINES:]
+            out += [("│ " + ln, Q) for ln in lines]
         elif k == "write" and ev.get("undiffable"):
             out.append(("The existing file will be replaced entirely: " + clean(ev["undiffable"]), W))
             mode = ev.get("mode")
@@ -429,7 +446,7 @@ class Card(Block):
         return out
 
     def full_text(self):
-        return "\n".join(t for t, _ in self.body())
+        return "\n".join(t for t, _ in self.body(full=True))
 
     def lines(self, w):
         if self.state == "auto":
@@ -471,6 +488,7 @@ class Model:
         self.next_attachments = [] # reviewed shell context for the next prompt the user submits
         self.hello = None
         self.coding = False
+        self.runner = None         # the profile's sandbox, from hello and network events
         self.context = None        # (used, limit)
         self.exited = None         # genai's exit code once it has gone
         self.quit = False
@@ -507,7 +525,7 @@ class Model:
         if t != "text":
             self.reply = None
         if t == "hello":
-            self.hello, self.coding = ev, bool(ev.get("coding"))
+            self.hello, self.coding, self.runner = ev, bool(ev.get("coding")), ev.get("runner")
             self.add(Banner(ev, self.shell_where))
             if "skills" in (ev.get("features") or []):
                 self.send({"type": "skills"})          # for the info panel; not printed
@@ -518,7 +536,9 @@ class Model:
         elif t == "proposal":
             card = self.add(Card(ev))
             self.cards[card.id] = card
-            if ev.get("auto"):
+            if ev.get("auto") and ev.get("kind") == "sandbox":
+                card.state = "running"
+            elif ev.get("auto"):
                 card.state = "auto"
             elif ev.get("kind") == "command":
                 card.state = "shown"
@@ -534,6 +554,8 @@ class Model:
             if card:
                 card.state = "done" if ev.get("status") == "ok" else "error"
                 card.detail = ev.get("detail") or ""
+                if isinstance(ev.get("output"), str):
+                    card.output = ev["output"]
                 card.changed()
         elif t in ("trace", "system"):
             self.actions.append(("show", ev))
@@ -555,6 +577,8 @@ class Model:
             self.context = ((ev.get("context") or {}).get("used"), (ev.get("context") or {}).get("limit"))
             if ev.get("reason") == "step_limit":
                 self.note("genai stopped after its step limit; send a message to continue", W)
+            elif ev.get("reason") == "stopped":
+                self.note("the sandboxed run was stopped; send a message to continue", W)
             self.next_queued()
         elif t == "context":
             self.context = (ev.get("used"), ev.get("limit"))
@@ -571,6 +595,9 @@ class Model:
         elif t == "coding":
             self.coding = bool(ev.get("on"))
             self.note(f"coding mode is {'on' if self.coding else 'off'}", W if self.coding else Q)
+        elif t == "network":
+            self.runner = ev.get("runner")
+            self.note(self.network_text(), W if (self.runner or {}).get("network") else Q)
         elif t == "skills":
             rows = ev.get("skills") or []
             self.skills = rows
@@ -591,6 +618,15 @@ class Model:
             if masked:
                 self.note("genai masked " + ", ".join(f"{n} {clean(k)}" for k, n in masked.items())
                           + " in what you shared", W)
+
+    def network_text(self):
+        r = self.runner
+        if not r:
+            return "no sandbox: the profile has no 'sandbox'"
+        if r.get("problem"):
+            return f"the profile's sandbox can't run here: {clean(r['problem'])}"
+        return (f"sandbox network is {'ON: each sandboxed run asks first' if r.get('network') else 'off'}"
+                + ("" if self.coding else " (the sandbox is used in coding mode)") + " · /network on|off")
 
     def exit(self, code, err=""):
         self.exited, self.busy, self.pending = code, False, []
@@ -643,7 +679,7 @@ class Model:
     def command(self, line):
         cmd, _, arg = line.partition(" ")
         arg = arg.strip()
-        to_genai = cmd in ("/coding", "/skills", "/skill", "/compact")
+        to_genai = cmd in ("/coding", "/skills", "/skill", "/compact", "/network")
         if to_genai and (self.busy or self.exited is not None):
             self.note(f"{cmd} has to wait until genai finishes this reply", W)
         elif cmd == "/help":
@@ -656,6 +692,13 @@ class Model:
                 self.send({"type": "coding", "on": arg == "on"})
             else:
                 self.note(f"coding mode is {'on' if self.coding else 'off'} (/coding on|off)")
+        elif cmd == "/network":
+            if arg in ("on", "off"):
+                self.send({"type": "network", "on": arg == "on"})
+            elif arg:
+                self.note("usage: /network, /network on or /network off", R)
+            else:
+                self.note(self.network_text())
         elif cmd == "/skills":
             self.show_skills = True
             self.send({"type": "skills"})
@@ -753,6 +796,8 @@ class Model:
                         "session": h.get("session"), "sandbox": sb.get("name") if sb else None,
                         "shell_where": self.shell_where},
             "coding": self.coding, "busy": self.busy, "context": list(self.context or (None, None)),
+            "runner": self.runner and {"network": bool(self.runner.get("network")), "problem": self.runner.get("problem"),
+                                       "image": self.runner.get("image")},
             "skills": self.skills,
             "proposals": [{"id": c.id, "title": c.title(), "state": c.state, "detail": clean(c.detail)}
                           for c in self.cards.values() if c.state != "auto"],
@@ -1364,6 +1409,9 @@ class App:
             c = self.m.pending[0]
             more = f"  ({len(self.m.pending)} waiting)" if len(self.m.pending) > 1 else ""
             lines = [[(f"Allow {c.id}: {c.title()}?", W), (more, Q)]]
+            if c.ev.get("kind") == "sandbox":
+                lines.append([("  $ ", A), (fit(command_text(c.ev.get("command", "")).replace("\n", "⏎"), w - 6), "")])
+                lines.append([("  The network is on: on a throwaway copy, but it could send what it reads anywhere.", R)])
             if c.ev.get("secret"):
                 ep = (self.m.hello or {}).get("endpoint") or {}
                 lines.append([(f"It looks like it holds secrets; allowing sends it to {ep.get('base_url', 'the endpoint')}", R)])

@@ -515,9 +515,10 @@ class TestBundledSkills(unittest.TestCase):
 class Proc:
     """genai --json as a subprocess, driven line by line."""
 
-    def __init__(self, home, cwd, args):
+    def __init__(self, home, cwd, args, env=None):
         env = dict(os.environ, XDG_CONFIG_HOME=os.path.dirname(home), HTTPS_PROXY="http://127.0.0.1:9",
-                   https_proxy="http://127.0.0.1:9", HTTP_PROXY="http://127.0.0.1:9", http_proxy="http://127.0.0.1:9")
+                   https_proxy="http://127.0.0.1:9", HTTP_PROXY="http://127.0.0.1:9", http_proxy="http://127.0.0.1:9",
+                   **(env or {}))
         env.pop("NO_PROXY", None)
         env.pop("no_proxy", None)
         self.p = subprocess.Popen([sys.executable, SCRIPT, "--json"] + args, cwd=cwd, env=env, text=True,
