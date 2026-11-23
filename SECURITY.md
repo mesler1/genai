@@ -13,8 +13,10 @@ recognised agent-security concerns to those choices.
 - **Assume the model can be turned against you.** Any text it reads can carry instructions: a
   file, a command's output, an attachment. No prompt wording reliably prevents that, so genai's
   rules are enforced in code, not in the system prompt.
-- **The model proposes, the human acts.** It has five tools and none of them executes anything.
-  A command is only ever shown. A file write happens only after you accept the exact change.
+- **The model proposes, the human acts.** None of its tools executes anything on your system.
+  A command is only ever shown. A file write happens only after you accept the exact change. The
+  one opt-in exception is a profile's sandbox: in coding mode the model may run commands in an
+  offline container, on a throwaway copy of the project, with secret files hidden (section 5).
 - **The model has no way out of the machine by itself.** There is no fetch tool, no rendered
   links or images, and one network destination: the endpoint you reviewed.
 - **What you see is what runs.** Model text is escaped before it reaches the terminal, and an
@@ -72,6 +74,9 @@ advice is to remove one of the three, or put a human in front of it.
 - The only network destination is the blessed endpoint. Redirects are refused and nothing more
   is sent. `OPENAI_BASE_URL` and the proxy environment variables are ignored.
 - Anything else that leaves the machine goes through a command you chose to run.
+- A sandboxed run (section 5) has no network unless you switch it on for the session, and then
+  each run asks first. Its output goes to the endpoint, like a file the model reads, after the
+  same masking; files that look like secrets are hidden from it.
 
 What remains: the endpoint receives every prompt, attachment and file the model reads. In
 coding mode the model reads non-hidden files in the working directory without asking (a file
@@ -83,13 +88,15 @@ endpoint.
 *LLM06, ASI02, AML.T0053, AML.T0101.* The causes OWASP names are too much functionality, too
 much permission and too much autonomy.
 
-- **Functionality.** Five tools: propose a command, read a file, list a directory, write a
-  file, edit a file. No delete, no fetch, no execute.
+- **Functionality.** Six tools: propose a command, read a file, list a directory, write a
+  file, edit a file, propose a plan. No delete, no fetch, no execute on your system. A seventh,
+  `run_in_sandbox`, exists only in coding mode with a profile's sandbox (section 5).
 - **Permission.** File tools take relative paths only. `..`, absolute paths and `~` are
   rejected, and each path is walked one component at a time with `O_NOFOLLOW`, so a symlink
   anywhere in it is refused. Reads refuse FIFOs, devices and binary files. New files are
   created without execute permission.
-- **Autonomy.** A turn ends when a command is proposed. A turn is capped at 10 model steps.
+- **Autonomy.** A turn ends when a command is proposed. A turn is capped at 10 model steps,
+  which also caps how many sandboxed runs one turn makes.
   Reads are capped at 256 KiB, writes at 1 MiB, overwrite snapshots at 8 MiB, and directory scans at 500 entries plus a truncation check. Without a terminal and
   outside JSON mode, nothing is performed at all.
 
@@ -135,10 +142,37 @@ in between.
   on `PATH` or `LD_LIBRARY_PATH`. The hook files must be owned by you and not writable by
   anyone else, and they are never mounted into the sandbox.
 
+- **Sandboxed runs** (`run_in_sandbox`, only in coding mode, only with a profile's `sandbox`) are
+  the one place genai executes model output without a person in between, so the container
+  carries the safety instead:
+  - The project is a copy-on-write overlay (`-v DIR:/work:O`). Whatever the command writes,
+    including `.git`, build files and test configuration, is discarded with the container, so it
+    can't leave behind something you later run on the host. Real changes are only the edits and
+    writes you approve.
+  - Secret-looking files and directories (by name, or by contents, including the endpoint key)
+    are covered by `/dev/null` or an empty read-only directory. A guard inside the container
+    checks each of them is empty before the command starts, and the run is refused if one
+    isn't, so a mount that silently failed doesn't expose it. (A `tmpfs` over a path inside the
+    overlay was found not to hide it, which is why the guard exists.)
+  - `--network=none` and no proxy variables, unless you switch the network on for the session;
+    then every run asks first.
+  - No home directory, `/tmp` or `/run` from the host, so no SSH agent, tmux or genai-tui
+    sockets. A read-only root, `--cap-drop=all`, `no-new-privileges`, `--userns=keep-id`, a time
+    limit, a 1 GB `/tmp`, and memory and process limits where cgroups are delegated.
+  - The command's output is masked and clipped before the model sees it, and the user sees the
+    same output. The audit log records each run by fingerprint, with its exit code and duration.
+
 What remains: the indicator is display only. A command you approve outside a sandbox can do
 anything you can. Inside `sandbox/run genai` the network is open, because genai has to reach
 the endpoint, so a command run there can reach any host. It can also read whatever your user
 can read under `/usr` and `/etc`, and under anything a sandbox hook mounted.
+
+For sandboxed runs: a container shares the host's kernel, so it holds against a model that is
+wrong or has been steered by what it read, not against a kernel exploit. Detecting secrets by name
+and content is a heuristic; a secret in an unusual form in a non-hidden file can be read and sent
+to the endpoint, as it could by `read_file` in coding mode. Virtual environments and
+`node_modules` are not scanned. Overlay writes go to podman's storage and are not size-limited
+until the run ends. Without delegated cgroups, only the time limit and `/tmp`'s size bound a run.
 
 ### 6. Improper output handling: the terminal as an attack surface
 
@@ -293,7 +327,8 @@ Sessions are plain text on disk.
 ### 11. Unbounded consumption
 
 *LLM10, ASI08.* The step limit, the size caps, a per-request timeout and a context check before
-every send (at the limit, nothing is sent) bound what a looping model can cost. A reply from the
+every send (at the limit, nothing is sent) bound what a looping model can cost. A sandboxed run
+has a time limit, and memory and process limits where the host allows them. A reply from the
 endpoint is capped at 8 MB, as is a single streamed line; past that the request fails and
 nothing is performed. The masking patterns run in linear time, so crafted command output cannot
 stall genai.

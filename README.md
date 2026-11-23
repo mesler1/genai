@@ -1,7 +1,10 @@
 # genai
 
 A small command-line client for OpenAI-compatible APIs, standard library only, Python 3.10+.
-**The model never executes anything:** it proposes a command or a file operation, and you decide.
+**The model never executes anything on your system:** it proposes a command or a file operation, and
+you decide. The one exception is opt-in: in coding mode, a profile can give it a sandbox, an offline
+container working on a throwaway copy of the project, to build and test in
+([Sandboxed runs](#sandboxed-runs)).
 See [DECISIONS.md](DECISIONS.md) for the design choices and known limitations, and
 [SECURITY.md](SECURITY.md) for the risks of a tool like this and how genai handles each.
 
@@ -59,6 +62,7 @@ model, default skills, sampling settings and coding mode:
 | Sessions | `genai -p NAME -S nightly "summarize" > out.txt` |
 | Coding mode | `genai -e NAME --coding` (reads stop asking, except files that look like secrets; writes still ask) |
 | Coding mode where it is refused | `genai -e NAME --coding-anywhere` (prints what that exposes) |
+| Builds and tests the model runs itself | a profile with `"coding": true` and a `"sandbox"` ([Sandboxed runs](#sandboxed-runs)) |
 | Wrappers | `genai -p NAME --json` (JSON Lines over stdio) |
 | Lists | `genai --list-endpoints`, `--list-profiles`, `--list-skills`, `--list-sessions` (each with `--json`) |
 
@@ -182,6 +186,52 @@ proxy, CA bundle or headers), or an older session has no recorded destination, g
 `--allow-session-endpoint-change` before sending the saved conversation. Check the URL shown in
 the error before approving the transfer. Another model on the same server needs no consent.
 
+## Sandboxed runs
+
+In coding mode the model can only propose commands, so you run every build and test yourself. A
+profile can instead give it a sandbox, where it runs them itself and fixes what fails:
+
+```json
+{
+  "name": "coder-py",
+  "endpoint": "work-llm",
+  "coding": true,
+  "sandbox": {"image": "localhost/myproject-dev:latest"}
+}
+```
+
+The model then has a `run_in_sandbox` tool. Each command runs in a rootless podman container:
+
+- **On a throwaway copy of the project.** The working directory is mounted at `/work` as an
+  overlay: the command can write anything, and every change is discarded when it ends. The only
+  way the real project changes is an edit or write you approve. So a test run can't plant a git
+  hook, a `Makefile` or a `conftest.py` that later runs on your machine.
+- **Without your secrets.** Files that look like secrets are hidden: `.env*`, `.netrc`, `.npmrc`,
+  `.pypirc`, `.git-credentials`, private keys and keystores, directories such as `.aws` and `.ssh`,
+  a `.git/config` holding a credential, and any file whose contents look like a secret (including
+  the endpoint's key). Before the command runs, genai checks inside the container that each
+  of them really is empty, and refuses to run it if one isn't. Virtual environments (directories
+  with a `pyvenv.cfg`) and `node_modules` aren't scanned. Your home directory, `/tmp` and `/run`
+  are not in the sandbox at all; its `HOME` is its own `/tmp`.
+- **Offline.** `--network=none`, and no proxy variables. Nothing can be downloaded, so the image
+  must already have the project's tools and dependencies, or the project a virtual environment.
+- **Limited.** A time limit (`timeout`, default 300 s), a 1 GB `/tmp`, a read-only root, no
+  capabilities and `no-new-privileges`. It also gets memory (`memory`, default `"4g"`) and process
+  (`pids`, default 1024) limits where the host delegates cgroups to you. Where it doesn't, such as
+  a login without a systemd user session, genai says so once and runs without them.
+
+An offline run needs no approval: you see the command, then its exit code and output, and so does
+the model. Ctrl-C stops it and ends the turn. Every run is in the audit log, by fingerprint.
+
+**The network switch.** `:network on` (or the JSON `network` message) gives the sandbox the
+network for this session; `:network off` takes it away, and a new session starts as the profile
+says (`"network": true` starts it on, which blessing flags). While it is on, **every sandboxed
+command asks first**, because code that can read the project and reach the network could send the
+project anywhere.
+
+The image is used as it is (`--pull=never`); pull or build it yourself. Podman is the only engine
+so far (`"engine": "podman"` or `"auto"`).
+
 ## JSON protocol
 
 `genai --json` speaks JSON Lines over stdin and stdout: one object per line, each with a
@@ -191,7 +241,8 @@ arrives as it is, so the wrapper must escape it before it displays it.
 
 genai's first line is `hello`. It has `protocol` (1), `version`, `features`, `endpoint`,
 `profile`, `session`, `resumed`, `coding`, `coding_from`, `coding_override`, `cwd`, `sandbox`,
-the active `skills`, and the model's `tools`. Check `features` before you use a message added
+`runner` (the profile's sandbox for `run_in_sandbox`: `engine`, `image`, `network`, `timeout` and
+`problem`, or `null`), the active `skills`, and the model's `tools`. Check `features` before you use a message added
 later.
 
 **Messages a wrapper sends**
@@ -211,6 +262,7 @@ later.
 | `trace` | optional `from`, `to` (exchange numbers) | Answered by `trace`: the exchanges with the endpoint in that range (default: the latest), exactly as sent and received. Each has `n`, `time`, `method`, `url`, `headers` (the API key and the endpoint's own header values are not shown), `request` (the body, as sent), `http`, `stream`, `response` (the reply as it arrived: each streamed line, or the whole body), `status` (`ok` or `error`, with `error`), `message` (the reply as genai put it together), `usage` and `ms`. genai keeps the last 30, in memory only; `kept` gives the range it still has. |
 | `system` | | Answered by `system`: the system prompt and the tool definitions the next request will carry, with `model` and `params`. |
 | `plan` | optional `clear: true` | Answered by `plan`: the approved plan, or `null`. With `clear`, drops it first, so everything asks again. |
+| `network` | optional `on` (true or false) | Turns the sandbox's network on or off for this session (error `no_sandbox` without one). Answered by `network`: `runner` as in `hello`, and `available` (whether `run_in_sandbox` is offered now). |
 
 While proposals are waiting for decisions, only `decision`, `result`, `attach`, `trace` and `system` are accepted.
 Anything else gets the error `busy`, so coding mode and skills never change halfway through a
@@ -221,14 +273,14 @@ decision.
 | `type` | Meaning |
 |---|---|
 | `text` | A piece of the model's reply. |
-| `proposal` | `id`, `kind` (`read`, `list`, `write`, `edit`, `command`, `external`, `invalid`), and the proposal's fields, such as `path`, `content`, `diff`, `command` and `reason`. `auto: true` means it needed no approval: coding mode, or a read the approved plan names. A `plan` proposal has `goal` and numbered `steps` (`n`, `kind`: `read`, `edit`, `write` or `command`, a `path` or the exact `command`, and `why`). While a plan is approved, a proposal it covers has `plan_step`; a command matching an approved step character for character also has `preapproved: true`, so the wrapper may run it without asking again; a command, edit or write the plan doesn't cover has `off_plan: true`. Edits and writes always ask. `secret: true` means the file looks like it holds secrets. A command is only shown: the wrapper runs it, if the user wants to, and can share the output with `attach`. |
-| `result` | `id`, `status`, `detail`: what happened to a proposal that was performed. |
-| `done` | The turn ended. `reason` is `reply`, `command` or `step_limit`; `context` gives `used` and `limit`; `exchanges` gives the first and last exchange numbers of this turn, for `trace` (also on an `error` that ends a turn). |
+| `proposal` | `id`, `kind` (`read`, `list`, `write`, `edit`, `command`, `sandbox`, `external`, `invalid`), and the proposal's fields, such as `path`, `content`, `diff`, `command` and `reason`. `auto: true` means it needed no approval: coding mode, or a read the approved plan names. A `plan` proposal has `goal` and numbered `steps` (`n`, `kind`: `read`, `edit`, `write` or `command`, a `path` or the exact `command`, and `why`). While a plan is approved, a proposal it covers has `plan_step`; a command matching an approved step character for character also has `preapproved: true`, so the wrapper may run it without asking again; a command, edit or write the plan doesn't cover has `off_plan: true`. Edits and writes always ask. `secret: true` means the file looks like it holds secrets. A command is only shown: the wrapper runs it, if the user wants to, and can share the output with `attach`. A `sandbox` proposal (`command`, `reason`, `network`, `image`) is genai running the command in the sandbox: offline it has `auto: true` and runs at once; online it waits for a `decision`. |
+| `result` | `id`, `status`, `detail`: what happened to a proposal that was performed. For a `sandbox` run, also `exit` (`null` if it was killed at the time limit or never ran) and `output`, exactly what the model is sent. |
+| `done` | The turn ended. `reason` is `reply`, `command`, `stopped` (Ctrl-C during a sandboxed run) or `step_limit`; `context` gives `used` and `limit`; `exchanges` gives the first and last exchange numbers of this turn, for `trace` (also on an `error` that ends a turn). |
 | `context` | The conversation is getting near the context limit. |
 | `notice` | Something the user should know. |
 | `error` | `code` and `message`. |
 | `plan` | The approved plan changed: approved, a step done, or dropped. `plan` has `id`, `goal` and `steps`, each with `approved`, `status` (`todo`, `done`, `left out`) and `edited` when the user changed its command; `null` when there is none. A plan is never saved with the session. |
-| `attached`, `registered`, `compacted`, `coding`, `skills`, `files`, `trace`, `system` | Answers to the messages above. |
+| `attached`, `registered`, `compacted`, `coding`, `skills`, `files`, `trace`, `system`, `network` | Answers to the messages above. |
 
 When stdin closes, every waiting proposal is declined and genai exits.
 
