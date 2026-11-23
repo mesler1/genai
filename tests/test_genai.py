@@ -966,6 +966,51 @@ class TestEndToEnd(Tmp):
             self.assertEqual([(a["name"], a["on"]) for a in self.audit() if a["event"] == "skill"],
                              [("slurm", True), ("slurm", False)])
 
+    def test_read_shows_a_file_to_the_user_only(self):
+        with FakeAPI([]) as api:
+            home, path = make_home(self.tmp, api.url, key_env="GENAI_VIEW_KEY")
+            bless_path(home, path)
+            self.home = home
+            wd = self.wd = self.path("wd")
+            os.makedirs(os.path.join(wd, "sub"))
+            files = {"plain.txt": "hello\nPLAIN-MARKER\n", "id_rsa": "-----BEGIN RSA PRIVATE KEY-----\nMIIE\n"
+                     "-----END RSA PRIVATE KEY-----\n", "keyed.txt": "the key is sk-viewer-key-12345 ok\n"}
+            for rel, text in files.items():
+                with open(os.path.join(wd, rel), "w") as f:
+                    f.write(text)
+            with open(os.path.join(wd, "blob.bin"), "wb") as f:
+                f.write(b"\0\1\2")
+            with open(os.path.join(wd, "big.txt"), "w") as f:
+                f.write("x" * (G.READ_CAP + 1))
+            os.symlink("/etc/hostname", os.path.join(wd, "link"))
+            g = Proc(home, wd, ["-e", "test"], env={"GENAI_VIEW_KEY": "sk-viewer-key-12345"})
+            self.assertIn("read", g.until("hello")["features"])
+
+            g.send({"type": "read", "path": "plain.txt"})
+            ev = g.until("file")
+            self.assertEqual((ev["path"], ev["text"], ev["size"], ev["secret"], ev["redacted"]),
+                             ("plain.txt", files["plain.txt"], 19, False, {}))
+            g.send({"type": "read", "path": "id_rsa"})
+            self.assertTrue(g.until("file")["secret"])
+            g.send({"type": "read", "path": "keyed.txt"})
+            ev = g.until("file")
+            self.assertTrue(ev["secret"])
+            self.assertNotIn("sk-viewer-key-12345", ev["text"])
+            self.assertEqual(ev["redacted"], {"endpoint key": 1})
+            for bad in ("link", "sub", "../outside", "blob.bin", "big.txt", "missing"):
+                g.send({"type": "read", "path": bad})
+                err = g.until("error")
+                self.assertEqual((err["code"], err["path"]), ("bad_path", bad), bad)
+            g.send({"type": "read", "path": 3})
+            self.assertEqual(g.until("error")["code"], "bad_message")
+            g.close()
+            self.assertEqual(api.requests, [])
+            reads = [a for a in self.audit() if a["event"] == "user_read"]
+            self.assertEqual([(a["path"], a["chars"], a["secret"]) for a in reads],
+                             [("plain.txt", 19, False), ("id_rsa", len(files["id_rsa"]), True),
+                              ("keyed.txt", len(files["keyed.txt"]), True)])
+            self.assertNotIn("PLAIN-MARKER", json.dumps(reads))
+
     def test_files_marks_secrets_for_the_tree(self):
         with FakeAPI([]) as api:
             g = self.start(api)

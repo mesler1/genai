@@ -2456,6 +2456,15 @@ class Engine:
             rows.append(row)
         return rows, truncated
 
+    def view(self, path):
+        """A file for the user's viewer: read through the same checks as the model's reads, with the endpoint key
+        masked. It goes to the wrapper only, never into the session. Returns (text, size, secret, redacted)."""
+        text = self.wd.read(path)
+        secret = looks_secret(text) or any(key and key in text for key in self.secrets())
+        shown, counts = redact(text, self.secrets())
+        self.audit.log("user_read", path=path, chars=len(text), secret=secret)
+        return shown, len(text.encode()), secret, counts
+
     def prepare_auto_read(self, proposal):
         """Read the file now, so what is sent is exactly what was checked for secrets. A read that fails (a missing,
         binary or oversized file) stays automatic and reports its error: there is nothing secret to ask about."""
@@ -3413,7 +3422,8 @@ def run_json(engine, ui, first_prompt, attachments):
     ui.engine = engine
     ui.emit({"type": "hello", "protocol": PROTOCOL, "version": VERSION,
              "features": ["proposals", "decisions", "attach", "register_tools", "compact", "context", "coding",
-                          "set_coding", "skills", "files", "trace", "system", "plan", "network", "clear", "models"],
+                          "set_coding", "skills", "files", "read", "trace", "system", "plan", "network", "clear",
+                          "models"],
              "endpoint": engine.endpoint.info(),
              "profile": {"name": engine.profile.name, "description": engine.profile.description}
              if engine.profile else None,
@@ -3544,6 +3554,17 @@ def run_json(engine, ui, first_prompt, attachments):
                 ui.emit({"type": "files", "path": path, "entries": entries, "truncated": truncated})
             except (ValueError, OSError) as err:
                 ui.error(f"cannot list {path}: {err}", "bad_path")
+        elif t == "read":
+            path = msg.get("path")
+            if not isinstance(path, str):
+                ui.error("read needs 'path' as a string", "bad_message")
+                continue
+            try:
+                text, size, secret, counts = engine.view(path)
+                ui.emit({"type": "file", "path": path, "text": text, "size": size, "secret": secret,
+                         "redacted": counts})
+            except (ValueError, OSError) as err:
+                ui.error(f"cannot read {path}: {err}", "bad_path", path=path)
         elif t in ("trace", "system"):
             inspect(engine, ui, msg)
         elif t == "plan":

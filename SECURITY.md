@@ -380,6 +380,9 @@ injected instruction into later sessions.
   exactly, and an empty buffer sends nothing.
 - Files are sent as they are, deliberately, because masking would corrupt code. genai warns
   when a file looks like it holds secrets.
+- A wrapper's file viewer (the `read` message) reads through the same checks as the model's reads.
+  The text goes only to the wrapper, never to the model or the session, with the endpoint key
+  masked, and each read is audit-logged with its path and size, not its content.
 - A failed edit on a file the model may not read reports only "declined", so edits cannot be
   used to probe file contents. The same holds for paths: where the model may not read without
   asking, an error that would reveal a symlink or a file in the middle of a path is shown to you
