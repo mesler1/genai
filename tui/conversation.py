@@ -46,6 +46,7 @@ COMMANDS = {
     "/mark": "shell context starts at the shell's current prompt (or right-click a line in the shell)",
     "/shell": "show the shell and move there (`` on its empty prompt hides it again)",
     "/panel": "show or hide the info panel on the right",
+    "/plan": "[clear]: show the approved plan, or drop it so everything asks again",
     "/raw": "[N|all]: what was sent to the endpoint and what came back, for the last turn, turn N, or all kept",
     "/system": "the system prompt and tool definitions sent with every request",
     "/compact": "shrink the conversation when the context is getting full",
@@ -303,6 +304,47 @@ class Banner(Block):
         return out
 
 
+def step_text(st):
+    """One plan step, escaped: what it does to which file, or the exact command."""
+    if st.get("kind") == "command":
+        return "run " + clean(st.get("command", "")).replace("\n", "\\n")
+    return f"{st.get('kind', '?')} {clean(st.get('path', ''))}"
+
+
+def plan_line(st):
+    """A step as a line in the plan editor."""
+    if st.get("kind") == "command":
+        cmd = st.get("command", "")
+        if "\n" in cmd:
+            return f"{st.get('n')} run (a {cmd.count(chr(10)) + 1}-line command: keep or delete this line; it can't be changed here)"
+        return f"{st.get('n')} run {cmd}"
+    return f"{st.get('n')} {st.get('kind')} {st.get('path', '')}"
+
+
+def parse_plan_edit(text, steps):
+    """What the user kept of a plan in their editor: (step numbers kept, {number: changed command}, problem)."""
+    keep, edits = set(), {}
+    for ln in text.split("\n"):
+        if not ln.strip():
+            continue
+        m = re.fullmatch(r"([0-9]{1,3}) (read|edit|write|run) (.+)", ln)
+        st = steps.get(int(m.group(1))) if m else None
+        if st and ln == plan_line(st):
+            keep.add(st["n"])
+            continue
+        if not st or (m.group(2) == "run") != (st.get("kind") == "command") or \
+                (m.group(2) != "run" and m.group(2) != st.get("kind")):
+            return set(), {}, f"this line isn't a step of the plan: {clean(ln)[:60]}"
+        if st.get("kind") == "command":
+            if "\n" in st.get("command", ""):
+                return set(), {}, f"step {st['n']} is a multi-line command; keep its line as it was, or delete it"
+            edits[st["n"]] = m.group(3)
+        elif m.group(3) != st.get("path"):
+            return set(), {}, f"step {st['n']}'s path was changed; leave the step out instead"
+        keep.add(st["n"])
+    return keep, edits, None
+
+
 class Card(Block):
     """A proposal. Its state changes as it is decided and performed."""
     STATE_ROLE = {"waiting": W, "accepted": D, "done": D, "declined": Q, "error": R, "shown": A, "auto": Q,
@@ -321,13 +363,20 @@ class Card(Block):
         path = clean(ev.get("path", ""))
         return {"read": f"read {path}", "list": f"list {path or '.'}", "edit": f"edit {path}",
                 "write": f"{'overwrite' if ev.get('exists') else 'create'} {path}",
-                "command": "command", "external": f"tool {clean(ev.get('tool', ''))}"}.get(k, str(k))
+                "command": "command", "external": f"tool {clean(ev.get('tool', ''))}",
+                "plan": f"plan · {len(ev.get('steps') or [])} steps"}.get(k, str(k))
 
     def body(self):
         """(text, role) lines inside the card."""
         ev, k, out = self.ev, self.ev.get("kind"), []
+        if ev.get("preapproved"):
+            out.append((f"step {ev.get('plan_step')} of the plan you approved", D))
+        elif ev.get("plan_step"):
+            out.append((f"step {ev.get('plan_step')} of the plan", Q))
+        elif ev.get("off_plan"):
+            out.append(("NOT in the plan you approved", W))
         if ev.get("reason"):
-            out += [(ln, Q) for ln in clean(ev["reason"]).split("\n")]
+            out += [(ln, A if k == "plan" else Q) for ln in clean(ev["reason"]).split("\n")]
         if ev.get("secret"):
             out.append(("this file looks like it contains secrets", R))
         if ev.get("flagged"):
@@ -346,6 +395,10 @@ class Card(Block):
             out.append((f"{ev['size']} bytes", Q))
         elif k == "external":
             out.append((clean(json.dumps(ev.get("args", {}), ensure_ascii=False)), ""))
+        elif k == "plan":
+            for st in ev.get("steps") or []:
+                out.append((f"{st.get('n', '?'):>2}. {step_text(st)}", ""))
+                out.append((f"    {clean(st.get('why', ''))}", Q))
         return out
 
     def full_text(self):
@@ -401,6 +454,9 @@ class Model:
         self.recent = []           # the shell pane's latest commands, for the info panel
         self.turn = 0              # turns sent to genai so far
         self.exchanges = {}        # turn: [first, last] exchange with the endpoint, for /raw
+        self.plan = None           # the approved plan, as genai last reported it
+        self.plan_cmds = set()     # commands the user approved in it: our own record, checked against genai's
+        self.plan_auto = False     # run those commands as they come, without asking again
 
     def add(self, block):
         if "turn" not in vars(block):
@@ -436,6 +492,8 @@ class Model:
                 card.state = "auto"
             elif ev.get("kind") == "command":
                 card.state = "shown"
+                if ev.get("preapproved") and ev.get("command") in self.plan_cmds and self.shell:
+                    self.actions.append(("plan_cmd", card))
             elif ev.get("kind") == "invalid":
                 card.state = "error"
                 card.detail = f"the model asked for a tool that does not exist: {ev.get('tool', '?')}"
@@ -449,6 +507,17 @@ class Model:
                 card.changed()
         elif t in ("trace", "system"):
             self.actions.append(("show", ev))
+        elif t == "plan":
+            was, self.plan = self.plan, ev.get("plan")
+            if self.plan is None:
+                self.plan_cmds, self.plan_auto = set(), False
+                if was:
+                    self.note("plan dropped: everything asks again", W)
+            elif not was or was.get("id") != self.plan.get("id"):
+                n = sum(1 for st in self.plan.get("steps") or [] if st.get("approved"))
+                self.note(f"plan {self.plan.get('id')} approved: {n} step{'s' if n != 1 else ''}"
+                          + ("; planned commands run on their own" if self.plan_auto else
+                             "; each planned command asks once") + " · /plan shows it", D)
         elif t == "done":
             if ev.get("exchanges"):
                 self.exchanges[self.turn] = ev["exchanges"]
@@ -594,6 +663,23 @@ class Model:
             self.note(f"{cmd} has to wait until genai finishes this reply", W)
         elif cmd == "/system":
             self.send({"type": "system"})
+        elif cmd == "/plan":
+            if arg == "clear" and self.busy:
+                self.note("/plan clear has to wait until genai finishes this reply", W)
+            elif arg == "clear":
+                self.send({"type": "plan", "clear": True})
+            elif arg:
+                self.note("usage: /plan or /plan clear", R)
+            elif not self.plan:
+                self.note("no plan approved")
+            else:
+                self.note(f"plan {self.plan.get('id')}: {clean(self.plan.get('goal', ''))}", A)
+                for st in self.plan.get("steps") or []:
+                    mark = {"done": "✓", "todo": "·", "left out": "✗"}.get(st.get("status"), "?")
+                    self.note(f"  {mark} {st.get('n', '?'):>2}. {step_text(st)}"
+                              + (" (you changed it)" if st.get("edited") else "")
+                              + (" (left out)" if st.get("status") == "left out" else ""),
+                              D if st.get("status") == "done" else Q if st.get("status") == "left out" else "")
         elif cmd == "/raw":
             self.raw(arg)
         elif cmd == "/context":
@@ -636,6 +722,9 @@ class Model:
             "proposals": [{"id": c.id, "title": c.title(), "state": c.state, "detail": clean(c.detail)}
                           for c in self.cards.values() if c.state != "auto"],
             "commands": self.recent,
+            "plan": self.plan and {"goal": clean(self.plan.get("goal", "")), "auto": self.plan_auto,
+                                   "steps": [{"n": st.get("n"), "text": step_text(st), "status": st.get("status")}
+                                             for st in self.plan.get("steps") or []]},
         }
 
     def request(self, msg):
@@ -663,6 +752,28 @@ class Model:
         """Shell context the user reviewed: it goes with their next message, so they can ask about it."""
         self.send({"type": "attach", "label": label, "text": text})
         self.note(f"attached {label}; it goes with your next message", D)
+
+    def decide_plan(self, approve=None, edits=None, auto=False):
+        """Approve the plan showing: every step, or those in approve, with commands changed as in edits
+        ({number: command}). Planned commands then ask once each, or with auto run as they come."""
+        card = self.pending.pop(0)
+        steps = {st.get("n"): st for st in card.ev.get("steps") or []}
+        keep = set(steps) if approve is None else set(approve)
+        edits = edits or {}
+        self.plan_cmds = {edits.get(n, st.get("command")) for n, st in steps.items()
+                          if n in keep and st.get("kind") == "command"}
+        self.plan_auto = auto
+        card.state = "accepted"
+        card.detail = ("all steps" if approve is None else f"steps {', '.join(map(str, sorted(keep)))}") + \
+            (f"; you changed step {', '.join(map(str, sorted(edits)))}" if edits else "") + \
+            ("; commands run on their own" if auto else "")
+        card.changed()
+        msg = {"type": "decision", "id": card.id, "decision": "accept"}
+        if approve is not None:
+            msg["approve"] = sorted(keep)
+        if edits:
+            msg["edits"] = {str(n): c for n, c in edits.items()}
+        self.send(msg)
 
     def decide(self, accept):
         if not self.pending:
@@ -1134,7 +1245,8 @@ class App:
             if ask["kind"] == "run":
                 c = ask["card"]
                 where = self.where()
-                lines = [[(f"Run {c.id}{' (edited)' if ask['edited'] else ''} in the shell pane? ", A),
+                step = f" (step {c.ev['plan_step']} of the plan)" if c.ev.get("preapproved") and not ask["edited"] else ""
+                lines = [[(f"Run {c.id}{step}{' (edited)' if ask['edited'] else ''} in the shell pane? ", A),
                           (f"It runs {where}, in your shell, as you:", R if where.startswith("OUTSIDE") else "")]]
                 lines += [[("    $ " if i == 0 else "      ", Q), (fit(ln, w - 6), "")]
                           for i, ln in enumerate(clean(ask["command"]).split("\n")[:4])]
@@ -1143,6 +1255,19 @@ class App:
             lines = [[(ask["question"], A)],
                      [("  y", A), (" review it in your editor, then send   ", ""), ("n", A), (" keep it to yourself", "")]]
             return lines, None, "y review and send · n or Esc don't share"
+        if self.m.pending and self.m.pending[0].ev.get("kind") == "plan":
+            c = self.m.pending[0]
+            n = len(c.ev.get("steps") or [])
+            cmds = sum(1 for st in c.ev.get("steps") or [] if st.get("kind") == "command")
+            lines = [[(f"Approve plan {c.id} ({n} steps, {cmds} command{'s' if cmds != 1 else ''})? ", W),
+                      ("Planned reads won't ask again; edits still will.", Q)],
+                     [("  y", A), (" approve: each planned command asks once   ", ""),
+                      ("a", A), (" approve, and run planned commands on their own", "")],
+                     [("  e", A), (" choose steps or change commands first   ", ""), ("n", A), (" no   ", ""),
+                      ("v", A), (" view it all", "")]]
+            if cmds and self.where().startswith("OUTSIDE"):
+                lines.append([(f"  Commands run {self.where()}, in your shell, as you.", R)])
+            return lines, None, "y approve · a approve and run commands on their own · e edit · n or Esc no · v view"
         if self.m.pending:
             c = self.m.pending[0]
             more = f"  ({len(self.m.pending)} waiting)" if len(self.m.pending) > 1 else ""
@@ -1244,6 +1369,20 @@ class App:
             if isinstance(k, str):
                 self.answer(k.lower())
             return
+        if m.pending and m.pending[0].ev.get("kind") == "plan":
+            if k in ("y", "Y"):
+                m.decide_plan()
+            elif k in ("a", "A"):
+                m.decide_plan(auto=True)
+            elif k in ("e", "E"):
+                self.edit_plan()
+            elif k in ("n", "N"):
+                m.decide(False)
+            elif k in ("v", "V"):
+                self.view(m.pending[0])
+            elif k in (curses.KEY_PPAGE, curses.KEY_NPAGE):
+                self.page(k)
+            return
         if m.pending:
             if k in ("y", "Y"):
                 m.decide(True)
@@ -1315,7 +1454,7 @@ class App:
         if self.m.ask is not self.ask_obj:
             self.ask_obj, self.ask_serial = self.m.ask, self.ask_serial + 1
         if mode != "input":
-            lines = [[(t, "question" if i == 0 and r in (A, W) else ("key" if t.strip() in ("y", "n", "v", "e") else r))
+            lines = [[(t, "question" if i == 0 and r in (A, W) else ("key" if t.strip() in ("y", "n", "v", "e", "a") else r))
                       for t, r in segs] for i, segs in enumerate(lines)]
         return {"mode": mode, "lines": lines if mode != "input" else [], "hints": "" if mode == "input" else hints,
                 "busy": self.m.busy, "status": " · ".join(status), "exited": self.m.exited is not None,
@@ -1603,6 +1742,35 @@ class App:
             sys.stdout.flush()
             self.scr.refresh()
 
+    def edit_plan(self):
+        """The plan in the user's editor: delete a step's line to leave it out, change a command to approve that
+        instead. Paths can't be changed here (the model chose them; leave the step out instead)."""
+        card = self.m.pending[0]
+        steps = {st.get("n"): st for st in card.ev.get("steps") or []}
+        text = "\n".join(f"# {st.get('n')}. {clean(st.get('why', ''))}\n{plan_line(st)}" for st in steps.values())
+        edited = self.edit(text, f"Plan {card.id}: {clean(card.ev.get('goal', ''))}",
+                           "the steps you approve. Delete a line to leave that step out; change a command after "
+                           "'run' to approve your version instead. Paths can't be changed", "decline the plan")
+        if edited is None:
+            return                                          # the editor failed: the question stays
+        keep, edits, bad = parse_plan_edit(edited, steps)
+        if bad:
+            self.m.note(f"{card.id}: {bad}; nothing decided yet", R)
+        elif not keep:
+            self.m.decide(False)
+            self.m.note(f"{card.id}: every step was left out, so the plan was declined")
+        else:                                               # after editing, each planned command asks once
+            self.m.decide_plan(approve=None if keep == set(steps) else sorted(keep), edits=edits)
+
+    def plan_cmd(self, card):
+        """genai marked a command as one the user approved in the plan, and our own record agrees."""
+        if self.m.ask or self.m.pending or self.running:
+            return                                          # it stays a card: click it or /run it
+        if self.m.plan_auto:
+            self.start_run(card, card.ev.get("command", ""))
+        else:
+            self.m.ask = {"kind": "run", "card": card, "command": card.ev.get("command", ""), "edited": False}
+
     def run_here(self, argv, full=False):
         """Run an editor or pager where the user can use it: in a tmux popup when typing happens in the prompt
         pane, else in this pane. Returns its exit code."""
@@ -1698,6 +1866,8 @@ class App:
                 self.list_commands()
             elif action[0] == "show":
                 self.show_raw(action[1])
+            elif action[0] == "plan_cmd":
+                self.plan_cmd(action[1])
             elif action[0] == "mark_line":
                 self.mark_line()
             elif action[0] == "unmark":

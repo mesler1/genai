@@ -195,6 +195,22 @@ safe and prompts are rare enough to be read.
   and which URL it goes to, and the banner, the `hello` event and the audit log record it.
 - In coding mode a file that looks like it holds secrets is not read automatically. It asks,
   like any read outside coding mode.
+- A plan (`propose_plan`) lets you approve steps before they come, and is held to what you
+  approved:
+  - A planned read needs no further approval, unless the file is hidden or looks like it holds
+    secrets.
+  - A planned edit or write still shows its diff and asks. Otherwise an approved test command
+    would run whatever the model had just written into the code it tests.
+  - A planned command is marked `preapproved` only when it matches the approved step character
+    for character; there are no patterns. genai still runs nothing: in genai-tui it is typed
+    into your shell without another question only if you chose that for this plan, and
+    genai-tui checks the command against its own record of what you approved, so it does not
+    rely on genai's word alone. Its output is still reviewed before the model sees it.
+  - A command, edit or write the plan doesn't name is flagged "not in the plan" and asks as
+    usual. A new plan needs a new approval.
+  - A plan is never saved with a session, so it doesn't survive a resume. `/plan clear` (or
+    `:plan clear`) drops it, and the audit log records the plan, each step it covered and its
+    commands by fingerprint only.
 
 The TUI (`tui/genai-tui`) is such a wrapper, split across tmux panes. Only its conversation pane
 talks to genai; the prompt pane, the info panel and tmux menus reach it over a Unix socket in a

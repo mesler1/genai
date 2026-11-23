@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
 from unittest import mock
 
@@ -656,6 +657,116 @@ class TestEndToEnd(Tmp):
             raw = json.dumps(tr)
             self.assertNotIn("sk-very-secret", raw)
             self.assertNotIn("hush-hush", raw)
+
+    def test_plan_is_approved_in_advance_and_enforced(self):
+        steps = [{"kind": "read", "path": "a.txt", "why": "see it"},
+                 {"kind": "edit", "path": "a.txt", "why": "fix it"},
+                 {"kind": "command", "command": "make test", "why": "check"},
+                 {"kind": "command", "command": "rm -rf build", "why": "clean"}]
+        turns = [call("propose_plan", goal="fix a", steps=steps),
+                 call("read_file", path="a.txt", reason="step 1"),
+                 call("edit_file", path="a.txt", old_text="old", new_text="new", reason="step 2"),
+                 call("propose_command", command="make test -j2", reason="step 3"),
+                 call("propose_command", command="rm -rf build", reason="left out"),
+                 call("write_file", path="b.txt", content="x", reason="not planned"), reply("ok")]
+        with FakeAPI(turns) as api:
+            g = self.start(api)
+            with open(os.path.join(self.wd, "a.txt"), "w") as f:
+                f.write("old\n")
+            self.assertIn("plan", g.until("hello")["features"])
+            g.send({"type": "user", "text": "fix a"})
+            p = g.until("proposal")
+            self.assertEqual((p["kind"], p["goal"], [s["n"] for s in p["steps"]]), ("plan", "fix a", [1, 2, 3, 4]))
+            g.send({"type": "decision", "id": p["id"], "decision": "accept", "approve": [1, 2, 3],
+                    "edits": {"3": "make test -j2"}})
+            plan = g.until("plan")["plan"]
+            self.assertEqual([(s["n"], s["status"]) for s in plan["steps"]],
+                             [(1, "todo"), (2, "todo"), (3, "todo"), (4, "left out")])
+            self.assertEqual(plan["steps"][2]["command"], "make test -j2")
+            read = g.until("proposal")
+            self.assertEqual((read["kind"], read.get("auto"), read["plan_step"]), ("read", True, 1))   # no question
+            edit = g.until("proposal")
+            self.assertEqual((edit["kind"], edit.get("auto"), edit["plan_step"]), ("edit", None, 2))   # still asks
+            g.send({"type": "decision", "id": edit["id"], "decision": "accept"})
+            cmd = g.until("proposal")
+            self.assertEqual((cmd["command"], cmd.get("preapproved"), cmd["plan_step"]), ("make test -j2", True, 3))
+            g.until("done")
+            g.send({"type": "user", "text": "go on"})
+            cmd = g.until("proposal")
+            self.assertEqual((cmd["command"], cmd.get("preapproved"), cmd.get("off_plan")), ("rm -rf build", None, True))
+            g.until("done")
+            g.send({"type": "user", "text": "and?"})
+            w = g.until("proposal")
+            self.assertTrue(w.get("off_plan"))
+            g.send({"type": "decision", "id": w["id"], "decision": "decline"})
+            g.until("done")
+            g.send({"type": "plan"})
+            last = g.until("plan")["plan"]
+            g.send({"type": "plan", "clear": True})
+            self.assertIsNone(g.until("plan")["plan"])
+            g.close()
+            self.assertEqual([s["status"] for s in last["steps"]], ["done", "done", "done", "left out"])
+            plan_result = next(m for m in api.requests[1]["body"]["messages"] if m["role"] == "tool")["content"]
+            self.assertIn("The user approved this plan", plan_result)
+            self.assertIn("3. run exactly: make test -j2", plan_result)
+            self.assertIn("4. run exactly: rm -rf build (LEFT OUT", plan_result)
+            self.assertIn("# The plan the user approved", api.requests[-1]["body"]["messages"][0]["content"])
+            events = [a["event"] for a in self.audit()]
+            self.assertIn("plan", events)
+            self.assertEqual(events.count("plan_match"), 3)
+            logged = next(a for a in self.audit() if a["event"] == "proposal" and a["kind"] == "plan")
+            self.assertNotIn("rm -rf build", json.dumps(logged))          # commands are fingerprinted, as always
+
+    def test_a_malformed_plan_choice_declines_it(self):
+        steps = [{"kind": "command", "command": "make", "why": "w"}]
+        with FakeAPI([call("propose_plan", goal="g", steps=steps), reply("ok")]) as api:
+            g = self.start(api)
+            g.send({"type": "user", "text": "go"})
+            p = g.until("proposal")
+            g.send({"type": "decision", "id": p["id"], "decision": "accept", "approve": [1, "x"]})
+            self.assertEqual(g.until("error")["code"], "bad_message")
+            g.until("done")
+            g.close()
+            tool = next(m for m in api.requests[-1]["body"]["messages"] if m["role"] == "tool")
+            self.assertIn("declined by the user", tool["content"])
+            self.assertNotIn("The plan the user approved", api.requests[-1]["body"]["messages"][0]["content"])
+
+    def test_plan_reads_of_secret_or_hidden_files_still_ask(self):
+        steps = [{"kind": "read", "path": "creds.txt", "why": "w"}, {"kind": "read", "path": ".env", "why": "w"}]
+        turns = [call("propose_plan", goal="g", steps=steps), call("read_file", path="creds.txt", reason="r"),
+                 call("read_file", path=".env", reason="r"), reply("ok")]
+        with FakeAPI(turns) as api:
+            g = self.start(api)
+            with open(os.path.join(self.wd, "creds.txt"), "w") as f:
+                f.write("AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n")
+            with open(os.path.join(self.wd, ".env"), "w") as f:
+                f.write("A=1\n")
+            g.send({"type": "user", "text": "go"})
+            p = g.until("proposal")
+            g.send({"type": "decision", "id": p["id"], "decision": "accept"})
+            for _ in range(2):
+                r = g.until("proposal")
+                self.assertFalse(r.get("auto"))
+                g.send({"type": "decision", "id": r["id"], "decision": "decline"})
+            g.until("done")
+            g.close()
+
+    def test_repl_picks_plan_steps(self):
+        p = types.SimpleNamespace(id="p1")
+        steps = [{"n": 1}, {"n": 2}, {"n": 3}]
+        for ans, want in (("a", ("accept", None)), ("", ("decline", None)), ("n", ("decline", None)),
+                          ("1,3", ("accept", [1, 3])), ("2 9", ("accept", [2])), ("1; rm", ("decline", None))):
+            with mock.patch("builtins.input", return_value=ans):
+                self.assertEqual(G.pick_steps(p, steps), want, ans)
+
+    def test_bad_plans_are_refused(self):
+        for args in ({"goal": "", "steps": [{"kind": "read", "path": "a", "why": ""}]}, {"goal": "g", "steps": []},
+                     {"goal": "g", "steps": [{"kind": "delete", "path": "a"}]},
+                     {"goal": "g", "steps": [{"kind": "command", "why": "no command"}]},
+                     {"goal": "g", "steps": [{"kind": "edit", "path": "../outside", "why": ""}]},
+                     {"goal": "g", "steps": [{"kind": "read", "path": "a", "why": ""}] * (G.PLAN_STEPS + 1)}):
+            with self.assertRaises(ValueError):
+                G.parse_plan(args)
 
     def test_wrapper_turns_skills_on_and_off(self):
         with FakeAPI([reply("one"), reply("two")]) as api:
