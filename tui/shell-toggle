@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Show genai-tui's shell pane above the conversation, or hide it again (it keeps running hidden).
+# Usage: shell-toggle [toggle|show|hide] [--focus]
+set -u
+shell=$(tmux show -gqv @genai_shell_pane)
+conv=$(tmux show -gqv @genai_conv_pane)
+prompt=$(tmux show -gqv @genai_prompt_pane)
+[ -n "$shell" ] && [ -n "$conv" ] || exit 1
+shown=0
+[ "$(tmux display -p -t "$shell" '#{window_id}')" = "$(tmux display -p -t "$conv" '#{window_id}')" ] && shown=1
+want=${1:-toggle}
+[ "$want" = toggle ] && { [ $shown = 1 ] && want=hide || want=show; }
+if [ "$want" = show ]; then
+  [ $shown = 1 ] || tmux join-pane -d -b -v -l 40% -s "$shell" -t "$conv"
+  [ "${2:-}" = --focus ] && tmux select-pane -t "$shell"
+elif [ $shown = 1 ]; then
+  tmux break-pane -d -s "$shell" -n shell
+  [ -n "$prompt" ] && tmux select-pane -t "$prompt"
+fi
+exit 0
