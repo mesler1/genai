@@ -242,7 +242,7 @@ safe and prompts are rare enough to be read.
     for character; there are no patterns. genai still runs nothing: in genai-tui it is typed
     into your shell without another question only if you chose that for this plan, and
     genai-tui checks the command against its own record of what you approved, so it does not
-    rely on genai's word alone. Its output is still reviewed before the model sees it.
+    rely on genai's word alone. Its output still goes to the model only when you share it.
   - A command, edit or write the plan doesn't name is flagged "not in the plan" and asks as
     usual. A new plan needs a new approval.
   - A plan is never saved with a session, so it doesn't survive a resume. `/plan clear` (or
@@ -267,8 +267,9 @@ shared filesystem; never an abstract socket, which has no permissions).
   (tmux `pipe-pane`), and is kept in memory only, never written to disk. Commands are told apart
   by invisible markers the prompt hook prints, each carrying a random word the shell keeps in an
   unexported variable; a program you run can't read it, so it can't fake where a command ends or
-  add one to the list. Nothing from the shell reaches the model until you have reviewed it in
-  your editor.
+  add one to the list. Nothing from the shell reaches the model until you say so: you review it
+  in your editor first (`y`), or send it as it is (`s`), which shows nothing more than the
+  question did. Either way genai masks the secrets it recognises, such as the endpoint key.
 
 What this cannot do is keep out a program running as you: it can connect to the socket, or send
 keys through tmux, exactly as you can. The shell pane runs as you, on the host unless genai-tui

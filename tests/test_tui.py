@@ -841,6 +841,24 @@ class TestGenaiTui(TmuxCase):
             self.assertIn("Output:\n```\nfrom-shell\n```", sent)
             self.assertIn("[output of p1 (exit 3)]", sent)
 
+    def test_share_without_review(self):
+        turns = [call("propose_command", command="echo '# kept'; echo plain", reason="look"), reply("got it")]
+        with FakeAPI(turns) as api:
+            self.start(api, editor="false")                       # an editor that fails: s must not open it
+            self.type("look around")
+            self.wait_for("click it, or /run p1")
+            self.type("/run")
+            self.wait_for("Run p1 in the shell pane?")
+            self.key("y")
+            self.wait_for("s send it as it is")
+            self.key("s")
+            self.wait_for("got it")
+            sent = self.sent(api)
+            self.assertIn("I ran this command ", sent)
+            self.assertIn("Output:\n```\n# kept\nplain\n```", sent)   # a line starting with # stays
+            self.assertNotIn("EVERYTHING below", sent)
+            self.assertIn("sent without review", self.screen())
+
     def test_click_a_command_for_its_menu(self):
         turns = [call("propose_command", command="echo via-menu", reason="r"),   # a command ends the turn
                  call("propose_command", command="echo at-prompt", reason="r")]
