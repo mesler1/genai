@@ -31,6 +31,7 @@ recognised agent-security concerns to those choices.
 | --- | --- | --- |
 | You, your shell environment (`EDITOR`, `SHELL`, variables) and `~/.config/genai` | Trusted | Anything that can change these already acts as you. |
 | A wrapper driving `--json` | Trusted | It is the user interface: it shows proposals and returns decisions. |
+| Programs running as you, including commands you run from genai-tui's shell pane | Trusted, unavoidably | They can reach the TUI's socket and its tmux server as you can. Run genai-tui in the sandbox to keep proposed commands outside that boundary. |
 | Endpoints, profiles, skills | Trusted only as blessed | You reviewed a specific version. Its sha256 is recorded, and any change is refused. |
 | The endpoint's operator | Sees everything you send | That is what an endpoint is. Its replies are still treated as untrusted text. |
 | The model's output: text, tool names, tool arguments | Untrusted | It may be wrong, or steered by something it read. |
@@ -145,6 +146,9 @@ in between.
 - **Sandboxed runs** (`run_in_sandbox`, only in coding mode, only with a profile's `sandbox`) are
   the one place genai executes model output without a person in between, so the container
   carries the safety instead:
+  - It never runs where coding mode is refused (section 7), and `--coding-anywhere` doesn't
+    change that: the overlay would copy your whole home directory, or a credential directory,
+    into a container that runs commands without asking.
   - The project is a copy-on-write overlay (`-v DIR:/work:O`). Whatever the command writes,
     including `.git`, build files and test configuration, is discarded with the container, so it
     can't leave behind something you later run on the host. Real changes are only the edits and
@@ -235,15 +239,44 @@ safe and prompts are rare enough to be read.
   - A planned edit or write still shows its diff and asks. Otherwise an approved test command
     would run whatever the model had just written into the code it tests.
   - A planned command is marked `preapproved` only when it matches the approved step character
-    for character; there are no patterns. genai still runs nothing: a wrapper may run it
-    without another question if you chose that for this plan, and should check it against its
-    own record of what you approved rather than rely on genai's word alone. Its output should
-    still be reviewed before the model sees it.
+    for character; there are no patterns. genai still runs nothing: in genai-tui it is typed
+    into your shell without another question only if you chose that for this plan, and
+    genai-tui checks the command against its own record of what you approved, so it does not
+    rely on genai's word alone. Its output is still reviewed before the model sees it.
   - A command, edit or write the plan doesn't name is flagged "not in the plan" and asks as
     usual. A new plan needs a new approval.
-  - A plan is never saved with a session, so it doesn't survive a resume. `:plan clear` (or a
-    wrapper's `plan` message with `clear`) drops it, and the audit log records the plan, each step it covered and its
+  - A plan is never saved with a session, so it doesn't survive a resume. `/plan clear` (or
+    `:plan clear`) drops it, and the audit log records the plan, each step it covered and its
     commands by fingerprint only.
+
+The TUI (`tui/genai-tui`) is such a wrapper, split across tmux panes. Only its conversation pane
+talks to genai; the prompt pane, the info panel and tmux menus reach it over a Unix socket in a
+directory only you can open (`mktemp -d`, mode 0700, in `$XDG_RUNTIME_DIR` or `/tmp`, never a
+shared filesystem; never an abstract socket, which has no permissions).
+
+- A connection from another user is closed: the socket's directory keeps them out, and the
+  kernel's peer credentials are checked as well.
+- Each pane connects in a role and may send only that role's messages. The info panel can switch
+  coding mode and blessed skills, as you could by typing; it cannot answer a question.
+- An answer names the question it answers. One meant for a question that has gone, or not yet
+  appeared, is ignored, and keys typed within 0.3 s of a question appearing count as typing.
+- Messages are size-limited; a line that is too long or not JSON ends the connection.
+- No text from the model goes into a tmux menu, pane title or popup command, where tmux would
+  run a `#(...)`.
+- The shell pane's output reaches the conversation pane through a FIFO in that same directory
+  (tmux `pipe-pane`), and is kept in memory only, never written to disk. Commands are told apart
+  by invisible markers the prompt hook prints, each carrying a random word the shell keeps in an
+  unexported variable; a program you run can't read it, so it can't fake where a command ends or
+  add one to the list. Nothing from the shell reaches the model until you have reviewed it in
+  your editor.
+
+What this cannot do is keep out a program running as you: it can connect to the socket, or send
+keys through tmux, exactly as you can. The shell pane runs as you, on the host unless genai-tui
+runs in the sandbox, so a harmful command you run there could approve further proposals. The
+TUI requires a full command preview before execution, and checks that the shell pane
+still matches the reviewed working directory. Automatic plans require a full preview
+and reserve each approved command step for a single dispatch. Shell dispatch uses
+tmux keystrokes, so avoid typing in the shell pane while the TUI is dispatching.
 
 What remains: for commands, you are the last control. That is the design, and it is why the
 other sections matter. With `--coding-anywhere` in your home directory, everything there that is

@@ -452,6 +452,9 @@ class Sandbox:
             return "podman is not installed"
         if any(c in self.root for c in ":,"):
             return "the project's path contains ':' or ',', which podman can't mount"
+        refused = coding_refusal(self.root)
+        if refused:     # even with --coding-anywhere: the copy would hold all of it, and nothing here asks
+            return f"this is {refused[0]}; run genai in a project directory"
         return None
 
     def info(self):

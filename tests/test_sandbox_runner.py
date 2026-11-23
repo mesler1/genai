@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -103,6 +104,19 @@ class TestSandboxConfig(unittest.TestCase):
     def test_problem_when_podman_is_missing(self):
         with mock.patch.object(G.shutil, "which", return_value=None):
             self.assertEqual(G.Sandbox(conf(), ".", print).problem(), "podman is not installed")
+
+    def test_refused_where_coding_mode_is_refused_even_with_coding_anywhere(self):
+        home = os.path.realpath(tempfile.mkdtemp(prefix="genai-test-"))
+        self.addCleanup(shutil.rmtree, home, True)
+        for d in ("proj", ".ssh/keys", ".config/genai"):
+            os.makedirs(os.path.join(home, d))
+        env = {"HOME": home, "XDG_CONFIG_HOME": os.path.join(home, ".config")}
+        with mock.patch.dict(os.environ, env), mock.patch.object(G.shutil, "which", return_value="/usr/bin/podman"):
+            for where, phrase in (("", "your home directory"), ("..", "contains your home directory"),
+                                  (".ssh/keys", "holds credentials"), (".config/genai", "config directory")):
+                problem = G.Sandbox(conf(), os.path.join(home, where), print).problem()
+                self.assertIn(phrase, problem or "", where)
+            self.assertIsNone(G.Sandbox(conf(), os.path.join(home, "proj"), print).problem())
 
 
 # ---------------------------------------------------------------- what is hidden
