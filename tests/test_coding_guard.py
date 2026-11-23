@@ -196,6 +196,16 @@ class TestSecrets(Guard):
             with open(os.path.join(self.proj, name), "w") as f:
                 f.write(text)
 
+    def test_auto_read_sends_the_classified_snapshot(self):
+        eng, _ = self.engine(self.proj, session_coding=True)
+        call = {"id": "c1", "function": {"name": "read_file", "arguments": '{"path": "notes.txt"}'}}
+        proposal = eng.make_proposal(call)
+        self.assertTrue(proposal.auto)
+        with open(os.path.join(self.proj, "notes.txt"), "w") as f:
+            f.write("token=example-new-token")
+        proposal.decision = "accept"
+        self.assertEqual(eng.perform(proposal), "just some notes\n")
+
     def test_secret_looking_file_needs_approval(self):
         eng, ui = self.engine(self.proj, session_coding=True)
         for name in ("key.txt", "conf.txt"):

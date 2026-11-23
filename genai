@@ -36,6 +36,7 @@ PROTOCOL = 1
 STEP_LIMIT = 10
 READ_CAP = 256 * 1024          # bytes per read_file
 WRITE_CAP = 1024 * 1024        # bytes per write_file / edit result
+SNAPSHOT_CAP = 8 * WRITE_CAP   # maximum existing file size for an approved overwrite
 ATTACH_CAP = 256 * 1024        # bytes per -f file
 OUTPUT_CAP = 32 * 1024         # chars of command output before head/tail cut
 REPLY_CAP = 8 * 1024 * 1024    # bytes of one endpoint reply (and of one streamed line)
@@ -1077,6 +1078,13 @@ class DiskError(ValueError):
     """A failure that reveals something about what is on disk (a symlink, a file where a directory was expected)."""
 
 
+class StaleApproval(ValueError):
+    """The target no longer matches the approved snapshot."""
+
+
+_UNCHECKED = object()
+
+
 class Workdir:
     """Every operation walks the path one component at a time with O_NOFOLLOW,
     relative to a directory fd for the working directory."""
@@ -1143,6 +1151,12 @@ class Workdir:
             if st.st_size > cap:
                 raise ValueError(f"file is {st.st_size} bytes; the limit is {cap}")
             data = f.read(cap + 1)
+        return self.decode(data, cap)
+
+    @staticmethod
+    def decode(data, cap):
+        if len(data) > cap:
+            raise ValueError(f"file exceeds the {cap}-byte limit")
         if b"\0" in data[:8192]:
             raise ValueError("binary files are refused")
         try:
@@ -1150,32 +1164,40 @@ class Workdir:
         except UnicodeDecodeError:
             raise ValueError("binary (non UTF-8) files are refused")
 
-    def state(self, path):
-        """What a path holds right now: None if missing, else the sha256 of a regular file's
-        bytes, or a label for anything else. Used to bind an approval to what was reviewed."""
+    @staticmethod
+    def identity(st):
+        return (st.st_dev, st.st_ino, st.st_mode, st.st_uid, st.st_gid, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+    @classmethod
+    def _snapshot(cls, dfd, name):
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+        except FileNotFoundError:
+            return None, None
+        with os.fdopen(fd, "rb") as f:
+            st = os.fstat(f.fileno())
+            if not stat.S_ISREG(st.st_mode):
+                raise DiskError("the target is not a regular file")
+            if st.st_size > SNAPSHOT_CAP:
+                raise DiskError(f"existing file exceeds the {SNAPSHOT_CAP}-byte overwrite limit")
+            identity = cls.identity(st)
+            data = f.read(SNAPSHOT_CAP + 1)
+            if len(data) != st.st_size or identity != cls.identity(os.fstat(f.fileno())):
+                raise StaleApproval("the target changed while being read")
+        return (identity, hashlib.sha256(data).digest()), data
+
+    def snapshot(self, path):
         parts = split_rel(path)
         if not parts:
             raise ValueError("that is a directory")
         try:
             dfd = self._open_dir(parts[:-1])
         except FileNotFoundError:
-            return None
+            return None, None
         try:
-            try:
-                fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
-            except FileNotFoundError:
-                return None
-            except OSError as e:
-                return "symlink" if e.errno == 40 else f"unreadable:{e.errno}"
+            return self._snapshot(dfd, parts[-1])
         finally:
             os.close(dfd)
-        with os.fdopen(fd, "rb") as f:
-            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
-                return "not a regular file"
-            h = hashlib.sha256()
-            for block in iter(lambda: f.read(1 << 16), b""):
-                h.update(block)
-        return "sha256:" + h.hexdigest()
 
     def list(self, path):
         parts = split_rel(path) if path not in ("", ".", "./") else []
@@ -1184,15 +1206,17 @@ class Workdir:
         try:
             with os.scandir(dfd) as it:
                 for e in it:
+                    if len(out) == LIST_CAP:
+                        return sorted(out), True
                     st = e.stat(follow_symlinks=False)
                     kind = ("dir" if stat.S_ISDIR(st.st_mode) else "file" if stat.S_ISREG(st.st_mode)
                             else "symlink" if stat.S_ISLNK(st.st_mode) else "other")
                     out.append((e.name, kind, st.st_size if kind == "file" else None))
         finally:
             os.close(dfd)
-        return sorted(out)
+        return sorted(out), False
 
-    def write(self, path, content):
+    def write(self, path, content, expected=_UNCHECKED):
         data = content.encode("utf-8")
         if len(data) > WRITE_CAP:
             raise ValueError(f"content is {len(data)} bytes; the limit is {WRITE_CAP}")
@@ -1200,34 +1224,63 @@ class Workdir:
         if not parts:
             raise ValueError("a file name is required")
         dfd = self._open_dir(parts[:-1], create=True)
-        name, tmp = parts[-1], f".genai-tmp-{secrets.token_hex(6)}"
+        name, stage = parts[-1], f".genai-tmp-{secrets.token_hex(6)}"
         try:
-            mode = None
             try:
                 st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
-                if not stat.S_ISREG(st.st_mode):
-                    raise ValueError("the target exists and is not a regular file")
-                mode = stat.S_IMODE(st.st_mode)
             except FileNotFoundError:
-                pass
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o666, dir_fd=dfd)
+                st = None
+            if st is not None and not stat.S_ISREG(st.st_mode):
+                raise StaleApproval("the target exists and is not a regular file")
+            identity = self.identity(st) if st else None
+            if expected is not _UNCHECKED and identity != (expected[0] if expected else None):
+                raise StaleApproval("the target changed")
+            os.mkdir(stage, 0o700, dir_fd=dfd)
+            try:
+                self._publish(dfd, stage, name, data, st, expected)
+            finally:
+                os.rmdir(stage, dir_fd=dfd)
+        finally:
+            os.close(dfd)
+        return len(data)
+
+    def _publish(self, dfd, stage, name, data, st, expected):
+        staging_fd = os.open(stage, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dfd)
+        try:
+            directory = os.fstat(staging_fd)
+            if directory.st_uid != os.getuid() or directory.st_mode & 0o077:
+                raise StaleApproval("the staging directory is not private")
+            fd = os.open("file", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o666,
+                         dir_fd=staging_fd)
             try:
                 with os.fdopen(fd, "wb") as f:
                     f.write(data)
                     f.flush()
-                    if mode is not None:
-                        os.fchmod(f.fileno(), mode)
+                    if st is not None:
+                        os.fchmod(f.fileno(), stat.S_IMODE(st.st_mode))
                     os.fsync(f.fileno())
-                os.rename(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
-            except BaseException:
+                if st is None:
+                    try:
+                        os.link("file", name, src_dir_fd=staging_fd, dst_dir_fd=dfd)
+                    except FileExistsError as e:
+                        raise StaleApproval("the target now exists") from e
+                else:
+                    if expected is not _UNCHECKED:
+                        try:
+                            actual, _ = self._snapshot(dfd, name)
+                            latest = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+                        except (OSError, DiskError) as e:
+                            raise StaleApproval("the target changed") from e
+                        if actual != expected or self.identity(latest) != expected[0]:
+                            raise StaleApproval("the target changed")
+                    os.rename("file", name, src_dir_fd=staging_fd, dst_dir_fd=dfd)
+            finally:
                 try:
-                    os.unlink(tmp, dir_fd=dfd)
-                except OSError:
+                    os.unlink("file", dir_fd=staging_fd)
+                except FileNotFoundError:
                     pass
-                raise
         finally:
-            os.close(dfd)
-        return len(data)
+            os.close(staging_fd)
 
 
 def unified_diff(old, new, path):
@@ -1891,34 +1944,26 @@ class Engine:
                     st = self.wd.stat(path)
                     p.fields["size"] = st.st_size if st else None
                 if self.read_allowed(parts):
-                    p.auto = True
                     if kind == "read":
-                        try:
-                            secret = looks_secret(self.wd.read(path))
-                        except (ValueError, OSError):
-                            secret = False
-                        if secret:
-                            p.auto = False
-                            p.fields["secret"] = True
-                            self.ui.notice(f"{path} looks like it contains secrets, "
-                                           "so reading it needs your OK even in coding mode")
+                        self.prepare_auto_read(p)
+                    else:
+                        p.auto = True
                 return p
             if name == "write_file":
                 path, content = args.get("path"), args.get("content")
                 split_rel(path)
                 if not isinstance(content, str):
                     raise ValueError("content must be a string")
-                state = self.wd.state(path)
+                state, previous = self.wd.snapshot(path)
                 exists = state is not None
                 fields = {"path": path, "exists": exists, "content": content, "reason": reason, "_state": state,
                           "lines": content.count("\n") + (0 if content.endswith("\n") or not content else 1)}
                 if exists:
                     try:
-                        fields["diff"] = unified_diff(self.wd.read(path, WRITE_CAP), content, path)
-                    except (ValueError, OSError) as e:
-                        st = self.wd.stat(path)
+                        fields["diff"] = unified_diff(self.wd.decode(previous, WRITE_CAP), content, path)
+                    except ValueError as e:
                         fields.update(diff=f"(cannot diff the existing file: {e})", undiffable=str(e),
-                                      mode=f"{stat.S_IMODE(st.st_mode):04o}" if st else None)
+                                      mode=f"{stat.S_IMODE(state[0][2]):04o}")
                 return Proposal(pid, "write", tc["id"], **fields)
             if name == "edit_file":
                 path, old, new = args.get("path"), args.get("old_text"), args.get("new_text")
@@ -1926,7 +1971,10 @@ class Engine:
                     raise ValueError("old_text and new_text are required")
                 parts = split_rel(path)
                 try:
-                    current = self.wd.read(path, WRITE_CAP)
+                    state, previous = self.wd.snapshot(path)
+                    if state is None:
+                        raise FileNotFoundError(f"{path} does not exist")
+                    current = self.wd.decode(previous, WRITE_CAP)
                     n = current.count(old)
                     if n != 1:
                         raise ValueError(f"old_text appears {n} times in {path}; it must appear exactly once")
@@ -1940,8 +1988,7 @@ class Engine:
                     return p
                 updated = current.replace(old, new, 1)
                 return Proposal(pid, "edit", tc["id"], path=path, diff=unified_diff(current, updated, path),
-                                reason=reason, _old=old, _new=new,
-                                _state="sha256:" + hashlib.sha256(current.encode()).hexdigest())
+                                reason=reason, _content=updated, _state=state)
             if name == "propose_plan":
                 return Proposal(pid, "plan", tc["id"], **parse_plan(args))
             if name in self.external:
@@ -1967,7 +2014,8 @@ class Engine:
         the model. secret is None when genai would not read the file at all (too big, binary, unreadable)."""
         parts = split_rel(path) if path not in ("", ".", "./") else []
         rows = []
-        for name, kind, size in sorted(self.wd.list(path)):
+        entries, truncated = self.wd.list(path)
+        for name, kind, size in entries:
             sub = parts + [name]
             row = {"name": name, "kind": kind, "size": size, "hidden": is_hidden(sub)}
             if kind == "file":
@@ -1977,7 +2025,20 @@ class Engine:
                     row["secret"] = None
                 row["asks"] = not self.read_allowed(sub) or row["secret"] is not False
             rows.append(row)
-        return rows
+        return rows, truncated
+
+    def prepare_auto_read(self, proposal):
+        path = proposal.fields["path"]
+        try:
+            text = self.wd.read(path)
+        except (ValueError, OSError):
+            return
+        if looks_secret(text) or any(key and key in text for key in self.secrets()):
+            proposal.fields["secret"] = True
+            self.ui.notice(f"{path} looks like it contains secrets, so reading it needs your OK")
+            return
+        proposal.fields["_read_text"] = text
+        proposal.auto = True
 
     def read_allowed(self, parts):
         """Would reading this path be allowed without asking? (coding mode, not hidden)"""
@@ -2047,17 +2108,15 @@ class Engine:
             hit["status"] = "done"
         elif p.kind in ("read", "list") and not p.auto:
             parts = split_rel(p.fields["path"]) if hit["_where"] else []
-            secret = None
-            if p.kind == "read" and not is_hidden(parts):
-                try:
-                    secret = looks_secret(self.wd.read(p.fields["path"]))
-                except (ValueError, OSError):
-                    secret = False
-            if is_hidden(parts) or secret:
-                if secret:
-                    p.fields["secret"] = True
-                return                                  # in the plan, but still asks
-            p.auto = True
+            if is_hidden(parts):
+                return
+            if p.kind == "read":
+                if not p.fields.get("secret"):
+                    self.prepare_auto_read(p)
+                if not p.auto:
+                    return
+            else:
+                p.auto = True
         self.audit.log("plan_match", id=p.id, step=hit["n"], kind=p.kind)
         self.ui.plan(self.plan)
 
@@ -2109,36 +2168,32 @@ class Engine:
             return "declined by the user"
         try:
             if p.kind == "read":
-                text = self.wd.read(p.fields["path"])
+                text = p.fields["_read_text"] if p.auto else self.wd.read(p.fields["path"])
                 result = text
                 note = f"read {len(text)} characters"
                 if looks_secret(text):
                     self.ui.notice(f"warning: {p.fields['path']} looks like it contains secrets; it was sent as is")
             elif p.kind == "list":
-                rows = self.wd.list(p.fields["path"])
+                rows, truncated = self.wd.list(p.fields["path"])
                 lines = [f"{n}/" if k == "dir" else f"{n}  ({s} bytes)" if k == "file" else f"{n}  [{k}]"
-                         for n, k, s in rows[:LIST_CAP]]
-                if len(rows) > LIST_CAP:
-                    lines.append(f"... {len(rows) - LIST_CAP} more entries")
+                         for n, k, s in rows]
+                if truncated:
+                    lines.append(f"... listing stopped after {LIST_CAP} entries")
                 result = "\n".join(lines) or "(empty directory)"
                 note = f"listed {len(rows)} entries"
-            elif p.kind in ("write", "edit") and self.wd.state(p.fields["path"]) != p.fields["_state"]:
-                self.audit.log("file_op", id=p.id, kind=p.kind, path=p.fields["path"], status="stale")
-                self.ui.result(p, "error", f"{p.fields['path']} changed after you reviewed it "
-                                           "(another proposal or an editor), so nothing was written")
-                return (f"not applied: {p.fields['path']} changed since the user reviewed your proposal; "
-                        "propose the change again")
             elif p.kind == "write":
-                n = self.wd.write(p.fields["path"], p.fields["content"])
+                n = self.wd.write(p.fields["path"], p.fields["content"], expected=p.fields["_state"])
                 result = note = f"wrote {p.fields['path']} ({n} bytes)"
             elif p.kind == "edit":
-                current = self.wd.read(p.fields["path"], WRITE_CAP)
-                if current.count(p.fields["_old"]) != 1:
-                    raise ValueError("the file changed before the edit was applied")
-                self.wd.write(p.fields["path"], current.replace(p.fields["_old"], p.fields["_new"], 1))
+                self.wd.write(p.fields["path"], p.fields["_content"], expected=p.fields["_state"])
                 result = note = f"edited {p.fields['path']}"
             else:
                 return "error: unknown proposal"
+        except StaleApproval:
+            self.audit.log("file_op", id=p.id, kind=p.kind, path=p.fields["path"], status="stale")
+            self.ui.result(p, "error", f"{p.fields['path']} changed after you reviewed it, so nothing was written")
+            return (f"not applied: {p.fields['path']} changed since the user reviewed your proposal; "
+                    "propose the change again")
         except (ValueError, OSError) as e:
             self.audit.log("file_op", id=p.id, kind=p.kind, path=p.fields.get("path"), status="error", error=str(e))
             self.ui.result(p, "error", str(e))
@@ -2918,7 +2973,8 @@ def run_json(engine, ui, first_prompt, attachments):
                 ui.error("files needs 'path' as a string", "bad_message")
                 continue
             try:
-                ui.emit({"type": "files", "path": path, "entries": engine.files(path)})
+                entries, truncated = engine.files(path)
+                ui.emit({"type": "files", "path": path, "entries": entries, "truncated": truncated})
             except (ValueError, OSError) as err:
                 ui.error(f"cannot list {path}: {err}", "bad_path")
         elif t in ("trace", "system"):
