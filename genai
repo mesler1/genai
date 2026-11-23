@@ -606,8 +606,12 @@ class Endpoint:
         return cls(parse_json_bytes(raw, path), os.path.abspath(path))
 
     def destination_id(self):
-        """Fingerprint the destination without storing endpoint headers or proxy credentials."""
-        fields = [self.base_url, self.model, self.proxy, self.ca_bundle, self.headers]
+        """Fingerprint where a conversation goes, without storing endpoint headers or proxy credentials: the server
+        (scheme, host and port), and the proxy, CA bundle and headers that reach it. Not the model or the URL's
+        path, so switching models on the same server doesn't need consent each time."""
+        u = urllib.parse.urlsplit(self.base_url)
+        port = u.port or {"https": 443, "http": 80}.get(u.scheme)
+        fields = [u.scheme, (u.hostname or "").lower(), port, self.proxy, self.ca_bundle, self.headers]
         return hash_bytes(json.dumps(fields, sort_keys=True).encode())
 
     def key_source(self):
@@ -3014,7 +3018,7 @@ def main(argv=None):
         if session.messages and session.destination_id != destination_id:
             reason = ("has a different destination" if session.destination_id else
                       "was saved before its destination was recorded")
-            msg = f"session '{session.id}' {reason}. Saved context would go to {endpoint.base_url} (model {endpoint.model})."
+            msg = f"session '{session.id}' {reason}. Saved context would go to {endpoint.base_url}."
             if not args.allow_session_endpoint_change:
                 raise GenaiError(msg + " To approve this transfer, rerun with --allow-session-endpoint-change.",
                                  EXIT_USAGE, "session_endpoint_changed")

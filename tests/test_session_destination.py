@@ -35,6 +35,21 @@ class TestSessionDestination(Tmp):
             self.assertEqual(approved.returncode, 0, approved.stdout + approved.stderr)
             self.assertIn("original context", json.dumps(new.requests[0]["body"]["messages"]))
 
+    def test_another_model_on_the_same_server_needs_no_consent(self):
+        with FakeAPI([reply("first"), reply("second")]) as api:
+            home, path = make_home(self.tmp, api.url)
+            bless_path(home, path)
+            self.assertEqual(self.invoke(home, "original context").returncode, 0)
+            with open(path) as f:
+                endpoint = json.load(f)
+            endpoint.update(model="bigger-model", base_url=api.url.rstrip("/") + "/")
+            with open(path, "w") as f:
+                json.dump(endpoint, f)
+            bless_path(home, path)
+            again = self.invoke(home, "continue")
+            self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+            self.assertEqual(api.requests[-1]["body"]["model"], "bigger-model")
+
     def test_legacy_session_requires_opt_in(self):
         home, path = make_home(self.tmp, "https://local.example/v1")
         bless_path(home, path)
