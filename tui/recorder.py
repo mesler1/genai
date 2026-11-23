@@ -127,6 +127,7 @@ class Recorder:
         self.nonce = None
         self.alt = False
         self.ps1_lines = 1
+        self.primary_prompt = False
         self.buf = b""
         self.lock = threading.Lock()
         if fifo:
@@ -200,10 +201,14 @@ class Recorder:
             return False
         if nonce != self.nonce:
             return False
-        if kind == "S":
+        if kind == "P":
+            self.primary_prompt = False
+        elif kind == "S":
+            self.primary_prompt = False
             self.serial += 1
             self.current, self.alt = Command(self.serial, time.time()), False
         elif kind == "D":
+            self.primary_prompt = True
             c, self.current, self.alt = self.current, None, False
             if len(args) >= 4 and args[3].isdigit():
                 self.ps1_lines = max(int(args[3]), 1)
@@ -233,6 +238,10 @@ class Recorder:
     def last(self):
         with self.lock:
             return self.commands[-1] if self.commands else None
+
+    def at_primary_prompt(self):
+        with self.lock:
+            return self.primary_prompt
 
     def running(self):
         with self.lock:

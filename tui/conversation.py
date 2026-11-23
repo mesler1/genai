@@ -74,11 +74,15 @@ def clean(text):
             out.append("    ")
         elif o < 0x20 or 0x7F <= o < 0xA0:
             out.append(f"\\x{o:02x}")
-        elif o in _INVISIBLE or unicodedata.category(ch) in ("Cs", "Co", "Cn"):
+        elif o in _INVISIBLE or unicodedata.category(ch) in ("Cf", "Cs", "Co", "Cn", "Zl", "Zp"):
             out.append(f"\\u{o:04x}")
         else:
             out.append(ch)
     return "".join(out)
+
+
+def command_text(command):
+    return clean(command.replace("\\", "\\\\").replace("\t", "\\t"))
 
 
 def cells(ch):
@@ -307,7 +311,7 @@ class Banner(Block):
 def step_text(st):
     """One plan step, escaped: what it does to which file, or the exact command."""
     if st.get("kind") == "command":
-        return "run " + clean(st.get("command", "")).replace("\n", "\\n")
+        return "run " + command_text(st.get("command", "")).replace("\n", "\\n")
     return f"{st.get('kind', '?')} {clean(st.get('path', ''))}"
 
 
@@ -382,12 +386,20 @@ class Card(Block):
         if ev.get("flagged"):
             out.append(("hidden or control characters are shown as \\x.. or \\u.... escapes", R))
         if k == "command":
-            for i, ln in enumerate(clean(ev.get("command", "")).split("\n")):
+            for i, ln in enumerate(command_text(ev.get("command", "")).split("\n")):
                 out.append((("$ " if i == 0 else "  ") + ln, ""))
+        elif k == "write" and ev.get("undiffable"):
+            out.append(("The existing file will be replaced entirely: " + clean(ev["undiffable"]), W))
+            mode = ev.get("mode")
+            if mode:
+                executable = " (executable)" if int(mode, 8) & 0o111 else ""
+                out.append((f"The replacement keeps mode {mode}{executable}.", W))
+            out.extend(("+" + ln, D) for ln in clean(ev.get("content", "")).split("\n"))
         elif k in ("edit", "write") and ev.get("diff"):
-            for ln in clean(ev["diff"]).rstrip("\n").split("\n"):
-                if ln.startswith(("+++", "---")):
-                    continue
+            diff = clean(ev["diff"]).rstrip("\n").split("\n")
+            if len(diff) >= 2 and diff[0].startswith("--- a/") and diff[1].startswith("+++ b/"):
+                diff = diff[2:]
+            for ln in diff:
                 out.append((ln, D if ln.startswith("+") else R if ln.startswith("-") else Q if ln.startswith("@") else ""))
         elif k == "write":
             out += [("+" + ln, D) for ln in clean(ev.get("content", "")).rstrip("\n").split("\n")]
@@ -455,7 +467,8 @@ class Model:
         self.turn = 0              # turns sent to genai so far
         self.exchanges = {}        # turn: [first, last] exchange with the endpoint, for /raw
         self.plan = None           # the approved plan, as genai last reported it
-        self.plan_cmds = set()     # commands the user approved in it: our own record, checked against genai's
+        self.plan_cmds = {}        # (plan id, step number) -> approved command, consumed before execution
+        self.plan_context = None   # execution pane and directory reviewed for automatic runs
         self.plan_auto = False     # run those commands as they come, without asking again
 
     def add(self, block):
@@ -492,7 +505,7 @@ class Model:
                 card.state = "auto"
             elif ev.get("kind") == "command":
                 card.state = "shown"
-                if ev.get("preapproved") and ev.get("command") in self.plan_cmds and self.shell:
+                if ev.get("preapproved") and self.command_authorized(card) and self.shell:
                     self.actions.append(("plan_cmd", card))
             elif ev.get("kind") == "invalid":
                 card.state = "error"
@@ -510,7 +523,7 @@ class Model:
         elif t == "plan":
             was, self.plan = self.plan, ev.get("plan")
             if self.plan is None:
-                self.plan_cmds, self.plan_auto = set(), False
+                self.plan_cmds, self.plan_auto, self.plan_context = {}, False, None
                 if was:
                     self.note("plan dropped: everything asks again", W)
             elif not was or was.get("id") != self.plan.get("id"):
@@ -667,6 +680,7 @@ class Model:
             if arg == "clear" and self.busy:
                 self.note("/plan clear has to wait until genai finishes this reply", W)
             elif arg == "clear":
+                self.plan_cmds, self.plan_auto, self.plan_context = {}, False, None
                 self.send({"type": "plan", "clear": True})
             elif arg:
                 self.note("usage: /plan or /plan clear", R)
@@ -753,16 +767,21 @@ class Model:
         self.send({"type": "attach", "label": label, "text": text})
         self.note(f"attached {label}; it goes with your next message", D)
 
-    def decide_plan(self, approve=None, edits=None, auto=False):
+    def command_authorized(self, card):
+        ev = card.ev
+        key = ev.get("plan_id"), ev.get("plan_step")
+        return key in self.plan_cmds and self.plan_cmds[key] == ev.get("command")
+
+    def decide_plan(self, approve=None, edits=None, auto=False, context=None):
         """Approve the plan showing: every step, or those in approve, with commands changed as in edits
         ({number: command}). Planned commands then ask once each, or with auto run as they come."""
         card = self.pending.pop(0)
         steps = {st.get("n"): st for st in card.ev.get("steps") or []}
         keep = set(steps) if approve is None else set(approve)
         edits = edits or {}
-        self.plan_cmds = {edits.get(n, st.get("command")) for n, st in steps.items()
+        self.plan_cmds = {(card.id, n): edits.get(n, st.get("command")) for n, st in steps.items()
                           if n in keep and st.get("kind") == "command"}
-        self.plan_auto = auto
+        self.plan_auto, self.plan_context = auto, context
         card.state = "accepted"
         card.detail = ("all steps" if approve is None else f"steps {', '.join(map(str, sorted(keep)))}") + \
             (f"; you changed step {', '.join(map(str, sorted(edits)))}" if edits else "") + \
@@ -1028,39 +1047,72 @@ class Shell:
 
     def __init__(self, pane):
         self.pane = pane
+        self.primary_prompt = None
 
     @classmethod
     def from_env(cls):
         pane = os.environ.get("GENAI_TUI_SHELL")
         return cls(pane) if pane and os.environ.get("TMUX") else None
 
-    def tmux(self, *args, data=None):
-        r = subprocess.run(["tmux", *args], input=data, capture_output=True, text=True, timeout=5)
+    def tmux(self, *args, data=None, check=False):
+        r = subprocess.run(["tmux", *args], input=data, capture_output=True, text=True, timeout=5, check=check)
         return r.stdout
 
     def opt(self, name):
         return self.tmux("show", "-gv", name).strip()
 
-    def at_prompt(self):
-        """None if bash is waiting at its prompt; otherwise what the pane is doing."""
-        state = self.tmux("display", "-p", "-t", self.pane, "#{pane_current_command} #{pane_in_mode}").split()
-        if state == ["bash", "0"]:
-            return None
-        if state[1:] == ["1"]:
-            return "it is in copy mode; press q there"
-        return f"{state[0] if state else 'something'} is running"
+    def context(self):
+        """The live pane process and working directory used for dispatch."""
+        raw = self.tmux("display", "-p", "-t", self.pane,
+                        "#{pane_pid} #{pane_current_command} #{pane_in_mode} #{bracket_paste_flag} #{pane_current_path}",
+                        check=True)
+        fields = raw.removesuffix("\n").split(" ", 4)
+        if len(fields) != 5 or not fields[0].isdigit():
+            raise Busy("the shell pane's execution context is unavailable")
+        pid, command, mode, paste, cwd = fields
+        if not cwd:
+            raise Busy("the shell pane's working directory is unavailable")
+        return (pid, cwd), (command, mode, paste)
 
-    def type(self, command, enter=True):
-        """Type a command at the prompt, and press Enter unless told not to. Only when bash is idle: never into a
-        program."""
-        busy = self.at_prompt()
-        if busy:
-            raise Busy(busy)
-        self.tmux("load-buffer", "-b", "genai-run", "-", data=command)
-        self.tmux("send-keys", "-t", self.pane, "C-e", "C-u")   # anything half-typed goes to bash's kill ring
-        self.tmux("paste-buffer", "-p", "-d", "-b", "genai-run", "-t", self.pane)
+    def execution_where(self):
+        """Describe the shell pane itself, independently of the genai child."""
+        try:
+            (pid, _), _ = self.context()
+        except (Busy, OSError, subprocess.SubprocessError):
+            return "with unverified isolation"
+        root = f"/proc/{pid}/root"
+        if os.path.exists(f"{root}/run/.containerenv"):
+            return "inside the podman sandbox"
+        if os.path.exists(f"{root}/.dockerenv"):
+            return "inside the docker sandbox"
+        return "OUTSIDE any sandbox, directly on this host"
+
+    def ready(self):
+        context, (command, mode, paste) = self.context()
+        if mode == "1":
+            raise Busy("it is in copy mode; press q there")
+        if command != "bash":
+            raise Busy(f"{command or 'something'} is running")
+        if paste != "1" or self.primary_prompt is None or not self.primary_prompt():
+            raise Busy("Bash is not at its primary prompt with bracketed input enabled")
+        return context
+
+    def type(self, command, enter=True, expected=None):
+        """Type only into a Bash pane accepting bracketed input."""
+        if any(unicodedata.category(ch) in ("Cc", "Cs") and ch not in "\n\t" for ch in command):
+            raise Busy("the command contains terminal control characters")
+        context = self.ready()
+        if expected is not None and context != expected:
+            raise Busy("the shell or working directory changed since review")
+        self.tmux("load-buffer", "-b", "genai-run", "-", data=command, check=True)
+        if self.ready() != context:
+            raise Busy("the shell changed before paste")
+        self.tmux("send-keys", "-t", self.pane, "C-e", "C-u", check=True)
+        self.tmux("paste-buffer", "-p", "-d", "-b", "genai-run", "-t", self.pane, check=True)
         if enter:
-            self.tmux("send-keys", "-t", self.pane, "Enter")
+            if self.ready() != context:
+                raise Busy("the shell changed before Enter")
+            self.tmux("send-keys", "-t", self.pane, "Enter", check=True)
 
     def lines(self, upto=None):
         """The pane's history and screen as logical lines, to the cursor's line, or to row upto counted from the
@@ -1177,6 +1229,8 @@ class App:
         self.scr, self.child, self.shell = scr, child, shell
         self.m, self.ed = Model(), Editor()
         self.m.shell = shell is not None
+        self.shell_where = shell.execution_where() if shell else "OUTSIDE any sandbox, directly on this host"
+        self.plan_review = None
         self.running = None        # a /run command in the shell pane: card, command, commands done before it
         self.rows = []             # the block drawn on each screen row of the conversation
         self.state_dir = os.environ.get("GENAI_TUI_STATE") if shell else None
@@ -1185,6 +1239,8 @@ class App:
         self.hub = Hub(self.state_dir) if self.state_dir else None   # the other panes connect here
         fifo = fifo_path(self.state_dir) if self.state_dir else None
         self.rec = Recorder(fifo if fifo and os.path.exists(fifo) else None)   # each shell command and its output
+        if shell:
+            shell.primary_prompt = self.rec.at_primary_prompt
         self.ctx_line = None       # where shell context starts, in logical lines (see Shell.lines)
         self.sent = {}             # the last view sent to each role
         self.ask_obj, self.ask_serial = None, 0
@@ -1245,13 +1301,17 @@ class App:
             if ask["kind"] == "run":
                 c = ask["card"]
                 where = self.where()
-                step = f" (step {c.ev['plan_step']} of the plan)" if c.ev.get("preapproved") and not ask["edited"] else ""
-                lines = [[(f"Run {c.id}{step}{' (edited)' if ask['edited'] else ''} in the shell pane? ", A),
-                          (f"It runs {where}, in your shell, as you:", R if where.startswith("OUTSIDE") else "")]]
-                lines += [[("    $ " if i == 0 else "      ", Q), (fit(ln, w - 6), "")]
-                          for i, ln in enumerate(clean(ask["command"]).split("\n")[:4])]
-                lines.append([("  y", A), (" run   ", ""), ("e", A), (" edit first   ", ""), ("n", A), (" cancel", "")])
-                return lines, None, "y run it · e edit it first · n or Esc cancel"
+                cwd = clean(ask["context"][1]) if ask.get("context") else "shown in the full preview"
+                lines = [[(f"Run {c.id}{' (edited)' if ask['edited'] else ''} in the shell pane? ", A),
+                          (f"It runs {where}, in your shell, as you.", R if where.startswith("OUTSIDE") else "")],
+                         [(f"Directory: {cwd}", Q)]]
+                if ask.get("context"):
+                    lines.append([("  y", A), (" run   ", ""), ("v", A), (" view again   ", ""),
+                                  ("e", A), (" edit   ", ""), ("n", A), (" cancel", "")])
+                    return lines, None, "y run · v view again · e edit · n or Esc cancel"
+                lines.append([("  v", A), (" review full command   ", ""), ("e", A), (" edit   ", ""),
+                              ("n", A), (" cancel", "")])
+                return lines, None, "v or y review full command · e edit · n or Esc cancel"
             lines = [[(ask["question"], A)],
                      [("  y", A), (" review it in your editor, then send   ", ""), ("n", A), (" keep it to yourself", "")]]
             return lines, None, "y review and send · n or Esc don't share"
@@ -1262,12 +1322,14 @@ class App:
             lines = [[(f"Approve plan {c.id} ({n} steps, {cmds} command{'s' if cmds != 1 else ''})? ", W),
                       ("Planned reads won't ask again; edits still will.", Q)],
                      [("  y", A), (" approve: each planned command asks once   ", ""),
-                      ("a", A), (" approve, and run planned commands on their own", "")],
+                      ("a", A), (" review plan for automatic commands", "")],
                      [("  e", A), (" choose steps or change commands first   ", ""), ("n", A), (" no   ", ""),
                       ("v", A), (" view it all", "")]]
+            if self.plan_review and self.plan_review[0] == c.id:
+                lines[1][-1] = (" press a again to approve automatic runs", "")
             if cmds and self.where().startswith("OUTSIDE"):
                 lines.append([(f"  Commands run {self.where()}, in your shell, as you.", R)])
-            return lines, None, "y approve · a approve and run commands on their own · e edit · n or Esc no · v view"
+            return lines, None, "y approve · a review automatic runs · e edit · n or Esc no · v view"
         if self.m.pending:
             c = self.m.pending[0]
             more = f"  ({len(self.m.pending)} waiting)" if len(self.m.pending) > 1 else ""
@@ -1373,7 +1435,7 @@ class App:
             if k in ("y", "Y"):
                 m.decide_plan()
             elif k in ("a", "A"):
-                m.decide_plan(auto=True)
+                self.review_auto_plan(m.pending[0])
             elif k in ("e", "E"):
                 self.edit_plan()
             elif k in ("n", "N"):
@@ -1550,7 +1612,7 @@ class App:
             return
         command = card.ev.get("command", "")
         if what == "run":
-            self.start_run(card, command)
+            self.m.ask = {"kind": "run", "card": card, "command": command, "edited": False}
         elif what == "edit":
             self.m.ask = {"kind": "run", "card": card, "command": command, "edited": False}
             self.answer("e")
@@ -1559,24 +1621,57 @@ class App:
                 self.shell.type(command, enter=False)
                 self.shell.focus()
                 self.m.note(f"{card.id} is at the shell prompt; press Enter there to run it, then /share")
-            except Busy as e:
-                self.m.note(f"{card.id}: the shell pane is busy ({e})", R)
+            except (Busy, OSError, subprocess.SubprocessError) as e:
+                self.m.note(f"{card.id}: could not use the shell pane ({e})", R)
         elif what == "copy":
             self.shell.copy(command)
             self.m.note(f"{card.id} copied (tmux buffer, and your clipboard if the terminal allows it)")
 
     def where(self):
-        sb = (self.m.hello or {}).get("sandbox")
-        return f"inside the {sb['name']} sandbox" if sb else "OUTSIDE any sandbox, directly on this host"
+        return self.shell_where
+
+    def review_context(self):
+        try:
+            return self.shell.ready()
+        except (Busy, OSError, subprocess.SubprocessError) as e:
+            self.m.note(f"the shell pane is busy ({e})", R)
+            return None
+
+    def review_run(self, ask):
+        context = self.review_context()
+        if context and self.view_text(f"{ask['card'].id}: runs {self.where()}\n"
+                                      f"Directory: {clean(context[1])}\n\n"
+                                      f"{command_text(ask['command'])}\n"):
+            self.m.ask = {**ask, "context": context}
+
+    def review_auto_plan(self, card):
+        if not self.shell or not any(st["kind"] == "command" for st in card.ev.get("steps", [])):
+            self.m.note("this plan has no commands that can run in a shell pane", R)
+            return
+        context = self.review_context()
+        if not context:
+            self.plan_review = None
+            return
+        if self.plan_review == (card.id, context):
+            self.plan_review = None
+            self.m.decide_plan(auto=True, context=context)
+            return
+        if self.view_text(f"{card.id}: automatic commands run {self.where()}\n"
+                          f"Directory: {clean(context[1])}\n\n{card.full_text()}\n"):
+            self.plan_review = (card.id, context)
+        else:
+            self.plan_review = None
 
     def answer(self, k):
         """A key while one of our questions (run, share) is showing."""
         ask, m = self.m.ask, self.m
         if ask["kind"] == "run":
             card = ask["card"]
-            if k == "y":
+            if k == "v" or (k == "y" and not ask.get("context")):
+                self.review_run(ask)
+            elif k == "y":
                 m.ask = None
-                self.start_run(card, ask["command"])
+                self.start_run(card, ask["command"], context=ask["context"])
             elif k == "e":
                 reason = " ".join(clean(card.ev.get("reason", "")).split())
                 edited = self.edit(ask["command"], f"Proposed command [{card.id}]: {reason}",
@@ -1585,7 +1680,7 @@ class App:
                     m.ask = None
                     m.note(f"{card.id}: cancelled")
                 else:
-                    ask["command"], ask["edited"] = edited, edited != card.ev.get("command")
+                    m.ask = {**ask, "command": edited, "edited": edited != card.ev.get("command"), "context": None}
             elif k in ("n", "\x1b"):
                 m.ask = None
                 m.note(f"{card.id}: not run")
@@ -1606,10 +1701,10 @@ class App:
                 else:
                     m.share(f"output of {ask['what']} (exit {ask['rc']})", kept, f"Here is the output of {ask['what']}.")
 
-    def start_run(self, card, command):
+    def start_run(self, card, command, context):
         done = self.rec.done
         try:
-            self.shell.type(command)
+            self.shell.type(command, expected=context)
         except Busy as e:
             self.m.note(f"{card.id} not run: the shell pane is busy ({e}). When it is back at a prompt, /run "
                         f"{card.id} again.", R)
@@ -1764,10 +1859,12 @@ class App:
 
     def plan_cmd(self, card):
         """genai marked a command as one the user approved in the plan, and our own record agrees."""
-        if self.m.ask or self.m.pending or self.running:
+        if self.m.ask or self.m.pending or self.running or not self.m.command_authorized(card):
             return                                          # it stays a card: click it or /run it
-        if self.m.plan_auto:
-            self.start_run(card, card.ev.get("command", ""))
+        if self.m.plan_auto and self.m.plan_context:
+            ev = card.ev
+            self.m.plan_cmds.pop((ev.get("plan_id"), ev.get("plan_step")))
+            self.start_run(card, ev["command"], context=self.m.plan_context)
         else:
             self.m.ask = {"kind": "run", "card": card, "command": card.ev.get("command", ""), "edited": False}
 
@@ -1805,12 +1902,19 @@ class App:
 
     def view(self, card):
         """Show a proposal in full in a pager: cleaned text, so nothing in it reaches the terminal raw."""
-        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as f:
-            f.write(f"{card.id}: {card.title()}\n\n{card.full_text()}\n")
-            path = f.name
+        return self.view_text(f"{card.id}: {card.title()}\n\n{card.full_text()}\n")
+
+    def view_text(self, text):
+        fd, path = tempfile.mkstemp(prefix="genai-preview-", suffix=".txt", dir=self.state_dir)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
         curses.endwin()
         try:
-            self.run_here(["less", "-S", path] if shutil.which("less") else ["more", path])
+            pager = ["less", "-+F", path] if shutil.which("less") else ["more", path]
+            return self.run_here(pager) == 0
+        except OSError as e:
+            self.m.note(f"could not open the full preview: {e}", R)
+            return False
         finally:
             os.unlink(path)
             self.scr.refresh()

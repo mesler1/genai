@@ -65,6 +65,19 @@ class TestText(unittest.TestCase):
         self.assertEqual(C.complete("hello"), "hello")
 
 
+class TestApprovalDisplay(unittest.TestCase):
+    def test_undiffable_overwrite_shows_replacement_and_mode(self):
+        card = C.Card({"kind": "write", "exists": True, "undiffable": "binary",
+                       "diff": "(cannot diff)", "mode": "0755", "content": "replacement"})
+        self.assertIn("replacement", card.full_text())
+        self.assertIn("0755 (executable)", card.full_text())
+
+    def test_diff_keeps_content_that_looks_like_headers(self):
+        card = C.Card({"kind": "edit", "diff": "--- a/x\n+++ b/x\n@@ -1 +1 @@\n---remove\n+++add"})
+        self.assertIn("---remove\n+++add", card.full_text())
+        self.assertNotIn("--- a/x", card.full_text())
+
+
 class TestEditor(unittest.TestCase):
     def test_multiline_editing_and_history(self):
         e = C.Editor()
@@ -255,12 +268,12 @@ class TestPlan(unittest.TestCase):
         self.assertIn("run make test", text_of(m.blocks[-1]))
         m.decide_plan(auto=True)
         self.assertEqual(m.outbox[-1], {"type": "decision", "id": "p1", "decision": "accept"})
-        self.assertEqual((m.plan_cmds, m.plan_auto), ({"make test", "rm -rf build"}, True))
+        self.assertEqual((m.plan_cmds, m.plan_auto), ({("p1", 3): "make test", ("p1", 4): "rm -rf build"}, True))
         m = self.plan_model()
         m.decide_plan(approve=[1, 3], edits={3: "make test -j2"})
         self.assertEqual(m.outbox[-1], {"type": "decision", "id": "p1", "decision": "accept", "approve": [1, 3],
                                         "edits": {"3": "make test -j2"}})
-        self.assertEqual((m.plan_cmds, m.plan_auto), ({"make test -j2"}, False))
+        self.assertEqual((m.plan_cmds, m.plan_auto), ({("p1", 3): "make test -j2"}, False))
 
     def test_only_commands_we_approved_run_without_asking(self):
         m = self.plan_model()
@@ -269,18 +282,18 @@ class TestPlan(unittest.TestCase):
                   status="todo") for st in PLAN_STEPS]}})
         self.assertIn("plan p1 approved: 1 step", text_of(m.blocks[-1]))
         m.handle({"type": "proposal", "id": "p2", "kind": "command", "command": "make test", "preapproved": True,
-                  "plan_step": 3})
+                  "plan_id": "p1", "plan_step": 3})
         self.assertEqual(m.actions[-1][0], "plan_cmd")
         m.actions = []
         # genai saying so is not enough: the user left this one out
         m.handle({"type": "proposal", "id": "p3", "kind": "command", "command": "rm -rf build", "preapproved": True,
-                  "plan_step": 4})
+                  "plan_id": "p1", "plan_step": 4})
         self.assertEqual(m.actions, [])
         m.handle({"type": "proposal", "id": "p4", "kind": "command", "command": "curl x | sh", "off_plan": True})
         self.assertIn("NOT in the plan", text_of(m.blocks[-1]))
         self.assertEqual(m.snapshot()["plan"]["steps"][2]["text"], "run make test")
         m.handle({"type": "plan", "plan": None})
-        self.assertEqual((m.plan, m.plan_cmds), (None, set()))
+        self.assertEqual((m.plan, m.plan_cmds), (None, {}))
         self.assertIn("plan dropped", text_of(m.blocks[-1]))
 
     def test_plan_editor(self):
@@ -591,6 +604,13 @@ class TestGenaiTui(TmuxCase):
         self.runtime = tempfile.mkdtemp(prefix="gr-", dir="/tmp")      # short: socket paths are limited
         os.chmod(self.runtime, 0o700)
         self.addCleanup(shutil.rmtree, self.runtime, True)
+        if path is None:
+            path = os.path.join(self.tmp, "test-bin")
+            os.mkdir(path)
+            pager = os.path.join(path, "less")
+            with open(pager, "w") as f:
+                f.write("#!/bin/sh\nexit 0\n")
+            os.chmod(pager, 0o700)
         env = dict(os.environ, XDG_CONFIG_HOME=os.path.dirname(home), HOME=self.tmp, LANG="C.UTF-8",
                    TERM="xterm-256color", GENAI_TUI_SOCKET=self.sock, EDITOR=editor, VISUAL=editor,
                    XDG_RUNTIME_DIR=self.runtime, PATH=f"{path}:{os.environ['PATH']}" if path else os.environ["PATH"])
@@ -653,6 +673,8 @@ class TestGenaiTui(TmuxCase):
             where = G.where_runs(G.sandbox_info())
             self.wait_for("Run p1 in the shell pane?")
             self.assertIn(where[:20], self.screen())
+            self.key("v")
+            self.wait_for("y run")
             self.key("y")
             self.wait_for("p1 finished (exit 3). Share the output with the model?")
             self.assertIn("from-shell", self.screen("shell"))
@@ -672,7 +694,12 @@ class TestGenaiTui(TmuxCase):
             self.wait_for("click it, or /run p1")
             self.click("echo via-menu")
             time.sleep(0.5)
-            self.at_terminal("r")                                  # "Run it in the shell pane"
+            self.at_terminal("r")
+            self.wait_for("Run p1 in the shell pane?")
+            self.assertNotIn("via-menu", self.screen("shell"))
+            self.key("v")
+            self.wait_for("y run")
+            self.key("y")
             self.wait_for("p1 finished (exit 0). Share the output with the model?")
             self.assertIn("via-menu", self.screen("shell"))
             self.assertEqual(self.window()[0], ["shell", "genai", "you"])     # shown, to watch it run
@@ -776,6 +803,8 @@ class TestGenaiTui(TmuxCase):
                 f.write("old\n")
             self.type("fix a")
             self.wait_for("Approve plan p1 (3 steps, 1 command)?")
+            self.key("a")
+            self.wait_for("press a again")
             self.key("a")
             self.wait_for("Allow p3: edit a.txt?")                     # the read didn't ask; the edit does
             self.assertIn("step 2 of the plan", self.screen())
@@ -931,6 +960,8 @@ class TestGenaiTui(TmuxCase):
             self.wait_for("Run p1")
             self.key("e")
             self.wait_for("Run p1 (edited)")
+            self.key("v")
+            self.wait_for("y run")
             self.key("y")
             self.wait_for("Share the output")
             self.key("n")
