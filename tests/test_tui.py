@@ -156,6 +156,25 @@ class TestModel(unittest.TestCase):
         m.handle(dict({"type": "hello", "version": "1", "endpoint": {"name": "e", "model": "m", "base_url": "u"},
                        "sandbox": None}, **extra))
 
+    def test_clear_asks_genai_to_start_over(self):
+        m = C.Model()
+        self.hello(m, features=["clear"])
+        m.submit("hi")
+        m.handle({"type": "proposal", "id": "p1", "kind": "command", "command": "ls"})
+        m.handle({"type": "done", "reason": "reply", "context": {"used": 900, "limit": 1000}})
+        m.outbox.clear()
+        m.submit("/clear")
+        self.assertEqual(m.outbox, [{"type": "clear"}])
+        m.handle({"type": "cleared", "dropped": 3, "context": {"used": 40, "limit": 1000}})
+        self.assertEqual((m.cards, m.context), ({}, (40, 1000)))
+        self.assertEqual(len(m.blocks), 1)
+        self.assertIn("context cleared", text_of(m.blocks[0]))
+        old = C.Model()
+        self.hello(old)                                      # a genai without "clear": only the screen clears
+        old.submit("/clear")
+        self.assertNotIn({"type": "clear"}, old.outbox)
+        self.assertIn("only the screen", text_of(old.blocks[-1]))
+
     def test_reply_streams_into_one_block(self):
         m = C.Model()
         self.hello(m)
