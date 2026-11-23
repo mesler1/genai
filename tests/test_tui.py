@@ -156,6 +156,25 @@ class TestModel(unittest.TestCase):
         m.handle(dict({"type": "hello", "version": "1", "endpoint": {"name": "e", "model": "m", "base_url": "u"},
                        "sandbox": None}, **extra))
 
+    def test_clear_asks_genai_to_start_over(self):
+        m = C.Model()
+        self.hello(m, features=["clear"])
+        m.submit("hi")
+        m.handle({"type": "proposal", "id": "p1", "kind": "command", "command": "ls"})
+        m.handle({"type": "done", "reason": "reply", "context": {"used": 900, "limit": 1000}})
+        m.outbox.clear()
+        m.submit("/clear")
+        self.assertEqual(m.outbox, [{"type": "clear"}])
+        m.handle({"type": "cleared", "dropped": 3, "context": {"used": 40, "limit": 1000}})
+        self.assertEqual((m.cards, m.context), ({}, (40, 1000)))
+        self.assertEqual(len(m.blocks), 1)
+        self.assertIn("context cleared", text_of(m.blocks[0]))
+        old = C.Model()
+        self.hello(old)                                      # a genai without "clear": only the screen clears
+        old.submit("/clear")
+        self.assertNotIn({"type": "clear"}, old.outbox)
+        self.assertIn("only the screen", text_of(old.blocks[-1]))
+
     def test_reply_streams_into_one_block(self):
         m = C.Model()
         self.hello(m)
@@ -179,6 +198,7 @@ class TestModel(unittest.TestCase):
         m.handle({"type": "done", "reason": "command", "context": {"used": 1, "limit": 9}})
         m.submit("/decline")                                   # the latest
         self.assertEqual((m.cards["p2"].state, m.cards["p1"].state), ("declined", "shown"))
+        self.assertEqual((m.cards["p2"].key, m.keyed(1).id), (None, "p1"))   # Alt+1 moves to what's still open
         self.assertIn("p2 · command", text_of(m.cards["p2"]))
         self.assertNotIn("/run p2", text_of(m.cards["p2"]))
         m.submit("/decline p2")
@@ -191,6 +211,19 @@ class TestModel(unittest.TestCase):
         self.assertEqual(m.outbox[0]["label"], "declined p2")
         self.assertIn("did not run it:\nrm -rf build2", m.outbox[0]["text"])
         self.assertNotIn("decline", m.outbox[0])
+
+    def test_newest_commands_get_alt_keys(self):
+        m = C.Model()
+        self.hello(m)
+        for i in range(1, 12):
+            m.handle({"type": "proposal", "id": f"p{i}", "kind": "command", "command": f"echo {i}"})
+            m.handle({"type": "proposal", "id": f"r{i}", "kind": "read", "path": "x", "auto": True})
+        self.assertEqual([m.keyed(n).id for n in (1, 2, 9)], ["p11", "p10", "p3"])
+        self.assertIsNone(m.cards["p2"].key)
+        self.assertIsNone(m.keyed(10))
+        head = text_of(m.cards["p11"])
+        self.assertIn("p11 · command · Alt+1", head)
+        self.assertIn("click it, press Alt+1, or /run p11", head)
 
     def test_messages_typed_while_busy_are_queued(self):
         m = C.Model()
@@ -777,8 +810,11 @@ class TestInTmux(TmuxCase):
 class TestGenaiTui(TmuxCase):
     """tui/genai-tui itself: the conversation pane above a real bash pane, started through a pseudo-terminal."""
 
-    def start(self, api, editor="true", path=None):
+    def start(self, api, editor="true", path=None, args="-e test"):
         home = self.config(api)
+        if not args:        # genai then finds the endpoint the way a bare `genai` does
+            conf = dict(G.STARTER_CONFIG, default_endpoint="test")
+            G.write_private(os.path.join(home, "config.json"), json.dumps(conf))
         self.runtime = tempfile.mkdtemp(prefix="gr-", dir="/tmp")      # short: socket paths are limited
         os.chmod(self.runtime, 0o700)
         self.addCleanup(shutil.rmtree, self.runtime, True)
@@ -793,7 +829,7 @@ class TestGenaiTui(TmuxCase):
                    TERM="xterm-256color", GENAI_TUI_SOCKET=self.sock, EDITOR=editor, VISUAL=editor,
                    XDG_RUNTIME_DIR=self.runtime, PATH=f"{path}:{os.environ['PATH']}" if path else os.environ["PATH"])
         env.pop("TMUX", None)
-        self.proc = subprocess.Popen(["script", "-qfc", f"stty cols 110 rows 40; {REPO}/tui/genai-tui -e test",
+        self.proc = subprocess.Popen(["script", "-qfc", f"stty cols 110 rows 40; {REPO}/tui/genai-tui {args}",
                                       "/dev/null"], cwd=self.wd, env=env, stdin=subprocess.PIPE,
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.addCleanup(lambda: (self.tmux("kill-server"), self.proc.wait(10)))
@@ -828,11 +864,16 @@ class TestGenaiTui(TmuxCase):
         self.proc.stdin.write(keys.encode())
         self.proc.stdin.flush()
 
-    def click(self, text, pane="genai"):
-        """A left click (press and release, as a mouse sends them) on the first row of a pane showing text."""
+    def click(self, text, pane="genai", button=0, hold=0.3):
+        """A click on the first row of a pane showing text, at the terminal as a mouse sends it: the press, the
+        button held a moment (long enough for a menu to open), then the release."""
         y = next(i for i, ln in enumerate(self.screen(pane).splitlines()) if text in ln)
-        xy = [f"{33 + 4:02x}", f"{33 + y:02x}"]
-        self.tmux("send-keys", "-t", self.panes()[pane], "-H", "1b", "5b", "4d", "20", *xy, "1b", "5b", "4d", "23", *xy)
+        top, left = (int(v) for v in self.tmux("display", "-p", "-t", self.panes()[pane],
+                                                 "#{pane_top} #{pane_left}").split())
+        at = f"{button};{left + 5};{top + y + 1}"
+        self.at_terminal(f"\x1b[<{at}M")
+        time.sleep(hold)
+        self.at_terminal(f"\x1b[<{at}m")
 
     def shell(self, command):
         self.tmux("send-keys", "-t", self.panes()["shell"], command, "Enter")
@@ -841,12 +882,19 @@ class TestGenaiTui(TmuxCase):
     def sent(self, api):
         return [m for m in api.requests[-1]["body"]["messages"] if m["role"] == "user"][-1]["content"]
 
+    def test_starts_with_no_arguments(self):
+        with FakeAPI([reply("hello")]) as api:
+            self.start(api, args="")
+            self.assertNotIn("unrecognized arguments", self.screen())
+            self.type("hi")
+            self.wait_for("hello")
+
     def test_run_in_the_shell_pane_then_share(self):
         turns = [call("propose_command", command="echo from-shell; (exit 3)", reason="look"), reply("exit 3, I see.")]
         with FakeAPI(turns) as api:
             self.start(api)
             self.type("look around")
-            self.wait_for("click it, or /run p1")
+            self.wait_for("or /run p1, to send")
             self.type("/run")
             where = G.where_runs(G.sandbox_info())
             self.wait_for("Run p1 in the shell pane?")
@@ -863,13 +911,19 @@ class TestGenaiTui(TmuxCase):
             self.assertIn("Output:\n```\nfrom-shell\n```", sent)
             self.assertIn("[output of p1 (exit 3)]", sent)
 
+    def test_panes_get_a_term_that_remote_hosts_know(self):
+        with FakeAPI([reply("hi")]) as api:
+            self.start(api)
+            self.shell("echo T=$TERM")
+            self.assertIn("T=screen-256color", self.screen("shell"))
+
     def test_click_a_command_for_its_menu(self):
         turns = [call("propose_command", command="echo via-menu", reason="r"),   # a command ends the turn
                  call("propose_command", command="echo at-prompt", reason="r")]
         with FakeAPI(turns) as api:
             self.start(api)
             self.type("go")
-            self.wait_for("click it, or /run p1")
+            self.wait_for("or /run p1, to send")
             self.click("echo via-menu")
             time.sleep(0.5)
             self.at_terminal("r")
@@ -883,7 +937,12 @@ class TestGenaiTui(TmuxCase):
             self.assertEqual(self.window()[0], ["shell", "genai", "you"])     # shown, to watch it run
             self.key("n")
             self.type("again")
-            self.wait_for("click it, or /run p2")
+            self.wait_for("or /run p2, to send")
+            self.at_terminal("\x1b2")                              # Alt+2: p1, now that p2 has Alt+1
+            time.sleep(0.5)
+            self.at_terminal("c")
+            self.wait_for("p1 copied")
+            self.assertEqual(self.tmux("show-buffer", "-b", "genai-copy"), "echo via-menu")
             self.click("echo at-prompt")
             time.sleep(0.5)
             self.at_terminal("c")                                  # "Copy it"
@@ -943,7 +1002,7 @@ class TestGenaiTui(TmuxCase):
         with FakeAPI(turns) as api:
             self.start(api)
             self.type("go")
-            self.wait_for("click it, or /run p1")
+            self.wait_for("or /run p1, to send")
             env = dict(os.environ, GENAI_TUI_STATE=self.runtime_state())
             subprocess.run([sys.executable, os.path.join(REPO, "tui", "request.py"), "menu", "decline", "p1"],
                            env=env, check=True)
@@ -964,10 +1023,7 @@ class TestGenaiTui(TmuxCase):
             self.start(api, path=bindir)
             self.type("say hi")
             self.wait_for("hello there")
-            y = next(i for i, ln in enumerate(self.screen("genai").splitlines()) if "hello there" in ln)
-            top = int(self.tmux("display", "-p", "-t", self.panes()["genai"], "#{pane_top}"))
-            left = int(self.tmux("display", "-p", "-t", self.panes()["genai"], "#{pane_left}"))
-            self.at_terminal(f"\x1b[<2;{left + 5};{top + y + 1}M")       # right-click the reply
+            self.click("hello there", button=2)                          # right-click the reply
             time.sleep(0.5)
             self.at_terminal("r")                                         # "What was sent and received for this turn"
             end = time.time() + 10
@@ -1014,7 +1070,7 @@ class TestGenaiTui(TmuxCase):
             self.wait_for("all good")
             self.assertIn("planned-new", self.sent(api))
             self.type("check again")
-            self.wait_for("click it, or /run p5")
+            self.wait_for("or /run p5, to send")
             self.wait_for("step 3 of the plan, already run once", pane="genai")
             self.assertEqual(self.screen("shell").count("cat a.txt"), 1)
 
@@ -1052,9 +1108,7 @@ class TestGenaiTui(TmuxCase):
             for c in ("echo before-mark", "echo in-context"):
                 self.tmux("send-keys", "-t", sh, c, "Enter")
                 time.sleep(0.3)
-            y = next(i for i, ln in enumerate(self.screen("shell").splitlines()) if ln.endswith("echo in-context"))
-            top = int(self.tmux("display", "-p", "-t", sh, "#{pane_top}"))
-            self.at_terminal(f"\x1b[<2;5;{top + y + 1}M")              # a right-click, as the terminal reports it
+            self.click("echo in-context", pane="shell", button=2)            # held, then released on the same spot
             time.sleep(0.5)
             self.at_terminal("m")                                   # "Mark start of context here"
             time.sleep(0.5)
@@ -1139,7 +1193,7 @@ class TestGenaiTui(TmuxCase):
         with FakeAPI([call("propose_command", command="echo should-not-run", reason="r")]) as api:
             self.start(api)
             self.type("go")
-            self.wait_for("click it, or /run p1")
+            self.wait_for("or /run p1, to send")
             self.tmux("send-keys", "-t", self.panes()["shell"], "sleep 5", "Enter")
             time.sleep(0.5)
             self.type("/run p1")
@@ -1157,7 +1211,7 @@ class TestGenaiTui(TmuxCase):
         with FakeAPI(turns) as api:
             self.start(api, editor=editor)
             self.type("go")
-            self.wait_for("click it, or /run p1")
+            self.wait_for("or /run p1, to send")
             self.type("/run")
             self.wait_for("Run p1")
             self.key("e")
