@@ -233,3 +233,15 @@ class TreeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRefresh(unittest.TestCase):
+    def test_a_quick_second_refresh_is_not_lost(self):
+        t = F.Tree()
+        t.receive({"type": "listing", "path": ".", "entries": [{"name": "old", "kind": "file", "size": 1}]})
+        self.assertEqual([m["path"] for m in t.key("r") + t.key("r")], [".", "."])
+        t.receive({"type": "listing", "path": ".", "entries": [{"name": "old", "kind": "file", "size": 1}]})
+        t.receive({"type": "listing", "path": ".", "entries": [{"name": "new", "kind": "file", "size": 1}]})
+        self.assertEqual([e["name"] for e in t.listings["."]["entries"]], ["new"])
+        t.receive({"type": "listing", "path": ".", "entries": []})          # nothing more was asked for
+        self.assertEqual([e["name"] for e in t.listings["."]["entries"]], ["new"])

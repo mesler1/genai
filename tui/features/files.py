@@ -23,7 +23,7 @@ class Files(Feature):
     cant = "list files"
     events = ("files", "file")
     requests = {"list": ("files",), "view": ("files",), "attach": ("files",), "insert": ("files",)}
-    actions = ("files", "file")
+    actions = ("files", "file", "insert")
 
     def __init__(self):
         self.listing = []          # paths genai was asked to list, oldest first: its answers come in that order
@@ -41,6 +41,7 @@ class Files(Feature):
             features = ["files", "read"]         # the pane starts with genai; its hello is on the way, and in order
         if kind == "insert":
             m.panes.append(("prompt", {"type": "insert", "text": path}))
+            m.actions.append(("insert",))             # and go there, to type around it
         elif kind == "list":
             if "files" in features:
                 self.listing.append(path)
@@ -88,6 +89,9 @@ class Files(Feature):
     def action(self, app, action):
         if action[0] == "files":
             app.toggle_pane(app.files, "files", ["-b", "-l", "34"], "file tree")
+        elif action[0] == "insert":
+            if app.prompt and app.shell:
+                app.shell.tmux("select-pane", "-t", app.prompt)
         elif action[1] == "view":
             self.view(app, action[2])
         else:
@@ -112,7 +116,8 @@ class Files(Feature):
                 if ev.get("secret") else "")
         text = (warn + "# EVERYTHING below is sent to the model as saved. Remove anything you don't want it to see.\n"
                 f"File {path}:\n```\n{ev.get('text', '')}\n```\n")
-        kept = app.edit(text, f"file {path}", "sent to the model exactly as saved; nothing is added", "send nothing")
+        kept = app.edit(text, f"file {path}", "sent to the model exactly as saved; nothing is added", "send nothing",
+                        top_only=True)
         if kept is None or not kept.strip():
             app.m.note("nothing sent")
         else:
