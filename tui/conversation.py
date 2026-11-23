@@ -27,6 +27,7 @@ import time
 import unicodedata
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from features import disabled_names, load as load_features  # noqa: E402
 from ipc import Hub  # noqa: E402
 from recorder import Recorder, ago, fifo_path, label, trim  # noqa: E402
 
@@ -36,21 +37,15 @@ CARD_BODY_LINES = 12
 OUTPUT_LINES = 8               # last lines of a sandboxed run's output shown in its card
 INPUT_MAX_LINES = 8
 CMD_LINES = 4                  # lines of a command shown in a run question; a longer one is viewed in full first
-MODEL_MENU = 20               # models in the /model drop-down; the rest by name
-# A model name from the server, as genai accepts it. Checked again here before one goes into a tmux menu, whose
-# item names are formats: no '#', ',', '}', quotes or spaces can get through.
-MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+=-]{0,199}")
 MENU_KEYS = 9                  # Alt+1 .. Alt+9 open the menus of the newest command proposals, Alt+1 the newest
 
 COMMANDS = {
     "/help": "show this help",
     "/coding": "on|off: let the model read and list files here without asking",
     "/network": "[on|off]: the sandbox's network, for this session (on: each sandboxed run asks)",
-    "/model": "[NAME]: pick the model from those the server offers (a drop-down), or switch to NAME",
     "/skills": "list skills; * marks the ones in use",
     "/skill": "NAME on|off: use a blessed skill from the next message on, or stop",
     "/run": "[ID]: review and run a proposed command in the shell pane (the latest by default)",
-    "/decline": "[ID]: decline a proposed command (the latest by default); the model hears with your next message",
     "/share": "[N|mark|all]: send shell output, reviewed first or as it is: the last command, command N, from the "
               "mark, or all",
     "/commands": "list the commands run in the shell pane, numbered for /share N (also in the info panel)",
@@ -58,14 +53,13 @@ COMMANDS = {
     "/shell": "show the shell and move there (`` on its empty prompt hides it again)",
     "/panel": "show or hide the info panel on the right",
     "/plan": "[clear]: show the approved plan, or drop it so everything asks again",
-    "/copy": "[N]: copy your message and the reply to it, for the last turn or turn N (or right-click it)",
-    "/raw": "[N|all]: what was sent to the endpoint and what came back, for the last turn, turn N, or all kept",
-    "/system": "the system prompt and tool definitions sent with every request",
     "/compact": "shrink the conversation when the context is getting full",
     "/context": "show how full the context is",
     "/clear": "start over: the model forgets this conversation, and the screen clears (the saved session keeps it)",
     "/quit": "leave (also Ctrl-D on an empty input)",
 }
+# The commands of the features are in tui/features. Of the core's own, these wait while genai is replying:
+TO_GENAI = ("/coding", "/skills", "/skill", "/compact", "/network", "/clear")
 
 # --------------------------------------------------------------------------
 # Text: what is safe to draw, and how wide it is
@@ -493,7 +487,8 @@ class Card(Block):
 # State: genai's events in, the user's messages out. No curses here, so it can be tested.
 
 class Model:
-    def __init__(self):
+    def __init__(self, features=None):
+        self.features = load_features(core=CORE) if features is None else features   # see tui/features
         self.blocks = []
         self.cards = {}
         self.pending = []          # cards waiting for a decision, oldest first
@@ -510,9 +505,6 @@ class Model:
         self.quit = False
         self.shell = False         # a shell pane is there (inside genai-tui)
         self.shell_where = None
-        self.models = []           # the server's models, as genai last listed them
-        self.picking = False       # /model asked for that list, to show it as a drop-down
-        self.remote_host = None    # the host of a genai-ssh session in the shell pane, while it is up
         self.skills = None         # genai's skill list, once asked for
         self.show_skills = False   # print the next skill list in the conversation (the user typed /skills)
         self.ask = None            # a question of ours in place of the input box: run or share
@@ -550,6 +542,22 @@ class Model:
 
     def send(self, msg):
         self.outbox.append(msg)
+
+    def feature(self, name):
+        return next((f for f in self.features if f.name == name), None)
+
+    def commands(self):
+        """Every command there is, for /help and completion: the core's first, then each feature's."""
+        return command_list(self.features)
+
+    def takes(self, role, kind):
+        """Does some feature take this kind of request from this role?"""
+        return any(role in f.requests.get(kind, ()) for f in self.features)
+
+    def run_started(self, card):
+        """A command was typed into the shell pane to run, so features that held it back let go of it."""
+        for f in self.features:
+            f.run_started(self, card)
 
     # -- from genai
 
@@ -591,8 +599,6 @@ class Model:
                 if isinstance(ev.get("output"), str):
                     card.output = ev["output"]
                 card.changed()
-        elif t in ("trace", "system"):
-            self.actions.append(("show", ev))
         elif t == "plan":
             was, self.plan = self.plan, ev.get("plan")
             if self.plan is None:
@@ -629,27 +635,6 @@ class Model:
         elif t == "coding":
             self.coding = bool(ev.get("on"))
             self.note(f"coding mode is {'on' if self.coding else 'off'}", W if self.coding else Q)
-        elif t == "models":
-            self.models = [m["id"] for m in ev.get("models") or []
-                           if isinstance(m, dict) and isinstance(m.get("id"), str) and MODEL_ID.fullmatch(m["id"])]
-            current = (self.hello or {}).get("endpoint", {}).get("model")
-            if not self.models:
-                self.note("the server lists no models genai can use", R)
-            elif self.picking and self.shell:
-                self.actions.append(("model_menu",))
-            else:
-                for mid in self.models:
-                    self.note(("* " if mid == current else "  ") + mid)
-                self.note("/model NAME switches")
-            self.picking = False
-        elif t == "model":
-            ep = ev.get("endpoint")
-            if isinstance(ep, dict) and self.hello is not None:
-                self.hello = {**self.hello, "endpoint": ep}
-            ctx = ev.get("context") or {}
-            if isinstance(ctx.get("used"), int) and isinstance(ctx.get("limit"), int):
-                self.context = (ctx["used"], ctx["limit"])
-            self.note(f"model: {clean(str((ep or {}).get('model', '?')))} from your next message", D)
         elif t == "network":
             self.runner = ev.get("runner")
             self.note(self.network_text(), W if (self.runner or {}).get("network") else Q)
@@ -679,6 +664,10 @@ class Model:
             if masked:
                 self.note("genai masked " + ", ".join(f"{n} {clean(k)}" for k, n in masked.items())
                           + " in what you shared", W)
+        else:
+            for f in self.features:
+                if t in f.events:
+                    f.event(self, ev)
 
     def network_text(self):
         r = self.runner
@@ -740,11 +729,12 @@ class Model:
     def command(self, line):
         cmd, _, arg = line.partition(" ")
         arg = arg.strip()
-        to_genai = cmd in ("/coding", "/skills", "/skill", "/compact", "/network", "/model", "/clear")
+        feature = next((f for f in self.features if cmd in f.commands), None)
+        to_genai = cmd in TO_GENAI or (feature is not None and cmd in feature.to_genai)
         if to_genai and (self.busy or self.exited is not None):
             self.note(f"{cmd} has to wait until genai finishes this reply", W)
         elif cmd == "/help":
-            for c, d in COMMANDS.items():
+            for c, d in self.commands().items():
                 self.note(f"{c:9} {d}")
             self.note("Enter sends · Alt+Enter or \\ then Enter adds a line · ↑↓ earlier messages · "
                       "PgUp/PgDn scroll · // starts a message with /")
@@ -774,20 +764,14 @@ class Model:
             else:
                 self.note(f"skill {clean(name)}: {state} from your next message", Q)
                 self.send({"type": "skill", "name": name, "on": state == "on"})
-        elif cmd == "/model" and "models" not in ((self.hello or {}).get("features") or []):
-            self.note("this genai can't list or switch models", R)
-        elif cmd == "/model":
-            if arg:
-                self.send({"type": "model", "model": arg})
-            else:
-                self.picking = True
-                self.send({"type": "models"})
+        elif feature and feature.needs and feature.needs not in ((self.hello or {}).get("features") or []):
+            self.note(f"this genai can't {feature.cant}", R)
+        elif feature:
+            feature.command(self, cmd, arg)
         elif cmd == "/compact":
             self.send({"type": "compact"})
         elif cmd in ("/run", "/share", "/shell", "/mark", "/commands") and not self.shell:
             self.note(f"{cmd} needs the shell pane: start genai with genai-tui", R)
-        elif cmd == "/decline":
-            self.decline(arg)
         elif cmd == "/run":
             cards = [c for c in self.cards.values() if c.ev.get("kind") == "command"]
             card = self.cards.get(arg) if arg else (cards[-1] if cards else None)
@@ -810,10 +794,6 @@ class Model:
             self.actions.append(("focus_shell",))
         elif cmd == "/panel":
             self.actions.append(("panel",))
-        elif cmd in ("/raw", "/system") and self.busy and not self.pending:
-            self.note(f"{cmd} has to wait until genai finishes this reply", W)
-        elif cmd == "/system":
-            self.send({"type": "system"})
         elif cmd == "/plan":
             if arg == "clear" and self.busy:
                 self.note("/plan clear has to wait until genai finishes this reply", W)
@@ -832,10 +812,6 @@ class Model:
                               + (" (you changed it)" if st.get("edited") else "")
                               + (" (left out)" if st.get("status") == "left out" else ""),
                               D if st.get("status") == "done" else Q if st.get("status") == "left out" else "")
-        elif cmd == "/raw":
-            self.raw(arg)
-        elif cmd == "/copy":
-            self.copy(arg)
         elif cmd == "/context":
             used, limit = self.context or (None, None)
             self.note(f"context: {used}/{limit} tokens" if used is not None else "context: not measured yet")
@@ -850,57 +826,14 @@ class Model:
         else:
             self.note(f"unknown command {cmd} (/help lists them)", R)
 
-    def turn_text(self, turn):
-        """Your message for a turn and the replies that followed it, as text to copy (escaped, as shown), or None."""
-        asked = [b for b in self.blocks if isinstance(b, UserMsg) and b.turn == turn and not b.queued]
-        if not turn or not asked:
-            return None
-        said = clean(asked[0].text).strip("\n")
-        parts = ["\n".join("> " + ln if ln else ">" for ln in said.split("\n"))]
-        parts += [clean(b.text).strip("\n") for b in self.blocks
-                  if isinstance(b, Reply) and b.turn == turn and b.text.strip()]
-        return "\n\n".join(parts) + "\n"
-
-    def copy(self, arg):
-        if arg and not arg.isdigit():
-            self.note("usage: /copy or /copy N (a turn)", R)
-            return
-        turns = [b.turn for b in self.blocks if isinstance(b, UserMsg) and not b.queued]
-        turn = int(arg) if arg else max(turns, default=0)
-        text = self.turn_text(turn)
-        if text is None:
-            self.note("nothing to copy yet" if not arg else f"turn {turn} isn't on screen", R)
-        elif not self.shell:
-            self.note("/copy needs tmux: start genai with genai-tui", R)
-        else:
-            self.actions.append(("copy", turn, text))
-
-    def raw(self, arg):
-        """Ask genai for a turn's exchanges with the endpoint: the latest turn that had any, turn N, or all."""
-        if arg == "all":
-            self.send({"type": "trace", "from": 1, "to": 1 << 30})
-            return
-        if arg and not arg.isdigit():
-            self.note("usage: /raw, /raw N (a turn) or /raw all", R)
-            return
-        turn = int(arg) if arg else max(self.exchanges, default=None)
-        if self.busy and self.pending and not arg:
-            self.send({"type": "trace"})               # this turn hasn't ended: its latest exchange
-        elif turn is None or turn not in self.exchanges:
-            self.note("nothing has been sent to the endpoint yet" if turn is None else
-                      f"turn {turn} has no exchanges with the endpoint", R)
-        else:
-            lo, hi = self.exchanges[turn]
-            self.send({"type": "trace", "from": lo, "to": hi})
-
     def snapshot(self):
         """What the info panel shows. Proposal titles and details are escaped here and again where drawn."""
         h = self.hello or {}
         ep, sb, prof = h.get("endpoint") or {}, h.get("sandbox"), h.get("profile") or {}
-        return {
+        view = {
             "session": {"endpoint": ep.get("name"), "model": ep.get("model"), "profile": prof.get("name"),
                         "session": h.get("session"), "sandbox": sb.get("name") if sb else None,
-                        "shell_where": remote_where(self.remote_host) if self.remote_host else self.shell_where},
+                        "shell_where": self.shell_where},
             "coding": self.coding, "busy": self.busy, "context": list(self.context or (None, None)),
             "runner": self.runner and {"network": bool(self.runner.get("network")), "problem": self.runner.get("problem"),
                                        "image": self.runner.get("image")},
@@ -912,9 +845,13 @@ class Model:
                                    "steps": [{"n": st.get("n"), "text": step_text(st), "status": st.get("status")}
                                              for st in self.plan.get("steps") or []]},
         }
+        for f in self.features:
+            f.snapshot(self, view)
+        return view
 
-    def request(self, msg):
-        """A request from the info panel, checked and turned into the command a user would type."""
+    def request(self, msg, role=None):
+        """A request from the info panel or a menu, checked and turned into the command a user would type. role is
+        the pane it came from: the Hub has already refused kinds that role may not send."""
         t = msg.get("type") if isinstance(msg, dict) else None
         if t == "coding" and isinstance(msg.get("on"), bool):
             self.command(f"/coding {'on' if msg['on'] else 'off'}")
@@ -923,44 +860,16 @@ class Model:
             self.command(f"/skill {msg['name']} {'on' if msg['on'] else 'off'}")
         elif t == "skills" and not self.busy and self.exited is None:
             self.send({"type": "skills"})
-        elif t == "raw" and (type(msg.get("turn")) is int or msg.get("turn") in ("all", "last")):
-            self.command(f"/raw {'' if msg['turn'] == 'last' else msg['turn']}".strip())
-        elif t == "system":
-            self.command("/system")
-        elif t == "models":
-            self.command("/model")
-        elif t == "model" and type(msg.get("n")) is int and 0 <= msg["n"] < len(self.models):
-            self.command(f"/model {self.models[msg['n']]}")      # the menu sent a position; the name is ours
-        elif t == "copy" and type(msg.get("turn")) is int:
-            self.command(f"/copy {msg['turn']}")
         elif t == "share" and msg.get("what") in ("mark", "all", "last") and self.shell:
             self.actions.append(("share", msg["what"]))
         elif t == "command" and type(msg.get("n")) is int and self.shell:
             self.actions.append(("share_cmd", msg["n"]))
         elif t == "mark" and isinstance(msg.get("on"), bool) and self.shell:
             self.actions.append(("mark_line",) if msg["on"] else ("unmark",))
-
-    def decline(self, arg):
-        """/decline [ID], or Decline in a command's menu: the card says so, and the model hears with the next
-        message, so it doesn't assume the command ran."""
-        cards = [c for c in self.cards.values() if c.ev.get("kind") == "command" and c.state == "shown"]
-        card = self.cards.get(arg) if arg else (cards[-1] if cards else None)
-        if not card or card.ev.get("kind") != "command":
-            self.note("no command proposal to decline" + (f" with id {arg}" if arg else ""), R)
-        elif card.state != "shown":
-            self.note(f"{card.id} is {card.state}; only a command that hasn't run can be declined", R)
         else:
-            card.state, card.detail = "declined", "you declined it; the model hears with your next message"
-            card.changed()
-            self.next_attachments.append({"type": "attach", "label": f"declined {card.id}", "decline": card.id,
-                                          "text": f"I declined the command you proposed as {card.id}, and did not "
-                                                  f"run it:\n{card.ev.get('command', '')}"})
-            self.number_commands()
-            self.note(f"{card.id} declined", Q)
-
-    def undecline(self, card):
-        """A declined command is run after all: the model is no longer told it was declined."""
-        self.next_attachments = [a for a in self.next_attachments if a.get("decline") != card.id]
+            for f in self.features:
+                if t in f.requests and (role is None or role in f.requests[t]):
+                    f.request(self, role, msg)
 
     def attach(self, label, text):
         """Shell context the user reviewed: it goes with their next message, so they can ask about it."""
@@ -1019,11 +928,38 @@ def edit_key(ed, k):
     return True
 
 
-def complete(text):
-    """Tab on a partial /command: the completion, or text unchanged when there is none or several."""
+def command_list(features):
+    """The core's commands, then each feature's, with their help."""
+    out = dict(COMMANDS)
+    for f in features:
+        out.update(f.commands)
+    return out
+
+
+def configured_features():
+    """The features that are on, as the config file and GENAI_TUI_DISABLE say, and a warning if the file was no good."""
+    disabled, warning = disabled_names()
+    return load_features(disabled, CORE), warning
+
+
+def feature_requests(features):
+    """{role: kinds} of the requests the features take, for the Hub: what is not here, it refuses."""
+    out = {}
+    for f in features:
+        for kind, roles in f.requests.items():
+            for role in roles:
+                out.setdefault(role, set()).add(kind)
+    return out
+
+
+def complete(text, commands=None):
+    """Tab on a partial /command: the completion, or text unchanged when there is none or several. commands are
+    those there are (the core's, and those of the features that are on) unless given."""
     if not text.startswith("/") or " " in text:
         return text
-    hits = [c for c in COMMANDS if c.startswith(text)]
+    if commands is None:
+        commands = command_list(configured_features()[0])
+    hits = [c for c in commands if c.startswith(text)]
     if len(hits) == 1:
         return hits[0] + " "
     return os.path.commonprefix(hits) if hits else text
@@ -1171,63 +1107,18 @@ def review_buffer(command, rc, where, output):
             f"I ran this command {where} (exit {rc}):\n```\n{command}\n```\nOutput:\n```\n{output}\n```\n")
 
 
-# --------------------------------------------------------------------------
-# The raw view: what went to the endpoint and what came back
+class Core:
+    """The helpers of this module, for the features (tui/features): they can't import it, as it may be the program
+    itself. Names are looked up when used, so they see the module as it is."""
 
-def pretty(text):
-    """JSON text indented for reading, or the text as it is if it isn't JSON."""
-    try:
-        return json.dumps(json.loads(text), indent=2, ensure_ascii=False)
-    except ValueError:
-        return text
-
-
-def safe_lines(text):
-    """Text for the pager: control and invisible characters shown as escapes, as everywhere else."""
-    return "\n".join(clean(ln) for ln in text.split("\n"))
+    def __getattr__(self, name):
+        try:
+            return globals()[name]
+        except KeyError:
+            raise AttributeError(name) from None
 
 
-def render_trace(ev, turns):
-    """A trace event as text for a pager. turns maps a turn to its [first, last] exchange, to name them."""
-    exs = ev.get("exchanges") or []
-    named = {n: t for t, (a, b) in turns.items() for n in range(a, b + 1)}
-    kept = ev.get("kept")
-    out = ["genai: what was sent to the endpoint, and what came back",
-           "Exactly as sent and received, except your API key and the endpoint's own header values. Request bodies",
-           "are indented here for reading; they were sent as compact JSON. q leaves, / searches.", ""]
-    if not exs:
-        out.append("genai no longer has these exchanges" + (f" (it keeps the last 30: {kept[0]}–{kept[1]})" if kept
-                                                            else ""))
-    for ex in exs:
-        n = ex.get("n")
-        status = ex.get("status", "?") + (f": {ex['error']}" if ex.get("error") else "")
-        took = f" · {ex['ms'] / 1000:.1f} s" if isinstance(ex.get("ms"), int) else ""
-        turn = f" · turn {named[n]}" if n in named else ""
-        out += ["═" * 78, f"Exchange {n}{turn} · {ex.get('time', '')}{took} · {status}", "═" * 78, "",
-                f"{ex.get('method', 'POST')} {ex.get('url', '')}"]
-        out += [f"{k}: {v}" for k, v in (ex.get("headers") or {}).items()]
-        body = ex.get("request") or ""
-        out += ["", f"── Request body ({len(body.encode())} bytes) " + "─" * 40, pretty(body), ""]
-        resp = ex.get("response") or []
-        how = "streamed, " + f"{len(resp)} lines" if ex.get("stream") else "one body"
-        out += [f"── Response: HTTP {ex.get('http', '?')}, {how} " + "─" * 40]
-        out += resp if ex.get("stream") else [pretty("".join(resp))]
-        if ex.get("message") is not None:
-            out += ["", "── The reply as genai put it together " + "─" * 40,
-                    json.dumps(ex["message"], indent=2, ensure_ascii=False)]
-        if ex.get("usage"):
-            out += ["", f"usage: {json.dumps(ex['usage'])}"]
-        out.append("")
-    return safe_lines("\n".join(out))
-
-
-def render_system(ev):
-    out = ["genai: the system prompt and tools sent with every request",
-           "Your conversation follows the system prompt in each request. q leaves, / searches.", "",
-           f"model: {ev.get('model', '?')}", f"params: {json.dumps(ev.get('params') or {})}", "",
-           "── System prompt " + "─" * 60, ev.get("system", ""), "",
-           "── Tools " + "─" * 68, json.dumps(ev.get("tools") or [], indent=2, ensure_ascii=False)]
-    return safe_lines("\n".join(out))
+CORE = Core()
 
 
 # --------------------------------------------------------------------------
@@ -1235,6 +1126,13 @@ def render_system(ev):
 
 class Busy(Exception):
     pass
+
+
+def menu_text_ok(name, key):
+    """A menu item's name and key come from fixed text in a feature, but they are tmux formats too: no '#', which
+    starts one, and nothing unprintable."""
+    return (isinstance(name, str) and isinstance(key, str) and "#" not in name and name.isprintable()
+            and len(name) <= 80 and len(key) <= 1 and key.isprintable())
 
 
 def menu_item(*args):
@@ -1359,57 +1257,49 @@ class Shell:
         """To tmux's buffer and, through the terminal (OSC 52), the system clipboard where the terminal allows it."""
         self.tmux("set-buffer", "-w", "-b", "genai-copy", "--", text)
 
-    def menu(self, pid, where, at="M"):
+    def popup_menu(self, *args):
+        """tmux's display-menu in this pane, without waiting for it to close. Titles, names and commands are tmux
+        formats: callers pass only fixed words and checked numbers and ids."""
+        self.menus = [p for p in getattr(self, "menus", []) if p.poll() is None]
+        self.menus.append(subprocess.Popen(["tmux", "display-menu", "-t", os.environ.get("TMUX_PANE", ""), *args],
+                                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                           stderr=subprocess.DEVNULL))
+
+    def menu(self, pid, where, at="M", extra=()):
         """tmux's own menu at the mouse, for a command card. Menu titles, names and commands are tmux formats, so
-        none of them carries text from the model: only the proposal id, checked here, and fixed words."""
+        none of them carries text from the model: only the proposal id, checked here, and fixed words. extra is
+        what features add: (name, key, action_word) each."""
         if not re.fullmatch(r"p[0-9]{1,9}", pid):
             return
-        me = os.environ.get("TMUX_PANE", "")
 
         def pick(what):
             return menu_item("menu", what, pid)
-        # display-menu returns only when the menu closes, so don't wait for it.
-        self.menus = [p for p in getattr(self, "menus", []) if p.poll() is None]
-        self.menus.append(subprocess.Popen(["tmux", "display-menu", "-t", me, "-x", at, "-y", at, "-T", f" {pid}: runs {where} ",
-                  "Run it in the shell pane", "r", pick("run"),
-                  "Edit it, then run", "e", pick("edit"),
-                  "Put it at the shell prompt (you press Enter)", "p", pick("prompt"),
-                  "Copy it", "c", pick("copy"),
-                  "Decline it (the model hears with your next message)", "d", pick("decline"),
-                  "", "Cancel", "q", ""],
-                                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
-
-    def model_menu(self, models, current):
-        """The /model drop-down: tmux's menu, in the middle of the screen. Names are checked against MODEL_ID first,
-        and each item sends back only its position."""
         items = []
-        for i, mid in enumerate(models[:MODEL_MENU]):
-            if MODEL_ID.fullmatch(mid):
-                items += [("• " if mid == current else "  ") + mid, str((i + 1) % 10) if i < 10 else "",
-                          menu_item("model", str(i))]
-        if len(models) > MODEL_MENU:
-            items += ["", f"-  {len(models) - MODEL_MENU} more: /model NAME", "", ""]
-        items += ["", "Cancel", "q", ""]
-        self.menus = [p for p in getattr(self, "menus", []) if p.poll() is None]
-        self.menus.append(subprocess.Popen(["tmux", "display-menu", "-t", os.environ.get("TMUX_PANE", ""), "-x", "C",
-                                            "-y", "C", "-T", " model · ↑↓ Enter ", *items],
-                                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        for name, key, what in extra:
+            if menu_text_ok(name, key) and re.fullmatch(r"[a-z]{1,12}", what):
+                items += [name, key, pick(what)]
+        self.popup_menu("-x", at, "-y", at, "-T", f" {pid}: runs {where} ",
+                        "Run it in the shell pane", "r", pick("run"),
+                        "Edit it, then run", "e", pick("edit"),
+                        "Put it at the shell prompt (you press Enter)", "p", pick("prompt"),
+                        "Copy it", "c", pick("copy"),
+                        *items,
+                        "", "Cancel", "q", "")
 
-    def raw_menu(self, turn, copy=0):
-        """Right-click in the conversation: tmux's menu for copying a turn and looking behind it. Only fixed words
-        and numbers."""
-        me = os.environ.get("TMUX_PANE", "")
-        pick = menu_item
-        items = (["Copy this message and its reply", "c", pick("copy", str(copy)), ""] if copy else []) + \
-            (["What was sent and received for this turn", "r", pick("raw", str(turn))] if turn else []) + [
-            "What was sent and received last", "l", pick("raw", "last"),
-            "Everything genai still has (last 30)", "a", pick("raw", "all"),
-            "The system prompt and tools", "s", pick("system"),
-            "", "Cancel", "q", ""]
-        self.menus = [p for p in getattr(self, "menus", []) if p.poll() is None]
-        self.menus.append(subprocess.Popen(["tmux", "display-menu", "-t", me, "-x", "M", "-y", "M", "-T",
-                                            f" turn {copy or turn} " if copy or turn else " raw view ", *items],
-                                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+    def turn_menu(self, turn, extra):
+        """Right-click in the conversation: tmux's menu for what the features offer on a turn (extra: a list of
+        (name, key, request_args...) from each of them). Only fixed words and numbers."""
+        groups = []
+        for group in extra:
+            items = []
+            for name, key, *args in group:
+                if menu_text_ok(name, key) and args and all(re.fullmatch(r"[a-z]{1,12}|[0-9]{1,9}", a) for a in args):
+                    items += [name, key, menu_item(*args)]
+            if items:
+                groups.append(items)
+        items = [x for i, g in enumerate(groups) for x in (g if i == 0 else ["", *g])]
+        self.popup_menu("-x", "M", "-y", "M", "-T", f" turn {turn} " if turn else " raw view ",
+                        *items, *([""] if items else []), "Cancel", "q", "")
 
     def title(self, text):
         self.tmux("set", "-p", "-t", os.environ.get("TMUX_PANE", ""), "@genai_title", text)
@@ -1465,7 +1355,10 @@ SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 class App:
     def __init__(self, scr, child, shell=None):
         self.scr, self.child, self.shell = scr, child, shell
-        self.m, self.ed = Model(), Editor()
+        on, warning = configured_features()
+        self.m, self.ed = Model(on), Editor()
+        if warning:
+            self.m.note(warning, W)
         self.m.shell = shell is not None
         self.m.shell_where = shell.execution_where() if shell else None
         self.plan_review = None
@@ -1474,7 +1367,8 @@ class App:
         self.state_dir = os.environ.get("GENAI_TUI_STATE") if shell else None
         self.panel = os.environ.get("GENAI_TUI_PANEL") if shell else None
         self.prompt = os.environ.get("GENAI_TUI_PROMPT") if shell else None   # input happens in that pane
-        self.hub = Hub(self.state_dir) if self.state_dir else None   # the other panes connect here
+        # the other panes connect here; a feature that is off has no requests, so the Hub refuses them
+        self.hub = Hub(self.state_dir, feature_requests(on)) if self.state_dir else None
         fifo = fifo_path(self.state_dir) if self.state_dir else None
         self.rec = Recorder(fifo if fifo and os.path.exists(fifo) else None)   # each shell command and its output
         if shell:
@@ -1726,7 +1620,7 @@ class App:
                 m.note("Ctrl-C again (or Ctrl-D) to quit" + (". genai's reply can't be interrupted yet." if m.busy else ""))
             self.ctrl_c = now
         elif k == "\t":
-            ed.text = complete(ed.text)
+            ed.text = complete(ed.text, self.m.commands())
             ed.pos = len(ed.text)
         elif k == "\x0c":
             self.scr.clear()
@@ -1850,14 +1744,17 @@ class App:
         elif b & (curses.BUTTON3_RELEASED | curses.BUTTON3_CLICKED) and self.shell:
             block = self.rows[y] if 0 <= y < len(self.rows) else None
             turn = getattr(block, "turn", 0)
-            self.shell.raw_menu(turn if turn in self.m.exchanges else 0, turn if self.m.turn_text(turn) else 0)
+            here = [f.turn_menu(self.m, turn) for f in self.m.features]
+            # the menu is about the turn if a feature has something to offer for it in particular
+            specific = any(len(h) > len(f.turn_menu(self.m, 0)) for f, h in zip(self.m.features, here))
+            self.shell.turn_menu(turn if specific else 0, here)
         elif 0 <= y < len(self.rows) and not self.m.pending and not self.m.ask:
             card = self.rows[y]
             if isinstance(card, Card) and card.ev.get("kind") == "command":
                 if not self.shell:
                     self.m.note(f"{card.id}: start genai with genai-tui to send commands to a shell pane", R)
                     return
-                self.shell.menu(card.id, self.where())
+                self.shell.menu(card.id, self.where(), extra=self.card_items(card))
 
     def open_menu(self, n):
         """Alt+N, through tmux: the menu of the command proposal its card shows Alt+N on, in the middle of the
@@ -1870,7 +1767,11 @@ class App:
         elif not self.shell:
             self.m.note(f"{card.id}: start genai with genai-tui to send commands to a shell pane", R)
         else:
-            self.shell.menu(card.id, self.where(), at="C")
+            self.shell.menu(card.id, self.where(), at="C", extra=self.card_items(card))
+
+    def card_items(self, card):
+        """What the features add to a command card's menu."""
+        return [item for f in self.m.features for item in f.card_menu(self.m, card)]
 
     def menu_action(self, what, pid):
         """A choice from a command card's menu, sent by request.py."""
@@ -1885,11 +1786,13 @@ class App:
             self.answer("e")
         elif what == "prompt":
             self.m.ask = {"kind": "run", "card": card, "command": command, "edited": False, "paste_only": True}
-        elif what == "decline":
-            self.m.decline(pid)
         elif what == "copy":
             self.shell.copy(command)
             self.m.note(f"{card.id} copied (tmux buffer, and your clipboard if the terminal allows it)")
+        else:
+            for f in self.m.features:
+                if what in f.card_actions:
+                    f.card_action(self, what, card)
 
     def where(self):
         """Where a command typed into the shell pane now runs: here, or on the host of a genai-ssh session."""
@@ -2029,7 +1932,7 @@ class App:
             self.m.note(f"{card.id} not run: tmux failed ({e})", R)
             return
         self.shell.show()                                # so the command can be watched as it runs
-        self.m.undecline(card)
+        self.m.run_started(card)
         card.state, card.detail = "running", "typed into the shell pane"
         self.m.number_commands()
         card.changed()
@@ -2047,22 +1950,6 @@ class App:
         self.m.ask = {"kind": "share", "label": f"{card.id} finished (exit {c.rc})", "what": card.id,
                       "question": f"{card.id} finished (exit {c.rc}). Share the output with the model?",
                       "command": r["command"], "rc": c.rc, "output": self.output_of(c), "where": self.ran_where(c)}
-
-    def poll_handshake(self):
-        """A genai-ssh shell on another host asks for its key: type it in now, once (see recorder.py). Its echo is
-        off, so the key isn't shown; it goes through ssh's encrypted connection, and nowhere else."""
-        self.m.remote_host = self.rec.remote_host()
-        key = self.rec.take_handshake()
-        if key and self.shell:
-            try:
-                self.shell.tmux("send-keys", "-t", self.shell.pane, "-l", key, check=True)
-                self.shell.tmux("send-keys", "-t", self.shell.pane, "Enter", check=True)
-            except (OSError, subprocess.SubprocessError) as e:
-                self.m.note(f"genai-ssh: could not answer the other host ({e}); genai-tui won't follow that session",
-                            R)
-                return
-            self.m.note("genai-ssh: following the shell on the other host. Commands sent there run on that host, "
-                        "and each still asks first.", W)
 
     def output_of(self, c):
         out = trim(c.text())
@@ -2212,24 +2099,6 @@ class App:
         size = ["-w", "100%", "-h", "100%"] if full else ["-w", "90%", "-h", "85%"]
         return subprocess.call(["tmux", "display-popup", "-E", *size, cmd])
 
-    def show_raw(self, ev):
-        """A trace or system answer from genai, full screen in a pager. The file holds the whole conversation, so
-        it goes in genai-tui's private directory (or a private one of its own) and is gone when the pager closes."""
-        text = render_system(ev) if ev.get("type") == "system" else render_trace(ev, self.m.exchanges)
-        where = self.state_dir or tempfile.mkdtemp(prefix="genai-tui-raw-")
-        fd, path = tempfile.mkstemp(prefix="raw-", suffix=".txt", dir=where)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(text + "\n")
-            curses.endwin()
-            pager = ["less", "-+F", "-i", path] if shutil.which("less") else ["more", path]
-            self.run_here(pager, full=True)
-        finally:
-            os.unlink(path)
-            if not self.state_dir:
-                os.rmdir(where)
-            self.scr.refresh()
-
     def page(self, k):
         h, _ = self.scr.getmaxyx()
         step = max(h - 6, 1)
@@ -2280,7 +2149,8 @@ class App:
 
     def pump(self):
         self.poll_run()
-        self.poll_handshake()
+        for f in self.m.features:
+            f.poll(self)
         while self.hub:
             try:
                 role, msg = self.hub.inbox.get_nowait()
@@ -2291,13 +2161,14 @@ class App:
             elif role == "prompt":
                 self.from_prompt(msg)
             elif role == "panel":
-                self.m.request(msg)
-            elif role == "menu" and msg.get("type") in ("share", "mark", "raw", "system", "copy", "model"):
-                self.m.request(msg)
+                self.m.request(msg, role)
+            elif role == "menu" and (msg.get("type") in ("share", "mark") or self.m.takes(role, msg.get("type"))):
+                self.m.request(msg, role)
             elif role == "menu" and msg.get("type") == "menu" and msg.get("action") == "open":
                 self.open_menu(msg.get("key"))
             elif role == "menu" and msg.get("type") == "menu" and isinstance(msg.get("id"), str):
-                if msg.get("action") in ("run", "edit", "prompt", "copy", "decline"):
+                if msg.get("action") in ("run", "edit", "prompt", "copy") or any(
+                        msg.get("action") in f.card_actions for f in self.m.features):
                     self.menu_action(msg["action"], msg["id"])
         for action in self.m.actions:
             if action == ("share", "last"):
@@ -2306,15 +2177,6 @@ class App:
                 self.share_command(self.rec.get(action[1]), action[1])
             elif action[0] == "commands":
                 self.list_commands()
-            elif action[0] == "show":
-                self.show_raw(action[1])
-            elif action[0] == "model_menu" and self.shell:
-                self.shell.model_menu(self.m.models, (self.m.hello or {}).get("endpoint", {}).get("model"))
-            elif action[0] == "copy":
-                self.shell.copy(action[2])
-                n = action[2].count("\n")
-                self.m.note(f"turn {action[1]} copied: your message and the reply, {n} lines (tmux buffer, and your "
-                            "clipboard if the terminal allows it)")
             elif action[0] == "plan_cmd":
                 self.plan_cmd(action[1])
             elif action[0] == "mark_line":
@@ -2329,6 +2191,10 @@ class App:
                 self.shell.focus()
             elif action[0] == "panel":
                 self.toggle_panel()
+            else:
+                for f in self.m.features:
+                    if action[0] in f.actions:
+                        f.action(self, action)
         self.m.actions = []
         while True:
             try:

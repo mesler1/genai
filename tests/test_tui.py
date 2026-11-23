@@ -32,6 +32,8 @@ sys.path.insert(0, os.path.join(REPO, "tui"))
 C_PROMPT = load("prompt", os.path.join(REPO, "tui", "prompt.py"))
 IPC = load("ipc", os.path.join(REPO, "tui", "ipc.py"))
 REC = load("recorder", os.path.join(REPO, "tui", "recorder.py"))
+RAW = C.Model().feature("raw")
+F = importlib.import_module("features")
 G = load("genai_for_tui", os.path.join(REPO, "genai"))
 
 
@@ -205,7 +207,7 @@ class TestModel(unittest.TestCase):
         m.submit("/decline p2")
         self.assertIn("p2 is declined", text_of(m.blocks[-1]))
         m.submit("/decline p1")
-        m.undecline(m.cards["p1"])                             # run after all: the model isn't told
+        m.run_started(m.cards["p1"])                             # run after all: the model isn't told
         m.outbox.clear()
         m.submit("ok, something else")
         self.assertEqual([x["type"] for x in m.outbox], ["attach", "user"])
@@ -224,13 +226,14 @@ class TestModel(unittest.TestCase):
             m.handle({"type": "proposal", "id": f"p{m.turn}", "kind": "read", "path": "x", "auto": True})
             m.handle({"type": "text", "text": "and more"})
             m.handle({"type": "done", "reason": "reply", "context": {"used": 1, "limit": 9}})
-        self.assertEqual(m.turn_text(1), "> first\n> question\n\nHere is one\n\nand more\n")
-        self.assertEqual(m.turn_text(2), "> second\n\nHere is two\\x1b[2J\n\nand more\n")   # escaped, as shown
-        self.assertIsNone(m.turn_text(3))
+        self.assertEqual(m.feature("copy").turn_text(m, 1), "> first\n> question\n\nHere is one\n\nand more\n")
+        self.assertEqual(m.feature("copy").turn_text(m, 2),
+                         "> second\n\nHere is two\\x1b[2J\n\nand more\n")                 # escaped, as shown
+        self.assertIsNone(m.feature("copy").turn_text(m, 3))
         m.submit("/copy")
         self.assertEqual(m.actions[-1][:2], ("copy", 2))
         m.submit("/copy 1")
-        self.assertEqual(m.actions[-1], ("copy", 1, m.turn_text(1)))
+        self.assertEqual(m.actions[-1], ("copy", 1, m.feature("copy").turn_text(m, 1)))
         m.submit("/copy 7")
         self.assertIn("turn 7 isn't on screen", text_of(m.blocks[-1]))
 
@@ -255,7 +258,7 @@ class TestModel(unittest.TestCase):
         self.assertEqual(m.outbox[-1], {"type": "models"})
         m.handle({"type": "models", "current": "m", "models": [{"id": "qwen3-coder"}, {"id": "x#{evil}"},
                                                                  {"id": "llama"}, "junk"]})
-        self.assertEqual((m.models, m.actions[-1]), (["qwen3-coder", "llama"], ("model_menu",)))
+        self.assertEqual((m.feature("model").models, m.actions[-1]), (["qwen3-coder", "llama"], ("model_menu",)))
         m.request({"type": "model", "n": 1})                       # the menu sends a position, never a name
         self.assertEqual(m.outbox[-1], {"type": "model", "model": "llama"})
         m.request({"type": "model", "n": 7})
@@ -272,7 +275,7 @@ class TestModel(unittest.TestCase):
     def test_model_menu_items_carry_only_positions(self):
         sh = C.Shell("%1")
         with mock.patch.object(C.subprocess, "Popen") as popen:
-            sh.model_menu(["qwen3-coder", "bad#{x}"] + [f"m{i}" for i in range(25)], "qwen3-coder")
+            C.Model().feature("model").menu(sh, ["qwen3-coder", "bad#{x}"] + [f"m{i}" for i in range(25)], "qwen3-coder")
         argv = popen.call_args[0][0]
         self.assertIn("• qwen3-coder", argv)
         self.assertNotIn("bad#{x}", " ".join(argv))
@@ -598,7 +601,7 @@ class TestRawView(unittest.TestCase):
             "request": json.dumps({"messages": [{"role": "user", "content": "hi\u202e"}]}),
             "response": ['data: {"choices":[{"delta":{"content":"he\u001b[2Jllo"}}]}', "data: [DONE]"],
             "status": "ok", "message": {"role": "assistant", "content": "hello"}, "usage": {"total_tokens": 9}}]}
-        text = C.render_trace(ev, {2: [3, 3]})
+        text = RAW.render_trace(ev, {2: [3, 3]})
         self.assertIn("Exchange 3 · turn 2 · t · 1.5 s · ok", text)
         self.assertIn("Authorization: Bearer (your API key, not shown)", text)
         self.assertIn('"content": "hi\\u202e"', text)          # escaped, never raw
@@ -606,8 +609,8 @@ class TestRawView(unittest.TestCase):
         self.assertIn('"total_tokens": 9', text)
         self.assertNotIn("\u202e", text)
         self.assertNotIn("\x1b", text)
-        self.assertIn("no longer has", C.render_trace({"exchanges": [], "kept": [5, 34]}, {}))
-        sys_text = C.render_system({"system": "You are genai", "tools": [{"name": "t"}], "model": "m"})
+        self.assertIn("no longer has", RAW.render_trace({"exchanges": [], "kept": [5, 34]}, {}))
+        sys_text = RAW.render_system({"system": "You are genai", "tools": [{"name": "t"}], "model": "m"})
         self.assertIn("You are genai", sys_text)
 
 
@@ -743,6 +746,129 @@ class TestRecorder(unittest.TestCase):
         self.assertFalse(m.busy)
         m.submit("again")
         self.assertTrue(m.busy)
+
+
+class TestFeatures(unittest.TestCase):
+    """tui/features: the registry, and switching features off."""
+
+    def setUp(self):
+        self.config = tempfile.mkdtemp(prefix="genai-config-")
+        self.addCleanup(shutil.rmtree, self.config, True)
+        os.makedirs(os.path.join(self.config, "genai"))
+
+    def environ(self, **extra):
+        return dict({"XDG_CONFIG_HOME": self.config}, **extra)
+
+    def write_config(self, text):
+        with open(os.path.join(self.config, "genai", "tui.json"), "w") as f:
+            f.write(text)
+
+    def model(self, environ):
+        names, warning = F.disabled_names(environ)
+        return C.Model(F.load(names, C.CORE)), warning
+
+    def test_all_built_in_features_load(self):
+        on = F.load(core=C.CORE)
+        self.assertEqual([f.name for f in on], ["model", "copy", "decline", "raw", "ssh"])
+        m = C.Model()
+        self.assertEqual([f.name for f in m.features], [f.name for f in on])
+        self.assertEqual(list(m.commands())[-5:], ["/model", "/copy", "/decline", "/raw", "/system"])
+        self.assertEqual(C.feature_requests(on), {"panel": {"models"}, "menu": {"model", "copy", "raw", "system"}})
+
+    def test_environment_disables_a_feature(self):
+        m, warning = self.model(self.environ(GENAI_TUI_DISABLE="copy, model"))
+        self.assertIsNone(warning)
+        self.assertEqual([f.name for f in m.features], ["decline", "raw", "ssh"])
+        m.submit("/copy")
+        self.assertIn("unknown command /copy (/help lists them)", text_of(m.blocks[-1]))
+        m.submit("/help")
+        helped = "\n".join(text_of(b) for b in m.blocks)
+        self.assertNotIn("/copy", helped.replace("unknown command /copy", ""))
+        self.assertNotIn("/model", helped)
+        self.assertIn("/raw", helped)
+        m.handle({"type": "models", "models": [{"id": "x"}]})                # its events are ignored too
+        self.assertEqual(m.actions, [])
+        self.assertEqual(C.complete("/mo", C.command_list(m.features)), "/mo")
+
+    def test_config_file_disables_a_feature(self):
+        self.write_config('{"disable": ["decline", "raw"]}')
+        m, warning = self.model(self.environ())
+        self.assertIsNone(warning)
+        self.assertEqual([f.name for f in m.features], ["model", "copy", "ssh"])
+        m.submit("/decline")
+        self.assertIn("unknown command /decline", text_of(m.blocks[-1]))
+
+    def test_no_config_file_means_everything_is_on(self):
+        names, warning = F.disabled_names(self.environ())
+        self.assertEqual((names, warning), (set(), None))
+
+    def test_a_malformed_config_is_ignored_with_one_warning(self):
+        for text in ("{not json", '{"disable": "copy"}', '["copy"]', '{"disable": [1]}'):
+            self.write_config(text)
+            m, warning = self.model(self.environ())
+            self.assertEqual(len(m.features), 5, text)
+            self.assertIn("was ignored, so every feature is on", warning)
+
+    def test_the_hub_refuses_the_requests_of_a_disabled_feature(self):
+        names, _ = F.disabled_names(self.environ(GENAI_TUI_DISABLE="copy"))
+        d = tempfile.mkdtemp(prefix="genai-ipc-")
+        os.chmod(d, 0o700)
+        self.addCleanup(shutil.rmtree, d, True)
+        hub = IPC.Hub(d, C.feature_requests(F.load(names, C.CORE)))
+        self.addCleanup(hub.close)
+        menu = IPC.Client(d, "menu")
+        self.addCleanup(menu.close)
+        menu.send({"type": "copy", "turn": 1})
+        menu.send({"type": "model", "n": 0})
+        got = []
+        end = time.time() + 2
+        while len(got) < 2 and time.time() < end:
+            try:
+                got.append(hub.inbox.get(timeout=0.1))
+            except Exception:
+                pass
+        self.assertEqual(got, [("hello", "menu"), ("menu", {"type": "model", "n": 0})])
+
+    def test_features_cannot_be_given_the_power_to_answer(self):
+        roles = {r: set(k) for r, k in IPC.ROLES.items()}
+        for role, kind in (("prompt", "copy"), ("menu", "key"), ("panel", "decision"), ("menu", "share"),
+                           ("root", "copy")):
+            with self.assertRaises(ValueError):
+                IPC.allow(roles, role, [kind])
+        self.assertEqual(roles, IPC.ROLES)
+
+    def test_a_model_request_from_a_role_it_does_not_allow_does_nothing(self):
+        m = C.Model()
+        m.request({"type": "copy", "turn": 1}, "panel")
+        self.assertEqual((m.blocks, m.actions), ([], []))
+
+    def test_menu_items_from_features_keep_only_fixed_words_and_numbers(self):
+        sh = C.Shell("%1")
+        m = C.Model()
+        m.shell = object()
+        m.add(C.UserMsg("hi"))
+        m.blocks[-1].turn = m.turn = 1
+        m.exchanges[1] = [1, 1]
+        here = [f.turn_menu(m, 1) for f in m.features]
+        self.assertTrue(any(here))
+        evil = [[("Copy #{x}", "c", "copy", "1"), ("ok", "c", "copy", "1; rm"), ("ok", "cc", "copy", "1"),
+                 ("fine", "f", "copy", "7")]]
+        with mock.patch.object(C.subprocess, "Popen") as popen:
+            sh.turn_menu(1, here + evil)
+            argv = popen.call_args[0][0]
+            sh.menu("p1", "here", extra=[("Decline it", "d", "decline"), ("bad#", "x", "decline"),
+                                         ("ok", "k", "rm -rf"), ("ok", "k", "$(x)")])
+            card = popen.call_args[0][0]
+        self.assertIn("Copy this message and its reply", argv)
+        self.assertIn("fine", argv)
+        self.assertNotIn("Copy #{x}", argv)
+        self.assertNotIn("ok", argv)
+        picks = [a for a in argv if "request.py" in a]
+        self.assertTrue(all(re.search(r"request.py (copy [0-9]+|raw (last|all|[0-9]+)|system)\\?\"$", a) for a in picks),
+                        picks)
+        self.assertIn("Decline it", card)
+        self.assertEqual(sum("request.py" in a for a in card), 5)         # run, edit, prompt, copy, decline
+        self.assertNotIn("bad#", card)
 
 
 class TestSocket(unittest.TestCase):
