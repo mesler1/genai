@@ -48,7 +48,11 @@ q() { printf '%q' "$1"; }
 
 read -r rows cols < <(stty size 2>/dev/null) || true
 cols=${cols:-120}
-t -f /dev/null new-session -d -s genai -n genai -x "$cols" -y "${rows:-40}" -c "$PWD" \
+# The panes' TERM. screen-256color, not tmux-256color: an ssh from the shell pane takes TERM with it, and
+# many hosts (SLES among them) have no tmux-256color, where the shell then draws erased characters as
+# blanks. It has to be set before the first pane starts, so the server starts first.
+t -f /dev/null start-server \; set -g default-terminal screen-256color \; \
+  new-session -d -s genai -n genai -x "$cols" -y "${rows:-40}" -c "$PWD" \
   -e "GENAI_TUI_TOGGLE=$here/shell-toggle" "bash --rcfile $(q "$here/shellrc") -i"
 shell=$(t display -p -t genai '#{pane_id}')
 # tmux copies what the shell prints into a FIFO the conversation pane reads, in memory, to know each
@@ -69,9 +73,6 @@ if [ "$panel" = 0 ] || [ "$cols" -lt 100 ]; then
   t break-pane -d -s "$side" -n panel
 fi
 
-term=screen-256color
-infocmp tmux-256color >/dev/null 2>&1 && term=tmux-256color
-t set -g default-terminal "$term"
 t set -g escape-time 10
 t set -g history-limit 50000
 t set -g mouse on
