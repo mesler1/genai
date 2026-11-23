@@ -136,6 +136,25 @@ class TestWorkdir(Tmp):
                 self.wd.write("new.txt", "replacement", expected=None)
         self.assertEqual(self.wd.read("new.txt"), "concurrent update")
 
+    def test_new_files_without_hard_links(self):
+        def no_links(*args, **kwargs):
+            raise OSError(G.errno.EPERM, "Operation not permitted")
+
+        with mock.patch.object(G.os, "link", side_effect=no_links):
+            self.wd.write("fresh.txt", "made anyway", expected=None)
+        self.assertEqual(self.wd.read("fresh.txt"), "made anyway")
+
+        def creator_wins(*args, **kwargs):          # someone creates the name just before we do
+            with open(self.path("wd", "taken.txt"), "x") as f:
+                f.write("someone else's")
+            no_links()
+
+        with mock.patch.object(G.os, "link", side_effect=creator_wins):
+            with self.assertRaises(G.StaleApproval):
+                self.wd.write("taken.txt", "replacement", expected=None)
+        self.assertEqual(self.wd.read("taken.txt"), "someone else's")
+        self.assertEqual([n for n in os.listdir(self.path("wd")) if n.startswith(".genai")], [])
+
     def test_existing_file_snapshot_is_bounded(self):
         with mock.patch.object(G, "SNAPSHOT_CAP", 4):
             with self.assertRaisesRegex(G.DiskError, "overwrite limit"):
