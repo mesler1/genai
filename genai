@@ -2645,6 +2645,17 @@ class Engine:
         """Exact values to mask in text bound for the model: the endpoint key."""
         return [getattr(self.client, "_key", None)]
 
+    def clear(self):
+        """Start the conversation over: from now on the model gets none of it, and an approved plan is dropped.
+        The session's history still holds all of it. Returns how many messages the model no longer gets."""
+        dropped = len(self.session.messages)
+        self.session.messages = []
+        self.session.usage = None
+        self.clear_plan()
+        self.audit.log("clear", dropped=dropped)
+        self.session.save()
+        return dropped
+
     def compact(self, edit_summary=None):
         """Prune old bulk, then summarize older turns only if still over the warning line."""
         msgs = self.session.messages
@@ -3064,6 +3075,7 @@ Commands (on an empty buffer):
   :plan [clear]   show the approved plan and how far it has got, or drop it
   :compact [-e]   prune old file contents and output; summarize if still large
   :context        show how full the context is
+  :clear          start over: the model forgets this conversation (the saved session keeps it)
   :skills         list skills, marking the ones in use
   :skill NAME on|off  use a blessed skill from the next message on, or stop using it
   :bless PATH     bless a skill, endpoint or profile
@@ -3190,6 +3202,10 @@ class Repl:
                     print(self.box_line())
             elif cmd == "compact":
                 self.do_compact(arg == "-e")
+            elif cmd == "clear":
+                n = self.e.clear()
+                print(f"context cleared: the model starts over ({n} messages dropped; "
+                      f"{'the saved session keeps them' if self.e.session.path else 'they were not saved'})")
             elif cmd == "context":
                 print(f"context: {self.e.used()}/{self.e.endpoint.context_limit} tokens (estimated)")
             elif cmd == "skills":
@@ -3340,7 +3356,7 @@ def run_json(engine, ui, first_prompt, attachments):
     ui.engine = engine
     ui.emit({"type": "hello", "protocol": PROTOCOL, "version": VERSION,
              "features": ["proposals", "decisions", "attach", "register_tools", "compact", "context", "coding",
-                          "set_coding", "skills", "files", "trace", "system", "plan", "network"],
+                          "set_coding", "skills", "files", "trace", "system", "plan", "network", "clear"],
              "endpoint": engine.endpoint.info(),
              "profile": {"name": engine.profile.name, "description": engine.profile.description}
              if engine.profile else None,
@@ -3403,6 +3419,10 @@ def run_json(engine, ui, first_prompt, attachments):
                          "summary": r["summary"]})
             except GenaiError as err:
                 ui.error(str(err), err.kind)
+        elif t == "clear":
+            n = engine.clear()
+            ui.emit({"type": "cleared", "dropped": n, "context": {"used": engine.used(),
+                                                                   "limit": engine.endpoint.context_limit}})
         elif t == "coding":
             on = msg.get("on")
             if not isinstance(on, bool):
