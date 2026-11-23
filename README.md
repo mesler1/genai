@@ -188,6 +188,21 @@ genai-tui require `--allow-session-endpoint-change` before sending the saved con
 the URL shown in the error before approving the transfer. Another model on the same server needs
 no consent.
 
+## Another host from genai-tui
+
+In genai-tui's shell pane, connect with `genai-ssh` instead of `ssh`:
+
+```
+genai-ssh -p 2222 me@login1.cluster      # ssh options as usual; no remote command
+```
+
+It is your own ssh (config, keys, agent) starting bash on that host with genai-tui's prompt hook,
+so genai-tui follows each command there as it does here: `/run` sends a proposed command to that
+host (the question says so, in red), `/share N` and the info panel show which host a command ran
+on, and nothing is installed there. The session has a key of its own that never appears on a
+command line or on screen; see SECURITY.md, section 7. Plain `ssh` still works, but genai-tui
+can't follow it, and `/run` refuses while it runs.
+
 ## Sandboxed runs
 
 In coding mode the model can only propose commands, so you run every build and test yourself. A

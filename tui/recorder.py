@@ -12,12 +12,29 @@ markers without it are taken as ordinary output. So a command can't fake the end
 a command to the list, by printing markers of its own.
 
 Full-screen programs (vim, top, less) draw on tmux's alternate screen; what they draw there isn't output and
-is left out. Standard library only.
+is left out.
+
+genai-ssh (a function in tui/shellrc) follows commands on another host the same way, with a key of their own:
+
+1. The local shell announces the session with a marker carrying its own word, so no program can: X, with a
+   random id and the destination you typed. The recorder makes a fresh key for it, here, in memory.
+2. ssh starts bash on the remote host with our rc. Before anything else runs there, the rc turns the terminal's
+   echo off and asks for the key: R, with the id, and nothing secret. The id came over the command line, which
+   other users of that host can see, so it only names the session: an R is accepted once, for the session
+   announced, within REMOTE_WAIT seconds.
+3. genai-tui types the key into the pane, through ssh's encrypted connection. Echo is off, so the key isn't
+   shown or recorded, and it is never on a command line, in the environment or in a file. The remote bash
+   keeps it in an unexported variable, as the local one keeps its word.
+4. The remote markers carry that key, so a program run there can't fake them, and they bring the remote's
+   host name and directory. The key is forgotten when the local shell's next prompt says ssh has ended.
+
+Standard library only.
 """
 
 import base64
 import os
 import re
+import secrets
 import threading
 import time
 
@@ -27,6 +44,7 @@ HEAD = 256 * 1024            # bytes kept from the start of one command's output
 TAIL = 768 * 1024            # and from its end; the middle of a huge output is dropped
 ALT_ON = re.compile(rb"\x1b\[\?(?:1049|1047|47)h")
 ALT_OFF = re.compile(rb"\x1b\[\?(?:1049|1047|47)l")
+REMOTE_WAIT = 20             # seconds from genai-ssh's announcement to the remote shell asking for its key
 
 
 class Command:
@@ -37,6 +55,7 @@ class Command:
         self.head, self.tail = bytearray(), bytearray()
         self.size = 0                # bytes printed, including any that were dropped
         self.screen = False          # it used the alternate screen (a full-screen program)
+        self.host = None             # the host a genai-ssh session ran it on; None for this one
         self._text = None
 
     def add(self, data):
@@ -115,6 +134,21 @@ def render(data):
     return "\n".join(lines) + ("\n" if s.endswith("\n") else "")
 
 
+class Remote:
+    """A genai-ssh session, from its announcement until the local prompt comes back."""
+
+    def __init__(self, sid, dest):
+        self.id, self.dest = sid, dest
+        self.until = time.time() + REMOTE_WAIT
+        self.key = None              # made when the remote shell asks for it; its markers carry it
+        self.host, self.cwd = None, ""   # as the remote shell reports them at each prompt
+        self.prompt = False
+        self.current, self.alt = None, False
+
+    def name(self):
+        return self.host or self.dest
+
+
 class Recorder:
     """Reads the shell pane's output from a FIFO in a thread. commands is newest last; done counts the
     commands that have finished, ever."""
@@ -128,6 +162,8 @@ class Recorder:
         self.alt = False
         self.ps1_lines = 1
         self.primary_prompt = False
+        self.remote = None           # the genai-ssh session: id, key, destination, and once it is up host and cwd
+        self.handshake = None        # a key to type now, for the remote shell asking for it
         self.buf = b""
         self.lock = threading.Lock()
         if fifo:
@@ -172,21 +208,30 @@ class Recorder:
                 self._marker(body)                      # one without the word is ignored, and shows nothing
 
     def _output(self, data):
+        r = self.remote
+        if r and r.current is not None and data:
+            self._into(r, data)
         if not data or self.current is None:
             return
-        while data:                                     # drop what a full-screen program draws
-            if self.alt:
+        self._into(self, data)
+
+    @staticmethod
+    def _into(holder, data):
+        """Add output to the command running in holder (the recorder, or a Remote), leaving out what a full-screen
+        program draws."""
+        while data:
+            if holder.alt:
                 m = ALT_OFF.search(data)
                 if not m:
                     return
-                self.alt, data = False, data[m.end():]
+                holder.alt, data = False, data[m.end():]
             else:
                 m = ALT_ON.search(data)
                 if not m:
-                    self.current.add(data)
+                    holder.current.add(data)
                     return
-                self.current.add(data[:m.start()])
-                self.current.screen, self.alt = True, True
+                holder.current.add(data[:m.start()])
+                holder.current.screen, holder.alt = True, True
                 data = data[m.end():]
 
     def _marker(self, body):
@@ -194,6 +239,11 @@ class Recorder:
         if len(parts) < 2:
             return False
         nonce, kind, args = parts[0], parts[1], parts[2:]
+        r = self.remote
+        if nonce == "ssh" and kind == "R":
+            return self._asked(args)
+        if r and r.key and nonce == r.key:
+            return self._remote_marker(r, kind, args)
         if self.nonce is None:
             if kind == "H" and re.fullmatch(r"[0-9a-f]{16,64}", nonce):
                 self.nonce = nonce
@@ -201,6 +251,8 @@ class Recorder:
             return False
         if nonce != self.nonce:
             return False
+        if kind == "X":
+            return self._announced(args)
         if kind == "P":
             self.primary_prompt = False
         elif kind == "S":
@@ -209,6 +261,7 @@ class Recorder:
             self.current, self.alt = Command(self.serial, time.time()), False
         elif kind == "D":
             self.primary_prompt = True
+            self.remote = self.handshake = None             # the local prompt is back: any ssh session has ended
             c, self.current, self.alt = self.current, None, False
             if len(args) >= 4 and args[3].isdigit():
                 self.ps1_lines = max(int(args[3]), 1)
@@ -226,6 +279,77 @@ class Recorder:
             del self.commands[:-MAX_KEEP]
             self.done += 1
         return True
+
+    def _announced(self, args):
+        """X from the local shell (its word proves it): genai-ssh is about to start a session."""
+        if len(args) < 2 or not re.fullmatch(r"[0-9a-f]{32}", args[0]):
+            return False
+        try:
+            dest = printable(base64.b64decode(args[1]).decode("utf-8", "replace"))
+        except ValueError:
+            return False
+        self.remote = Remote(args[0], dest[:200])
+        return True
+
+    def _asked(self, args):
+        """R: a remote shell asks for its key. Only the session just announced, only once, only in time."""
+        r = self.remote
+        if not r or r.key or not args or args[0] != r.id or time.time() > r.until:
+            return False
+        r.key = secrets.token_hex(16)
+        self.handshake = r.key
+        return True
+
+    def _remote_marker(self, r, kind, args):
+        if kind == "P":
+            r.prompt = False
+        elif kind == "S":
+            r.prompt = False
+            self.serial += 1
+            r.current, r.alt = Command(self.serial, time.time()), False
+            r.current.host = r.name()
+        elif kind == "D":
+            r.prompt = True
+            if len(args) >= 6:
+                for field, value in (("cwd", args[4]), ("host", args[5])):
+                    try:                                # from the other host: shown, so only printable text
+                        setattr(r, field, printable(base64.b64decode(value).decode("utf-8", "replace"))[:300]
+                                or getattr(r, field))
+                    except ValueError:
+                        pass
+            c, r.current, r.alt = r.current, None, False
+            if c is None:
+                return True
+            c.ended = time.time()
+            c.rc = int(args[0]) if args and args[0].isdigit() else None
+            c.in_history = len(args) >= 2 and args[1] == "1"
+            if c.in_history and len(args) >= 3:
+                try:
+                    c.cmd = base64.b64decode(args[2]).decode("utf-8", "replace").strip()
+                except ValueError:
+                    c.cmd = ""
+            self.commands.append(c)
+            del self.commands[:-MAX_KEEP]
+            self.done += 1
+        return True
+
+    def take_handshake(self):
+        """The key to type into the shell pane now, once, or None."""
+        with self.lock:
+            key, self.handshake = self.handshake, None
+            return key
+
+    def remote_prompt(self):
+        """(host, directory) while a genai-ssh session's shell is at its prompt; None otherwise."""
+        with self.lock:
+            r = self.remote
+            return (r.name(), r.cwd) if r and r.key and r.prompt else None
+
+    def remote_host(self):
+        """The host of a genai-ssh session that is up, or None."""
+        with self.lock:
+            r = self.remote
+            return r.name() if r and r.key else None
 
     def finished(self):
         with self.lock:
@@ -245,7 +369,11 @@ class Recorder:
 
     def running(self):
         with self.lock:
-            return self.current
+            return (self.remote and self.remote.current) or self.current
+
+
+def printable(text):
+    return "".join(ch for ch in text if ch.isprintable()).strip()
 
 
 def fifo_path(state_dir):
@@ -253,8 +381,9 @@ def fifo_path(state_dir):
 
 
 def label(c):
-    """How a command shows in lists: its command line, or why there is none."""
-    return c.cmd if c.in_history else "(a command kept out of your history)"
+    """How a command shows in lists: its command line, or why there is none, and the host if it ran on another."""
+    text = c.cmd if c.in_history else "(a command kept out of your history)"
+    return f"{c.host}: {text}" if c.host else text
 
 
 def trim(text, head=60, tail=240):

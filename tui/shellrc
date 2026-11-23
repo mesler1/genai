@@ -5,18 +5,38 @@
 # The word in every marker. It is not exported, so no program run from here can read it, and print
 # markers of its own that would be believed. The first marker announces it, once tmux is copying
 # this pane's output and before anything else has run.
-__genai_nonce=$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
-if [ -n "${TMUX:-}" ] && [ -n "$__genai_nonce" ]; then
-  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-    [ "$(tmux display -p -t "$TMUX_PANE" '#{pane_pipe}' 2>/dev/null)" = 1 ] && break
-    sleep 0.1
-  done
-  printf '\e]6973;%s;H\a' "$__genai_nonce"
-else
+if [ -n "${__genai_remote:-}" ]; then
+  # On another host, started by genai-ssh (below). Before anything else runs here, ask genai-tui for this
+  # session's key: echo off, so the key typed back through ssh is neither shown nor recorded, and only for the
+  # session genai-ssh announced (tui/recorder.py). Without it, this is a plain shell that genai-tui can't follow.
   __genai_nonce=
+  if stty -echo 2>/dev/null; then
+    printf '\e]6973;ssh;R;%s\a' "$__genai_remote"
+    IFS= read -r -t 20 __genai_nonce || __genai_nonce=
+    stty echo
+  fi
+  [[ $__genai_nonce =~ ^[0-9a-f]{32}$ ]] || __genai_nonce=
+  unset __genai_remote
+  # The start-up files ssh would have run without a command (a login shell's; they usually read ~/.bashrc).
+  [ -f /etc/profile ] && . /etc/profile
+  if [ -f ~/.bash_profile ]; then . ~/.bash_profile
+  elif [ -f ~/.bash_login ]; then . ~/.bash_login
+  elif [ -f ~/.profile ]; then . ~/.profile
+  fi
+else
+  __genai_nonce=$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
+  if [ -n "${TMUX:-}" ] && [ -n "$__genai_nonce" ]; then
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+      [ "$(tmux display -p -t "$TMUX_PANE" '#{pane_pipe}' 2>/dev/null)" = 1 ] && break
+      sleep 0.1
+    done
+    printf '\e]6973;%s;H\a' "$__genai_nonce"
+    __genai_rc=${BASH_SOURCE[0]}           # this file, which genai-ssh sends to the other host
+  else
+    __genai_nonce=
+  fi
+  [ -f ~/.bashrc ] && . ~/.bashrc
 fi
-
-[ -f ~/.bashrc ] && . ~/.bashrc
 # A command /run types arrives as one paste, so a multi-line command doesn't run line by line.
 bind 'set enable-bracketed-paste on' 2>/dev/null
 # Every command goes in history, repeats too, so the one that just ran can be named. A command typed
@@ -30,7 +50,7 @@ HISTCONTROL=${HISTCONTROL//erasedups/}
 # Continuation prompts accept bracketed input too, but must not receive a proposed command.
 [ -n "$__genai_nonce" ] && PS2='\['$'\e]6973;'"$__genai_nonce"$';P\a''\]'"${PS2:-}"
 # The next prompt: the exit code, whether a new history entry was made, the command line (base64),
-# and how many lines the prompt takes.
+# how many lines the prompt takes, and the directory and host name (base64; a genai-ssh session shows them).
 __genai_prompt() {
   local rc=$? h num new=0 cmd= p
   [ -n "$__genai_nonce" ] || return "$rc"
@@ -47,7 +67,8 @@ __genai_prompt() {
   fi
   p=${PS1//\\n/$'\n'}
   p=${p//[!$'\n']/}
-  printf '\e]6973;%s;D;%s;%s;%s;%s\a' "$__genai_nonce" "$rc" "$new" "$cmd" "$(( ${#p} + 1 ))"
+  printf '\e]6973;%s;D;%s;%s;%s;%s;%s;%s\a' "$__genai_nonce" "$rc" "$new" "$cmd" "$(( ${#p} + 1 ))" \
+    "$(printf %s "$PWD" | base64 -w0)" "$(printf %s "${HOSTNAME:-}" | base64 -w0)"
   return "$rc"
 }
 PROMPT_COMMAND="__genai_prompt${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
@@ -63,3 +84,32 @@ __genai_hide() {
   "$GENAI_TUI_TOGGLE" hide
 }
 bind -x '"``": __genai_hide' 2>/dev/null
+
+# genai-ssh [ssh options] [user@]host: ssh to a shell genai-tui can follow, as it follows this one. Nothing is
+# installed there and no key is on the command line: see tui/recorder.py. Only here, in genai-tui's shell pane.
+if [ -n "${__genai_rc:-}" ]; then
+  genai-ssh() {
+    local a dest= skip= n=0 at=0 id rc
+    for a in "$@"; do                      # the destination: the first argument that isn't an option or its value
+      n=$((n + 1))
+      if [ -n "$skip" ]; then skip=; continue; fi
+      case $a in
+        -[bBcDEeFIiJLlmOoPpQRSWw]) skip=1 ;;
+        -*) ;;
+        *) dest=$a; at=$n; break ;;
+      esac
+    done
+    if [ -z "$dest" ] || [ "$at" -ne $# ]; then
+      echo "usage: genai-ssh [ssh options] [user@]host   (it starts a shell there; no remote command)" >&2
+      return 2
+    fi
+    if [ ! -r "$__genai_rc" ]; then
+      echo "genai-ssh: can't read $__genai_rc" >&2
+      return 1
+    fi
+    id=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+    rc=$({ printf '__genai_remote=%s\n' "$id"; cat "$__genai_rc"; } | base64 -w0)
+    printf '\e]6973;%s;X;%s;%s\a' "$__genai_nonce" "$id" "$(printf %s "$dest" | base64 -w0)"
+    command ssh -t "$@" "exec bash -c 'exec bash --rcfile <(printf %s \"\$1\" | base64 -d) -i' genai-ssh $rc"
+  }
+fi
