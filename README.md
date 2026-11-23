@@ -75,6 +75,7 @@ skills/genai-endpoint/     helps you write an endpoint
 skills/genai-profile/      helps you write a profile (persona)
 skills/genai-skill/        helps you write a skill
 skills/bash-scripts/       conventions for small, safe bash scripts
+skills/hpc/                working on a Slurm cluster: login nodes, srun/sbatch, modules, scratch
 sandbox/run                podman sandbox for running genai and its tests, on this machine's OS
 sandbox/hooks/modules.sh   sandbox hook: makes loaded environment modules work inside the sandbox
 hooks/notify-desktop       example notify hook: a desktop notification when genai waits for you

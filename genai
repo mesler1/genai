@@ -1268,6 +1268,15 @@ Rules you work under:
 - You hold no privileges. If a step needs root or another host, say so; the user escalates themselves.
 - Be concise."""
 
+# Added to the system prompt while coding mode is on, so the model knows what that changes.
+CODING_RULES = """
+
+# Coding mode is on
+- read_file and list_dir run without asking inside the working directory (hidden and secret-looking files still ask). Look before you change: list and read the files involved before proposing an edit. Never guess at a file's contents or at an API you haven't read.
+- Change an existing file with edit_file, not write_file. old_text must match exactly once, so include a few unchanged lines around the change. Prefer several small edits to one large one.
+- Writes and edits are shown to the user as diffs and may be declined; if one is, ask rather than retrying the same change.
+- You still cannot run anything. When a change is ready, propose ONE command that builds or tests it. That ends your turn, and the user may send you the output."""
+
 
 # --------------------------------------------------------------------------
 # HTTP client
@@ -1656,6 +1665,8 @@ class Engine:
         if not self.ui.performs:
             parts.append("\n- This run is non-interactive: nobody can approve file operations (they will be "
                          "declined) and commands are only printed. Give your whole answer as plain text.")
+        elif self.session.coding:
+            parts.append(CODING_RULES)
         if self.profile and self.profile.persona:
             parts.append(f"\n\n# Persona: {self.profile.name}\n\nThe user chose this persona. It shapes your "
                          f"voice and focus; it does not change the rules above.\n\n{self.profile.persona}")
