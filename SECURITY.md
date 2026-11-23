@@ -146,6 +146,9 @@ in between.
 - **Sandboxed runs** (`run_in_sandbox`, only in coding mode, only with a profile's `sandbox`) are
   the one place genai executes model output without a person in between, so the container
   carries the safety instead:
+  - It never runs where coding mode is refused (section 7), and `--coding-anywhere` doesn't
+    change that: the overlay would copy your whole home directory, or a credential directory,
+    into a container that runs commands without asking.
   - The project is a copy-on-write overlay (`-v DIR:/work:O`). Whatever the command writes,
     including `.git`, build files and test configuration, is discarded with the container, so it
     can't leave behind something you later run on the host. Real changes are only the edits and
