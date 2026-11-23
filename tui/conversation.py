@@ -298,7 +298,7 @@ class Banner(Block):
 
     def lines(self, w):
         h, ep = self.h, self.h.get("endpoint") or {}
-        rows = [(f"genai {h.get('version', '?')}", A),
+        rows = [(f"◆ genai {h.get('version', '?')}", A),
                 (f"{ep.get('name', '?')}: {ep.get('model', '?')} at {ep.get('base_url', '?')}", "")]
         prof = h.get("profile")
         if prof:
@@ -369,6 +369,11 @@ def parse_plan_edit(text, steps):
             return set(), {}, f"step {st['n']}'s path was changed; leave the step out instead"
         keep.add(st["n"])
     return keep, edits, None
+
+
+MARK = {R: "✗", W: "⚠", D: "✓"}      # notes: the symbol before one in that role (a plain note has none)
+STATE_MARK = {"waiting": "◆", "shown": "▸", "running": "…", "accepted": "✓", "done": "✓", "ran": "✓",
+              "declined": "⊘", "cancelled": "⊘", "error": "✗", "auto": "↳"}
 
 
 class Card(Block):
@@ -454,7 +459,7 @@ class Card(Block):
         role = self.STATE_ROLE.get(self.state, Q)
         inner = max(w - 4, 8)
         head = f"─ {self.id} · {self.title()} "
-        tail = f" {self.state} ─"
+        tail = f" {STATE_MARK.get(self.state, '·')} {self.state} ─"
         head = fit(head, w - 2 - width(tail) - 1)
         fill = max(w - 2 - width(head) - width(tail), 1)
         out = [[], [("╭" + head + "─" * fill + tail + "╮", role)]]
@@ -513,7 +518,7 @@ class Model:
         return block
 
     def note(self, text, role=Q):
-        self.add(Note(text, role))
+        self.add(Note(text, role, MARK[role] + " " if role in MARK else "  "))
 
     def send(self, msg):
         self.outbox.append(msg)
