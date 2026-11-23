@@ -192,6 +192,10 @@ class TestModel(unittest.TestCase):
         self.assertIn("I ran this command OUTSIDE any sandbox, directly on this host (exit 2):\n```\nls\n```\nOutput:", buf)
         self.assertEqual(C.strip_comments("# a\nkeep\n#b\n"), "keep")
 
+    def test_session_destination_confirmation_is_forwarded(self):
+        args = C.parse_args(["-S", "saved", "--allow-session-endpoint-change"])
+        self.assertEqual(C.genai_args(args), ["-S", "saved", "--allow-session-endpoint-change"])
+
     def test_options_split_between_the_tui_and_genai(self):
         a = C.parse_args(["-p", "hpc", "-S", "night", "-k", "slurm", "-k", "draft", "--coding", "--no-panel"])
         self.assertEqual(C.genai_args(a), ["-p", "hpc", "-S", "night", "-k", "slurm", "-k", "draft", "--coding"])
