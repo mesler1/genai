@@ -45,12 +45,15 @@ COMMANDS = {
     "/skills": "list skills; * marks the ones in use",
     "/skill": "NAME on|off: use a blessed skill from the next message on, or stop",
     "/run": "[ID]: review and run a proposed command in the shell pane (the latest by default)",
-    "/share": "[N|mark|all]: review shell output, then send it: the last command, command N, from the mark, or all",
+    "/decline": "[ID]: decline a proposed command (the latest by default); the model hears with your next message",
+    "/share": "[N|mark|all]: send shell output, reviewed first or as it is: the last command, command N, from the "
+              "mark, or all",
     "/commands": "list the commands run in the shell pane, numbered for /share N (also in the info panel)",
     "/mark": "shell context starts at the shell's current prompt (or right-click a line in the shell)",
     "/shell": "show the shell and move there (`` on its empty prompt hides it again)",
     "/panel": "show or hide the info panel on the right",
     "/plan": "[clear]: show the approved plan, or drop it so everything asks again",
+    "/copy": "[N]: copy your message and the reply to it, for the last turn or turn N (or right-click it)",
     "/raw": "[N|all]: what was sent to the endpoint and what came back, for the last turn, turn N, or all kept",
     "/system": "the system prompt and tool definitions sent with every request",
     "/compact": "shrink the conversation when the context is getting full",
@@ -526,8 +529,10 @@ class Model:
     def number_commands(self):
         """Alt+1 for the newest command proposal, Alt+2 for the one before, up to MENU_KEYS."""
         cmds = [c for c in self.cards.values() if c.ev.get("kind") == "command"]
-        for i, c in enumerate(reversed(cmds)):
-            key = i + 1 if i < MENU_KEYS else None
+        live = [c for c in cmds if c.state != "declined"]          # a declined one keeps /run, not a key
+        keys = {id(c): i + 1 for i, c in enumerate(reversed(live)) if i < MENU_KEYS}
+        for c in cmds:
+            key = keys.get(id(c))
             if c.key != key:
                 c.key = key
                 c.changed()
@@ -700,7 +705,7 @@ class Model:
     def send_turn(self, msg):
         self.busy = True
         for attachment in msg.attachments:
-            self.send(attachment)
+            self.send({k: v for k, v in attachment.items() if k != "decline"})
         self.send({"type": "user", "text": msg.text})
 
     def command(self, line):
@@ -742,6 +747,8 @@ class Model:
             self.send({"type": "compact"})
         elif cmd in ("/run", "/share", "/shell", "/mark", "/commands") and not self.shell:
             self.note(f"{cmd} needs the shell pane: start genai with genai-tui", R)
+        elif cmd == "/decline":
+            self.decline(arg)
         elif cmd == "/run":
             cards = [c for c in self.cards.values() if c.ev.get("kind") == "command"]
             card = self.cards.get(arg) if arg else (cards[-1] if cards else None)
@@ -788,6 +795,8 @@ class Model:
                               D if st.get("status") == "done" else Q if st.get("status") == "left out" else "")
         elif cmd == "/raw":
             self.raw(arg)
+        elif cmd == "/copy":
+            self.copy(arg)
         elif cmd == "/context":
             used, limit = self.context or (None, None)
             self.note(f"context: {used}/{limit} tokens" if used is not None else "context: not measured yet")
@@ -801,6 +810,31 @@ class Model:
             self.quit = True
         else:
             self.note(f"unknown command {cmd} (/help lists them)", R)
+
+    def turn_text(self, turn):
+        """Your message for a turn and the replies that followed it, as text to copy (escaped, as shown), or None."""
+        asked = [b for b in self.blocks if isinstance(b, UserMsg) and b.turn == turn and not b.queued]
+        if not turn or not asked:
+            return None
+        said = clean(asked[0].text).strip("\n")
+        parts = ["\n".join("> " + ln if ln else ">" for ln in said.split("\n"))]
+        parts += [clean(b.text).strip("\n") for b in self.blocks
+                  if isinstance(b, Reply) and b.turn == turn and b.text.strip()]
+        return "\n\n".join(parts) + "\n"
+
+    def copy(self, arg):
+        if arg and not arg.isdigit():
+            self.note("usage: /copy or /copy N (a turn)", R)
+            return
+        turns = [b.turn for b in self.blocks if isinstance(b, UserMsg) and not b.queued]
+        turn = int(arg) if arg else max(turns, default=0)
+        text = self.turn_text(turn)
+        if text is None:
+            self.note("nothing to copy yet" if not arg else f"turn {turn} isn't on screen", R)
+        elif not self.shell:
+            self.note("/copy needs tmux: start genai with genai-tui", R)
+        else:
+            self.actions.append(("copy", turn, text))
 
     def raw(self, arg):
         """Ask genai for a turn's exchanges with the endpoint: the latest turn that had any, turn N, or all."""
@@ -854,12 +888,36 @@ class Model:
             self.command(f"/raw {'' if msg['turn'] == 'last' else msg['turn']}".strip())
         elif t == "system":
             self.command("/system")
+        elif t == "copy" and type(msg.get("turn")) is int:
+            self.command(f"/copy {msg['turn']}")
         elif t == "share" and msg.get("what") in ("mark", "all", "last") and self.shell:
             self.actions.append(("share", msg["what"]))
         elif t == "command" and type(msg.get("n")) is int and self.shell:
             self.actions.append(("share_cmd", msg["n"]))
         elif t == "mark" and isinstance(msg.get("on"), bool) and self.shell:
             self.actions.append(("mark_line",) if msg["on"] else ("unmark",))
+
+    def decline(self, arg):
+        """/decline [ID], or Decline in a command's menu: the card says so, and the model hears with the next
+        message, so it doesn't assume the command ran."""
+        cards = [c for c in self.cards.values() if c.ev.get("kind") == "command" and c.state == "shown"]
+        card = self.cards.get(arg) if arg else (cards[-1] if cards else None)
+        if not card or card.ev.get("kind") != "command":
+            self.note("no command proposal to decline" + (f" with id {arg}" if arg else ""), R)
+        elif card.state != "shown":
+            self.note(f"{card.id} is {card.state}; only a command that hasn't run can be declined", R)
+        else:
+            card.state, card.detail = "declined", "you declined it; the model hears with your next message"
+            card.changed()
+            self.next_attachments.append({"type": "attach", "label": f"declined {card.id}", "decline": card.id,
+                                          "text": f"I declined the command you proposed as {card.id}, and did not "
+                                                  f"run it:\n{card.ev.get('command', '')}"})
+            self.number_commands()
+            self.note(f"{card.id} declined", Q)
+
+    def undecline(self, card):
+        """A declined command is run after all: the model is no longer told it was declined."""
+        self.next_attachments = [a for a in self.next_attachments if a.get("decline") != card.id]
 
     def attach(self, label, text):
         """Shell context the user reviewed: it goes with their next message, so they can ask about it."""
@@ -1259,21 +1317,24 @@ class Shell:
                   "Edit it, then run", "e", pick("edit"),
                   "Put it at the shell prompt (you press Enter)", "p", pick("prompt"),
                   "Copy it", "c", pick("copy"),
+                  "Decline it (the model hears with your next message)", "d", pick("decline"),
                   "", "Cancel", "q", ""],
                                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
 
-    def raw_menu(self, turn):
-        """Right-click in the conversation: tmux's menu for looking behind it. Only fixed words and a number."""
+    def raw_menu(self, turn, copy=0):
+        """Right-click in the conversation: tmux's menu for copying a turn and looking behind it. Only fixed words
+        and numbers."""
         me = os.environ.get("TMUX_PANE", "")
         pick = menu_item
-        items = (["What was sent and received for this turn", "r", pick("raw", str(turn))] if turn else []) + [
+        items = (["Copy this message and its reply", "c", pick("copy", str(copy)), ""] if copy else []) + \
+            (["What was sent and received for this turn", "r", pick("raw", str(turn))] if turn else []) + [
             "What was sent and received last", "l", pick("raw", "last"),
             "Everything genai still has (last 30)", "a", pick("raw", "all"),
             "The system prompt and tools", "s", pick("system"),
             "", "Cancel", "q", ""]
         self.menus = [p for p in getattr(self, "menus", []) if p.poll() is None]
         self.menus.append(subprocess.Popen(["tmux", "display-menu", "-t", me, "-x", "M", "-y", "M", "-T",
-                                            f" raw view{f' · turn {turn}' if turn else ''} ", *items],
+                                            f" turn {copy or turn} " if copy or turn else " raw view ", *items],
                                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
 
     def title(self, text):
@@ -1422,8 +1483,9 @@ class App:
                               (" view it in full first   ", ""), ("e", A), (" edit   ", ""), ("n", A), (" cancel", "")])
                 return lines, None, "y or v view the whole command first · e edit · n or Esc cancel"
             lines = [[(ask["question"], A)],
-                     [("  y", A), (" review it in your editor, then send   ", ""), ("n", A), (" keep it to yourself", "")]]
-            return lines, None, "y review and send · n or Esc don't share"
+                     [("  y", A), (" review it in your editor, then send   ", ""), ("s", A), (" send it as it is   ", ""),
+                      ("n", A), (" keep it to yourself", "")]]
+            return lines, None, "y review, then send · s send as it is · n or Esc don't share"
         if self.m.pending and self.m.pending[0].ev.get("kind") == "plan":
             c = self.m.pending[0]
             n = len(c.ev.get("steps") or [])
@@ -1713,7 +1775,7 @@ class App:
         elif b & (curses.BUTTON3_RELEASED | curses.BUTTON3_CLICKED) and self.shell:
             block = self.rows[y] if 0 <= y < len(self.rows) else None
             turn = getattr(block, "turn", 0)
-            self.shell.raw_menu(turn if turn in self.m.exchanges else 0)
+            self.shell.raw_menu(turn if turn in self.m.exchanges else 0, turn if self.m.turn_text(turn) else 0)
         elif 0 <= y < len(self.rows) and not self.m.pending and not self.m.ask:
             card = self.rows[y]
             if isinstance(card, Card) and card.ev.get("kind") == "command":
@@ -1748,6 +1810,8 @@ class App:
             self.answer("e")
         elif what == "prompt":
             self.m.ask = {"kind": "run", "card": card, "command": command, "edited": False, "paste_only": True}
+        elif what == "decline":
+            self.m.decline(pid)
         elif what == "copy":
             self.shell.copy(command)
             self.m.note(f"{card.id} copied (tmux buffer, and your clipboard if the terminal allows it)")
@@ -1844,14 +1908,18 @@ class App:
                 m.note(f"{card.id}: not run")
         else:
             m.ask = None
-            if k == "y":
+            if k in ("y", "s"):                             # y: review it in your editor first; s: send it as it is
                 if ask.get("context"):
                     text = ("# EVERYTHING below is sent to the model as saved. Remove anything you don't want it to "
                             f"see.\nMy shell session{ask['from']}:\n```\n{ask['output']}\n```\n")
                 else:
                     text = review_buffer(ask["command"], ask["rc"], self.where(), ask["output"])
-                kept = self.edit(text, ask["label"], "sent to the model exactly as saved; nothing is added",
-                                 "send nothing")
+                if k == "s":                                # the same text, without the editor's # lines on top
+                    kept = text.split("\n", 1 if ask.get("context") else 2)[-1].strip("\n")
+                    m.note(f"{ask['label']}: sent without review (genai still masks the secrets it recognises)", Q)
+                else:
+                    kept = self.edit(text, ask["label"], "sent to the model exactly as saved; nothing is added",
+                                     "send nothing")
                 if kept is None or not kept.strip():
                     m.note("nothing sent")
                 elif ask.get("context"):
@@ -1880,7 +1948,9 @@ class App:
             self.m.note(f"{card.id} not run: tmux failed ({e})", R)
             return
         self.shell.show()                                # so the command can be watched as it runs
+        self.m.undecline(card)
         card.state, card.detail = "running", "typed into the shell pane"
+        self.m.number_commands()
         card.changed()
         self.running = {"card": card, "command": command, "done": done}
 
@@ -2123,12 +2193,12 @@ class App:
                 self.from_prompt(msg)
             elif role == "panel":
                 self.m.request(msg)
-            elif role == "menu" and msg.get("type") in ("share", "mark", "raw", "system"):
+            elif role == "menu" and msg.get("type") in ("share", "mark", "raw", "system", "copy"):
                 self.m.request(msg)
             elif role == "menu" and msg.get("type") == "menu" and msg.get("action") == "open":
                 self.open_menu(msg.get("key"))
             elif role == "menu" and msg.get("type") == "menu" and isinstance(msg.get("id"), str):
-                if msg.get("action") in ("run", "edit", "prompt", "copy"):
+                if msg.get("action") in ("run", "edit", "prompt", "copy", "decline"):
                     self.menu_action(msg["action"], msg["id"])
         for action in self.m.actions:
             if action == ("share", "last"):
@@ -2139,6 +2209,11 @@ class App:
                 self.list_commands()
             elif action[0] == "show":
                 self.show_raw(action[1])
+            elif action[0] == "copy":
+                self.shell.copy(action[2])
+                n = action[2].count("\n")
+                self.m.note(f"turn {action[1]} copied: your message and the reply, {n} lines (tmux buffer, and your "
+                            "clipboard if the terminal allows it)")
             elif action[0] == "plan_cmd":
                 self.plan_cmd(action[1])
             elif action[0] == "mark_line":
