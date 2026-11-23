@@ -45,7 +45,8 @@ COMMANDS = {
     "/skills": "list skills; * marks the ones in use",
     "/skill": "NAME on|off: use a blessed skill from the next message on, or stop",
     "/run": "[ID]: review and run a proposed command in the shell pane (the latest by default)",
-    "/share": "[N|mark|all]: review shell output, then send it: the last command, command N, from the mark, or all",
+    "/share": "[N|mark|all]: send shell output, reviewed first or as it is: the last command, command N, from the "
+              "mark, or all",
     "/commands": "list the commands run in the shell pane, numbered for /share N (also in the info panel)",
     "/mark": "shell context starts at the shell's current prompt (or right-click a line in the shell)",
     "/shell": "show the shell and move there (`` on its empty prompt hides it again)",
@@ -1417,8 +1418,9 @@ class App:
                               (" view it in full first   ", ""), ("e", A), (" edit   ", ""), ("n", A), (" cancel", "")])
                 return lines, None, "y or v view the whole command first · e edit · n or Esc cancel"
             lines = [[(ask["question"], A)],
-                     [("  y", A), (" review it in your editor, then send   ", ""), ("n", A), (" keep it to yourself", "")]]
-            return lines, None, "y review and send · n or Esc don't share"
+                     [("  y", A), (" review it in your editor, then send   ", ""), ("s", A), (" send it as it is   ", ""),
+                      ("n", A), (" keep it to yourself", "")]]
+            return lines, None, "y review, then send · s send as it is · n or Esc don't share"
         if self.m.pending and self.m.pending[0].ev.get("kind") == "plan":
             c = self.m.pending[0]
             n = len(c.ev.get("steps") or [])
@@ -1839,14 +1841,18 @@ class App:
                 m.note(f"{card.id}: not run")
         else:
             m.ask = None
-            if k == "y":
+            if k in ("y", "s"):                             # y: review it in your editor first; s: send it as it is
                 if ask.get("context"):
                     text = ("# EVERYTHING below is sent to the model as saved. Remove anything you don't want it to "
                             f"see.\nMy shell session{ask['from']}:\n```\n{ask['output']}\n```\n")
                 else:
                     text = review_buffer(ask["command"], ask["rc"], self.where(), ask["output"])
-                kept = self.edit(text, ask["label"], "sent to the model exactly as saved; nothing is added",
-                                 "send nothing")
+                if k == "s":                                # the same text, without the editor's # lines on top
+                    kept = text.split("\n", 1 if ask.get("context") else 2)[-1].strip("\n")
+                    m.note(f"{ask['label']}: sent without review (genai still masks the secrets it recognises)", Q)
+                else:
+                    kept = self.edit(text, ask["label"], "sent to the model exactly as saved; nothing is added",
+                                     "send nothing")
                 if kept is None or not kept.strip():
                     m.note("nothing sent")
                 elif ask.get("context"):
