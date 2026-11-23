@@ -5,6 +5,8 @@
 # what it printed, and right-clicking the shell marks where shell context starts. Clicking a proposed
 # command, or Alt+1..Alt+9 (Alt+1 the newest), opens its menu: run it, edit it, paste it or copy it.
 # In the shell, genai-ssh [ssh options] HOST connects to another host in a way genai-tui can follow.
+# Features (/model, /copy, /decline, /raw and /system, genai-ssh's handshake) can be switched off: {"disable":
+# ["copy", "model"]} in ${XDG_CONFIG_HOME:-~/.config}/genai/tui.json, or GENAI_TUI_DISABLE=copy,model.
 # Usage: genai-tui [-h] [-p PROFILE] [-e ENDPOINT] [-S SESSION] [-k SKILL] [--coding] [--no-panel]
 set -euo pipefail
 here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)

@@ -212,6 +212,21 @@ on, and nothing is installed there. The session has a key of its own that never 
 command line or on screen; see SECURITY.md, section 7. Plain `ssh` still works, but genai-tui
 can't follow it, and `/run` refuses while it runs.
 
+### Features
+
+genai-tui's `/model`, `/copy`, `/decline`, `/raw` and `/system`, and the `genai-ssh` handshake, are
+features, each in its own module under `tui/features/`. To switch some off, list them in
+`~/.config/genai/tui.json` (`$XDG_CONFIG_HOME/genai/tui.json`):
+
+```json
+{"disable": ["copy", "model"]}
+```
+
+or set `GENAI_TUI_DISABLE=copy,model` for one run. Names are `model`, `copy`, `decline`, `raw`
+and `ssh`. A disabled feature has no command, help line or menu item, and genai-tui's socket
+refuses its requests. Without `ssh`, a genai-ssh session isn't followed. No file means
+everything is on; a file that can't be read is ignored, with a note in the conversation.
+
 ## Sandboxed runs
 
 In coding mode the model can only propose commands, so you run every build and test yourself. A

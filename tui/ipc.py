@@ -25,9 +25,23 @@ HELLO_TIMEOUT = 2          # seconds to send a complete handshake
 SEND_TIMEOUT = 2            # seconds a send may wait on a pane that has stopped reading
 ROLES = {
     "prompt": {"input", "key", "scroll", "quit"},
-    "panel": {"coding", "skill", "skills", "command", "models"},
-    "menu": {"share", "menu", "mark", "raw", "system", "copy", "model"},
+    "panel": {"coding", "skill", "skills", "command"},
+    "menu": {"share", "menu", "mark"},
 }
+# What no feature may ever be given: answering a question or approving something is the prompt pane's alone.
+NEVER = {"hello", "input", "key", "scroll", "quit", "decision", "answer"}
+
+
+def allow(roles, role, types):
+    """Add kinds of message a role may send, in roles (a copy of ROLES) for one Hub: the requests of the features that
+    are on. A kind that is not added is refused like any unknown one. The prompt role can't gain any, and nobody
+    gains what answers questions or what the core already gives out."""
+    if role not in ROLES or role == "prompt":
+        raise ValueError(f"no feature may add requests for the {role!r} role")
+    bad = set(types) & (NEVER | set().union(*ROLES.values()))
+    if bad:
+        raise ValueError(f"{sorted(bad)} can't be added: the core owns them")
+    roles[role] |= set(types)
 
 
 def socket_path(state_dir):
@@ -90,7 +104,10 @@ class Hub:
     """The listening end, in the conversation pane. inbox gets (role, message), and ("hello", role) when a
     pane connects, so the conversation pane can send it the current view at once."""
 
-    def __init__(self, state_dir):
+    def __init__(self, state_dir, extra=None):
+        self.roles = {role: set(kinds) for role, kinds in ROLES.items()}     # extra: what the features that are on add
+        for role, kinds in (extra or {}).items():
+            allow(self.roles, role, kinds)
         self.inbox = queue.Queue()
         self.clients = []          # (connection, role)
         self.connections = set()   # includes sockets still sending a handshake
@@ -130,14 +147,14 @@ class Hub:
             msgs = messages(conn, first_timeout=HELLO_TIMEOUT)
             hello = next(msgs, None)
             role = hello.get("role") if hello and hello.get("type") == "hello" else None
-            if not isinstance(role, str) or role not in ROLES:
+            if not isinstance(role, str) or role not in self.roles:
                 return
             with self.lock:
                 self.clients.append((conn, role))
             self.inbox.put(("hello", role))
             for msg in msgs:
                 kind = msg.get("type")
-                if isinstance(kind, str) and kind in ROLES[role]:
+                if isinstance(kind, str) and kind in self.roles[role]:
                     self.inbox.put((role, msg))
         except OSError:
             pass
