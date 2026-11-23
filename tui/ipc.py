@@ -21,6 +21,7 @@ import time
 SOCKET = "sock"
 MAX_LINE = 1 << 20          # a pasted message can be long; a longer line ends the connection
 MAX_CLIENTS = 16
+HELLO_TIMEOUT = 2          # seconds to send a complete handshake
 SEND_TIMEOUT = 2            # seconds a send may wait on a pane that has stopped reading
 ROLES = {
     "prompt": {"input", "key", "scroll", "quit"},
@@ -46,11 +47,17 @@ def peer_uid(conn):
     return uid
 
 
-def messages(conn):
+def messages(conn, first_timeout=None):
     """JSON objects from a connection, until it closes or sends something too long or not a JSON object."""
     buf = b""
+    deadline = None if first_timeout is None else time.monotonic() + first_timeout
     while True:
         try:
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                conn.settimeout(remaining)
             chunk = conn.recv(65536)
         except OSError:
             return
@@ -59,12 +66,17 @@ def messages(conn):
         buf += chunk
         while b"\n" in buf:
             line, buf = buf.split(b"\n", 1)
+            if len(line) > MAX_LINE:
+                return
             try:
                 msg = json.loads(line)
             except ValueError:
                 return
             if not isinstance(msg, dict):
                 return
+            if deadline is not None:
+                conn.settimeout(None)
+                deadline = None
             yield msg
         if len(buf) > MAX_LINE:
             return
@@ -81,6 +93,8 @@ class Hub:
     def __init__(self, state_dir):
         self.inbox = queue.Queue()
         self.clients = []          # (connection, role)
+        self.connections = set()   # includes sockets still sending a handshake
+        self.closed = False
         self.lock = threading.Lock()
         self.path = socket_path(state_dir)
         self.srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -95,31 +109,42 @@ class Hub:
                 conn, _ = self.srv.accept()
             except OSError:
                 return
-            uid = peer_uid(conn)
+            try:
+                uid = peer_uid(conn)
+            except OSError:
+                conn.close()
+                continue
             with self.lock:
-                full = len(self.clients) >= MAX_CLIENTS
-            if (uid is not None and uid != os.getuid()) or full:
+                accepted = ((uid is None or uid == os.getuid()) and not self.closed
+                            and len(self.connections) < MAX_CLIENTS)
+                if accepted:
+                    self.connections.add(conn)
+            if not accepted:
                 conn.close()
                 continue
             threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
 
     def _serve(self, conn):
-        send_timeout(conn)
-        msgs = messages(conn)
         try:
+            send_timeout(conn)
+            msgs = messages(conn, first_timeout=HELLO_TIMEOUT)
             hello = next(msgs, None)
-            if not hello or hello.get("type") != "hello" or hello.get("role") not in ROLES:
+            role = hello.get("role") if hello and hello.get("type") == "hello" else None
+            if not isinstance(role, str) or role not in ROLES:
                 return
-            role = hello["role"]
             with self.lock:
                 self.clients.append((conn, role))
             self.inbox.put(("hello", role))
             for msg in msgs:
-                if msg.get("type") in ROLES[role]:
+                kind = msg.get("type")
+                if isinstance(kind, str) and kind in ROLES[role]:
                     self.inbox.put((role, msg))
+        except OSError:
+            pass
         finally:
             with self.lock:
                 self.clients = [c for c in self.clients if c[0] is not conn]
+                self.connections.discard(conn)
             conn.close()
 
     def send(self, role, msg):
@@ -134,7 +159,16 @@ class Hub:
                 pass
 
     def close(self):
+        with self.lock:
+            self.closed = True
+            connections = list(self.connections)
         self.srv.close()
+        for conn in connections:
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            conn.close()
         try:
             os.unlink(self.path)
         except OSError:
