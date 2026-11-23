@@ -189,6 +189,29 @@ class TestModel(unittest.TestCase):
         self.assertEqual(sum(isinstance(b, C.Reply) for b in m.blocks), 1)
         self.assertIn("Hello", text_of(m.blocks[-1]))
 
+    def test_decline_a_command(self):
+        m = C.Model()
+        self.hello(m)
+        m.submit("go")
+        for i in (1, 2):
+            m.handle({"type": "proposal", "id": f"p{i}", "kind": "command", "command": f"rm -rf build{i}"})
+        m.handle({"type": "done", "reason": "command", "context": {"used": 1, "limit": 9}})
+        m.submit("/decline")                                   # the latest
+        self.assertEqual((m.cards["p2"].state, m.cards["p1"].state), ("declined", "shown"))
+        self.assertEqual((m.cards["p2"].key, m.keyed(1).id), (None, "p1"))   # Alt+1 moves to what's still open
+        self.assertIn("p2 · command", text_of(m.cards["p2"]))
+        self.assertNotIn("/run p2", text_of(m.cards["p2"]))
+        m.submit("/decline p2")
+        self.assertIn("p2 is declined", text_of(m.blocks[-1]))
+        m.submit("/decline p1")
+        m.undecline(m.cards["p1"])                             # run after all: the model isn't told
+        m.outbox.clear()
+        m.submit("ok, something else")
+        self.assertEqual([x["type"] for x in m.outbox], ["attach", "user"])
+        self.assertEqual(m.outbox[0]["label"], "declined p2")
+        self.assertIn("did not run it:\nrm -rf build2", m.outbox[0]["text"])
+        self.assertNotIn("decline", m.outbox[0])
+
     def test_copy_a_message_and_its_reply(self):
         m = C.Model()
         self.hello(m)
@@ -1012,6 +1035,21 @@ class TestGenaiTui(TmuxCase):
             self.key("y")
             self.wait_for("got it")
             self.assertIn("```\necho first-out\n```\nOutput:\n```\nfirst-out\n```", self.sent(api))
+
+    def test_decline_from_the_menu(self):
+        turns = [call("propose_command", command="echo not-wanted", reason="r"), reply("fine, something else")]
+        with FakeAPI(turns) as api:
+            self.start(api)
+            self.type("go")
+            self.wait_for("or /run p1, to send")
+            env = dict(os.environ, GENAI_TUI_STATE=self.runtime_state())
+            subprocess.run([sys.executable, os.path.join(REPO, "tui", "request.py"), "menu", "decline", "p1"],
+                           env=env, check=True)
+            self.wait_for("you declined it")
+            self.type("then what?")
+            self.wait_for("fine, something else")
+            self.assertIn("I declined the command you proposed as p1", self.sent(api))
+            self.assertNotIn("not-wanted", self.screen("shell"))
 
     def test_copy_a_turn_from_the_menu_and_by_command(self):
         with FakeAPI([reply("the answer")]) as api:

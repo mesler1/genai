@@ -45,6 +45,7 @@ COMMANDS = {
     "/skills": "list skills; * marks the ones in use",
     "/skill": "NAME on|off: use a blessed skill from the next message on, or stop",
     "/run": "[ID]: review and run a proposed command in the shell pane (the latest by default)",
+    "/decline": "[ID]: decline a proposed command (the latest by default); the model hears with your next message",
     "/share": "[N|mark|all]: send shell output, reviewed first or as it is: the last command, command N, from the "
               "mark, or all",
     "/commands": "list the commands run in the shell pane, numbered for /share N (also in the info panel)",
@@ -523,8 +524,10 @@ class Model:
     def number_commands(self):
         """Alt+1 for the newest command proposal, Alt+2 for the one before, up to MENU_KEYS."""
         cmds = [c for c in self.cards.values() if c.ev.get("kind") == "command"]
-        for i, c in enumerate(reversed(cmds)):
-            key = i + 1 if i < MENU_KEYS else None
+        live = [c for c in cmds if c.state != "declined"]          # a declined one keeps /run, not a key
+        keys = {id(c): i + 1 for i, c in enumerate(reversed(live)) if i < MENU_KEYS}
+        for c in cmds:
+            key = keys.get(id(c))
             if c.key != key:
                 c.key = key
                 c.changed()
@@ -697,7 +700,7 @@ class Model:
     def send_turn(self, msg):
         self.busy = True
         for attachment in msg.attachments:
-            self.send(attachment)
+            self.send({k: v for k, v in attachment.items() if k != "decline"})
         self.send({"type": "user", "text": msg.text})
 
     def command(self, line):
@@ -739,6 +742,8 @@ class Model:
             self.send({"type": "compact"})
         elif cmd in ("/run", "/share", "/shell", "/mark", "/commands") and not self.shell:
             self.note(f"{cmd} needs the shell pane: start genai with genai-tui", R)
+        elif cmd == "/decline":
+            self.decline(arg)
         elif cmd == "/run":
             cards = [c for c in self.cards.values() if c.ev.get("kind") == "command"]
             card = self.cards.get(arg) if arg else (cards[-1] if cards else None)
@@ -886,6 +891,28 @@ class Model:
             self.actions.append(("share_cmd", msg["n"]))
         elif t == "mark" and isinstance(msg.get("on"), bool) and self.shell:
             self.actions.append(("mark_line",) if msg["on"] else ("unmark",))
+
+    def decline(self, arg):
+        """/decline [ID], or Decline in a command's menu: the card says so, and the model hears with the next
+        message, so it doesn't assume the command ran."""
+        cards = [c for c in self.cards.values() if c.ev.get("kind") == "command" and c.state == "shown"]
+        card = self.cards.get(arg) if arg else (cards[-1] if cards else None)
+        if not card or card.ev.get("kind") != "command":
+            self.note("no command proposal to decline" + (f" with id {arg}" if arg else ""), R)
+        elif card.state != "shown":
+            self.note(f"{card.id} is {card.state}; only a command that hasn't run can be declined", R)
+        else:
+            card.state, card.detail = "declined", "you declined it; the model hears with your next message"
+            card.changed()
+            self.next_attachments.append({"type": "attach", "label": f"declined {card.id}", "decline": card.id,
+                                          "text": f"I declined the command you proposed as {card.id}, and did not "
+                                                  f"run it:\n{card.ev.get('command', '')}"})
+            self.number_commands()
+            self.note(f"{card.id} declined", Q)
+
+    def undecline(self, card):
+        """A declined command is run after all: the model is no longer told it was declined."""
+        self.next_attachments = [a for a in self.next_attachments if a.get("decline") != card.id]
 
     def attach(self, label, text):
         """Shell context the user reviewed: it goes with their next message, so they can ask about it."""
@@ -1285,6 +1312,7 @@ class Shell:
                   "Edit it, then run", "e", pick("edit"),
                   "Put it at the shell prompt (you press Enter)", "p", pick("prompt"),
                   "Copy it", "c", pick("copy"),
+                  "Decline it (the model hears with your next message)", "d", pick("decline"),
                   "", "Cancel", "q", ""],
                                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
 
@@ -1777,6 +1805,8 @@ class App:
             self.answer("e")
         elif what == "prompt":
             self.m.ask = {"kind": "run", "card": card, "command": command, "edited": False, "paste_only": True}
+        elif what == "decline":
+            self.m.decline(pid)
         elif what == "copy":
             self.shell.copy(command)
             self.m.note(f"{card.id} copied (tmux buffer, and your clipboard if the terminal allows it)")
@@ -1913,7 +1943,9 @@ class App:
             self.m.note(f"{card.id} not run: tmux failed ({e})", R)
             return
         self.shell.show()                                # so the command can be watched as it runs
+        self.m.undecline(card)
         card.state, card.detail = "running", "typed into the shell pane"
+        self.m.number_commands()
         card.changed()
         self.running = {"card": card, "command": command, "done": done}
 
@@ -2161,7 +2193,7 @@ class App:
             elif role == "menu" and msg.get("type") == "menu" and msg.get("action") == "open":
                 self.open_menu(msg.get("key"))
             elif role == "menu" and msg.get("type") == "menu" and isinstance(msg.get("id"), str):
-                if msg.get("action") in ("run", "edit", "prompt", "copy"):
+                if msg.get("action") in ("run", "edit", "prompt", "copy", "decline"):
                     self.menu_action(msg["action"], msg["id"])
         for action in self.m.actions:
             if action == ("share", "last"):
