@@ -4,6 +4,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import socket
 import shutil
 import subprocess
@@ -201,6 +202,40 @@ class TestModel(unittest.TestCase):
         head = text_of(m.cards["p11"])
         self.assertIn("p11 · command · Alt+1", head)
         self.assertIn("click it, press Alt+1, or /run p11", head)
+
+    def test_model_picker(self):
+        m = C.Model()
+        self.hello(m, features=["models"])
+        m.shell = object()
+        m.submit("/model")
+        self.assertEqual(m.outbox[-1], {"type": "models"})
+        m.handle({"type": "models", "current": "m", "models": [{"id": "qwen3-coder"}, {"id": "x#{evil}"},
+                                                                 {"id": "llama"}, "junk"]})
+        self.assertEqual((m.models, m.actions[-1]), (["qwen3-coder", "llama"], ("model_menu",)))
+        m.request({"type": "model", "n": 1})                       # the menu sends a position, never a name
+        self.assertEqual(m.outbox[-1], {"type": "model", "model": "llama"})
+        m.request({"type": "model", "n": 7})
+        self.assertEqual(m.outbox[-1], {"type": "model", "model": "llama"})       # out of range: nothing
+        m.handle({"type": "model", "endpoint": {"name": "e", "model": "llama", "base_url": "u"},
+                  "context": {"used": 5, "limit": 8000}})
+        self.assertEqual((m.snapshot()["session"]["model"], m.context), ("llama", (5, 8000)))
+        self.assertIn("model: llama", text_of(m.blocks[-1]))
+        old = C.Model()
+        self.hello(old)
+        old.submit("/model")
+        self.assertIn("can't list or switch models", text_of(old.blocks[-1]))
+
+    def test_model_menu_items_carry_only_positions(self):
+        sh = C.Shell("%1")
+        with mock.patch.object(C.subprocess, "Popen") as popen:
+            sh.model_menu(["qwen3-coder", "bad#{x}"] + [f"m{i}" for i in range(25)], "qwen3-coder")
+        argv = popen.call_args[0][0]
+        self.assertIn("• qwen3-coder", argv)
+        self.assertNotIn("bad#{x}", " ".join(argv))
+        self.assertIn("-  7 more: /model NAME", argv)
+        picks = [a for a in argv if "request.py" in a]
+        self.assertEqual(len(picks), 19)
+        self.assertTrue(all(re.search(r"model [0-9]+\\?\"$", a) for a in picks), picks[:2])
 
     def test_messages_typed_while_busy_are_queued(self):
         m = C.Model()
@@ -973,6 +1008,22 @@ class TestGenaiTui(TmuxCase):
             self.key("y")
             self.wait_for("got it")
             self.assertIn("```\necho first-out\n```\nOutput:\n```\nfirst-out\n```", self.sent(api))
+
+    def test_switch_model_from_the_drop_down(self):
+        with FakeAPI([reply("from fake"), reply("from qwen")],
+                     models=[{"id": "fake-model"}, {"id": "qwen3-coder", "max_model_len": 65536}]) as api:
+            self.start(api)
+            self.type("hi")
+            self.wait_for("from fake")
+            self.type("/model")
+            time.sleep(0.5)
+            env = dict(os.environ, GENAI_TUI_STATE=self.runtime_state())
+            subprocess.run([sys.executable, os.path.join(REPO, "tui", "request.py"), "model", "1"], env=env, check=True)
+            self.wait_for("model: qwen3-coder from your next message")
+            self.wait_for("qwen3-coder ▾", pane="info")
+            self.type("and now?")
+            self.wait_for("from qwen")
+            self.assertEqual([r["body"]["model"] for r in api.requests if r.get("body")], ["fake-model", "qwen3-coder"])
 
     def test_raw_view_from_the_menu_and_by_command(self):
         bindir = tempfile.mkdtemp(prefix="genai-tui-bin-")

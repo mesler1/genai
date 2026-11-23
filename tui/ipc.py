@@ -25,8 +25,8 @@ HELLO_TIMEOUT = 2          # seconds to send a complete handshake
 SEND_TIMEOUT = 2            # seconds a send may wait on a pane that has stopped reading
 ROLES = {
     "prompt": {"input", "key", "scroll", "quit"},
-    "panel": {"coding", "skill", "skills", "command"},
-    "menu": {"share", "menu", "mark", "raw", "system"},
+    "panel": {"coding", "skill", "skills", "command", "models"},
+    "menu": {"share", "menu", "mark", "raw", "system", "model"},
 }
 
 
