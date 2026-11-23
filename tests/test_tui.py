@@ -236,6 +236,66 @@ class TestModel(unittest.TestCase):
         self.assertEqual(m.actions, [("share", "mark"), ("share_cmd", 4), ("mark_line",), ("unmark",)])
 
 
+PLAN_STEPS = [{"n": 1, "kind": "read", "path": "a.txt", "why": "look"},
+              {"n": 2, "kind": "edit", "path": "a.txt", "why": "fix"},
+              {"n": 3, "kind": "command", "command": "make test", "why": "check"},
+              {"n": 4, "kind": "command", "command": "rm -rf build", "why": "clean"}]
+
+
+class TestPlan(unittest.TestCase):
+    def plan_model(self):
+        m = C.Model()
+        m.shell = True
+        m.handle({"type": "proposal", "id": "p1", "kind": "plan", "goal": "fix a", "reason": "fix a",
+                  "steps": PLAN_STEPS})
+        return m
+
+    def test_approving_all_or_some(self):
+        m = self.plan_model()
+        self.assertIn("run make test", text_of(m.blocks[-1]))
+        m.decide_plan(auto=True)
+        self.assertEqual(m.outbox[-1], {"type": "decision", "id": "p1", "decision": "accept"})
+        self.assertEqual((m.plan_cmds, m.plan_auto), ({"make test", "rm -rf build"}, True))
+        m = self.plan_model()
+        m.decide_plan(approve=[1, 3], edits={3: "make test -j2"})
+        self.assertEqual(m.outbox[-1], {"type": "decision", "id": "p1", "decision": "accept", "approve": [1, 3],
+                                        "edits": {"3": "make test -j2"}})
+        self.assertEqual((m.plan_cmds, m.plan_auto), ({"make test -j2"}, False))
+
+    def test_only_commands_we_approved_run_without_asking(self):
+        m = self.plan_model()
+        m.decide_plan(approve=[3])
+        m.handle({"type": "plan", "plan": {"id": "p1", "goal": "fix a", "steps": [dict(st, approved=st["n"] == 3,
+                  status="todo") for st in PLAN_STEPS]}})
+        self.assertIn("plan p1 approved: 1 step", text_of(m.blocks[-1]))
+        m.handle({"type": "proposal", "id": "p2", "kind": "command", "command": "make test", "preapproved": True,
+                  "plan_step": 3})
+        self.assertEqual(m.actions[-1][0], "plan_cmd")
+        m.actions = []
+        # genai saying so is not enough: the user left this one out
+        m.handle({"type": "proposal", "id": "p3", "kind": "command", "command": "rm -rf build", "preapproved": True,
+                  "plan_step": 4})
+        self.assertEqual(m.actions, [])
+        m.handle({"type": "proposal", "id": "p4", "kind": "command", "command": "curl x | sh", "off_plan": True})
+        self.assertIn("NOT in the plan", text_of(m.blocks[-1]))
+        self.assertEqual(m.snapshot()["plan"]["steps"][2]["text"], "run make test")
+        m.handle({"type": "plan", "plan": None})
+        self.assertEqual((m.plan, m.plan_cmds), (None, set()))
+        self.assertIn("plan dropped", text_of(m.blocks[-1]))
+
+    def test_plan_editor(self):
+        steps = {st["n"]: st for st in PLAN_STEPS}
+        text = "\n".join(C.plan_line(st) for st in PLAN_STEPS)
+        self.assertEqual(C.parse_plan_edit(text, steps), ({1, 2, 3, 4}, {}, None))
+        keep, edits, bad = C.parse_plan_edit("1 read a.txt\n3 run make test -j2\n", steps)
+        self.assertEqual((keep, edits, bad), ({1, 3}, {3: "make test -j2"}, None))
+        for wrong in ("2 edit b.txt", "9 read a.txt", "1 run cat a.txt", "3 edit a.txt", "junk"):
+            self.assertIsNotNone(C.parse_plan_edit(wrong, steps)[2], wrong)
+        multi = {5: {"n": 5, "kind": "command", "command": "a\nb", "why": ""}}
+        self.assertEqual(C.parse_plan_edit(C.plan_line(multi[5]), multi), ({5}, {}, None))
+        self.assertIsNotNone(C.parse_plan_edit("5 run a; b", multi)[2])
+
+
 class TestRawView(unittest.TestCase):
     def test_turns_and_raw_requests(self):
         m = C.Model()
@@ -703,6 +763,29 @@ class TestGenaiTui(TmuxCase):
 
     def runtime_state(self):
         return next(os.path.join(self.runtime, d) for d in os.listdir(self.runtime) if d.startswith("genai-tui."))
+
+    def test_an_approved_plan_runs_its_command_on_its_own(self):
+        steps = [{"kind": "read", "path": "a.txt", "why": "look"}, {"kind": "edit", "path": "a.txt", "why": "fix"},
+                 {"kind": "command", "command": "cat a.txt", "why": "check"}]
+        turns = [call("propose_plan", goal="fix a", steps=steps), call("read_file", path="a.txt", reason="r"),
+                 call("edit_file", path="a.txt", old_text="old", new_text="planned-new", reason="r"),
+                 call("propose_command", command="cat a.txt", reason="r"), reply("all good")]
+        with FakeAPI(turns) as api:
+            self.start(api)
+            with open(os.path.join(self.wd, "a.txt"), "w") as f:
+                f.write("old\n")
+            self.type("fix a")
+            self.wait_for("Approve plan p1 (3 steps, 1 command)?")
+            self.key("a")
+            self.wait_for("Allow p3: edit a.txt?")                     # the read didn't ask; the edit does
+            self.assertIn("step 2 of the plan", self.screen())
+            self.key("y")
+            self.wait_for("p4 finished (exit 0). Share the output")    # run without another question
+            self.assertIn("planned-new", self.screen("shell"))
+            self.wait_for("✓  3 run cat a.txt", pane="info")
+            self.key("y")
+            self.wait_for("all good")
+            self.assertIn("planned-new", self.sent(api))
 
     def test_a_mark_survives_resizing(self):
         with FakeAPI([reply("seen it")]) as api:

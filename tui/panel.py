@@ -62,6 +62,18 @@ def view(st, w, sel):
     add(bar(ctx[0] or 0, ctx[1], w) if ctx[0] is not None else [("not measured yet", Q)])
     if st.get("busy"):
         add([("genai is replying", W)])
+    plan = st.get("plan")
+    if plan:
+        head("PLAN")
+        add([(fit(clean(plan.get("goal", "")), w), "")])
+        for step in (plan.get("steps") or [])[:14]:
+            status = step.get("status")
+            mark, role = {"done": ("✓", D), "left out": ("✗", Q)}.get(status, ("·", ""))
+            add([(f"{mark} ", role), (f"{step.get('n', '?'):>2} ", Q),
+                 (fit(clean(step.get("text", "")), w - 6), Q if status == "left out" else "")])
+        add([("commands run on their own" if plan.get("auto") else "each planned command asks once",
+              W if plan.get("auto") else Q)])
+        add([("/plan clear drops it", Q)])
     head("SKILLS")
     skills = st.get("skills")
     if skills is None:
