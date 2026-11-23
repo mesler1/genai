@@ -326,6 +326,71 @@ PLAN_STEPS = [{"n": 1, "kind": "read", "path": "a.txt", "why": "look"},
               {"n": 4, "kind": "command", "command": "rm -rf build", "why": "clean"}]
 
 
+class TestSandboxRuns(unittest.TestCase):
+    RUNNER = {"engine": "podman", "image": "dev:1", "network": False, "timeout": 300, "problem": None}
+
+    def model(self, **runner):
+        m = C.Model()
+        m.handle({"type": "hello", "version": "1", "endpoint": {"name": "e", "model": "m", "base_url": "u"},
+                  "sandbox": None, "coding": True, "runner": dict(self.RUNNER, **runner)})
+        return m
+
+    def test_banner_says_the_model_runs_things_offline(self):
+        self.assertIn("offline", text_of(self.model().blocks[0], 200))
+        self.assertIn("WITH the network", text_of(self.model(network=True).blocks[0], 200))
+        self.assertIn("can't run here: podman is not installed",
+                      text_of(self.model(problem="podman is not installed").blocks[0], 200))
+
+    def test_an_offline_run_shows_its_command_then_the_end_of_its_output(self):
+        m = self.model()
+        m.submit("test it")
+        m.handle({"type": "proposal", "id": "p1", "kind": "sandbox", "command": "make test\x1b[2J", "reason": "check",
+                  "network": False, "image": "dev:1", "auto": True})
+        card = m.cards["p1"]
+        self.assertEqual((card.state, m.pending), ("running", []))
+        self.assertIn("sandbox · offline", text_of(card))
+        self.assertIn("$ make test\\x1b[2J", text_of(card))
+        m.handle({"type": "result", "id": "p1", "status": "error", "detail": "exit 1 in 2.0 s", "exit": 1,
+                  "output": "".join(f"line {i}\n" for i in range(20)) + "\x1b]0;t\x07"})
+        shown = text_of(card, 80)
+        self.assertEqual(card.state, "error")
+        self.assertIn("13 earlier lines of output", shown)
+        self.assertIn("line 19", shown)
+        self.assertNotIn("line 11\n", shown)
+        self.assertNotIn("\x1b", shown)
+        self.assertIn("line 0", card.full_text())                 # v shows it all
+        self.assertIn("exit 1", shown)
+
+    def test_an_online_run_asks_and_says_why(self):
+        m = self.model(network=True)
+        m.submit("go")
+        m.handle({"type": "proposal", "id": "p1", "kind": "sandbox", "command": "pip install x", "reason": "r",
+                  "network": True, "image": "dev:1"})
+        self.assertEqual([c.id for c in m.pending], ["p1"])
+        self.assertIn("sandbox · ONLINE", text_of(m.cards["p1"]))
+        m.decide(True)
+        self.assertEqual(m.outbox[-1], {"type": "decision", "id": "p1", "decision": "accept"})
+
+    def test_network_command_and_panel(self):
+        m = self.model()
+        m.submit("/network")
+        self.assertIn("sandbox network is off", text_of(m.blocks[-1], 200))
+        m.submit("/network on")
+        self.assertEqual(m.outbox[-1], {"type": "network", "on": True})
+        m.submit("/network maybe")
+        self.assertEqual(m.outbox[-1], {"type": "network", "on": True})
+        m.handle({"type": "network", "runner": dict(self.RUNNER, network=True), "available": True})
+        self.assertIn("ON: each sandboxed run asks", text_of(m.blocks[-1], 200))
+        snap = m.snapshot()
+        self.assertEqual(snap["runner"]["network"], True)
+        PANEL = load("panel", os.path.join(REPO, "tui", "panel.py"))
+        lines, _ = PANEL.view(snap, 42, None)
+        self.assertIn("sandbox  ONLINE", "\n".join("".join(t for t, _ in ln) for ln in lines))
+        m.submit("go")
+        m.submit("/network off")
+        self.assertNotEqual(m.outbox[-1], {"type": "network", "on": False})   # waits until the reply ends
+
+
 class TestPlan(unittest.TestCase):
     def plan_model(self):
         m = C.Model()
