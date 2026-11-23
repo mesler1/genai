@@ -36,6 +36,7 @@ CARD_BODY_LINES = 12
 OUTPUT_LINES = 8               # last lines of a sandboxed run's output shown in its card
 INPUT_MAX_LINES = 8
 CMD_LINES = 4                  # lines of a command shown in a run question; a longer one is viewed in full first
+MENU_KEYS = 9                  # Alt+1 .. Alt+9 open the menus of the newest command proposals, Alt+1 the newest
 
 COMMANDS = {
     "/help": "show this help",
@@ -380,6 +381,7 @@ class Card(Block):
         super().__init__()
         self.ev, self.state, self.detail = ev, "waiting", ""
         self.output = None         # a sandboxed run's output, as the model got it
+        self.key = None            # N when Alt+N opens this command's menu
 
     @property
     def id(self):
@@ -453,7 +455,7 @@ class Card(Block):
             return [[("  ↳ ", Q), (fit(f"{self.title()}  (coding mode: no approval needed)", w - 4), Q)]]
         role = self.STATE_ROLE.get(self.state, Q)
         inner = max(w - 4, 8)
-        head = f"─ {self.id} · {self.title()} "
+        head = f"─ {self.id} · {self.title()}{f' · Alt+{self.key}' if self.key else ''} "
         tail = f" {self.state} ─"
         head = fit(head, w - 2 - width(tail) - 1)
         fill = max(w - 2 - width(head) - width(tail), 1)
@@ -464,7 +466,8 @@ class Card(Block):
         if len(shown) < len(body):
             rows.append((f"… {len(body) - len(shown)} more lines (v views it all)", Q))
         if self.ev.get("kind") == "command" and self.state == "shown":
-            rows.append((f"click it, or /run {self.id}, to send it to your shell; genai never runs it", A))
+            how = f"click it, press Alt+{self.key}," if self.key else "click it,"
+            rows.append((f"{how} or /run {self.id}, to send it to your shell; genai never runs it", A))
         if self.detail:
             rows.append((fit(clean(self.detail), inner), R if self.state == "error" else Q))
         for t, r in rows:
@@ -515,6 +518,18 @@ class Model:
     def note(self, text, role=Q):
         self.add(Note(text, role))
 
+    def number_commands(self):
+        """Alt+1 for the newest command proposal, Alt+2 for the one before, up to MENU_KEYS."""
+        cmds = [c for c in self.cards.values() if c.ev.get("kind") == "command"]
+        for i, c in enumerate(reversed(cmds)):
+            key = i + 1 if i < MENU_KEYS else None
+            if c.key != key:
+                c.key = key
+                c.changed()
+
+    def keyed(self, n):
+        return next((c for c in self.cards.values() if c.ev.get("kind") == "command" and c.key == n), None)
+
     def send(self, msg):
         self.outbox.append(msg)
 
@@ -542,6 +557,7 @@ class Model:
                 card.state = "auto"
             elif ev.get("kind") == "command":
                 card.state = "shown"
+                self.number_commands()
                 if ev.get("preapproved") and self.command_authorized(card) and self.shell:
                     self.actions.append(("plan_cmd", card))
             elif ev.get("kind") == "invalid":
@@ -687,6 +703,8 @@ class Model:
                 self.note(f"{c:9} {d}")
             self.note("Enter sends · Alt+Enter or \\ then Enter adds a line · ↑↓ earlier messages · "
                       "PgUp/PgDn scroll · // starts a message with /")
+            self.note("Alt+1 … Alt+9 open the menu of a command proposal, Alt+1 the newest (as its card says); "
+                      "↑↓ and Enter, or the letter shown, choose")
         elif cmd == "/coding":
             if arg in ("on", "off"):
                 self.send({"type": "coding", "on": arg == "on"})
@@ -1210,7 +1228,7 @@ class Shell:
         """To tmux's buffer and, through the terminal (OSC 52), the system clipboard where the terminal allows it."""
         self.tmux("set-buffer", "-w", "-b", "genai-copy", "--", text)
 
-    def menu(self, pid, where):
+    def menu(self, pid, where, at="M"):
         """tmux's own menu at the mouse, for a command card. Menu titles, names and commands are tmux formats, so
         none of them carries text from the model: only the proposal id, checked here, and fixed words."""
         if not re.fullmatch(r"p[0-9]{1,9}", pid):
@@ -1221,7 +1239,7 @@ class Shell:
             return menu_item("menu", what, pid)
         # display-menu returns only when the menu closes, so don't wait for it.
         self.menus = [p for p in getattr(self, "menus", []) if p.poll() is None]
-        self.menus.append(subprocess.Popen(["tmux", "display-menu", "-t", me, "-x", "M", "-y", "M", "-T", f" {pid}: runs {where} ",
+        self.menus.append(subprocess.Popen(["tmux", "display-menu", "-t", me, "-x", at, "-y", at, "-T", f" {pid}: runs {where} ",
                   "Run it in the shell pane", "r", pick("run"),
                   "Edit it, then run", "e", pick("edit"),
                   "Put it at the shell prompt (you press Enter)", "p", pick("prompt"),
@@ -1315,7 +1333,8 @@ class App:
         self.sent = {}             # the last view sent to each role
         self.ask_obj, self.ask_serial = None, 0
         self.mouse = 0
-        for name in ("BUTTON1_PRESSED", "BUTTON1_CLICKED", "BUTTON3_PRESSED", "BUTTON4_PRESSED", "BUTTON5_PRESSED"):
+        for name in ("BUTTON1_RELEASED", "BUTTON1_CLICKED", "BUTTON3_RELEASED", "BUTTON3_CLICKED", "BUTTON4_PRESSED",
+                     "BUTTON5_PRESSED"):
             self.mouse |= getattr(curses, name, 0)
         curses.mousemask(self.mouse)
         curses.mouseinterval(0)
@@ -1663,7 +1682,9 @@ class App:
             self.shell.tmux("join-pane", "-d", "-h", "-f", "-l", "42", "-s", self.panel, "-t", me)
 
     def click(self):
-        """The wheel scrolls; a click on a command card opens its menu; a right-click anywhere opens the raw view's."""
+        """The wheel scrolls; a click on a command card opens its menu; a right-click anywhere opens the raw view's.
+        A menu opens when the button is released: tmux closes a menu that a program opened at the next mouse event
+        other than a press, so one opened on the press would close again on the release."""
         try:
             _, x, y, _, b = curses.getmouse()
         except curses.error:
@@ -1672,9 +1693,9 @@ class App:
             self.scroll += 3
         elif b & getattr(curses, "BUTTON5_PRESSED", 0x200000):
             self.scroll = max(self.scroll - 3, 0)
-        elif not b & (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED | curses.BUTTON3_PRESSED):
-            return                                  # a release, or a move: only a press opens the menu
-        elif b & curses.BUTTON3_PRESSED and self.shell:
+        elif not b & (curses.BUTTON1_RELEASED | curses.BUTTON1_CLICKED | curses.BUTTON3_RELEASED | curses.BUTTON3_CLICKED):
+            return                                  # a press, or a move: only the release opens the menu
+        elif b & (curses.BUTTON3_RELEASED | curses.BUTTON3_CLICKED) and self.shell:
             block = self.rows[y] if 0 <= y < len(self.rows) else None
             turn = getattr(block, "turn", 0)
             self.shell.raw_menu(turn if turn in self.m.exchanges else 0)
@@ -1685,6 +1706,19 @@ class App:
                     self.m.note(f"{card.id}: start genai with genai-tui to send commands to a shell pane", R)
                     return
                 self.shell.menu(card.id, self.where())
+
+    def open_menu(self, n):
+        """Alt+N, through tmux: the menu of the command proposal its card shows Alt+N on, in the middle of the
+        screen, to be used with the keys."""
+        if type(n) is not int or not 1 <= n <= MENU_KEYS or self.m.pending or self.m.ask:
+            return
+        card = self.m.keyed(n)
+        if not card:
+            self.m.note(f"no command proposal has Alt+{n}", Q)
+        elif not self.shell:
+            self.m.note(f"{card.id}: start genai with genai-tui to send commands to a shell pane", R)
+        else:
+            self.shell.menu(card.id, self.where(), at="C")
 
     def menu_action(self, what, pid):
         """A choice from a command card's menu, sent by request.py."""
@@ -2076,6 +2110,8 @@ class App:
                 self.m.request(msg)
             elif role == "menu" and msg.get("type") in ("share", "mark", "raw", "system"):
                 self.m.request(msg)
+            elif role == "menu" and msg.get("type") == "menu" and msg.get("action") == "open":
+                self.open_menu(msg.get("key"))
             elif role == "menu" and msg.get("type") == "menu" and isinstance(msg.get("id"), str):
                 if msg.get("action") in ("run", "edit", "prompt", "copy"):
                     self.menu_action(msg["action"], msg["id"])

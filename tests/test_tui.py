@@ -170,6 +170,19 @@ class TestModel(unittest.TestCase):
         self.assertEqual(sum(isinstance(b, C.Reply) for b in m.blocks), 1)
         self.assertIn("Hello", text_of(m.blocks[-1]))
 
+    def test_newest_commands_get_alt_keys(self):
+        m = C.Model()
+        self.hello(m)
+        for i in range(1, 12):
+            m.handle({"type": "proposal", "id": f"p{i}", "kind": "command", "command": f"echo {i}"})
+            m.handle({"type": "proposal", "id": f"r{i}", "kind": "read", "path": "x", "auto": True})
+        self.assertEqual([m.keyed(n).id for n in (1, 2, 9)], ["p11", "p10", "p3"])
+        self.assertIsNone(m.cards["p2"].key)
+        self.assertIsNone(m.keyed(10))
+        head = text_of(m.cards["p11"])
+        self.assertIn("p11 · command · Alt+1", head)
+        self.assertIn("click it, press Alt+1, or /run p11", head)
+
     def test_messages_typed_while_busy_are_queued(self):
         m = C.Model()
         m.submit("one")
@@ -806,11 +819,16 @@ class TestGenaiTui(TmuxCase):
         self.proc.stdin.write(keys.encode())
         self.proc.stdin.flush()
 
-    def click(self, text, pane="genai"):
-        """A left click (press and release, as a mouse sends them) on the first row of a pane showing text."""
+    def click(self, text, pane="genai", button=0, hold=0.3):
+        """A click on the first row of a pane showing text, at the terminal as a mouse sends it: the press, the
+        button held a moment (long enough for a menu to open), then the release."""
         y = next(i for i, ln in enumerate(self.screen(pane).splitlines()) if text in ln)
-        xy = [f"{33 + 4:02x}", f"{33 + y:02x}"]
-        self.tmux("send-keys", "-t", self.panes()[pane], "-H", "1b", "5b", "4d", "20", *xy, "1b", "5b", "4d", "23", *xy)
+        top, left = (int(v) for v in self.tmux("display", "-p", "-t", self.panes()[pane],
+                                                 "#{pane_top} #{pane_left}").split())
+        at = f"{button};{left + 5};{top + y + 1}"
+        self.at_terminal(f"\x1b[<{at}M")
+        time.sleep(hold)
+        self.at_terminal(f"\x1b[<{at}m")
 
     def shell(self, command):
         self.tmux("send-keys", "-t", self.panes()["shell"], command, "Enter")
@@ -824,7 +842,7 @@ class TestGenaiTui(TmuxCase):
         with FakeAPI(turns) as api:
             self.start(api)
             self.type("look around")
-            self.wait_for("click it, or /run p1")
+            self.wait_for("or /run p1, to send")
             self.type("/run")
             where = G.where_runs(G.sandbox_info())
             self.wait_for("Run p1 in the shell pane?")
@@ -847,7 +865,7 @@ class TestGenaiTui(TmuxCase):
         with FakeAPI(turns) as api:
             self.start(api)
             self.type("go")
-            self.wait_for("click it, or /run p1")
+            self.wait_for("or /run p1, to send")
             self.click("echo via-menu")
             time.sleep(0.5)
             self.at_terminal("r")
@@ -861,7 +879,12 @@ class TestGenaiTui(TmuxCase):
             self.assertEqual(self.window()[0], ["shell", "genai", "you"])     # shown, to watch it run
             self.key("n")
             self.type("again")
-            self.wait_for("click it, or /run p2")
+            self.wait_for("or /run p2, to send")
+            self.at_terminal("\x1b2")                              # Alt+2: p1, now that p2 has Alt+1
+            time.sleep(0.5)
+            self.at_terminal("c")
+            self.wait_for("p1 copied")
+            self.assertEqual(self.tmux("show-buffer", "-b", "genai-copy"), "echo via-menu")
             self.click("echo at-prompt")
             time.sleep(0.5)
             self.at_terminal("c")                                  # "Copy it"
@@ -927,10 +950,7 @@ class TestGenaiTui(TmuxCase):
             self.start(api, path=bindir)
             self.type("say hi")
             self.wait_for("hello there")
-            y = next(i for i, ln in enumerate(self.screen("genai").splitlines()) if "hello there" in ln)
-            top = int(self.tmux("display", "-p", "-t", self.panes()["genai"], "#{pane_top}"))
-            left = int(self.tmux("display", "-p", "-t", self.panes()["genai"], "#{pane_left}"))
-            self.at_terminal(f"\x1b[<2;{left + 5};{top + y + 1}M")       # right-click the reply
+            self.click("hello there", button=2)                          # right-click the reply
             time.sleep(0.5)
             self.at_terminal("r")                                         # "What was sent and received for this turn"
             end = time.time() + 10
@@ -977,7 +997,7 @@ class TestGenaiTui(TmuxCase):
             self.wait_for("all good")
             self.assertIn("planned-new", self.sent(api))
             self.type("check again")
-            self.wait_for("click it, or /run p5")
+            self.wait_for("or /run p5, to send")
             self.wait_for("step 3 of the plan, already run once", pane="genai")
             self.assertEqual(self.screen("shell").count("cat a.txt"), 1)
 
@@ -1015,9 +1035,7 @@ class TestGenaiTui(TmuxCase):
             for c in ("echo before-mark", "echo in-context"):
                 self.tmux("send-keys", "-t", sh, c, "Enter")
                 time.sleep(0.3)
-            y = next(i for i, ln in enumerate(self.screen("shell").splitlines()) if ln.endswith("echo in-context"))
-            top = int(self.tmux("display", "-p", "-t", sh, "#{pane_top}"))
-            self.at_terminal(f"\x1b[<2;5;{top + y + 1}M")              # a right-click, as the terminal reports it
+            self.click("echo in-context", pane="shell", button=2)            # held, then released on the same spot
             time.sleep(0.5)
             self.at_terminal("m")                                   # "Mark start of context here"
             time.sleep(0.5)
@@ -1102,7 +1120,7 @@ class TestGenaiTui(TmuxCase):
         with FakeAPI([call("propose_command", command="echo should-not-run", reason="r")]) as api:
             self.start(api)
             self.type("go")
-            self.wait_for("click it, or /run p1")
+            self.wait_for("or /run p1, to send")
             self.tmux("send-keys", "-t", self.panes()["shell"], "sleep 5", "Enter")
             time.sleep(0.5)
             self.type("/run p1")
@@ -1120,7 +1138,7 @@ class TestGenaiTui(TmuxCase):
         with FakeAPI(turns) as api:
             self.start(api, editor=editor)
             self.type("go")
-            self.wait_for("click it, or /run p1")
+            self.wait_for("or /run p1, to send")
             self.type("/run")
             self.wait_for("Run p1")
             self.key("e")
