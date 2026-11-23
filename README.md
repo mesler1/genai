@@ -292,6 +292,26 @@ genai's first line is `hello`. It has `protocol` (1), `version`, `features`, `en
 `problem`, or `null`), the active `skills`, and the model's `tools`. Check `features` before you use a message added
 later.
 
+`hello` also says where genai runs: `host` (its host name), `user` (the effective user's name, or the uid
+if it has none), `uid`, and `remote` (true with `--config-stdin`). They are always present. As root, the REPL
+banner adds a `[!]` line saying every command it proposes would run as root.
+
+`--config-stdin` (with `--json` only; not with `-e`, `-p`, `-S` or `-k`) is for genai-tui's remote mode, where genai
+runs on another host over ssh. genai first reads one line from stdin, before `hello`:
+
+```
+{"type": "config", "endpoint": {...}, "profile": {...} or null, "token": "<32 to 128 hex characters>"}
+```
+
+The endpoint and profile are the fields of an endpoint file and a profile file, checked the same way. Here they
+come from the wrapper, which checked the user's blessed files on its side, so genai blesses nothing on this host
+for them; the audit log records a `remote_config` event with their hashes. The endpoint may not name a key
+(`key_env`, `key_file`) or a `proxy`, and its `base_url` must be `http://127.0.0.1:PORT`, with an optional path:
+the key stays on the user's machine, and the port is a tunnel to a proxy there. genai sends the token in an
+`X-Genai-Token` header and never shows it. The profile's `endpoint` is ignored, and its skills are not available
+yet (a `notice` after `hello` says so). A bad line ends genai with exit status 3 and an `error` with code
+`bad_config`, and nothing is sent to any endpoint.
+
 **Messages a wrapper sends**
 
 | `type` | Fields | What happens |
