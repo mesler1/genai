@@ -156,20 +156,6 @@ class TestModel(unittest.TestCase):
         m.handle(dict({"type": "hello", "version": "1", "endpoint": {"name": "e", "model": "m", "base_url": "u"},
                        "sandbox": None}, **extra))
 
-    def test_reply_streams_into_one_block(self):
-        m = C.Model()
-        self.hello(m)
-        m.submit("hi")
-        self.assertEqual(m.outbox, [{"type": "user", "text": "hi"}])
-        self.assertTrue(m.busy)
-        for chunk in ("Hel", "lo"):
-            m.handle({"type": "text", "text": chunk})
-        m.handle({"type": "done", "reason": "reply", "context": {"used": 10, "limit": 100}})
-        self.assertFalse(m.busy)
-        self.assertEqual(m.context, (10, 100))
-        self.assertEqual(sum(isinstance(b, C.Reply) for b in m.blocks), 1)
-        self.assertIn("Hello", text_of(m.blocks[-1]))
-
     def test_clear_asks_genai_to_start_over(self):
         m = C.Model()
         self.hello(m, features=["clear"])
@@ -188,6 +174,20 @@ class TestModel(unittest.TestCase):
         old.submit("/clear")
         self.assertNotIn({"type": "clear"}, old.outbox)
         self.assertIn("only the screen", text_of(old.blocks[-1]))
+
+    def test_reply_streams_into_one_block(self):
+        m = C.Model()
+        self.hello(m)
+        m.submit("hi")
+        self.assertEqual(m.outbox, [{"type": "user", "text": "hi"}])
+        self.assertTrue(m.busy)
+        for chunk in ("Hel", "lo"):
+            m.handle({"type": "text", "text": chunk})
+        m.handle({"type": "done", "reason": "reply", "context": {"used": 10, "limit": 100}})
+        self.assertFalse(m.busy)
+        self.assertEqual(m.context, (10, 100))
+        self.assertEqual(sum(isinstance(b, C.Reply) for b in m.blocks), 1)
+        self.assertIn("Hello", text_of(m.blocks[-1]))
 
     def test_messages_typed_while_busy_are_queued(self):
         m = C.Model()
