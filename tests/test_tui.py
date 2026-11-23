@@ -888,6 +888,12 @@ class TestGenaiTui(TmuxCase):
             self.assertIn("Output:\n```\nfrom-shell\n```", sent)
             self.assertIn("[output of p1 (exit 3)]", sent)
 
+    def test_panes_get_a_term_that_remote_hosts_know(self):
+        with FakeAPI([reply("hi")]) as api:
+            self.start(api)
+            self.shell("echo T=$TERM")
+            self.assertIn("T=screen-256color", self.screen("shell"))
+
     def test_click_a_command_for_its_menu(self):
         turns = [call("propose_command", command="echo via-menu", reason="r"),   # a command ends the turn
                  call("propose_command", command="echo at-prompt", reason="r")]
