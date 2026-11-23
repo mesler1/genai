@@ -867,6 +867,25 @@ class TestEndToEnd(Tmp):
             self.assertIn("declined by the user", tool["content"])
             self.assertNotIn("The plan the user approved", api.requests[-1]["body"]["messages"][0]["content"])
 
+    def test_a_planned_command_is_preapproved_once(self):
+        steps = [{"kind": "command", "command": "make test", "why": "check"}]
+        turns = [call("propose_plan", goal="g", steps=steps), call("propose_command", command="make test", reason="1"),
+                 call("propose_command", command="make test", reason="again")]
+        with FakeAPI(turns) as api:
+            g = self.start(api)
+            g.send({"type": "user", "text": "go"})
+            p = g.until("proposal")
+            g.send({"type": "decision", "id": p["id"], "decision": "accept"})
+            first = g.until("proposal")
+            g.until("done")
+            g.send({"type": "user", "text": "again"})
+            second = g.until("proposal")
+            g.until("done")
+            g.close()
+        self.assertEqual((first.get("preapproved"), first["plan_step"]), (True, 1))
+        self.assertEqual((second.get("preapproved"), second.get("plan_repeat"), second["plan_step"],
+                          second.get("off_plan")), (None, True, 1, None))
+
     def test_plan_reads_of_secret_or_hidden_files_still_ask(self):
         steps = [{"kind": "read", "path": "creds.txt", "why": "w"}, {"kind": "read", "path": ".env", "why": "w"}]
         turns = [call("propose_plan", goal="g", steps=steps), call("read_file", path="creds.txt", reason="r"),
