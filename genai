@@ -10,6 +10,7 @@ import argparse
 import collections
 import datetime
 import difflib
+import errno
 import hashlib
 import ipaddress
 import json
@@ -36,6 +37,7 @@ PROTOCOL = 1
 STEP_LIMIT = 10
 READ_CAP = 256 * 1024          # bytes per read_file
 WRITE_CAP = 1024 * 1024        # bytes per write_file / edit result
+SNAPSHOT_CAP = 8 * WRITE_CAP   # maximum existing file size for an approved overwrite
 ATTACH_CAP = 256 * 1024        # bytes per -f file
 OUTPUT_CAP = 32 * 1024         # chars of command output before head/tail cut
 REPLY_CAP = 8 * 1024 * 1024    # bytes of one endpoint reply (and of one streamed line)
@@ -108,14 +110,81 @@ def write_private(path, data):
         raise
 
 
-def read_json(path, default=None):
+def own_group(gid):
+    """Is gid your personal group: your primary group, named after you, with no other members? Then a
+    group-writable mode lets nobody else write, as with the umask 002 of user-private-group systems."""
+    if gid != os.getgid():
+        return False
     try:
-        with open(path, encoding="utf-8") as f:
+        import grp
+        import pwd
+        group, me = grp.getgrgid(gid), pwd.getpwuid(os.getuid()).pw_name
+    except (ImportError, KeyError):
+        return False
+    return group.gr_name == me and all(m == me for m in group.gr_mem)
+
+
+def others_can_write(st):
+    return bool(st.st_mode & 0o002 or st.st_mode & 0o020 and not own_group(st.st_gid))
+
+
+def state_directory(path):
+    """Resolve the configured location and check that other users cannot replace its entries."""
+    path = os.path.abspath(path)
+    resolved = os.path.realpath(path)
+    uid = os.getuid()
+    for location in dict.fromkeys((path, resolved)):
+        current = location
+        while True:
+            try:
+                st = os.lstat(current)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                raise GenaiError(f"cannot inspect genai state directory {current}: {e.strerror}")
+            else:
+                owners = (uid,) if current == location else (uid, 0)
+                if stat.S_ISLNK(st.st_mode):
+                    pass                      # its target is checked too: the resolved path is walked as well
+                elif not stat.S_ISDIR(st.st_mode):
+                    raise GenaiError(f"unsafe genai state directory {current}: it is not a directory")
+                elif st.st_uid not in owners:
+                    raise GenaiError(f"unsafe genai state directory {current}: it belongs to another user, who "
+                                     "could replace what is in it. Use a directory you own.")
+                # Sticky parents such as /tmp protect entries owned by trusted users.
+                elif others_can_write(st) and (current == location or not st.st_mode & stat.S_ISVTX):
+                    raise GenaiError(f"unsafe genai state directory {current}: other users can write to it. "
+                                     f"If it is yours: chmod go-w {shlex.quote(current)}")
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            current = parent
+    return path
+
+
+def open_state_file(path, flags, mode=0o600):
+    fd = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK, mode)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+            raise GenaiError(f"unsafe genai state file {path}: it must be a regular file owned by you")
+        if others_can_write(st):
+            raise GenaiError(f"unsafe genai state file {path}: other users can write to it. "
+                             f"If it is yours: chmod 600 {shlex.quote(path)}")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def read_state_json(path, default=None):
+    try:
+        with os.fdopen(open_state_file(path, os.O_RDONLY), encoding="utf-8") as f:
             return json.load(f)
     except FileNotFoundError:
         return default
     except (OSError, ValueError) as e:
-        raise GenaiError(f"cannot read {path}: {e}")
+        raise GenaiError(f"cannot read genai state file {path}: {e}")
 
 
 def read_bytes_or_missing(path, what):
@@ -322,10 +391,10 @@ class Audit:
         rec.update(fields)
         try:
             ensure_dir(os.path.dirname(self.path))
-            fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            fd = open_state_file(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
             with os.fdopen(fd, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        except OSError as e:
+        except (OSError, GenaiError) as e:
             eprint(f"genai: warning: cannot write audit log: {e}")
 
 
@@ -350,8 +419,8 @@ STARTER_CONFIG = {
 
 class Config:
     def __init__(self, home=None):
-        self.home = home or config_home()
-        data = read_json(os.path.join(self.home, "config.json"), {}) or {}
+        self.home = state_directory(home or config_home())
+        data = read_state_json(os.path.join(self.home, "config.json"), {}) or {}
         if not isinstance(data, dict):
             raise GenaiError("config.json must be a JSON object")
         unknown = sorted(k for k in data if k not in STARTER_CONFIG and not k.startswith("_"))
@@ -375,6 +444,9 @@ class Config:
         self.endpoint_dirs, self.profile_dirs, self.skill_dirs = dirs("endpoints"), dirs("profiles"), dirs("skills")
         self.blessed_path = os.path.join(self.home, "blessed.json")
         self.sessions = os.path.join(self.home, "sessions")
+        state_directory(self.sessions)
+        if os.path.islink(self.sessions):
+            raise GenaiError(f"unsafe genai state directory {self.sessions}: symlinks are refused")
         self.audit = Audit(os.path.join(self.home, "audit.log"))
 
     def ensure(self):
@@ -382,7 +454,13 @@ class Config:
         directories and files are left as they are; a failure is a warning, not an error."""
         fresh = not os.path.exists(self.home)
         try:
-            os.makedirs(self.home, 0o700, exist_ok=True)       # parents like ~/.config get the default mode
+            missing, d = [], os.path.abspath(self.home)
+            while not os.path.lexists(d):
+                missing.append(d)
+                d = os.path.dirname(d)
+            for d in reversed(missing):                       # ~/.config too, whatever the umask
+                os.mkdir(d, 0o700)
+            state_directory(self.home)
             for d in (self.endpoint_dirs[0], self.profile_dirs[0], self.skill_dirs[0], self.sessions):
                 if not os.path.isdir(d):
                     os.mkdir(d, 0o700)
@@ -396,7 +474,7 @@ class Config:
             eprint(f"genai: created {self.home} (config.json, endpoints/, profiles/, skills/, sessions/)")
 
     def blessed(self):
-        b = read_json(self.blessed_path, {}) or {}
+        b = read_state_json(self.blessed_path, {}) or {}
         return b if isinstance(b, dict) else {}
 
     def set_blessed(self, path, entry):
@@ -604,6 +682,15 @@ class Endpoint:
     @classmethod
     def parse(cls, raw, path):
         return cls(parse_json_bytes(raw, path), os.path.abspath(path))
+
+    def destination_id(self):
+        """Fingerprint where a conversation goes, without storing endpoint headers or proxy credentials: the server
+        (scheme, host and port), and the proxy, CA bundle and headers that reach it. Not the model or the URL's
+        path, so switching models on the same server doesn't need consent each time."""
+        u = urllib.parse.urlsplit(self.base_url)
+        port = u.port or {"https": 443, "http": 80}.get(u.scheme)
+        fields = [u.scheme, (u.hostname or "").lower(), port, self.proxy, self.ca_bundle, self.headers]
+        return hash_bytes(json.dumps(fields, sort_keys=True).encode())
 
     def key_source(self):
         """Where the key comes from, escaped for one line. Returns (text, flagged)."""
@@ -1077,6 +1164,16 @@ class DiskError(ValueError):
     """A failure that reveals something about what is on disk (a symlink, a file where a directory was expected)."""
 
 
+NO_HARD_LINKS = {errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP, errno.ENOSYS}
+
+
+class StaleApproval(ValueError):
+    """The target no longer matches the approved snapshot."""
+
+
+_UNCHECKED = object()
+
+
 class Workdir:
     """Every operation walks the path one component at a time with O_NOFOLLOW,
     relative to a directory fd for the working directory."""
@@ -1143,6 +1240,12 @@ class Workdir:
             if st.st_size > cap:
                 raise ValueError(f"file is {st.st_size} bytes; the limit is {cap}")
             data = f.read(cap + 1)
+        return self.decode(data, cap)
+
+    @staticmethod
+    def decode(data, cap):
+        if len(data) > cap:
+            raise ValueError(f"file exceeds the {cap}-byte limit")
         if b"\0" in data[:8192]:
             raise ValueError("binary files are refused")
         try:
@@ -1150,32 +1253,40 @@ class Workdir:
         except UnicodeDecodeError:
             raise ValueError("binary (non UTF-8) files are refused")
 
-    def state(self, path):
-        """What a path holds right now: None if missing, else the sha256 of a regular file's
-        bytes, or a label for anything else. Used to bind an approval to what was reviewed."""
+    @staticmethod
+    def identity(st):
+        return (st.st_dev, st.st_ino, st.st_mode, st.st_uid, st.st_gid, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+    @classmethod
+    def _snapshot(cls, dfd, name):
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+        except FileNotFoundError:
+            return None, None
+        with os.fdopen(fd, "rb") as f:
+            st = os.fstat(f.fileno())
+            if not stat.S_ISREG(st.st_mode):
+                raise DiskError("the target is not a regular file")
+            if st.st_size > SNAPSHOT_CAP:
+                raise DiskError(f"existing file exceeds the {SNAPSHOT_CAP}-byte overwrite limit")
+            identity = cls.identity(st)
+            data = f.read(SNAPSHOT_CAP + 1)
+            if len(data) != st.st_size or identity != cls.identity(os.fstat(f.fileno())):
+                raise StaleApproval("the target changed while being read")
+        return (identity, hashlib.sha256(data).digest()), data
+
+    def snapshot(self, path):
         parts = split_rel(path)
         if not parts:
             raise ValueError("that is a directory")
         try:
             dfd = self._open_dir(parts[:-1])
         except FileNotFoundError:
-            return None
+            return None, None
         try:
-            try:
-                fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
-            except FileNotFoundError:
-                return None
-            except OSError as e:
-                return "symlink" if e.errno == 40 else f"unreadable:{e.errno}"
+            return self._snapshot(dfd, parts[-1])
         finally:
             os.close(dfd)
-        with os.fdopen(fd, "rb") as f:
-            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
-                return "not a regular file"
-            h = hashlib.sha256()
-            for block in iter(lambda: f.read(1 << 16), b""):
-                h.update(block)
-        return "sha256:" + h.hexdigest()
 
     def list(self, path):
         parts = split_rel(path) if path not in ("", ".", "./") else []
@@ -1184,15 +1295,17 @@ class Workdir:
         try:
             with os.scandir(dfd) as it:
                 for e in it:
+                    if len(out) == LIST_CAP:
+                        return sorted(out), True
                     st = e.stat(follow_symlinks=False)
                     kind = ("dir" if stat.S_ISDIR(st.st_mode) else "file" if stat.S_ISREG(st.st_mode)
                             else "symlink" if stat.S_ISLNK(st.st_mode) else "other")
                     out.append((e.name, kind, st.st_size if kind == "file" else None))
         finally:
             os.close(dfd)
-        return sorted(out)
+        return sorted(out), False
 
-    def write(self, path, content):
+    def write(self, path, content, expected=_UNCHECKED):
         data = content.encode("utf-8")
         if len(data) > WRITE_CAP:
             raise ValueError(f"content is {len(data)} bytes; the limit is {WRITE_CAP}")
@@ -1200,34 +1313,80 @@ class Workdir:
         if not parts:
             raise ValueError("a file name is required")
         dfd = self._open_dir(parts[:-1], create=True)
-        name, tmp = parts[-1], f".genai-tmp-{secrets.token_hex(6)}"
+        name, stage = parts[-1], f".genai-tmp-{secrets.token_hex(6)}"
         try:
-            mode = None
             try:
                 st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
-                if not stat.S_ISREG(st.st_mode):
-                    raise ValueError("the target exists and is not a regular file")
-                mode = stat.S_IMODE(st.st_mode)
             except FileNotFoundError:
-                pass
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o666, dir_fd=dfd)
+                st = None
+            if st is not None and not stat.S_ISREG(st.st_mode):
+                raise StaleApproval("the target exists and is not a regular file")
+            identity = self.identity(st) if st else None
+            if expected is not _UNCHECKED and identity != (expected[0] if expected else None):
+                raise StaleApproval("the target changed")
+            os.mkdir(stage, 0o700, dir_fd=dfd)
+            try:
+                self._publish(dfd, stage, name, data, st, expected)
+            finally:
+                os.rmdir(stage, dir_fd=dfd)
+        finally:
+            os.close(dfd)
+        return len(data)
+
+    @staticmethod
+    def _create_new(dfd, name, data):
+        """Where the filesystem has no hard links (CIFS, some FUSE mounts): create the name only if it is still
+        free, then write. Never replaces a file, but another program could see it half-written."""
+        try:
+            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o666, dir_fd=dfd)
+        except FileExistsError as e:
+            raise StaleApproval("the target now exists") from e
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+
+    def _publish(self, dfd, stage, name, data, st, expected):
+        staging_fd = os.open(stage, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dfd)
+        try:
+            directory = os.fstat(staging_fd)
+            if directory.st_uid != os.getuid() or directory.st_mode & 0o077:
+                raise StaleApproval("the staging directory is not private")
+            fd = os.open("file", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o666,
+                         dir_fd=staging_fd)
             try:
                 with os.fdopen(fd, "wb") as f:
                     f.write(data)
                     f.flush()
-                    if mode is not None:
-                        os.fchmod(f.fileno(), mode)
+                    if st is not None:
+                        os.fchmod(f.fileno(), stat.S_IMODE(st.st_mode))
                     os.fsync(f.fileno())
-                os.rename(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
-            except BaseException:
+                if st is None:
+                    try:
+                        os.link("file", name, src_dir_fd=staging_fd, dst_dir_fd=dfd)
+                    except FileExistsError as e:
+                        raise StaleApproval("the target now exists") from e
+                    except OSError as e:
+                        if e.errno not in NO_HARD_LINKS:
+                            raise
+                        self._create_new(dfd, name, data)
+                else:
+                    if expected is not _UNCHECKED:
+                        try:
+                            actual, _ = self._snapshot(dfd, name)
+                            latest = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+                        except (OSError, DiskError) as e:
+                            raise StaleApproval("the target changed") from e
+                        if actual != expected or self.identity(latest) != expected[0]:
+                            raise StaleApproval("the target changed")
+                    os.rename("file", name, src_dir_fd=staging_fd, dst_dir_fd=dfd)
+            finally:
                 try:
-                    os.unlink(tmp, dir_fd=dfd)
-                except OSError:
+                    os.unlink("file", dir_fd=staging_fd)
+                except FileNotFoundError:
                     pass
-                raise
         finally:
-            os.close(dfd)
-        return len(data)
+            os.close(staging_fd)
 
 
 def unified_diff(old, new, path):
@@ -1475,6 +1634,7 @@ class Session:
         self.id = sid
         self.path = os.path.join(cfg.sessions, f"{sid}.json") if sid else None
         self.endpoint = None
+        self.destination_id = None
         self.profile = None      # persona profile name, or None
         self.coding = False
         self.cwd = os.getcwd()
@@ -1492,13 +1652,14 @@ class Session:
         if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", sid):
             raise GenaiError(f"bad session name '{sid}'", EXIT_USAGE)
         s = cls(cfg, sid)
-        data = read_json(s.path)
+        data = read_state_json(s.path)
         if data:
             s.resumed = True
             if "endpoint" in data:
                 s.endpoint, s.profile = data.get("endpoint"), data.get("profile")
             else:                # sessions from before the split stored the endpoint as "profile"
                 s.endpoint = data.get("profile")
+            s.destination_id = data.get("destination_id")
             s.coding = bool(data.get("coding"))
             s.cwd = data.get("cwd", s.cwd)
             s.skills = data.get("skills", [])
@@ -1540,7 +1701,7 @@ class Session:
         if not self.path:
             return
         data = {"id": self.id, "endpoint": self.endpoint, "profile": self.profile, "coding": self.coding, "cwd": self.cwd,
-                "skills": self.skills, "created": self.created, "updated": now(),
+                "destination_id": self.destination_id, "skills": self.skills, "created": self.created, "updated": now(),
                 "messages": self.messages, "history": self.history}
         write_private(self.path, json.dumps(data, ensure_ascii=False) + "\n")
 
@@ -1553,7 +1714,7 @@ def list_sessions(cfg):
         return out
     for n in sorted(names):
         if n.endswith(".json"):
-            d = read_json(os.path.join(cfg.sessions, n), {}) or {}
+            d = read_state_json(os.path.join(cfg.sessions, n), {}) or {}
             first = next((m.get("content") for m in d.get("history", []) if m.get("role") == "user"), "") or ""
             ep, prof = (d.get("endpoint"), d.get("profile")) if "endpoint" in d else (d.get("profile"), None)
             out.append({"id": n[:-5], "endpoint": ep, "profile": prof, "updated": d.get("updated"),
@@ -1891,34 +2052,26 @@ class Engine:
                     st = self.wd.stat(path)
                     p.fields["size"] = st.st_size if st else None
                 if self.read_allowed(parts):
-                    p.auto = True
                     if kind == "read":
-                        try:
-                            secret = looks_secret(self.wd.read(path))
-                        except (ValueError, OSError):
-                            secret = False
-                        if secret:
-                            p.auto = False
-                            p.fields["secret"] = True
-                            self.ui.notice(f"{path} looks like it contains secrets, "
-                                           "so reading it needs your OK even in coding mode")
+                        self.prepare_auto_read(p)
+                    else:
+                        p.auto = True
                 return p
             if name == "write_file":
                 path, content = args.get("path"), args.get("content")
                 split_rel(path)
                 if not isinstance(content, str):
                     raise ValueError("content must be a string")
-                state = self.wd.state(path)
+                state, previous = self.wd.snapshot(path)
                 exists = state is not None
                 fields = {"path": path, "exists": exists, "content": content, "reason": reason, "_state": state,
                           "lines": content.count("\n") + (0 if content.endswith("\n") or not content else 1)}
                 if exists:
                     try:
-                        fields["diff"] = unified_diff(self.wd.read(path, WRITE_CAP), content, path)
-                    except (ValueError, OSError) as e:
-                        st = self.wd.stat(path)
+                        fields["diff"] = unified_diff(self.wd.decode(previous, WRITE_CAP), content, path)
+                    except ValueError as e:
                         fields.update(diff=f"(cannot diff the existing file: {e})", undiffable=str(e),
-                                      mode=f"{stat.S_IMODE(st.st_mode):04o}" if st else None)
+                                      mode=f"{stat.S_IMODE(state[0][2]):04o}")
                 return Proposal(pid, "write", tc["id"], **fields)
             if name == "edit_file":
                 path, old, new = args.get("path"), args.get("old_text"), args.get("new_text")
@@ -1926,7 +2079,10 @@ class Engine:
                     raise ValueError("old_text and new_text are required")
                 parts = split_rel(path)
                 try:
-                    current = self.wd.read(path, WRITE_CAP)
+                    state, previous = self.wd.snapshot(path)
+                    if state is None:
+                        raise FileNotFoundError(f"{path} does not exist")
+                    current = self.wd.decode(previous, WRITE_CAP)
                     n = current.count(old)
                     if n != 1:
                         raise ValueError(f"old_text appears {n} times in {path}; it must appear exactly once")
@@ -1940,8 +2096,7 @@ class Engine:
                     return p
                 updated = current.replace(old, new, 1)
                 return Proposal(pid, "edit", tc["id"], path=path, diff=unified_diff(current, updated, path),
-                                reason=reason, _old=old, _new=new,
-                                _state="sha256:" + hashlib.sha256(current.encode()).hexdigest())
+                                reason=reason, _content=updated, _state=state)
             if name == "propose_plan":
                 return Proposal(pid, "plan", tc["id"], **parse_plan(args))
             if name in self.external:
@@ -1967,7 +2122,8 @@ class Engine:
         the model. secret is None when genai would not read the file at all (too big, binary, unreadable)."""
         parts = split_rel(path) if path not in ("", ".", "./") else []
         rows = []
-        for name, kind, size in sorted(self.wd.list(path)):
+        entries, truncated = self.wd.list(path)
+        for name, kind, size in entries:
             sub = parts + [name]
             row = {"name": name, "kind": kind, "size": size, "hidden": is_hidden(sub)}
             if kind == "file":
@@ -1977,7 +2133,24 @@ class Engine:
                     row["secret"] = None
                 row["asks"] = not self.read_allowed(sub) or row["secret"] is not False
             rows.append(row)
-        return rows
+        return rows, truncated
+
+    def prepare_auto_read(self, proposal):
+        """Read the file now, so what is sent is exactly what was checked for secrets. A read that fails (a missing,
+        binary or oversized file) stays automatic and reports its error: there is nothing secret to ask about."""
+        path = proposal.fields["path"]
+        try:
+            text = self.wd.read(path)
+        except (ValueError, OSError) as e:
+            proposal.fields["_read_error"] = e
+            proposal.auto = True
+            return
+        if looks_secret(text) or any(key and key in text for key in self.secrets()):
+            proposal.fields["secret"] = True
+            self.ui.notice(f"{path} looks like it contains secrets, so reading it needs your OK")
+            return
+        proposal.fields["_read_text"] = text
+        proposal.auto = True
 
     def read_allowed(self, parts):
         """Would reading this path be allowed without asking? (coding mode, not hidden)"""
@@ -2054,17 +2227,15 @@ class Engine:
             hit["status"] = "done"
         elif p.kind in ("read", "list") and not p.auto:
             parts = split_rel(p.fields["path"]) if hit["_where"] else []
-            secret = None
-            if p.kind == "read" and not is_hidden(parts):
-                try:
-                    secret = looks_secret(self.wd.read(p.fields["path"]))
-                except (ValueError, OSError):
-                    secret = False
-            if is_hidden(parts) or secret:
-                if secret:
-                    p.fields["secret"] = True
-                return                                  # in the plan, but still asks
-            p.auto = True
+            if is_hidden(parts):
+                return
+            if p.kind == "read":
+                if not p.fields.get("secret"):
+                    self.prepare_auto_read(p)
+                if not p.auto:
+                    return
+            else:
+                p.auto = True
         self.audit.log("plan_match", id=p.id, step=hit["n"], kind=p.kind)
         self.ui.plan(self.plan)
 
@@ -2116,36 +2287,34 @@ class Engine:
             return "declined by the user"
         try:
             if p.kind == "read":
-                text = self.wd.read(p.fields["path"])
+                if p.auto and "_read_error" in p.fields:
+                    raise p.fields["_read_error"]
+                text = p.fields["_read_text"] if p.auto else self.wd.read(p.fields["path"])
                 result = text
                 note = f"read {len(text)} characters"
                 if looks_secret(text):
                     self.ui.notice(f"warning: {p.fields['path']} looks like it contains secrets; it was sent as is")
             elif p.kind == "list":
-                rows = self.wd.list(p.fields["path"])
+                rows, truncated = self.wd.list(p.fields["path"])
                 lines = [f"{n}/" if k == "dir" else f"{n}  ({s} bytes)" if k == "file" else f"{n}  [{k}]"
-                         for n, k, s in rows[:LIST_CAP]]
-                if len(rows) > LIST_CAP:
-                    lines.append(f"... {len(rows) - LIST_CAP} more entries")
+                         for n, k, s in rows]
+                if truncated:
+                    lines.append(f"... listing stopped after {LIST_CAP} entries")
                 result = "\n".join(lines) or "(empty directory)"
                 note = f"listed {len(rows)} entries"
-            elif p.kind in ("write", "edit") and self.wd.state(p.fields["path"]) != p.fields["_state"]:
-                self.audit.log("file_op", id=p.id, kind=p.kind, path=p.fields["path"], status="stale")
-                self.ui.result(p, "error", f"{p.fields['path']} changed after you reviewed it "
-                                           "(another proposal or an editor), so nothing was written")
-                return (f"not applied: {p.fields['path']} changed since the user reviewed your proposal; "
-                        "propose the change again")
             elif p.kind == "write":
-                n = self.wd.write(p.fields["path"], p.fields["content"])
+                n = self.wd.write(p.fields["path"], p.fields["content"], expected=p.fields["_state"])
                 result = note = f"wrote {p.fields['path']} ({n} bytes)"
             elif p.kind == "edit":
-                current = self.wd.read(p.fields["path"], WRITE_CAP)
-                if current.count(p.fields["_old"]) != 1:
-                    raise ValueError("the file changed before the edit was applied")
-                self.wd.write(p.fields["path"], current.replace(p.fields["_old"], p.fields["_new"], 1))
+                self.wd.write(p.fields["path"], p.fields["_content"], expected=p.fields["_state"])
                 result = note = f"edited {p.fields['path']}"
             else:
                 return "error: unknown proposal"
+        except StaleApproval:
+            self.audit.log("file_op", id=p.id, kind=p.kind, path=p.fields["path"], status="stale")
+            self.ui.result(p, "error", f"{p.fields['path']} changed after you reviewed it, so nothing was written")
+            return (f"not applied: {p.fields['path']} changed since the user reviewed your proposal; "
+                    "propose the change again")
         except (ValueError, OSError) as e:
             self.audit.log("file_op", id=p.id, kind=p.kind, path=p.fields.get("path"), status="error", error=str(e))
             self.ui.result(p, "error", str(e))
@@ -2925,7 +3094,8 @@ def run_json(engine, ui, first_prompt, attachments):
                 ui.error("files needs 'path' as a string", "bad_message")
                 continue
             try:
-                ui.emit({"type": "files", "path": path, "entries": engine.files(path)})
+                entries, truncated = engine.files(path)
+                ui.emit({"type": "files", "path": path, "entries": entries, "truncated": truncated})
             except (ValueError, OSError) as err:
                 ui.error(f"cannot list {path}: {err}", "bad_path")
         elif t in ("trace", "system"):
@@ -2952,6 +3122,8 @@ def parse_args(argv):
     ap.add_argument("-f", "--file", action="append", default=[], help="attach a file (repeatable)")
     ap.add_argument("-k", "--skill", action="append", default=[], help="use a blessed skill (repeatable)")
     ap.add_argument("-S", "--session", help="keep the conversation in a named session (created or resumed)")
+    ap.add_argument("--allow-session-endpoint-change", action="store_true",
+                    help="allow this invocation to send saved context to a changed or unrecorded destination")
     ap.add_argument("--coding", action="store_true", help="let the model read and list files here without asking")
     ap.add_argument("--coding-anywhere", action="store_true",
                     help="--coding, also where it is normally refused (your home directory, credential "
@@ -3008,9 +3180,17 @@ def main(argv=None):
         persona = select_named(cfg, "profile", pname) if pname else None
         endpoint = select_endpoint(cfg, args.endpoint or (persona.endpoint if persona else None)
                                    or session.endpoint or cfg.default_endpoint)
-        if session.resumed and session.endpoint and session.endpoint != endpoint.name:
-            notices.append(f"warning: session '{session.id}' was used with endpoint '{session.endpoint}', "
-                           f"now '{endpoint.name}'")
+        destination_id = endpoint.destination_id()
+        if session.messages and session.destination_id != destination_id:
+            reason = ("has a different destination" if session.destination_id else
+                      "was saved before its destination was recorded")
+            msg = f"session '{session.id}' {reason}. Saved context would go to {endpoint.base_url}."
+            if not args.allow_session_endpoint_change:
+                raise GenaiError(msg + " To approve this transfer, rerun with --allow-session-endpoint-change.",
+                                 EXIT_USAGE, "session_endpoint_changed")
+            notices.append(msg)
+            cfg.audit.log("session_endpoint_change", session=session.id, endpoint=endpoint.info())
+        session.destination_id = destination_id
         if session.resumed and args.profile and session.profile != args.profile:
             notices.append(f"session '{session.id}' was used with profile '{session.profile or '-'}', "
                            f"now '{args.profile}'")
