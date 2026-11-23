@@ -3,7 +3,8 @@
 
 The conversation pane pushes what to show over genai-tui's private socket (see ipc.py), and this
 pane sends requests back the same way. It connects in the "panel" role, which may only switch
-coding mode and skills or ask for the skill list: it can never approve anything or reach genai.
+coding mode and skills, ask for the skill list, or ask to share a shell command's output (which you
+then review): it can never approve anything or reach genai.
 Standard library only; Python 3.10 or newer.
 """
 
@@ -76,6 +77,21 @@ def view(st, w, sel):
              (" " + ("" if blessed else s.get("status", "")), R if s.get("status") == "changed" else Q)], i)
         if i == sel and not blessed:
             add([(fit(f"  bless: genai --bless {clean(s.get('path', ''))}", w), Q)], i)
+    head("COMMANDS")
+    cmds = st.get("commands") or []
+    if not cmds:
+        add([("none run in the shell yet", Q)])
+    for c in cmds:
+        if c.get("running"):
+            add([(f"{c.get('n', '?'):>3} ", Q), ("running…", A)])
+            continue
+        ok = c.get("rc") == 0
+        info = f" {c.get('lines', 0)}L {c.get('ago', '')}"
+        cmd = fit(clean(c.get("cmd", "")), max(w - 6 - width(info), 4))
+        add([(f"{c.get('n', '?'):>3} ", Q), ("✓ " if ok else "✗ ", D if ok else R), (cmd, ""),
+             (" " * max(w - 6 - width(cmd) - width(info), 0) + info, Q)], ("cmd", c.get("n")))
+    if cmds:
+        add([("click one to share it", Q)])
     head("PROPOSALS")
     props = st.get("proposals") or []
     if not props:
@@ -148,6 +164,8 @@ class Panel:
         st = self.st or {}
         if what == "coding":
             ok = self.request({"type": "coding", "on": not st.get("coding")})
+        elif isinstance(what, tuple) and what[0] == "cmd" and type(what[1]) is int:
+            ok = self.request({"type": "command", "n": what[1]})
         elif isinstance(what, int) and what < len(self.skills()):
             s = self.skills()[what]
             if s.get("status") != "blessed" and not s.get("active"):
@@ -176,7 +194,7 @@ class Panel:
             except curses.error:
                 return
             if 0 <= y < len(self.acts) and self.acts[y] is not None:
-                if isinstance(self.acts[y], int):
+                if type(self.acts[y]) is int:
                     self.sel = self.acts[y]
                 self.act(self.acts[y])
 

@@ -1,21 +1,55 @@
-# genai-tui's shell pane: your own ~/.bashrc, plus a prompt hook that tells the conversation pane
-# where each prompt starts, the last command and its exit code, so /run and /share can find one
-# command's output. It only records positions and numbers in tmux options; it reads no output.
+# genai-tui's shell pane: your own ~/.bashrc, plus invisible markers around each command, so the
+# conversation pane knows each command, its exit code and its output (tui/recorder.py). tmux shows
+# nothing for them; genai-tui reads them, with the output, from tmux, in memory only.
+
+# The word in every marker. It is not exported, so no program run from here can read it, and print
+# markers of its own that would be believed. The first marker announces it, once tmux is copying
+# this pane's output and before anything else has run.
+__genai_nonce=$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
+if [ -n "${TMUX:-}" ] && [ -n "$__genai_nonce" ]; then
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    [ "$(tmux display -p -t "$TMUX_PANE" '#{pane_pipe}' 2>/dev/null)" = 1 ] && break
+    sleep 0.1
+  done
+  printf '\e]6973;%s;H\a' "$__genai_nonce"
+else
+  __genai_nonce=
+fi
+
 [ -f ~/.bashrc ] && . ~/.bashrc
 # A command /run types arrives as one paste, so a multi-line command doesn't run line by line.
 bind 'set enable-bracketed-paste on' 2>/dev/null
+# Every command goes in history, repeats too, so the one that just ran can be named. A command typed
+# with a leading space stays out, as you asked (ignorespace), and is listed without its text.
+HISTCONTROL=${HISTCONTROL//ignoreboth/ignorespace}
+HISTCONTROL=${HISTCONTROL//ignoredups/}
+HISTCONTROL=${HISTCONTROL//erasedups/}
+
+# A command starts: bash prints PS0 after you press Enter and before the command runs.
+[ -n "$__genai_nonce" ] && PS0="${PS0:-}"$'\e]6973;'"$__genai_nonce"$';S\a'
+# The next prompt: the exit code, whether a new history entry was made, the command line (base64),
+# and how many lines the prompt takes.
 __genai_prompt() {
-  local rc=$? hs cy
-  [ -n "${TMUX:-}" ] || return "$rc"
-  read -r hs cy < <(tmux display -p -t "$TMUX_PANE" '#{history_size} #{cursor_y}')
-  __genai_seq=$(( ${__genai_seq:-0} + 1 ))
-  tmux set -g @genai_rc "$rc" \; set -g @genai_prev_mark "${__genai_mark:-0}" \; \
-       set -g @genai_mark "$((hs + cy))" \; set -g @genai_seq "$__genai_seq" \; \
-       set -g @genai_last_cmd "$(fc -ln -1 2>/dev/null | sed 's/^[[:space:]]*//')"
-  __genai_mark=$((hs + cy))
+  local rc=$? h num new=0 cmd= p
+  [ -n "$__genai_nonce" ] || return "$rc"
+  h=$(HISTTIMEFORMAT= history 1)           # "  123  the command": its number changes only for a new entry
+  h=${h#"${h%%[! ]*}"}
+  num=${h%%[!0-9]*}
+  if [ -z "${__genai_hnum+set}" ]; then
+    __genai_hnum=$num                      # the first prompt: nothing has run yet
+  elif [ "$num" != "$__genai_hnum" ]; then
+    new=1
+    __genai_hnum=$num
+    h=${h#"$num"}
+    cmd=$(printf '%s' "${h#"${h%%[! ]*}"}" | base64 -w0)
+  fi
+  p=${PS1//\\n/$'\n'}
+  p=${p//[!$'\n']/}
+  printf '\e]6973;%s;D;%s;%s;%s;%s\a' "$__genai_nonce" "$rc" "$new" "$cmd" "$(( ${#p} + 1 ))"
   return "$rc"
 }
 PROMPT_COMMAND="__genai_prompt${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
+
 # `` on an empty command line hides this shell again (it keeps running) and goes back to the prompt.
 # Anywhere else `` is typed as it is, and a single ` types after a moment (readline's keyseq-timeout).
 __genai_hide() {

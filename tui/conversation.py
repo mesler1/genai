@@ -28,6 +28,7 @@ import unicodedata
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ipc import Hub  # noqa: E402
+from recorder import Recorder, ago, fifo_path, label, trim  # noqa: E402
 
 GENAI = os.environ.get("GENAI_BIN") or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                                     "genai")
@@ -40,7 +41,8 @@ COMMANDS = {
     "/skills": "list skills; * marks the ones in use",
     "/skill": "NAME on|off: use a blessed skill from the next message on, or stop",
     "/run": "[ID]: review and run a proposed command in the shell pane (the latest by default)",
-    "/share": "[mark|all]: review shell output, then send it: the last command, from the mark, or everything",
+    "/share": "[N|mark|all]: review shell output, then send it: the last command, command N, from the mark, or all",
+    "/commands": "list the commands run in the shell pane, numbered for /share N (also in the info panel)",
     "/mark": "shell context starts at the shell's current prompt (or right-click a line in the shell)",
     "/shell": "show the shell and move there (`` on its empty prompt hides it again)",
     "/panel": "show or hide the info panel on the right",
@@ -392,6 +394,7 @@ class Model:
         self.show_skills = False   # print the next skill list in the conversation (the user typed /skills)
         self.ask = None            # a question of ours in place of the input box: run or share
         self.actions = []          # things for the screen to do: ("share", "last"), ("focus_shell",)
+        self.recent = []           # the shell pane's latest commands, for the info panel
 
     def add(self, block):
         self.blocks.append(block)
@@ -547,7 +550,7 @@ class Model:
                 self.send({"type": "skill", "name": name, "on": state == "on"})
         elif cmd == "/compact":
             self.send({"type": "compact"})
-        elif cmd in ("/run", "/share", "/shell", "/mark") and not self.shell:
+        elif cmd in ("/run", "/share", "/shell", "/mark", "/commands") and not self.shell:
             self.note(f"{cmd} needs the shell pane: start genai with genai-tui", R)
         elif cmd == "/run":
             cards = [c for c in self.cards.values() if c.ev.get("kind") == "command"]
@@ -557,10 +560,14 @@ class Model:
             else:
                 self.ask = {"kind": "run", "card": card, "command": card.ev.get("command", ""), "edited": False}
         elif cmd == "/share":
-            if arg not in ("", "mark", "all"):
-                self.note("usage: /share, /share mark or /share all", R)
+            if re.fullmatch(r"#?[0-9]{1,9}", arg):
+                self.actions.append(("share_cmd", int(arg.lstrip("#"))))
+            elif arg not in ("", "mark", "all"):
+                self.note("usage: /share, /share N, /share mark or /share all", R)
             else:
                 self.actions.append(("share", arg or "last"))
+        elif cmd == "/commands":
+            self.actions.append(("commands",))
         elif cmd == "/mark":
             self.actions.append(("mark",))
         elif cmd == "/shell":
@@ -588,6 +595,7 @@ class Model:
             "skills": self.skills,
             "proposals": [{"id": c.id, "title": c.title(), "state": c.state, "detail": clean(c.detail)}
                           for c in self.cards.values() if c.state != "auto"],
+            "commands": self.recent,
         }
 
     def request(self, msg):
@@ -602,6 +610,10 @@ class Model:
             self.send({"type": "skills"})
         elif t == "share" and msg.get("what") in ("mark", "all", "last") and self.shell:
             self.actions.append(("share", msg["what"]))
+        elif t == "command" and type(msg.get("n")) is int and self.shell:
+            self.actions.append(("share_cmd", msg["n"]))
+        elif t == "mark" and isinstance(msg.get("on"), bool) and self.shell:
+            self.actions.append(("mark_line",) if msg["on"] else ("unmark",))
 
     def attach(self, label, text):
         """Shell context the user reviewed: it goes with their next message, so they can ask about it."""
@@ -789,8 +801,9 @@ class Busy(Exception):
 
 
 class Shell:
-    """The shell pane genai-tui opened below the conversation. Its prompt hook (tui/shellrc) keeps a count
-    of prompts, the exit code, the last command and where each prompt starts, in tmux options."""
+    """The shell pane genai-tui opened beside the conversation. What each command printed comes from the
+    recorder (tui/recorder.py); this reads the screen and its history only for shell context, by logical line:
+    a line wrapped onto several rows counts once, so resizing the pane doesn't move a mark."""
 
     def __init__(self, pane):
         self.pane = pane
@@ -806,12 +819,6 @@ class Shell:
 
     def opt(self, name):
         return self.tmux("show", "-gv", name).strip()
-
-    def num(self, name):
-        try:
-            return int(self.opt(name) or 0)
-        except ValueError:
-            return 0
 
     def at_prompt(self):
         """None if bash is waiting at its prompt; otherwise what the pane is doing."""
@@ -834,13 +841,16 @@ class Shell:
         if enter:
             self.tmux("send-keys", "-t", self.pane, "Enter")
 
-    def output(self, start, end):
-        """The lines between two prompt marks: one command's output."""
-        hs = int(self.tmux("display", "-p", "-t", self.pane, "#{history_size}").strip() or 0)
-        if end <= start + 1:
-            return ""
-        return self.tmux("capture-pane", "-p", "-J", "-t", self.pane, "-S", str(start + 1 - hs),
-                         "-E", str(end - 1 - hs)).rstrip("\n")
+    def lines(self, upto=None):
+        """The pane's history and screen as logical lines, to the cursor's line, or to row upto counted from the
+        oldest line of history."""
+        if upto is None:
+            end = self.tmux("display", "-p", "-t", self.pane, "#{cursor_y}").strip() or "0"
+        else:
+            hs = int(self.tmux("display", "-p", "-t", self.pane, "#{history_size}").strip() or 0)
+            end = str(upto - hs)
+        out = self.tmux("capture-pane", "-p", "-J", "-t", self.pane, "-S", "-", "-E", end)
+        return [ln.rstrip() for ln in out.removesuffix("\n").split("\n")]
 
     def show(self, focus=False):
         """Bring the shell pane into view above the conversation (it runs hidden), and go there if asked."""
@@ -934,13 +944,15 @@ class App:
         self.scr, self.child, self.shell = scr, child, shell
         self.m, self.ed = Model(), Editor()
         self.m.shell = shell is not None
-        self.running = None        # a /run command in the shell pane: card, command, prompt count, start mark
-        self.next_poll = 0.0
+        self.running = None        # a /run command in the shell pane: card, command, commands done before it
         self.rows = []             # the block drawn on each screen row of the conversation
         self.state_dir = os.environ.get("GENAI_TUI_STATE") if shell else None
         self.panel = os.environ.get("GENAI_TUI_PANEL") if shell else None
         self.prompt = os.environ.get("GENAI_TUI_PROMPT") if shell else None   # input happens in that pane
         self.hub = Hub(self.state_dir) if self.state_dir else None   # the other panes connect here
+        fifo = fifo_path(self.state_dir) if self.state_dir else None
+        self.rec = Recorder(fifo if fifo and os.path.exists(fifo) else None)   # each shell command and its output
+        self.ctx_line = None       # where shell context starts, in logical lines (see Shell.lines)
         self.sent = {}             # the last view sent to each role
         self.ask_obj, self.ask_serial = None, 0
         self.mouse = 0
@@ -1330,8 +1342,8 @@ class App:
                     m.share(f"output of {ask['what']} (exit {ask['rc']})", kept, f"Here is the output of {ask['what']}.")
 
     def start_run(self, card, command):
+        done = self.rec.done
         try:
-            seq, start = self.shell.num("@genai_seq"), self.shell.num("@genai_mark")
             self.shell.type(command)
         except Busy as e:
             self.m.note(f"{card.id} not run: the shell pane is busy ({e}). When it is back at a prompt, /run "
@@ -1343,76 +1355,102 @@ class App:
         self.shell.show()                                # so the command can be watched as it runs
         card.state, card.detail = "running", "typed into the shell pane"
         card.changed()
-        self.running = {"card": card, "command": command, "seq": seq, "start": start}
+        self.running = {"card": card, "command": command, "done": done}
 
     def poll_run(self):
         """Has the command from /run finished? Then offer to share its output."""
-        if not self.running or time.time() < self.next_poll:
-            return
-        self.next_poll = time.time() + 0.3
         r = self.running
-        try:
-            if self.shell.num("@genai_seq") <= r["seq"]:
-                return
-            rc, out = self.shell.opt("@genai_rc"), self.shell.output(r["start"], self.shell.num("@genai_mark"))
-        except (OSError, subprocess.SubprocessError):
+        if not r or self.rec.done <= r["done"]:
             return
         self.running = None
-        card = r["card"]
-        card.state, card.detail = "ran", f"exit {rc}"
+        c, card = self.rec.last(), r["card"]
+        card.state, card.detail = "ran", f"exit {c.rc}"
         card.changed()
-        self.m.ask = {"kind": "share", "label": f"{card.id} finished (exit {rc})", "what": card.id,
-                      "question": f"{card.id} finished (exit {rc}). Share the output with the model?",
-                      "command": r["command"], "rc": rc, "output": out}
+        self.m.ask = {"kind": "share", "label": f"{card.id} finished (exit {c.rc})", "what": card.id,
+                      "question": f"{card.id} finished (exit {c.rc}). Share the output with the model?",
+                      "command": r["command"], "rc": c.rc, "output": self.output_of(c)}
 
-    def share_last(self):
-        """/share: the last command typed in the shell pane, whoever typed it."""
-        try:
-            cmd, rc = self.shell.opt("@genai_last_cmd"), self.shell.opt("@genai_rc")
-            out = self.shell.output(self.shell.num("@genai_prev_mark"), self.shell.num("@genai_mark"))
-        except (OSError, subprocess.SubprocessError) as e:
-            self.m.note(f"tmux failed ({e})", R)
+    def output_of(self, c):
+        out = trim(c.text())
+        if c.screen:
+            out += "\n[it ran a full-screen program; what that drew is not included]"
+        return out
+
+    def share_command(self, c, what):
+        """/share, /share N, or a click in the info panel: one command from the shell pane and its output."""
+        if c is None:
+            self.m.note("nothing has run in the shell pane yet" if what == "last" else
+                        f"no command {what} in the shell pane (/commands lists them)", R)
             return
-        if not cmd:
-            self.m.note("nothing has run in the shell pane yet", R)
+        cmd = c.cmd if c.in_history else "(not shown: I kept it out of my shell history)"
+        name = fit(clean(label(c)), 40)
+        n = c.lines()
+        label_ = f"Command {c.n} in the shell pane: {name} (exit {c.rc}, {n} line{'s' if n != 1 else ''})"
+        self.m.ask = {"kind": "share", "label": label_, "what": f"command {c.n}", "command": cmd, "rc": c.rc,
+                      "output": self.output_of(c), "question": f"{label_}. Share the output with the model?"}
+
+    def list_commands(self):
+        cmds = self.rec.finished()
+        if not cmds:
+            self.m.note("nothing has run in the shell pane yet")
             return
-        label = f"Last command in the shell pane: {fit(clean(cmd), 40)} (exit {rc})"
-        self.m.ask = {"kind": "share", "label": label, "what": "that command", "command": cmd, "rc": rc,
-                      "output": out, "question": f"{label}. Share the output with the model?"}
+        for c in cmds[-20:]:
+            n = c.lines()
+            self.m.note(f"{c.n:>3} {'✓' if c.rc == 0 else '✗'} {fit(clean(label(c)), 32):32} exit {c.rc} · "
+                        f"{n} line{'s' if n != 1 else ''} · {ago(c.ended)}", "" if c.rc == 0 else W)
+        self.m.note("/share N reviews one, then sends it; so does a click on it in the info panel")
+
+    def recent(self):
+        """The info panel's COMMANDS: the latest first, with what a click shares."""
+        rows = [{"n": c.n, "cmd": clean(label(c)), "rc": c.rc, "lines": c.lines(), "ago": ago(c.ended),
+                 "screen": c.screen} for c in reversed(self.rec.finished()[-10:])]
+        cur = self.rec.running()
+        if cur:
+            rows.insert(0, {"n": cur.n, "cmd": "", "rc": None, "lines": None, "ago": "", "running": True})
+        return rows
 
     def share_context(self, what):
         """Shell history for the model to refer to: everything, or from the line the user marked."""
+        if what == "mark" and self.ctx_line is None:
+            self.m.note("no mark yet: right-click a line in the shell pane and choose \"Mark start of "
+                        "context here\", or /mark", R)
+            return
         try:
-            end = self.shell.num("@genai_mark")            # where the shell's current prompt starts
-            if what == "mark":
-                raw = self.shell.opt("@genai_ctx_mark")
-                if not raw.isdigit():
-                    self.m.note("no mark yet: right-click a line in the shell pane and choose \"Mark start of "
-                                "context here\", or /mark", R)
-                    return
-                start = int(raw) - 1
-            else:
-                start = -1
-            out = self.shell.output(start, end) if end > start + 1 else ""
+            lines = self.shell.lines()
         except (OSError, subprocess.SubprocessError) as e:
             self.m.note(f"tmux failed ({e})", R)
             return
+        end = max(len(lines) - self.rec.ps1_lines, 0)        # the current prompt isn't context
+        out = "\n".join(lines[(self.ctx_line if what == "mark" else 0):end]).strip("\n")
         if not out.strip():
             self.m.note("the shell pane has nothing " + ("after the mark" if what == "mark" else "to share") + " yet", R)
             return
         n = out.count("\n") + 1
-        label = f"{n} lines of shell history" + (" from the mark" if what == "mark" else "")
-        self.m.ask = {"kind": "share", "context": True, "label": label, "output": out,
+        label_ = f"{n} lines of shell history" + (" from the mark" if what == "mark" else "")
+        self.m.ask = {"kind": "share", "context": True, "label": label_, "output": out,
                       "from": " from the line I marked" if what == "mark" else "",
-                      "question": f"Share {label} with the model? It goes with your next message."}
+                      "question": f"Share {label_} with the model? It goes with your next message."}
 
     def mark_here(self):
+        """/mark: shell context starts at the shell's current prompt."""
         try:
-            self.shell.tmux("set", "-g", "@genai_ctx_mark", str(self.shell.num("@genai_mark")))
+            self.ctx_line = max(len(self.shell.lines()) - self.rec.ps1_lines, 0)
         except (OSError, subprocess.SubprocessError) as e:
             self.m.note(f"tmux failed ({e})", R)
             return
         self.m.note("shell context starts at the shell's current prompt; /share mark sends it from there")
+
+    def mark_line(self):
+        """The right-click menu marked a line: turn its row number into a logical line now, before a resize could
+        move it."""
+        try:
+            raw = self.shell.opt("@genai_ctx_mark")
+            if not raw.isdigit():
+                return
+            self.ctx_line = len(self.shell.lines(upto=int(raw))) - 1
+            self.shell.tmux("display-message", "-t", self.shell.pane, "genai: shell context starts at this line")
+        except (OSError, subprocess.SubprocessError) as e:
+            self.m.note(f"tmux failed ({e})", R)
 
     def edit(self, text, title, what, cancel):
         """Open text in the user's editor; what they save, without # lines. None if the editor failed."""
@@ -1501,14 +1539,22 @@ class App:
                 self.from_prompt(msg)
             elif role == "panel":
                 self.m.request(msg)
-            elif role == "menu" and msg.get("type") == "share":
+            elif role == "menu" and msg.get("type") in ("share", "mark"):
                 self.m.request(msg)
             elif role == "menu" and msg.get("type") == "menu" and isinstance(msg.get("id"), str):
                 if msg.get("action") in ("run", "edit", "prompt", "copy"):
                     self.menu_action(msg["action"], msg["id"])
         for action in self.m.actions:
             if action == ("share", "last"):
-                self.share_last()
+                self.share_command(self.rec.last(), "last")
+            elif action[0] == "share_cmd":
+                self.share_command(self.rec.get(action[1]), action[1])
+            elif action[0] == "commands":
+                self.list_commands()
+            elif action[0] == "mark_line":
+                self.mark_line()
+            elif action[0] == "unmark":
+                self.ctx_line = None
             elif action[0] == "share":
                 self.share_context(action[1])
             elif action[0] == "mark":
@@ -1533,6 +1579,8 @@ class App:
         for msg in self.m.outbox:
             self.child.send(msg)
         self.m.outbox = []
+        if self.shell:
+            self.m.recent = self.recent()
         self.publish()
 
 

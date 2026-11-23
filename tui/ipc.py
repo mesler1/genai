@@ -24,8 +24,8 @@ MAX_CLIENTS = 16
 SEND_TIMEOUT = 2            # seconds a send may wait on a pane that has stopped reading
 ROLES = {
     "prompt": {"input", "key", "scroll", "quit"},
-    "panel": {"coding", "skill", "skills"},
-    "menu": {"share", "menu"},
+    "panel": {"coding", "skill", "skills", "command"},
+    "menu": {"share", "menu", "mark"},
 }
 
 
