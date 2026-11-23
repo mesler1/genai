@@ -46,6 +46,8 @@ COMMANDS = {
     "/mark": "shell context starts at the shell's current prompt (or right-click a line in the shell)",
     "/shell": "show the shell and move there (`` on its empty prompt hides it again)",
     "/panel": "show or hide the info panel on the right",
+    "/raw": "[N|all]: what was sent to the endpoint and what came back, for the last turn, turn N, or all kept",
+    "/system": "the system prompt and tool definitions sent with every request",
     "/compact": "shrink the conversation when the context is getting full",
     "/context": "show how full the context is",
     "/clear": "clear the screen (the conversation itself is kept)",
@@ -206,6 +208,8 @@ Q, A, W, D, R = "quiet", "accent", "waiting", "done", "risk"
 
 
 class Block:
+    turn = 0                       # the turn it belongs to (0: before the first message)
+
     def __init__(self):
         self.version = 0
 
@@ -395,8 +399,12 @@ class Model:
         self.ask = None            # a question of ours in place of the input box: run or share
         self.actions = []          # things for the screen to do: ("share", "last"), ("focus_shell",)
         self.recent = []           # the shell pane's latest commands, for the info panel
+        self.turn = 0              # turns sent to genai so far
+        self.exchanges = {}        # turn: [first, last] exchange with the endpoint, for /raw
 
     def add(self, block):
+        if "turn" not in vars(block):
+            block.turn = self.turn
         self.blocks.append(block)
         return block
 
@@ -439,7 +447,11 @@ class Model:
                 card.state = "done" if ev.get("status") == "ok" else "error"
                 card.detail = ev.get("detail") or ""
                 card.changed()
+        elif t in ("trace", "system"):
+            self.actions.append(("show", ev))
         elif t == "done":
+            if ev.get("exchanges"):
+                self.exchanges[self.turn] = ev["exchanges"]
             self.busy = False
             self.context = ((ev.get("context") or {}).get("used"), (ev.get("context") or {}).get("limit"))
             if ev.get("reason") == "step_limit":
@@ -448,6 +460,8 @@ class Model:
         elif t == "context":
             self.context = (ev.get("used"), ev.get("limit"))
         elif t == "error":
+            if ev.get("exchanges"):
+                self.exchanges[self.turn] = ev["exchanges"]
             self.note(f"error: {ev.get('message', '')}", R)
             if self.busy and not self.pending and ev.get("code") not in ("busy", "unknown_id", "bad_message",
                                                                          "unknown_type"):
@@ -503,6 +517,7 @@ class Model:
         elif self.busy:
             self.queued.append(self.add(UserMsg(text, queued=True, attached=attached)))
         else:
+            self.turn += 1
             self.add(UserMsg(text, attached=attached))
             self.busy = True
             self.send({"type": "user", "text": text})
@@ -515,7 +530,8 @@ class Model:
     def next_queued(self):
         if self.queued and not self.busy:
             msg = self.queued.pop(0)
-            msg.queued = False
+            self.turn += 1
+            msg.queued, msg.turn = False, self.turn
             msg.changed()
             self.blocks.remove(msg)
             self.add(msg)
@@ -574,6 +590,12 @@ class Model:
             self.actions.append(("focus_shell",))
         elif cmd == "/panel":
             self.actions.append(("panel",))
+        elif cmd in ("/raw", "/system") and self.busy and not self.pending:
+            self.note(f"{cmd} has to wait until genai finishes this reply", W)
+        elif cmd == "/system":
+            self.send({"type": "system"})
+        elif cmd == "/raw":
+            self.raw(arg)
         elif cmd == "/context":
             used, limit = self.context or (None, None)
             self.note(f"context: {used}/{limit} tokens" if used is not None else "context: not measured yet")
@@ -583,6 +605,24 @@ class Model:
             self.quit = True
         else:
             self.note(f"unknown command {cmd} (/help lists them)", R)
+
+    def raw(self, arg):
+        """Ask genai for a turn's exchanges with the endpoint: the latest turn that had any, turn N, or all."""
+        if arg == "all":
+            self.send({"type": "trace", "from": 1, "to": 1 << 30})
+            return
+        if arg and not arg.isdigit():
+            self.note("usage: /raw, /raw N (a turn) or /raw all", R)
+            return
+        turn = int(arg) if arg else max(self.exchanges, default=None)
+        if self.busy and self.pending and not arg:
+            self.send({"type": "trace"})               # this turn hasn't ended: its latest exchange
+        elif turn is None or turn not in self.exchanges:
+            self.note("nothing has been sent to the endpoint yet" if turn is None else
+                      f"turn {turn} has no exchanges with the endpoint", R)
+        else:
+            lo, hi = self.exchanges[turn]
+            self.send({"type": "trace", "from": lo, "to": hi})
 
     def snapshot(self):
         """What the info panel shows. Proposal titles and details are escaped here and again where drawn."""
@@ -608,6 +648,10 @@ class Model:
             self.command(f"/skill {msg['name']} {'on' if msg['on'] else 'off'}")
         elif t == "skills" and not self.busy and self.exited is None:
             self.send({"type": "skills"})
+        elif t == "raw" and (type(msg.get("turn")) is int or msg.get("turn") in ("all", "last")):
+            self.command(f"/raw {'' if msg['turn'] == 'last' else msg['turn']}".strip())
+        elif t == "system":
+            self.command("/system")
         elif t == "share" and msg.get("what") in ("mark", "all", "last") and self.shell:
             self.actions.append(("share", msg["what"]))
         elif t == "command" and type(msg.get("n")) is int and self.shell:
@@ -794,10 +838,76 @@ def review_buffer(command, rc, where, output):
 
 
 # --------------------------------------------------------------------------
+# The raw view: what went to the endpoint and what came back
+
+def pretty(text):
+    """JSON text indented for reading, or the text as it is if it isn't JSON."""
+    try:
+        return json.dumps(json.loads(text), indent=2, ensure_ascii=False)
+    except ValueError:
+        return text
+
+
+def safe_lines(text):
+    """Text for the pager: control and invisible characters shown as escapes, as everywhere else."""
+    return "\n".join(clean(ln) for ln in text.split("\n"))
+
+
+def render_trace(ev, turns):
+    """A trace event as text for a pager. turns maps a turn to its [first, last] exchange, to name them."""
+    exs = ev.get("exchanges") or []
+    named = {n: t for t, (a, b) in turns.items() for n in range(a, b + 1)}
+    kept = ev.get("kept")
+    out = ["genai: what was sent to the endpoint, and what came back",
+           "Exactly as sent and received, except your API key and the endpoint's own header values. Request bodies",
+           "are indented here for reading; they were sent as compact JSON. q leaves, / searches.", ""]
+    if not exs:
+        out.append("genai no longer has these exchanges" + (f" (it keeps the last 30: {kept[0]}–{kept[1]})" if kept
+                                                            else ""))
+    for ex in exs:
+        n = ex.get("n")
+        status = ex.get("status", "?") + (f": {ex['error']}" if ex.get("error") else "")
+        took = f" · {ex['ms'] / 1000:.1f} s" if isinstance(ex.get("ms"), int) else ""
+        turn = f" · turn {named[n]}" if n in named else ""
+        out += ["═" * 78, f"Exchange {n}{turn} · {ex.get('time', '')}{took} · {status}", "═" * 78, "",
+                f"{ex.get('method', 'POST')} {ex.get('url', '')}"]
+        out += [f"{k}: {v}" for k, v in (ex.get("headers") or {}).items()]
+        body = ex.get("request") or ""
+        out += ["", f"── Request body ({len(body.encode())} bytes) " + "─" * 40, pretty(body), ""]
+        resp = ex.get("response") or []
+        how = "streamed, " + f"{len(resp)} lines" if ex.get("stream") else "one body"
+        out += [f"── Response: HTTP {ex.get('http', '?')}, {how} " + "─" * 40]
+        out += resp if ex.get("stream") else [pretty("".join(resp))]
+        if ex.get("message") is not None:
+            out += ["", "── The reply as genai put it together " + "─" * 40,
+                    json.dumps(ex["message"], indent=2, ensure_ascii=False)]
+        if ex.get("usage"):
+            out += ["", f"usage: {json.dumps(ex['usage'])}"]
+        out.append("")
+    return safe_lines("\n".join(out))
+
+
+def render_system(ev):
+    out = ["genai: the system prompt and tools sent with every request",
+           "Your conversation follows the system prompt in each request. q leaves, / searches.", "",
+           f"model: {ev.get('model', '?')}", f"params: {json.dumps(ev.get('params') or {})}", "",
+           "── System prompt " + "─" * 60, ev.get("system", ""), "",
+           "── Tools " + "─" * 68, json.dumps(ev.get("tools") or [], indent=2, ensure_ascii=False)]
+    return safe_lines("\n".join(out))
+
+
+# --------------------------------------------------------------------------
 # The shell pane, through tmux
 
 class Busy(Exception):
     pass
+
+
+def menu_item(*args):
+    """The tmux command for a menu item: it runs request.py, which sends the choice over the socket. A menu
+    command is a tmux format, so it is quoted for tmux, and carries only fixed words and checked ids."""
+    cmd = shlex.join([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "request.py"), *args])
+    return 'run-shell -b "' + cmd.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("#", "##") + '"'
 
 
 class Shell:
@@ -873,11 +983,9 @@ class Shell:
         if not re.fullmatch(r"p[0-9]{1,9}", pid):
             return
         me = os.environ.get("TMUX_PANE", "")
-        helper = os.path.join(os.path.dirname(os.path.abspath(__file__)), "request.py")
 
-        def pick(what):            # a menu item runs request.py, which sends the choice over the socket
-            cmd = shlex.join([sys.executable, helper, "menu", what, pid])
-            return 'run-shell -b "' + cmd.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("#", "##") + '"'
+        def pick(what):
+            return menu_item("menu", what, pid)
         # display-menu returns only when the menu closes, so don't wait for it.
         self.menus = [p for p in getattr(self, "menus", []) if p.poll() is None]
         self.menus.append(subprocess.Popen(["tmux", "display-menu", "-t", me, "-x", "M", "-y", "M", "-T", f" {pid}: runs {where} ",
@@ -886,6 +994,20 @@ class Shell:
                   "Put it at the shell prompt (you press Enter)", "p", pick("prompt"),
                   "Copy it", "c", pick("copy"),
                   "", "Cancel", "q", ""],
+                                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+
+    def raw_menu(self, turn):
+        """Right-click in the conversation: tmux's menu for looking behind it. Only fixed words and a number."""
+        me = os.environ.get("TMUX_PANE", "")
+        pick = menu_item
+        items = (["What was sent and received for this turn", "r", pick("raw", str(turn))] if turn else []) + [
+            "What was sent and received last", "l", pick("raw", "last"),
+            "Everything genai still has (last 30)", "a", pick("raw", "all"),
+            "The system prompt and tools", "s", pick("system"),
+            "", "Cancel", "q", ""]
+        self.menus = [p for p in getattr(self, "menus", []) if p.poll() is None]
+        self.menus.append(subprocess.Popen(["tmux", "display-menu", "-t", me, "-x", "M", "-y", "M", "-T",
+                                            f" raw view{f' · turn {turn}' if turn else ''} ", *items],
                                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
 
     def title(self, text):
@@ -1259,7 +1381,7 @@ class App:
             self.shell.tmux("join-pane", "-d", "-h", "-f", "-l", "42", "-s", self.panel, "-t", me)
 
     def click(self):
-        """The wheel scrolls; a click on a command card opens its menu."""
+        """The wheel scrolls; a click on a command card opens its menu; a right-click anywhere opens the raw view's."""
         try:
             _, x, y, _, b = curses.getmouse()
         except curses.error:
@@ -1270,6 +1392,10 @@ class App:
             self.scroll = max(self.scroll - 3, 0)
         elif not b & (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED | curses.BUTTON3_PRESSED):
             return                                  # a release, or a move: only a press opens the menu
+        elif b & curses.BUTTON3_PRESSED and self.shell:
+            block = self.rows[y] if 0 <= y < len(self.rows) else None
+            turn = getattr(block, "turn", 0)
+            self.shell.raw_menu(turn if turn in self.m.exchanges else 0)
         elif 0 <= y < len(self.rows) and not self.m.pending and not self.m.ask:
             card = self.rows[y]
             if isinstance(card, Card) and card.ev.get("kind") == "command":
@@ -1477,13 +1603,32 @@ class App:
             sys.stdout.flush()
             self.scr.refresh()
 
-    def run_here(self, argv):
+    def run_here(self, argv, full=False):
         """Run an editor or pager where the user can use it: in a tmux popup when typing happens in the prompt
         pane, else in this pane. Returns its exit code."""
         if not self.prompt:
             return subprocess.call(argv)
         cmd = shlex.join(argv).replace("#", "##")        # a popup's command is a tmux format
-        return subprocess.call(["tmux", "display-popup", "-E", "-w", "90%", "-h", "85%", cmd])
+        size = ["-w", "100%", "-h", "100%"] if full else ["-w", "90%", "-h", "85%"]
+        return subprocess.call(["tmux", "display-popup", "-E", *size, cmd])
+
+    def show_raw(self, ev):
+        """A trace or system answer from genai, full screen in a pager. The file holds the whole conversation, so
+        it goes in genai-tui's private directory (or a private one of its own) and is gone when the pager closes."""
+        text = render_system(ev) if ev.get("type") == "system" else render_trace(ev, self.m.exchanges)
+        where = self.state_dir or tempfile.mkdtemp(prefix="genai-tui-raw-")
+        fd, path = tempfile.mkstemp(prefix="raw-", suffix=".txt", dir=where)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text + "\n")
+            curses.endwin()
+            pager = ["less", "-+F", "-i", path] if shutil.which("less") else ["more", path]
+            self.run_here(pager, full=True)
+        finally:
+            os.unlink(path)
+            if not self.state_dir:
+                os.rmdir(where)
+            self.scr.refresh()
 
     def page(self, k):
         h, _ = self.scr.getmaxyx()
@@ -1539,7 +1684,7 @@ class App:
                 self.from_prompt(msg)
             elif role == "panel":
                 self.m.request(msg)
-            elif role == "menu" and msg.get("type") in ("share", "mark"):
+            elif role == "menu" and msg.get("type") in ("share", "mark", "raw", "system"):
                 self.m.request(msg)
             elif role == "menu" and msg.get("type") == "menu" and isinstance(msg.get("id"), str):
                 if msg.get("action") in ("run", "edit", "prompt", "copy"):
@@ -1551,6 +1696,8 @@ class App:
                 self.share_command(self.rec.get(action[1]), action[1])
             elif action[0] == "commands":
                 self.list_commands()
+            elif action[0] == "show":
+                self.show_raw(action[1])
             elif action[0] == "mark_line":
                 self.mark_line()
             elif action[0] == "unmark":
