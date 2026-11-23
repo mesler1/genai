@@ -14,7 +14,7 @@ import importlib
 import json
 import os
 
-BUILTIN = ("model", "copy", "decline", "raw", "ssh")
+BUILTIN = ("model", "copy", "decline", "raw", "ssh", "files")
 
 
 class Feature:
@@ -43,6 +43,11 @@ class Feature:
     def request(self, m, role, msg):
         """A socket request of one of its types, from a pane in one of the roles it allows (None where the Model is
         driven directly). msg is untrusted: check it, then act as the user's command would."""
+
+    def error(self, m, ev):
+        """A genai error event. Return True only for the failure of one of its own requests, which it has then dealt
+        with; any other is left to the core."""
+        return False
 
     def action(self, app, action):
         """One of its Model.actions, to be done on screen. app is the App."""

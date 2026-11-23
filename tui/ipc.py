@@ -27,6 +27,7 @@ ROLES = {
     "prompt": {"input", "key", "scroll", "quit"},
     "panel": {"coding", "skill", "skills", "command"},
     "menu": {"share", "menu", "mark"},
+    "files": set(),          # the files feature adds what this pane may ask for
 }
 # What no feature may ever be given: answering a question or approving something is the prompt pane's alone.
 NEVER = {"hello", "input", "key", "scroll", "quit", "decision", "answer"}
