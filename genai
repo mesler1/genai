@@ -7,6 +7,7 @@ human decides. Standard library only; Python 3.10 or newer.
 """
 
 import argparse
+import collections
 import datetime
 import difflib
 import hashlib
@@ -43,6 +44,7 @@ WARN_FRACTION = 0.8
 KEEP_TURNS = 2                 # user turns kept word for word by :compact
 SUMMARY_WORDS = 300
 HOOK_TIMEOUT = 10              # seconds a notify hook may run before it is killed
+TRACE_KEEP = 30                # exchanges with the endpoint kept in memory, for a wrapper to show
 
 EXIT_OK, EXIT_ERROR, EXIT_USAGE, EXIT_PROFILE, EXIT_API, EXIT_CONTEXT = 0, 1, 2, 3, 4, 5
 EXIT_INTERRUPT = 130
@@ -1293,8 +1295,13 @@ class Client:
         self.opener = urllib.request.build_opener(
             urllib.request.ProxyHandler(proxies),  # environment proxies are ignored
             urllib.request.HTTPSHandler(context=ctx), NoRedirect())
+        # Each chat request and its reply, exactly as sent and received, in memory only: a wrapper can show
+        # them (the trace message). Header values that may be secret are left out.
+        self.trace = collections.deque(maxlen=TRACE_KEEP)
+        self.exchanges = 0
+        self._ex = None
 
-    def _request(self, path, body=None):
+    def _request(self, path, body=None, trace=False):
         headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream",
                    "User-Agent": f"genai/{VERSION}"}
         headers.update(self.p.headers)
@@ -1303,10 +1310,24 @@ class Client:
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(self.p.base_url + path, data=data, headers=headers,
                                      method="POST" if data is not None else "GET")
+        if trace:
+            self.exchanges += 1
+            shown = {k: "Bearer (your API key, not shown)" if k == "Authorization" else
+                     "(set in the endpoint; not shown)" if k in self.p.headers else v for k, v in headers.items()}
+            self._ex = {"n": self.exchanges, "time": now(), "method": req.get_method(), "url": req.full_url,
+                        "headers": shown, "request": data.decode("utf-8", "replace") if data else "",
+                        "status": "sending", "response": [], "response_bytes": 0, "started": time.time()}
+            self.trace.append(self._ex)
         try:
-            return self.opener.open(req, timeout=self.p.timeout)
+            r = self.opener.open(req, timeout=self.p.timeout)
+            if trace:
+                self._ex["http"] = r.status
+            return r
         except urllib.error.HTTPError as e:
             detail = e.read(2000).decode("utf-8", "replace").strip()
+            if trace:
+                self._ex["http"] = e.code
+                self._got(detail)
             raise GenaiError(f"endpoint returned HTTP {e.code}: {detail[:500]}", EXIT_API, "api")
         except (urllib.error.URLError, OSError) as e:
             reason = getattr(e, "reason", e)
@@ -1316,8 +1337,27 @@ class Client:
         with self._request("/models") as r:
             return json.load(r)
 
+    def _got(self, text):
+        """Keep what the endpoint sent, as it came, up to the reply cap."""
+        ex = self._ex
+        if ex is not None and ex["response_bytes"] <= REPLY_CAP:
+            ex["response"].append(text)
+            ex["response_bytes"] += len(text)
+
     def chat(self, messages, tools, on_text, max_tokens=None):
         """Send one request. Returns (message, usage)."""
+        self._ex = None
+        try:
+            msg, usage = self._chat(messages, tools, on_text, max_tokens)
+        except GenaiError as e:
+            if self._ex is not None:
+                self._ex.update(status="error", error=str(e), ms=int(1000 * (time.time() - self._ex["started"])))
+            raise
+        if self._ex is not None:
+            self._ex.update(status="ok", message=msg, usage=usage, ms=int(1000 * (time.time() - self._ex["started"])))
+        return msg, usage
+
+    def _chat(self, messages, tools, on_text, max_tokens=None):
         params = dict(self.params)
         stream = bool(params.pop("stream", True))
         body = {"model": self.p.model, "messages": messages, "stream": stream}
@@ -1326,9 +1366,12 @@ class Client:
             body["tools"] = tools
         if max_tokens:
             body["max_tokens"] = max_tokens
-        with self._request("/chat/completions", body) as r:
+        with self._request("/chat/completions", body, trace=True) as r:
+            if self._ex is not None:
+                self._ex["stream"] = stream
             if not stream:
                 raw = r.read(REPLY_CAP + 1)
+                self._got(raw.decode("utf-8", "replace"))
                 if len(raw) > REPLY_CAP:
                     raise too_big()
                 data = json.loads(raw)
@@ -1350,6 +1393,8 @@ class Client:
             if not raw:
                 break
             line = raw.decode("utf-8", "replace").strip()
+            if line:
+                self._got(line)
             if not line.startswith("data:"):
                 continue
             payload = line[5:].strip()
@@ -2198,6 +2243,8 @@ class JsonUI:
                 self.error(f"no pending proposal {pid!r} of that kind", "unknown_id")
             elif t == "attach":
                 self.queue_attach(msg)
+            elif t in ("trace", "system"):
+                inspect(self.engine, self, msg)
             else:
                 self.error(f"'{t}' is not allowed while proposals are pending", "busy")
         for p in waiting.values():
@@ -2535,11 +2582,26 @@ def read_attachment(path):
 # --------------------------------------------------------------------------
 # JSON mode driver
 
+def inspect(engine, ui, msg):
+    """trace and system: what was sent to the endpoint and what came back, or what the next request will
+    carry besides the conversation. Read only, so allowed while proposals are pending."""
+    if msg.get("type") == "system":
+        ui.emit({"type": "system", "system": engine.system()["content"], "tools": engine.tools(),
+                 "model": engine.endpoint.model, "params": getattr(engine.client, "params", {})})
+        return
+    trace = list(getattr(engine.client, "trace", []))
+    lo, hi = msg.get("from"), msg.get("to")
+    if type(lo) is not int or type(hi) is not int:
+        lo = hi = trace[-1]["n"] if trace else 0
+    ui.emit({"type": "trace", "from": lo, "to": hi, "kept": [trace[0]["n"], trace[-1]["n"]] if trace else None,
+             "exchanges": [{k: v for k, v in ex.items() if k != "started"} for ex in trace if lo <= ex["n"] <= hi]})
+
+
 def run_json(engine, ui, first_prompt, attachments):
     ui.engine = engine
     ui.emit({"type": "hello", "protocol": PROTOCOL, "version": VERSION,
              "features": ["proposals", "decisions", "attach", "register_tools", "compact", "context", "coding",
-                          "set_coding", "skills", "files"],
+                          "set_coding", "skills", "files", "trace", "system"],
              "endpoint": engine.endpoint.info(),
              "profile": {"name": engine.profile.name, "description": engine.profile.description}
              if engine.profile else None,
@@ -2555,12 +2617,19 @@ def run_json(engine, ui, first_prompt, attachments):
                      sandbox=engine.sandbox)
 
     def turn(text, att):
+        first = getattr(engine.client, "exchanges", 0) + 1
         try:
             reason = engine.user_turn(text, att)
             ui.emit({"type": "done", "reason": reason, "context": {"used": engine.used(),
-                                                                    "limit": engine.endpoint.context_limit}})
+                                                                    "limit": engine.endpoint.context_limit},
+                     "exchanges": exchanges(first)})
         except GenaiError as err:
-            ui.error(str(err), err.kind)
+            ui.error(str(err), err.kind, exchanges=exchanges(first))
+
+    def exchanges(first):
+        """The numbers of this turn's exchanges with the endpoint, for the trace message; None if there were none."""
+        last = getattr(engine.client, "exchanges", 0)
+        return [first, last] if last >= first else None
 
     if first_prompt is not None:
         turn(first_prompt, attachments)
@@ -2628,6 +2697,8 @@ def run_json(engine, ui, first_prompt, attachments):
                 ui.emit({"type": "files", "path": path, "entries": engine.files(path)})
             except (ValueError, OSError) as err:
                 ui.error(f"cannot list {path}: {err}", "bad_path")
+        elif t in ("trace", "system"):
+            inspect(engine, ui, msg)
         elif t in ("decision", "result"):
             ui.error(f"no pending proposal {msg.get('id')!r}", "unknown_id")
         else:

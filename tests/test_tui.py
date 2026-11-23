@@ -32,6 +32,11 @@ REC = load("recorder", os.path.join(REPO, "tui", "recorder.py"))
 G = load("genai_for_tui", os.path.join(REPO, "genai"))
 
 
+def slurp(path):
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
 def text_of(block, w=60):
     return "\n".join("".join(t for t, _ in ln) for ln in block.lines(w))
 
@@ -229,6 +234,61 @@ class TestModel(unittest.TestCase):
                     {"type": "command", "n": True}, {"type": "mark", "on": True}, {"type": "mark", "on": False}):
             m.request(msg)
         self.assertEqual(m.actions, [("share", "mark"), ("share_cmd", 4), ("mark_line",), ("unmark",)])
+
+
+class TestRawView(unittest.TestCase):
+    def test_turns_and_raw_requests(self):
+        m = C.Model()
+        m.submit("/raw")
+        self.assertIn("nothing has been sent", text_of(m.blocks[-1]))
+        m.submit("one")
+        m.handle({"type": "done", "reason": "reply", "exchanges": [1, 2]})
+        m.submit("two")
+        m.handle({"type": "error", "code": "api", "message": "boom", "exchanges": [3, 3]})
+        self.assertEqual(m.exchanges, {1: [1, 2], 2: [3, 3]})
+        self.assertEqual([b.turn for b in m.blocks if isinstance(b, C.UserMsg)], [1, 2])
+        m.outbox = []
+        for line in ("/raw", "/raw 1", "/raw all", "/system", "/raw 9", "/raw x"):
+            m.submit(line)
+        self.assertEqual(m.outbox, [{"type": "trace", "from": 3, "to": 3}, {"type": "trace", "from": 1, "to": 2},
+                                    {"type": "trace", "from": 1, "to": 1 << 30}, {"type": "system"}])
+        self.assertIn("usage: /raw", text_of(m.blocks[-1]))
+        m.outbox = []
+        m.request({"type": "raw", "turn": 1})
+        m.request({"type": "raw", "turn": "last"})
+        m.request({"type": "raw", "turn": "1; rm"})
+        self.assertEqual(m.outbox, [{"type": "trace", "from": 1, "to": 2}, {"type": "trace", "from": 3, "to": 3}])
+        m.handle({"type": "trace", "exchanges": []})
+        self.assertEqual(m.actions[-1][0], "show")
+
+    def test_raw_waits_for_a_reply_to_finish(self):
+        m = C.Model()
+        m.submit("go")
+        m.outbox = []
+        m.submit("/raw")
+        self.assertEqual(m.outbox, [])
+        m.handle({"type": "proposal", "id": "p1", "kind": "write", "path": "x", "content": "y"})
+        m.submit("/raw")                                   # genai answers while a proposal waits
+        self.assertEqual(m.outbox, [{"type": "trace"}])
+
+    def test_rendered_exchange(self):
+        ev = {"type": "trace", "exchanges": [{
+            "n": 3, "time": "t", "method": "POST", "url": "https://e/v1/chat/completions", "ms": 1500,
+            "headers": {"Authorization": "Bearer (your API key, not shown)"}, "http": 200, "stream": True,
+            "request": json.dumps({"messages": [{"role": "user", "content": "hi\u202e"}]}),
+            "response": ['data: {"choices":[{"delta":{"content":"he\u001b[2Jllo"}}]}', "data: [DONE]"],
+            "status": "ok", "message": {"role": "assistant", "content": "hello"}, "usage": {"total_tokens": 9}}]}
+        text = C.render_trace(ev, {2: [3, 3]})
+        self.assertIn("Exchange 3 · turn 2 · t · 1.5 s · ok", text)
+        self.assertIn("Authorization: Bearer (your API key, not shown)", text)
+        self.assertIn('"content": "hi\\u202e"', text)          # escaped, never raw
+        self.assertIn("streamed, 2 lines", text)
+        self.assertIn('"total_tokens": 9', text)
+        self.assertNotIn("\u202e", text)
+        self.assertNotIn("\x1b", text)
+        self.assertIn("no longer has", C.render_trace({"exchanges": [], "kept": [5, 34]}, {}))
+        sys_text = C.render_system({"system": "You are genai", "tools": [{"name": "t"}], "model": "m"})
+        self.assertIn("You are genai", sys_text)
 
 
 def mark(kind, *args, nonce="0123456789abcdef"):
@@ -466,14 +526,14 @@ class TestInTmux(TmuxCase):
 class TestGenaiTui(TmuxCase):
     """tui/genai-tui itself: the conversation pane above a real bash pane, started through a pseudo-terminal."""
 
-    def start(self, api, editor="true"):
+    def start(self, api, editor="true", path=None):
         home = self.config(api)
         self.runtime = tempfile.mkdtemp(prefix="gr-", dir="/tmp")      # short: socket paths are limited
         os.chmod(self.runtime, 0o700)
         self.addCleanup(shutil.rmtree, self.runtime, True)
         env = dict(os.environ, XDG_CONFIG_HOME=os.path.dirname(home), HOME=self.tmp, LANG="C.UTF-8",
                    TERM="xterm-256color", GENAI_TUI_SOCKET=self.sock, EDITOR=editor, VISUAL=editor,
-                   XDG_RUNTIME_DIR=self.runtime)
+                   XDG_RUNTIME_DIR=self.runtime, PATH=f"{path}:{os.environ['PATH']}" if path else os.environ["PATH"])
         env.pop("TMUX", None)
         self.proc = subprocess.Popen(["script", "-qfc", f"stty cols 110 rows 40; {REPO}/tui/genai-tui -e test",
                                       "/dev/null"], cwd=self.wd, env=env, stdin=subprocess.PIPE,
@@ -608,6 +668,41 @@ class TestGenaiTui(TmuxCase):
             self.key("y")
             self.wait_for("got it")
             self.assertIn("```\necho first-out\n```\nOutput:\n```\nfirst-out\n```", self.sent(api))
+
+    def test_raw_view_from_the_menu_and_by_command(self):
+        bindir = tempfile.mkdtemp(prefix="genai-tui-bin-")
+        self.addCleanup(shutil.rmtree, bindir, True)
+        seen = os.path.join(bindir, "seen")
+        with open(os.path.join(bindir, "less"), "w") as f:                 # a pager that keeps what it was shown
+            f.write(f'#!/bin/sh\nfor a; do last=$a; done\ncat "$last" >> {seen}\n')
+        os.chmod(os.path.join(bindir, "less"), 0o700)
+        with FakeAPI([reply("hello there")]) as api:
+            self.start(api, path=bindir)
+            self.type("say hi")
+            self.wait_for("hello there")
+            y = next(i for i, ln in enumerate(self.screen("genai").splitlines()) if "hello there" in ln)
+            top = int(self.tmux("display", "-p", "-t", self.panes()["genai"], "#{pane_top}"))
+            left = int(self.tmux("display", "-p", "-t", self.panes()["genai"], "#{pane_left}"))
+            self.at_terminal(f"\x1b[<2;{left + 5};{top + y + 1}M")       # right-click the reply
+            time.sleep(0.5)
+            self.at_terminal("r")                                         # "What was sent and received for this turn"
+            end = time.time() + 10
+            while time.time() < end and not os.path.exists(seen):
+                time.sleep(0.1)
+            time.sleep(0.3)
+            shown = slurp(seen)
+            self.assertIn("Exchange 1 · turn 1", shown)
+            self.assertIn('"content": "say hi"', shown)
+            self.assertIn("data: ", shown)
+            self.type("/system")
+            end = time.time() + 10
+            while time.time() < end and "system prompt and tools" not in slurp(seen):
+                time.sleep(0.1)
+            self.assertIn("You are genai", slurp(seen))
+            self.assertEqual([n for n in os.listdir(self.runtime_state()) if n.startswith("raw-")], [])
+
+    def runtime_state(self):
+        return next(os.path.join(self.runtime, d) for d in os.listdir(self.runtime) if d.startswith("genai-tui."))
 
     def test_a_mark_survives_resizing(self):
         with FakeAPI([reply("seen it")]) as api:

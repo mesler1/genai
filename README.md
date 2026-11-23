@@ -202,8 +202,10 @@ later.
 | `skills` | | Answered by `skills`: every skill, its blessing `status`, and whether it is `active`. |
 | `skill` | `name`, `on` (true or false) | Uses a skill from the next request on, or stops using it. Only a blessed skill can be turned on (errors `unknown_skill`, `not_blessed`). Always answered by a fresh `skills` list. |
 | `files` | optional `path` (default `.`) | Lists one directory under the working directory, for a file tree. Each entry has `name`, `kind` (`file`, `dir`, `symlink`, `other`), `size` and `hidden`. A file also has `secret` (it looks like it holds secrets; `null` if genai would not read it at all, such as a binary or a file over the read limit) and `asks` (reading it would need your OK, even in coding mode). Contents are read only to classify them and never reach the model. Symlinks are listed, not followed; a bad path gets the error `bad_path`. |
+| `trace` | optional `from`, `to` (exchange numbers) | Answered by `trace`: the exchanges with the endpoint in that range (default: the latest), exactly as sent and received. Each has `n`, `time`, `method`, `url`, `headers` (the API key and the endpoint's own header values are not shown), `request` (the body, as sent), `http`, `stream`, `response` (the reply as it arrived: each streamed line, or the whole body), `status` (`ok` or `error`, with `error`), `message` (the reply as genai put it together), `usage` and `ms`. genai keeps the last 30, in memory only; `kept` gives the range it still has. |
+| `system` | | Answered by `system`: the system prompt and the tool definitions the next request will carry, with `model` and `params`. |
 
-While proposals are waiting for decisions, only `decision`, `result` and `attach` are accepted.
+While proposals are waiting for decisions, only `decision`, `result`, `attach`, `trace` and `system` are accepted.
 Anything else gets the error `busy`, so coding mode and skills never change halfway through a
 decision.
 
@@ -214,11 +216,11 @@ decision.
 | `text` | A piece of the model's reply. |
 | `proposal` | `id`, `kind` (`read`, `list`, `write`, `edit`, `command`, `external`, `invalid`), and the proposal's fields, such as `path`, `content`, `diff`, `command` and `reason`. `auto: true` means coding mode allowed it without asking. `secret: true` means the file looks like it holds secrets. A command is only shown: the wrapper runs it, if the user wants to, and can share the output with `attach`. |
 | `result` | `id`, `status`, `detail`: what happened to a proposal that was performed. |
-| `done` | The turn ended. `reason` is `reply`, `command` or `step_limit`; `context` gives `used` and `limit`. |
+| `done` | The turn ended. `reason` is `reply`, `command` or `step_limit`; `context` gives `used` and `limit`; `exchanges` gives the first and last exchange numbers of this turn, for `trace` (also on an `error` that ends a turn). |
 | `context` | The conversation is getting near the context limit. |
 | `notice` | Something the user should know. |
 | `error` | `code` and `message`. |
-| `attached`, `registered`, `compacted`, `coding`, `skills`, `files` | Answers to the messages above. |
+| `attached`, `registered`, `compacted`, `coding`, `skills`, `files`, `trace`, `system` | Answers to the messages above. |
 
 When stdin closes, every waiting proposal is declined and genai exits.
 

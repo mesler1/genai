@@ -619,6 +619,42 @@ class TestEndToEnd(Tmp):
             g.close()
             self.assertFalse(any(e["type"] == "coding" for e in g.events))
 
+    def test_wrapper_sees_each_exchange_as_sent_and_received(self):
+        turns = [call("write_file", path="x", content="y", reason="r"), reply("all done")]
+        with FakeAPI(turns) as api:
+            home, path = make_home(self.tmp, api.url, key_env="GENAI_TRACE_KEY", headers={"X-Team": "hush-hush"})
+            bless_path(home, path)
+            self.wd = self.path("wd")
+            os.makedirs(self.wd)
+            with mock.patch.dict(os.environ, GENAI_TRACE_KEY="sk-very-secret"):
+                g = Proc(home, self.wd, ["-e", "test"])
+            self.assertIn("trace", g.until("hello")["features"])
+            g.send({"type": "system"})
+            sysev = g.until("system")
+            self.assertIn("You are genai", sysev["system"])
+            self.assertIn("propose_command", [t["function"]["name"] for t in sysev["tools"]])
+            g.send({"type": "user", "text": "make x"})
+            p = g.until("proposal")
+            g.send({"type": "trace"})                                 # allowed while a proposal waits
+            ex = g.until("trace")["exchanges"]
+            self.assertEqual([e["n"] for e in ex], [1])
+            g.send({"type": "decision", "id": p["id"], "decision": "decline"})
+            done = g.until("done")
+            self.assertEqual(done["exchanges"], [1, 2])
+            g.send({"type": "trace", "from": 1, "to": 2})
+            tr = g.until("trace")
+            g.close()
+            first, second = tr["exchanges"]
+            self.assertEqual(json.loads(first["request"])["messages"][-1], {"role": "user", "content": "make x"})
+            self.assertEqual(first["message"]["tool_calls"][0]["function"]["name"], "write_file")
+            self.assertTrue(any(line.startswith("data:") for line in second["response"]))
+            self.assertEqual((second["status"], second["http"], second["message"]["content"]), ("ok", 200, "all done"))
+            self.assertEqual(second["headers"]["Authorization"], "Bearer (your API key, not shown)")
+            self.assertEqual(second["headers"]["X-Team"], "(set in the endpoint; not shown)")
+            raw = json.dumps(tr)
+            self.assertNotIn("sk-very-secret", raw)
+            self.assertNotIn("hush-hush", raw)
+
     def test_wrapper_turns_skills_on_and_off(self):
         with FakeAPI([reply("one"), reply("two")]) as api:
             g = self.start(api)
