@@ -6,6 +6,7 @@ Usage: request.py share mark|all|last
        request.py raw N|last|all
        request.py system
        request.py menu run|edit|prompt|copy ID
+       request.py menu open N          (Alt+N: the menu of the command proposal showing Alt+N)
 """
 
 import os
@@ -28,6 +29,8 @@ def main(argv):
     elif (len(argv) == 3 and argv[0] == "menu" and argv[1] in ("run", "edit", "prompt", "copy")
           and re.fullmatch(r"p[0-9]{1,9}", argv[2])):
         msg = {"type": "menu", "action": argv[1], "id": argv[2]}
+    elif len(argv) == 3 and argv[0] == "menu" and argv[1] == "open" and re.fullmatch(r"[1-9]", argv[2]):
+        msg = {"type": "menu", "action": "open", "key": int(argv[2])}
     else:
         print(__doc__, file=sys.stderr)
         return 2

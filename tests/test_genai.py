@@ -1072,6 +1072,28 @@ class TestEndToEnd(Tmp):
             self.assertFalse(api.requests[0]["body"]["stream"])
             self.assertGreaterEqual(done["context"]["used"], 12)
 
+    def test_clear_starts_the_conversation_over(self):
+        with FakeAPI([reply("noted"), reply("fresh")]) as api:
+            home, path = make_home(self.tmp, api.url)
+            bless_path(home, path)
+            g = Proc(home, self.tmp, ["-e", "test", "-S", "s1"])
+            self.assertIn("clear", g.until("hello")["features"])
+            g.send({"type": "user", "text": "remember zebra"})
+            g.until("done")
+            g.send({"type": "clear"})
+            c = g.until("cleared")
+            self.assertEqual(c["dropped"], 2)
+            self.assertLess(c["context"]["used"], 2000)
+            g.send({"type": "user", "text": "hi"})
+            g.until("done")
+            g.close()
+            sent = api.requests[-1]["body"]["messages"]
+            self.assertEqual([m["role"] for m in sent], ["system", "user"])
+            self.assertNotIn("zebra", json.dumps(sent))
+            sess = json.load(open(os.path.join(home, "sessions", "s1.json")))
+            self.assertIn("zebra", json.dumps(sess["history"]))
+            self.assertNotIn("zebra", json.dumps(sess["messages"]))
+
     def test_context_limit_refuses_and_compact_prunes(self):
         turns = [call("read_file", path="big.txt", reason="r"), reply("one"), reply("two"), reply("three"),
                  reply("after")]
