@@ -91,7 +91,7 @@ much permission and too much autonomy.
   anywhere in it is refused. Reads refuse FIFOs, devices and binary files. New files are
   created without execute permission.
 - **Autonomy.** A turn ends when a command is proposed. A turn is capped at 10 model steps.
-  Reads are capped at 256 KB, writes at 1 MB, listings at 500 entries. Without a terminal and
+  Reads are capped at 256 KiB, writes at 1 MiB, overwrite snapshots at 8 MiB, and directory scans at 500 entries plus a truncation check. Without a terminal and
   outside JSON mode, nothing is performed at all.
 
 ### 4. Identity, privilege and credentials
@@ -194,7 +194,7 @@ safe and prompts are rare enough to be read.
   a saved session and the model cannot. genai then prints what the model can read without asking
   and which URL it goes to, and the banner, the `hello` event and the audit log record it.
 - In coding mode a file that looks like it holds secrets is not read automatically. It asks,
-  like any read outside coding mode.
+  like any read outside coding mode. Automatic reads share the same bytes that were checked.
 - A plan (`propose_plan`) lets you approve steps before they come, and is held to what you
   approved:
   - A planned read needs no further approval, unless the file is hidden or looks like it holds
