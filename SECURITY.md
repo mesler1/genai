@@ -317,6 +317,21 @@ other sections matter. With `--coding-anywhere` in your home directory, everythi
 not hidden is one injected instruction away from the endpoint: reads no longer ask, and a file
 the model reads can tell it what to read next.
 
+#### Remote genai
+
+genai-tui's remote mode runs genai on another host over ssh with `--json --config-stdin`. The API key never
+leaves the user's machine. Over ssh go the endpoint and profile (without any key) and a per-session token.
+genai there sends its requests to `http://127.0.0.1:PORT`, which ssh's reverse tunnel carries back to a proxy
+on the user's machine; the proxy requires the token (`X-Genai-Token`) and adds the key. genai refuses `key_env`,
+`key_file` and `proxy` in this mode, and any `base_url` that is not `http://127.0.0.1:PORT`.
+
+The config is trusted because it arrived over the user's own ssh channel: genai-tui checked the user's blessed
+files before sending, and genai blesses nothing on the remote host for it. It logs a `remote_config` event with
+the hashes of what it received, never the token. Root on the remote host can use the session's token while the
+tunnel is up, and can read that session's prompts, replies and files, which are on that host anyway. It cannot
+read the key, which was never sent. Everything else (coding-mode refusals, the sandbox, the audit log, sessions)
+works for the user genai runs as. As root, the REPL banner warns that proposed commands would run as root.
+
 ### 8. Supply chain and configuration trust
 
 *LLM03, ASI04, AML.T0081, AML.T0104, AML.T0110; Invariant Labs on tool poisoning.* Recent

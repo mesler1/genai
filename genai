@@ -22,6 +22,7 @@ import secrets
 import shlex
 import shutil
 import signal
+import socket
 import ssl
 import stat
 import subprocess
@@ -63,6 +64,9 @@ INTRINSICS = ("propose_command", "read_file", "list_dir", "write_file", "edit_fi
 PLAN_STEPS = 30                # steps one plan may have
 ENDPOINT_KEYS = {"name", "base_url", "model", "key_env", "key_file", "context_limit", "timeout",
                  "ca_bundle", "headers", "params", "allow_http", "proxy", "description"}
+REMOTE_URL = re.compile(r"http://127\.0\.0\.1:([0-9]{1,5})((?:/[A-Za-z0-9._~-]+)*)")
+TOKEN_RE = re.compile(r"[0-9A-Fa-f]{32,128}")
+TOKEN_HEADER = "X-Genai-Token"
 PROFILE_KEYS = {"name", "description", "endpoint", "persona", "skills", "params", "coding", "sandbox"}
 NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
 ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -883,6 +887,7 @@ class Endpoint:
         self.params = dict(data.get("params", {}) or {})
         self.allow_http = bool(data.get("allow_http", False))
         self.proxy = data.get("proxy")
+        self.token = None       # remote mode: the session token the key proxy requires (see remote_config)
         if not isinstance(self.headers, dict) or not all(isinstance(v, str) for v in self.headers.values()):
             raise GenaiError(f"{path}: 'headers' must map names to strings", EXIT_PROFILE)
         if any(k.lower() in ("authorization", "proxy-authorization", "cookie") for k in self.headers):
@@ -1136,6 +1141,42 @@ def select_named(cfg, kind, name):
         raise GenaiError(f"{kind} '{name}' ({path}) changed since it was blessed. Nothing was sent.\n"
                          f"  Review it again, then: genai --bless {path}", EXIT_PROFILE)
     return obj
+
+
+def remote_config(line, audit):
+    """Parse the config line genai-tui sends first with --config-stdin: an endpoint, a profile (or null) and the
+    session token. genai-tui checked the user's blessed files on their machine, so nothing here is looked up or
+    blessed on this host; the audit log records what arrived. The key stays on the user's machine: the endpoint
+    is a loopback port that ssh forwards to a proxy there, which adds the key when the token matches."""
+    def bad(why):
+        return GenaiError(f"bad config from the wrapper: {why}. Nothing was sent.", EXIT_PROFILE, "bad_config")
+
+    try:
+        msg = json.loads(line)
+    except ValueError:
+        raise bad("the first line is not JSON") from None
+    if not isinstance(msg, dict) or msg.get("type") != "config":
+        raise bad("the first line must be a config message")
+    ep, prof, token = msg.get("endpoint"), msg.get("profile"), msg.get("token")
+    if not isinstance(token, str) or not TOKEN_RE.fullmatch(token):
+        raise bad("'token' must be 32 to 128 hex characters")
+    if not isinstance(ep, dict) or (prof is not None and not isinstance(prof, dict)):
+        raise bad("'endpoint' and 'profile' must be objects")
+    if "key_env" in ep or "key_file" in ep or ep.get("proxy") is not None:
+        raise bad("the endpoint may not name a key or a proxy here: the key stays on your machine")
+    try:
+        endpoint = Endpoint(ep, "config endpoint")
+        persona = Profile(prof, "config profile") if prof is not None else None
+    except GenaiError as e:
+        raise bad(str(e)) from None
+    m = REMOTE_URL.fullmatch(endpoint.base_url)
+    if not m or not 0 < int(m.group(1)) < 65536:
+        raise bad("base_url must be http://127.0.0.1:PORT, optionally with a path")
+    endpoint.token = token
+    digest = lambda o: hash_bytes(json.dumps(o, sort_keys=True).encode())
+    audit.log("remote_config", endpoint=endpoint.name, model=endpoint.model, endpoint_sha256=digest(ep),
+              profile=persona.name if persona else None, profile_sha256=digest(prof) if persona else None)
+    return endpoint, persona
 
 
 def select_endpoint(cfg, name):
@@ -1742,13 +1783,16 @@ class Client:
         headers.update(self.p.headers)
         if self._key:
             headers["Authorization"] = f"Bearer {self._key}"
+        if self.p.token:
+            headers[TOKEN_HEADER] = self.p.token
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(self.p.base_url + path, data=data, headers=headers,
                                      method="POST" if data is not None else "GET")
         if trace:
             self.exchanges += 1
             shown = {k: "Bearer (your API key, not shown)" if k == "Authorization" else
-                     "(set in the endpoint; not shown)" if k in self.p.headers else v for k, v in headers.items()}
+                     "(set in the endpoint; not shown)" if k in self.p.headers or (k == TOKEN_HEADER and self.p.token)
+                     else v for k, v in headers.items()}
             self._ex = {"n": self.exchanges, "time": now(), "method": req.get_method(), "url": req.full_url,
                         "headers": shown, "request": data.decode("utf-8", "replace") if data else "",
                         "status": "sending", "response": [], "response_bytes": 0, "started": time.time()}
@@ -3151,6 +3195,9 @@ class Repl:
     def banner(self):
         p = self.e.endpoint
         print(f"genai {VERSION} — {one_line(p.name)[0]}: {one_line(p.model)[0]} at {one_line(p.base_url)[0]}")
+        if os.geteuid() == 0:
+            print(f"  [!] running as root on {one_line(socket.gethostname())[0]}: "
+                  "every command it proposes would run as root")
         if self.e.profile:
             d = self.e.profile.description
             print(f"profile {one_line(self.e.profile.name)[0]}" + (f": {one_line(d)[0]}" if d else ""))
@@ -3418,9 +3465,21 @@ def inspect(engine, ui, msg):
              "exchanges": [{k: v for k, v in ex.items() if k != "started"} for ex in trace if lo <= ex["n"] <= hi]})
 
 
-def run_json(engine, ui, first_prompt, attachments):
+def whoami():
+    """The effective user's name (the uid if it has none) and uid."""
+    uid = os.geteuid()
+    try:
+        import pwd
+        return pwd.getpwuid(uid).pw_name, uid
+    except (ImportError, KeyError):
+        return str(uid), uid
+
+
+def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()):
     ui.engine = engine
+    user, uid = whoami()
     ui.emit({"type": "hello", "protocol": PROTOCOL, "version": VERSION,
+             "host": socket.gethostname(), "user": user, "uid": uid, "remote": remote,
              "features": ["proposals", "decisions", "attach", "register_tools", "compact", "context", "coding",
                           "set_coding", "skills", "files", "read", "trace", "system", "plan", "network", "clear",
                           "models"],
@@ -3438,6 +3497,8 @@ def run_json(engine, ui, first_prompt, attachments):
     engine.audit.log("start", mode="json", endpoint=engine.endpoint.info(),
                      profile=engine.profile.name if engine.profile else None, session=engine.session.id,
                      sandbox=engine.sandbox)
+    for n in after_hello:
+        ui.notice(n)
 
     def turn(text, att):
         first = getattr(engine.client, "exchanges", 0) + 1
@@ -3596,6 +3657,9 @@ def parse_args(argv):
                     help="--coding, also where it is normally refused (your home directory, credential "
                          "directories); prints what that exposes")
     ap.add_argument("--json", action="store_true", help="JSON Lines over stdio, for wrappers")
+    ap.add_argument("--config-stdin", action="store_true",
+                    help="with --json: read the endpoint, profile and session token from the first line of stdin "
+                         "(for genai-tui's remote mode)")
     ap.add_argument("--bless", metavar="PATH", help="review and bless a skill directory, endpoint or profile file")
     ap.add_argument("--list-skills", action="store_true", help="list skills (with --json: as JSON)")
     ap.add_argument("--list-endpoints", action="store_true", help="list endpoints (with --json: as JSON)")
@@ -3608,6 +3672,11 @@ def parse_args(argv):
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     try:
+        if args.config_stdin and not args.json:
+            raise GenaiError("--config-stdin needs --json", EXIT_USAGE)
+        if args.config_stdin and (args.endpoint or args.profile or args.session or args.skill):
+            raise GenaiError("--config-stdin takes the endpoint and profile from stdin: not with -e, -p, -S or -k",
+                             EXIT_USAGE)
         cfg = Config()
         cfg.ensure()
         if args.bless:
@@ -3643,10 +3712,16 @@ def main(argv=None):
 
         session = Session.open(cfg, args.session)
         notices = []
-        pname = args.profile or (session.profile if session.resumed else cfg.default_profile)
-        persona = select_named(cfg, "profile", pname) if pname else None
-        endpoint = select_endpoint(cfg, args.endpoint or (persona.endpoint if persona else None)
-                                   or session.endpoint or cfg.default_endpoint)
+        after_hello = []
+        if args.config_stdin:
+            endpoint, persona = remote_config(sys.stdin.readline(), cfg.audit)
+            if persona and persona.skills:
+                after_hello.append("skills aren't available in remote mode yet")
+        else:
+            pname = args.profile or (session.profile if session.resumed else cfg.default_profile)
+            persona = select_named(cfg, "profile", pname) if pname else None
+            endpoint = select_endpoint(cfg, args.endpoint or (persona.endpoint if persona else None)
+                                       or session.endpoint or cfg.default_endpoint)
         destination_id = endpoint.destination_id()
         if session.messages and session.destination_id != destination_id:
             reason = ("has a different destination" if session.destination_id else
@@ -3661,7 +3736,9 @@ def main(argv=None):
         if session.resumed and args.profile and session.profile != args.profile:
             notices.append(f"session '{session.id}' was used with profile '{session.profile or '-'}', "
                            f"now '{args.profile}'")
-        if not session.resumed:
+        if args.config_stdin:
+            base = []
+        elif not session.resumed:
             base = persona.skills if persona and persona.skills is not None else cfg.default_skills
         else:
             base = persona.skills if args.profile and persona and persona.skills else []
@@ -3692,7 +3769,7 @@ def main(argv=None):
             ui.notice("coding mode is on for this session")
 
         if args.json:
-            return run_json(engine, ui, prompt, attachments)
+            return run_json(engine, ui, prompt, attachments, args.config_stdin, after_hello)
         cfg.audit.log("start", mode="repl" if prompt is None else "oneshot", endpoint=endpoint.info(),
                       profile=persona.name if persona else None,
                       session=session.id, sandbox=engine.sandbox)

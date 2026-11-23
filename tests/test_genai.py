@@ -9,6 +9,7 @@ import pwd
 import re
 import shlex
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -1521,6 +1522,152 @@ class TestPersonaProfiles(Tmp):
         p = G.Profile.load(os.path.join(os.path.dirname(HERE), "profiles", "coder.json"))
         self.assertIsNone(p.endpoint)        # uses default_endpoint, or -e
         self.assertTrue(os.path.isdir(os.path.join(os.path.dirname(HERE), "skills", p.skills[0])))
+
+
+class TestRemoteConfig(Tmp):
+    """--config-stdin: genai-tui sends the endpoint, profile and session token as the first line."""
+    TOKEN = "ab12" * 16
+
+    def config(self, api, **ep):
+        endpoint = {"name": "remote", "base_url": api.url, "model": "fake-model", "context_limit": 100000}
+        endpoint.update(ep)
+        return {"type": "config", "endpoint": endpoint, "profile": None, "token": self.TOKEN}
+
+    def start(self, msg, args=()):
+        self.home = self.path("home", "genai")           # empty: nothing is configured or blessed here
+        os.makedirs(os.path.dirname(self.home))
+        g = Proc(self.home, self.tmp, ["--config-stdin"] + list(args))
+        g.send(msg) if isinstance(msg, dict) else g.p.stdin.write(msg)
+        g.p.stdin.flush()
+        if msg == "":
+            g.p.stdin.close()                            # EOF instead of a config line
+        return g
+
+    def audit(self):
+        with open(os.path.join(self.home, "audit.log")) as f:
+            return [json.loads(x) for x in f]
+
+    def test_happy_path(self):
+        with FakeAPI([reply("hello")]) as api:
+            g = self.start(self.config(api))
+            hello = g.until("hello")
+            me = pwd.getpwuid(os.geteuid()).pw_name
+            self.assertEqual((hello["remote"], hello["user"], hello["uid"]), (True, me, os.geteuid()))
+            self.assertEqual(hello["host"], socket.gethostname())
+            g.send({"type": "user", "text": "hi"})
+            self.assertEqual(g.until("done")["reason"], "reply")
+            self.assertEqual(g.close(), 0)
+            headers = {k.lower(): v for k, v in api.requests[0]["headers"].items()}
+            self.assertEqual(headers["x-genai-token"], self.TOKEN)
+            self.assertNotIn("authorization", headers)
+            remote = [a for a in self.audit() if a["event"] == "remote_config"]
+            self.assertEqual((remote[0]["endpoint"], remote[0]["model"]), ("remote", "fake-model"))
+            self.assertTrue(remote[0]["endpoint_sha256"].startswith("sha256:"))
+            self.assertIsNone(remote[0]["profile"])
+            out = json.dumps(g.events)
+            self.assertNotIn(self.TOKEN, out)
+            with open(os.path.join(self.home, "audit.log")) as f:
+                self.assertNotIn(self.TOKEN, f.read())
+
+    def test_trace_does_not_show_the_token(self):
+        with FakeAPI([reply("hello")]) as api:
+            g = self.start(self.config(api))
+            g.until("hello")
+            g.send({"type": "user", "text": "hi"})
+            g.until("done")
+            g.send({"type": "trace"})
+            tr = g.until("trace")
+            self.assertEqual(tr["exchanges"][0]["headers"]["X-Genai-Token"], "(set in the endpoint; not shown)")
+            g.close()
+            self.assertNotIn(self.TOKEN, json.dumps(g.events))
+
+    def test_normal_hello_is_not_remote(self):
+        with FakeAPI([]) as api:
+            home, path = make_home(self.tmp, api.url)
+            bless_path(home, path)
+            g = Proc(home, self.tmp, ["-e", "test"])
+            hello = g.until("hello")
+            self.assertFalse(hello["remote"])
+            self.assertIn("host", hello)
+            g.close()
+
+    def refused(self, msg, args=()):
+        with FakeAPI([]) as api:
+            g = self.start(msg(api) if callable(msg) else msg, args)
+            err = g.until("error")
+            self.assertEqual(err["code"], "bad_config")
+            self.assertNotIn(self.TOKEN, json.dumps(err))
+            if not g.p.stdin.closed:
+                g.p.stdin.close()
+            self.assertEqual(g.p.wait(10), G.EXIT_PROFILE)
+            g.p.stdout.close()
+            g.p.stderr.close()
+            self.assertEqual(api.requests, [])
+
+    def test_refused_configs(self):
+        for name, msg in {
+            "key_env": lambda api: self.config(api, key_env="API_KEY"),
+            "key_file": lambda api: self.config(api, key_file="/tmp/key"),
+            "https": lambda api: self.config(api, base_url="https://example.com/v1"),
+            "localhost": lambda api: self.config(api, base_url="http://localhost:1/v1"),
+            "other host": lambda api: self.config(api, base_url="http://10.0.0.1:1/v1"),
+            "no port": lambda api: self.config(api, base_url="http://127.0.0.1/v1"),
+            "credentials": lambda api: self.config(api, base_url="http://u:p@127.0.0.1:1/v1"),
+            "query": lambda api: self.config(api, base_url="http://127.0.0.1:1/v1?x=1"),
+            "proxy": lambda api: self.config(api, proxy="http://127.0.0.1:3128"),
+            "unknown field": lambda api: self.config(api, bogus=1),
+            "short token": lambda api: dict(self.config(api), token="abcd"),
+            "non-hex token": lambda api: dict(self.config(api), token="z" * 40),
+            "wrong type": lambda api: dict(self.config(api), type="hello"),
+            "not JSON": lambda api: "{nope\n",
+            "EOF": lambda api: "",
+        }.items():
+            with self.subTest(name):
+                self.setUp()
+                self.refused(msg)
+
+    def test_needs_json_and_excludes_endpoint_flags(self):
+        env = dict(os.environ, XDG_CONFIG_HOME=self.tmp)
+        for args in (["--config-stdin"], ["--json", "--config-stdin", "-e", "x"],
+                     ["--json", "--config-stdin", "-p", "x"], ["--json", "--config-stdin", "-S", "x"]):
+            r = subprocess.run([sys.executable, SCRIPT] + args, env=env, capture_output=True, text=True,
+                               input="")
+            self.assertEqual(r.returncode, G.EXIT_USAGE, args)
+
+    def test_profile_persona_and_skills_notice(self):
+        with FakeAPI([reply("ok")]) as api:
+            msg = self.config(api)
+            msg["profile"] = {"name": "ops", "persona": "You are the zebra of ops.", "skills": ["anything"],
+                              "endpoint": "ignored"}
+            g = self.start(msg)
+            g.until("hello")
+            self.assertEqual(g.until("notice")["message"], "skills aren't available in remote mode yet")
+            g.send({"type": "user", "text": "hi"})
+            g.until("done")
+            g.close()
+            system = api.requests[0]["body"]["messages"][0]
+            self.assertIn("zebra of ops", system["content"])
+            self.assertEqual([e for e in g.events if e["type"] == "error"], [])
+            self.assertEqual(g.events[0]["profile"]["name"], "ops")
+
+    def test_root_banner_warns(self):
+        ep = types.SimpleNamespace(name="e", model="m", base_url="http://127.0.0.1:1")
+        e = types.SimpleNamespace(endpoint=ep, profile=None, session=types.SimpleNamespace(id=None, coding=False),
+                                  sandbox=None, box=None, notifier=None)
+        for uid, shown in ((0, True), (1000, False)):
+            out = io.StringIO()
+            with mock.patch.object(os, "geteuid", return_value=uid), mock.patch("sys.stdout", out):
+                G.Repl(e).banner()
+            self.assertEqual("every command it proposes would run as root" in out.getvalue(), shown)
+
+    def test_model_auto(self):
+        with FakeAPI([reply("ok")], models=[{"id": "qwen3-coder"}]) as api:
+            g = self.start(self.config(api, model="auto"))
+            self.assertEqual(g.until("hello")["endpoint"]["model"], "qwen3-coder")
+            g.send({"type": "user", "text": "hi"})
+            g.until("done")
+            g.close()
+            self.assertEqual(api.requests[-1]["body"]["model"], "qwen3-coder")
 
 
 if __name__ == "__main__":
