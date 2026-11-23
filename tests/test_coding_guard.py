@@ -206,6 +206,15 @@ class TestSecrets(Guard):
         proposal.decision = "accept"
         self.assertEqual(eng.perform(proposal), "just some notes\n")
 
+    def test_auto_read_of_a_missing_or_binary_file_reports_the_error_without_asking(self):
+        eng, _ = self.engine(self.proj, session_coding=True)
+        with open(os.path.join(self.proj, "data.bin"), "wb") as f:
+            f.write(b"\x00\x01")
+        for name, error in (("nope.txt", "No such file"), ("data.bin", "binary")):
+            p, told = self.run_call(eng, "read_file", path=name)
+            self.assertTrue(p.auto, name)
+            self.assertIn(error, told)
+
     def test_secret_looking_file_needs_approval(self):
         eng, ui = self.engine(self.proj, session_coding=True)
         for name in ("key.txt", "conf.txt"):
