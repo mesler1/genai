@@ -1082,6 +1082,8 @@ EDITOR_HEADER = """# {title}
 # Lines starting with '#' are removed. What is left is {what}.
 # Save an empty file to {cancel}.
 """
+# For text that may hold '#' lines of its own (output, a file): only the comment lines on top are ours.
+EDITOR_HEADER_TOP = EDITOR_HEADER.replace("# Lines starting with '#' are removed.", "# The '#' lines up here are removed.")
 
 
 def editor_argv(path):
@@ -1095,8 +1097,14 @@ def editor_argv(path):
     return argv + [path]
 
 
-def strip_comments(text):
-    return "\n".join(ln for ln in text.split("\n") if not ln.startswith("#")).strip("\n")
+def strip_comments(text, top_only=False):
+    """Text without its '#' lines: all of them, or with top_only just the ones it starts with (the header)."""
+    lines = text.split("\n")
+    if top_only:
+        while lines and lines[0].startswith("#"):
+            lines.pop(0)
+        return "\n".join(lines).strip("\n")
+    return "\n".join(ln for ln in lines if not ln.startswith("#")).strip("\n")
 
 
 def remote_where(host):
@@ -1911,7 +1919,7 @@ class App:
                     m.note(f"{ask['label']}: sent without review (genai still masks the secrets it recognises)", Q)
                 else:
                     kept = self.edit(text, ask["label"], "sent to the model exactly as saved; nothing is added",
-                                     "send nothing")
+                                     "send nothing", top_only=True)
                 if kept is None or not kept.strip():
                     m.note("nothing sent")
                 elif ask.get("context"):
@@ -2042,12 +2050,14 @@ class App:
         except (OSError, subprocess.SubprocessError) as e:
             self.m.note(f"tmux failed ({e})", R)
 
-    def edit(self, text, title, what, cancel):
-        """Open text in the user's editor; what they save, without # lines. None if the editor failed."""
+    def edit(self, text, title, what, cancel, top_only=False):
+        """Open text in the user's editor; what they save, without # lines (with top_only, only those on top, so
+        a shared file or output keeps its own). None if the editor failed."""
         fd, path = tempfile.mkstemp(prefix="genai-tui-", suffix=".txt")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(EDITOR_HEADER.format(title=" ".join(title.split()), what=what, cancel=cancel) + text)
+                header = EDITOR_HEADER_TOP if top_only else EDITOR_HEADER
+                f.write(header.format(title=" ".join(title.split()), what=what, cancel=cancel) + text)
             curses.endwin()
             sys.stdout.write("\x1b[?2004l")
             sys.stdout.flush()
@@ -2060,7 +2070,7 @@ class App:
                 self.m.note(f"your editor exited with code {rc}; nothing was used", R)
                 return None
             with open(path, encoding="utf-8", errors="replace") as f:
-                return strip_comments(f.read())
+                return strip_comments(f.read(), top_only)
         finally:
             os.unlink(path)
             sys.stdout.write("\x1b[?2004h")

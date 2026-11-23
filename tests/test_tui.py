@@ -386,6 +386,8 @@ class TestModel(unittest.TestCase):
         buf = C.review_buffer("ls", 2, "OUTSIDE any sandbox, directly on this host", "x")
         self.assertIn("I ran this command OUTSIDE any sandbox, directly on this host (exit 2):\n```\nls\n```\nOutput:", buf)
         self.assertEqual(C.strip_comments("# a\nkeep\n#b\n"), "keep")
+        self.assertEqual(C.strip_comments("# header\n# more\nline\n## A heading\n# kept\n", top_only=True),
+                         "line\n## A heading\n# kept")
 
     def test_session_destination_confirmation_is_forwarded(self):
         args = C.parse_args(["-S", "saved", "--allow-session-endpoint-change"])
@@ -950,6 +952,8 @@ class TestFilesFeature(unittest.TestCase):
         m = self.model()
         m.request({"type": "insert", "path": "src/app.py"}, "files")
         self.assertEqual(self.panes(m), [("prompt", {"type": "insert", "text": "src/app.py"})])
+        self.assertEqual(m.actions, [("insert",)])                # and the input box gets the focus
+        m.actions.clear()
         for bad in ("../x", "/etc/passwd", "a/../b", "a//b", "a\0b", "", "x" * 4097, 7, None, "./a", "a/"):
             for kind in ("list", "view", "attach", "insert"):
                 m.request({"type": kind, "path": bad}, "files")

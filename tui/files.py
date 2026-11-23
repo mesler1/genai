@@ -83,7 +83,7 @@ class Tree:
     def __init__(self):
         self.listings = {}       # path -> {"entries": [...], "truncated": bool}
         self.errors = {}         # path -> message
-        self.pending = {"."}     # paths asked for and not yet answered
+        self.pending = {".": 1}  # path -> answers still owed: each ask gets one, so a quick second refresh isn't lost
         self.expanded = set()
         self.show_hidden = True
         self.sel = None          # path of the selected entry
@@ -109,7 +109,9 @@ class Tree:
             path = msg.get("path")
             if not valid_path(path) or path not in self.pending:
                 return
-            self.pending.discard(path)
+            self.pending[path] -= 1
+            if not self.pending[path]:
+                del self.pending[path]
             self.unavailable = None
             if isinstance(msg.get("error"), str):
                 self.errors[path] = msg["error"]
@@ -128,7 +130,7 @@ class Tree:
                                    "truncated": msg.get("truncated") is True or len(entries) > MAX_ENTRIES}
 
     def ask(self, path):
-        self.pending.add(path)
+        self.pending[path] = self.pending.get(path, 0) + 1
         self.errors.pop(path, None)
         return {"type": "list", "path": path}
 
