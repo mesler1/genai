@@ -26,7 +26,7 @@ SEND_TIMEOUT = 2            # seconds a send may wait on a pane that has stopped
 ROLES = {
     "prompt": {"input", "key", "scroll", "quit"},
     "panel": {"coding", "skill", "skills", "command", "models"},
-    "menu": {"share", "menu", "mark", "raw", "system", "model"},
+    "menu": {"share", "menu", "mark", "raw", "system", "copy", "model"},
 }
 
 

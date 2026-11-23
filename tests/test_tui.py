@@ -190,6 +190,50 @@ class TestModel(unittest.TestCase):
         self.assertEqual(sum(isinstance(b, C.Reply) for b in m.blocks), 1)
         self.assertIn("Hello", text_of(m.blocks[-1]))
 
+    def test_decline_a_command(self):
+        m = C.Model()
+        self.hello(m)
+        m.submit("go")
+        for i in (1, 2):
+            m.handle({"type": "proposal", "id": f"p{i}", "kind": "command", "command": f"rm -rf build{i}"})
+        m.handle({"type": "done", "reason": "command", "context": {"used": 1, "limit": 9}})
+        m.submit("/decline")                                   # the latest
+        self.assertEqual((m.cards["p2"].state, m.cards["p1"].state), ("declined", "shown"))
+        self.assertEqual((m.cards["p2"].key, m.keyed(1).id), (None, "p1"))   # Alt+1 moves to what's still open
+        self.assertIn("p2 · command", text_of(m.cards["p2"]))
+        self.assertNotIn("/run p2", text_of(m.cards["p2"]))
+        m.submit("/decline p2")
+        self.assertIn("p2 is declined", text_of(m.blocks[-1]))
+        m.submit("/decline p1")
+        m.undecline(m.cards["p1"])                             # run after all: the model isn't told
+        m.outbox.clear()
+        m.submit("ok, something else")
+        self.assertEqual([x["type"] for x in m.outbox], ["attach", "user"])
+        self.assertEqual(m.outbox[0]["label"], "declined p2")
+        self.assertIn("did not run it:\nrm -rf build2", m.outbox[0]["text"])
+        self.assertNotIn("decline", m.outbox[0])
+
+    def test_copy_a_message_and_its_reply(self):
+        m = C.Model()
+        self.hello(m)
+        m.shell = object()
+        for text, answer in (("first\nquestion", "one"), ("second", "two\x1b[2J")):
+            m.submit(text)
+            m.handle({"type": "text", "text": "Here is "})
+            m.handle({"type": "text", "text": answer})
+            m.handle({"type": "proposal", "id": f"p{m.turn}", "kind": "read", "path": "x", "auto": True})
+            m.handle({"type": "text", "text": "and more"})
+            m.handle({"type": "done", "reason": "reply", "context": {"used": 1, "limit": 9}})
+        self.assertEqual(m.turn_text(1), "> first\n> question\n\nHere is one\n\nand more\n")
+        self.assertEqual(m.turn_text(2), "> second\n\nHere is two\\x1b[2J\n\nand more\n")   # escaped, as shown
+        self.assertIsNone(m.turn_text(3))
+        m.submit("/copy")
+        self.assertEqual(m.actions[-1][:2], ("copy", 2))
+        m.submit("/copy 1")
+        self.assertEqual(m.actions[-1], ("copy", 1, m.turn_text(1)))
+        m.submit("/copy 7")
+        self.assertIn("turn 7 isn't on screen", text_of(m.blocks[-1]))
+
     def test_newest_commands_get_alt_keys(self):
         m = C.Model()
         self.hello(m)
@@ -591,6 +635,62 @@ class TestRecorder(unittest.TestCase):
         self.assertEqual(REC.label(r.get(2)), "(a command kept out of your history)")
         self.assertEqual(r.done, 2)
 
+    def remote_session(self, r, sid="5" * 32, dest="me@hpc1"):
+        """The local shell announces a genai-ssh session, and the remote shell asks for its key."""
+        import base64
+        r.feed(mark("H") + mark("S") + mark("X", sid, base64.b64encode(dest.encode()).decode()))
+        r.feed(mark("R", sid, nonce="ssh"))
+        return r.take_handshake()
+
+    def rdone(self, rc, cmd, key, cwd="/scratch/me", host="login1\x1b[2J"):
+        import base64
+        b = lambda t: base64.b64encode(t.encode()).decode()   # noqa: E731
+        return mark("D", str(rc), "1" if cmd else "0", b(cmd or ""), "1", b(cwd), b(host), nonce=key)
+
+    def test_genai_ssh_follows_the_remote_shell_with_its_own_key(self):
+        r = REC.Recorder()
+        key = self.remote_session(r)
+        self.assertRegex(key, r"^[0-9a-f]{32}$")
+        self.assertIsNone(r.take_handshake())                          # typed once
+        self.assertIsNone(r.remote_prompt())                           # not until the remote prompt comes
+        r.feed(b"Welcome to hpc1\r\n" + self.rdone(0, None, key))
+        self.assertEqual(r.remote_prompt(), ("login1[2J", "/scratch/me"))   # what the other host says, printable
+        r.feed(b"make\r\n" + mark("S", nonce=key) + b"built\r\n" + self.rdone(2, "make", key))
+        c = r.last()
+        self.assertEqual((c.host, c.cmd, c.rc, c.text()), ("login1[2J", "make", 2, "built"))
+        self.assertEqual(REC.label(c), "login1[2J: make")
+        r.feed(mark("S", nonce=key) + b"long job\r\n")
+        self.assertIsNone(r.remote_prompt())                           # busy there: nothing can be sent
+        self.assertEqual(r.running().text(), "long job")
+        r.feed(b"Connection closed\r\n" + done(255, "genai-ssh hpc1"))     # ssh ended: the local prompt is back
+        self.assertIsNone(r.remote)
+        self.assertEqual((r.last().host, r.last().cmd), (None, "genai-ssh hpc1"))
+        self.assertNotIn(key, "".join(c.text() for c in r.finished()))
+
+    def test_genai_ssh_handshake_is_once_for_the_session_announced_and_in_time(self):
+        import base64
+        r = REC.Recorder()
+        r.feed(mark("H") + mark("S") + mark("R", "5" * 32, nonce="ssh"))         # nothing announced
+        self.assertIsNone(r.take_handshake())
+        r.feed(mark("X", "5" * 32, "aG9zdA==", nonce="ab" * 8))                   # announced without the word
+        r.feed(mark("R", "5" * 32, nonce="ssh"))
+        self.assertIsNone(r.take_handshake())
+        r.feed(mark("X", "5" * 32, base64.b64encode(b"hpc1").decode()))
+        r.feed(mark("R", "6" * 32, nonce="ssh"))                                  # another session's id
+        self.assertIsNone(r.take_handshake())
+        r.feed(mark("R", "5" * 32, nonce="ssh"))
+        key = r.take_handshake()
+        r.feed(mark("R", "5" * 32, nonce="ssh"))                                  # a second ask gets nothing
+        self.assertIsNone(r.take_handshake())
+        r.feed(mark("S", nonce="cd" * 16) + b"forged\r\n" + self.rdone(0, "rm -rf /", "cd" * 16))   # not the key
+        self.assertEqual([c.cmd for c in r.finished() if c.host], [])
+        self.assertIsNotNone(key)
+        late = REC.Recorder()
+        late.feed(mark("H") + mark("S") + mark("X", "7" * 32, "aG9zdA=="))
+        late.remote.until = 0                                                     # REMOTE_WAIT has passed
+        late.feed(mark("R", "7" * 32, nonce="ssh"))
+        self.assertIsNone(late.take_handshake())
+
     def test_markers_split_across_reads(self):
         r = REC.Recorder()
         data = mark("H") + mark("S") + b"one\r\ntwo\r\n" + done(0, "echo")
@@ -923,6 +1023,24 @@ class TestGenaiTui(TmuxCase):
             self.assertIn("Output:\n```\nfrom-shell\n```", sent)
             self.assertIn("[output of p1 (exit 3)]", sent)
 
+    def test_share_without_review(self):
+        turns = [call("propose_command", command="echo '# kept'; echo plain", reason="look"), reply("got it")]
+        with FakeAPI(turns) as api:
+            self.start(api, editor="false")                       # an editor that fails: s must not open it
+            self.type("look around")
+            self.wait_for("or /run p1, to send")
+            self.type("/run")
+            self.wait_for("Run p1 in the shell pane?")
+            self.key("y")
+            self.wait_for("s send it as it is")
+            self.key("s")
+            self.wait_for("got it")
+            sent = self.sent(api)
+            self.assertIn("I ran this command ", sent)
+            self.assertIn("Output:\n```\n# kept\nplain\n```", sent)   # a line starting with # stays
+            self.assertNotIn("EVERYTHING below", sent)
+            self.assertIn("sent without review", self.screen())
+
     def test_panes_get_a_term_that_remote_hosts_know(self):
         with FakeAPI([reply("hi")]) as api:
             self.start(api)
@@ -1024,6 +1142,103 @@ class TestGenaiTui(TmuxCase):
             self.type("and now?")
             self.wait_for("from qwen")
             self.assertEqual([r["body"]["model"] for r in api.requests if r.get("body")], ["fake-model", "qwen3-coder"])
+
+    def fake_ssh(self):
+        """A PATH with an ssh that runs the remote command here through sh, as sshd runs it through your login
+        shell, in a "remote" home of its own; with no command, a plain shell genai-tui can't follow."""
+        bindir = os.path.join(self.tmp, "ssh-bin")
+        remote = os.path.join(self.tmp, "remote-home")
+        os.makedirs(bindir)
+        os.makedirs(remote)
+        named = os.path.join(self.tmp, "named")                       # a shell tmux reports as "ssh"
+        os.makedirs(named)
+        os.symlink(shutil.which("bash"), os.path.join(named, "ssh"))
+        with open(os.path.join(bindir, "ssh"), "w") as f:
+            f.write(f'#!/bin/sh\nfor a; do last=$a; done\ncd {remote}\n'
+                    f'case $last in exec*) exec env HOME={remote} sh -c "$last" ;; esac\n'
+                    f'exec env HOME={remote} {named}/ssh --norc -i\n')
+        with open(os.path.join(bindir, "less"), "w") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        for n in ("ssh", "less"):
+            os.chmod(os.path.join(bindir, n), 0o700)
+        return bindir, remote
+
+    def test_genai_ssh_runs_and_shares_commands_on_the_other_host(self):
+        turns = [call("propose_command", command="echo on-$PWD", reason="where am I"), reply("seen it")]
+        with FakeAPI(turns) as api:
+            bindir, remote = self.fake_ssh()
+            self.start(api, path=bindir)
+            self.shell("genai-ssh -p 2222 me@hpc1")
+            self.wait_for("following the shell on the other host")
+            self.wait_for("ON ANOTHER HOST", pane="info")                # the panel says where commands run now
+            time.sleep(0.5)
+            shown = self.screen("shell")
+            self.assertNotRegex(shown, r"[0-9a-f]{32}")                  # the key was typed with echo off
+            self.type("where am I?")
+            self.wait_for("/run p1, to send")
+            self.type("/run")
+            self.wait_for("ON ANOTHER HOST")
+            self.assertIn(f":{remote}", self.screen())                   # host:directory, as the remote reports
+            self.key("y")
+            self.wait_for("Share the output")
+            self.assertIn(f"on-{remote}", self.screen("shell"))
+            self.key("y")                                                 # EDITOR=true sends it as shown
+            self.wait_for("seen it")
+            sent = self.sent(api)
+            self.assertIn("I ran this command ON ANOTHER HOST, ", sent)
+            self.assertIn(f"on-{remote}", sent)
+            self.wait_for(": echo on-$PWD", pane="info")
+            self.shell("exit")                                            # back here: commands run here again
+            time.sleep(0.5)
+            self.type("/run p1")
+            self.wait_for("directly on this host")
+            self.key("n")
+
+    def test_plain_ssh_is_not_followed_and_says_how(self):
+        turns = [call("propose_command", command="hostname", reason="r")]
+        with FakeAPI(turns) as api:
+            bindir, _ = self.fake_ssh()
+            self.start(api, path=bindir)
+            self.shell("ssh hpc1")
+            time.sleep(0.5)
+            self.type("go")
+            self.wait_for("/run p1, to send")
+            self.type("/run")
+            self.wait_for("Run p1 in the shell pane?")
+            self.key("y")
+            self.wait_for("genai-ssh [ssh options] HOST")               # refused, and told how
+            self.assertNotIn("hostname\n", self.screen("shell"))
+
+    def test_decline_from_the_menu(self):
+        turns = [call("propose_command", command="echo not-wanted", reason="r"), reply("fine, something else")]
+        with FakeAPI(turns) as api:
+            self.start(api)
+            self.type("go")
+            self.wait_for("or /run p1, to send")
+            env = dict(os.environ, GENAI_TUI_STATE=self.runtime_state())
+            subprocess.run([sys.executable, os.path.join(REPO, "tui", "request.py"), "menu", "decline", "p1"],
+                           env=env, check=True)
+            self.wait_for("you declined it")
+            self.type("then what?")
+            self.wait_for("fine, something else")
+            self.assertIn("I declined the command you proposed as p1", self.sent(api))
+            self.assertNotIn("not-wanted", self.screen("shell"))
+
+    def test_copy_a_turn_from_the_menu_and_by_command(self):
+        with FakeAPI([reply("the answer")]) as api:
+            self.start(api)
+            self.type("the question")
+            self.wait_for("the answer")
+            env = dict(os.environ, GENAI_TUI_STATE=self.runtime_state())
+            subprocess.run([sys.executable, os.path.join(REPO, "tui", "request.py"), "copy", "1"], env=env, check=True)
+            self.wait_for("turn 1 copied")
+            self.assertEqual(self.tmux("show-buffer", "-b", "genai-copy"), "> the question\n\nthe answer\n")
+            self.tmux("delete-buffer", "-b", "genai-copy")
+            self.type("/copy")
+            end = time.time() + 5
+            while time.time() < end and not self.tmux("show-buffer", "-b", "genai-copy"):
+                time.sleep(0.1)
+            self.assertIn("the answer", self.tmux("show-buffer", "-b", "genai-copy"))
 
     def test_raw_view_from_the_menu_and_by_command(self):
         bindir = tempfile.mkdtemp(prefix="genai-tui-bin-")

@@ -4,6 +4,7 @@
 # the conversation, or hides it again. /run types a proposed command into that shell, /share sends
 # what it printed, and right-clicking the shell marks where shell context starts. Clicking a proposed
 # command, or Alt+1..Alt+9 (Alt+1 the newest), opens its menu: run it, edit it, paste it or copy it.
+# In the shell, genai-ssh [ssh options] HOST connects to another host in a way genai-tui can follow.
 # Usage: genai-tui [-h] [-p PROFILE] [-e ENDPOINT] [-S SESSION] [-k SKILL] [--coding] [--no-panel]
 set -euo pipefail
 here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
