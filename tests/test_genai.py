@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import pwd
 import re
 import shlex
 import shutil
@@ -238,10 +239,16 @@ def bless_path(home, path):
 
 
 class TestStatePermissions(Tmp):
+    """A group-writable mode is unsafe unless the group is your personal one. Which it is depends on the
+    machine, so each test says."""
+
     def test_group_writable_state_parent_is_refused(self):
         home, _ = make_home(self.tmp, "https://local.example/v1")
         os.chmod(os.path.dirname(home), 0o770)
-        with self.assertRaisesRegex(G.GenaiError, "unsafe genai state directory"):
+        with mock.patch.object(G, "own_group", return_value=False):
+            with self.assertRaisesRegex(G.GenaiError, "other users can write to it. If it is yours: chmod go-w"):
+                G.Config(home)
+        with mock.patch.object(G, "own_group", return_value=True):     # a user-private group, as with umask 002
             G.Config(home)
 
     def test_group_writable_trust_database_is_refused(self):
@@ -249,8 +256,37 @@ class TestStatePermissions(Tmp):
         bless_path(home, path)
         cfg = G.Config(home)
         os.chmod(cfg.blessed_path, 0o660)
-        with self.assertRaisesRegex(G.GenaiError, "unsafe genai state file"):
+        with mock.patch.object(G, "own_group", return_value=False):
+            with self.assertRaisesRegex(G.GenaiError, "chmod 600"):
+                G.select_endpoint(cfg, "test")
+        with mock.patch.object(G, "own_group", return_value=True):
             G.select_endpoint(cfg, "test")
+        os.chmod(cfg.blessed_path, 0o606)                               # others: never
+        with mock.patch.object(G, "own_group", return_value=True):
+            with self.assertRaisesRegex(G.GenaiError, "chmod 600"):
+                G.select_endpoint(cfg, "test")
+
+    def test_own_group_means_named_after_you_with_no_other_members(self):
+        me = pwd.getpwuid(os.getuid()).pw_name
+        group = lambda name, members: mock.Mock(gr_name=name, gr_mem=members)      # noqa: E731
+        with mock.patch("grp.getgrgid", return_value=group(me, [])):
+            self.assertTrue(G.own_group(os.getgid()))
+            self.assertFalse(G.own_group(os.getgid() + 1))
+        with mock.patch("grp.getgrgid", return_value=group(me, [me, "someone"])):
+            self.assertFalse(G.own_group(os.getgid()))
+        with mock.patch("grp.getgrgid", return_value=group("users", [])):
+            self.assertFalse(G.own_group(os.getgid()))
+
+    def test_first_run_creates_private_parents_whatever_the_umask(self):
+        home = self.path("fresh", ".config", "genai")
+        old = os.umask(0o002)
+        try:
+            with mock.patch.object(G, "own_group", return_value=False):
+                G.Config(home).ensure()
+                G.Config(home)                                           # and accepts them afterwards
+        finally:
+            os.umask(old)
+        self.assertEqual(stat.S_IMODE(os.stat(self.path("fresh", ".config")).st_mode), 0o700)
 
     def test_symlinked_trust_database_is_refused(self):
         home, path = make_home(self.tmp, "https://local.example/v1")
