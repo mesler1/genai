@@ -188,6 +188,15 @@ genai-tui require `--allow-session-endpoint-change` before sending the saved con
 the URL shown in the error before approving the transfer. Another model on the same server needs
 no consent.
 
+**Models.** `"model": "auto"` in an endpoint uses the first model the server lists (`GET /models`;
+vLLM and most local servers list the one they serve) and takes its context length from the list
+when the server gives one (vLLM's `max_model_len`). To switch while you work: `:models` lists them
+and `:model NAME` switches in the REPL; in genai-tui, `/model` (or a click on the model in the
+info panel) opens a drop-down, and `/model NAME` switches directly. Only a model the server lists
+can be chosen, the conversation carries on with it, and the audit log records the switch. It
+lasts for this run: the endpoint file isn't changed, and a resumed session starts with the file's
+model again.
+
 ## Sandboxed runs
 
 In coding mode the model can only propose commands, so you run every build and test yourself. A
@@ -263,6 +272,8 @@ later.
 | `result` | `id`, `status` (`ok`, `declined`, `error`), `output` | Answers a proposal for a tool the wrapper registered. |
 | `register_tools` | `tools`: a list of `{name, description, parameters}` | Adds tools the model can call. The wrapper performs them. Answered by `registered`. |
 | `compact` | | Shrinks the conversation. Answered by `compacted`. |
+| `models` | | Answered by `models`: `current`, and `models`, each `{"id", "context"}` (the server's list, `GET /models`, without names genai won't use). |
+| `model` | `model` (a name from `models`) | Uses that model from the next message, on the same server. Answered by `model` (`endpoint`, `context`), or an `unknown_model` error. |
 | `clear` | | Starts the conversation over: the model gets none of it from now on, and an approved plan is dropped. The saved session's history keeps it. Answered by `cleared` (`dropped`: how many messages, `context`). |
 | `coding` | `on` (true or false) | Turns coding mode on or off. The same places are refused as for `--coding` (error `coding_refused`), and `--coding-anywhere` stays a command-line flag. Always answered by a `coding` event with the state now. |
 | `skills` | | Answered by `skills`: every skill, its blessing `status`, and whether it is `active`. |
@@ -289,7 +300,7 @@ decision.
 | `notice` | Something the user should know. |
 | `error` | `code` and `message`. |
 | `plan` | The approved plan changed: approved, a step done, or dropped. `plan` has `id`, `goal` and `steps`, each with `approved`, `status` (`todo`, `done`, `left out`) and `edited` when the user changed its command; `null` when there is none. A plan is never saved with the session. |
-| `attached`, `registered`, `compacted`, `cleared`, `coding`, `skills`, `files`, `trace`, `system`, `network` | Answers to the messages above. |
+| `attached`, `registered`, `compacted`, `cleared`, `models`, `model`, `coding`, `skills`, `files`, `trace`, `system`, `network` | Answers to the messages above. |
 
 When stdin closes, every waiting proposal is declined and genai exits.
 

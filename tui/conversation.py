@@ -36,12 +36,17 @@ CARD_BODY_LINES = 12
 OUTPUT_LINES = 8               # last lines of a sandboxed run's output shown in its card
 INPUT_MAX_LINES = 8
 CMD_LINES = 4                  # lines of a command shown in a run question; a longer one is viewed in full first
+MODEL_MENU = 20               # models in the /model drop-down; the rest by name
+# A model name from the server, as genai accepts it. Checked again here before one goes into a tmux menu, whose
+# item names are formats: no '#', ',', '}', quotes or spaces can get through.
+MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+=-]{0,199}")
 MENU_KEYS = 9                  # Alt+1 .. Alt+9 open the menus of the newest command proposals, Alt+1 the newest
 
 COMMANDS = {
     "/help": "show this help",
     "/coding": "on|off: let the model read and list files here without asking",
     "/network": "[on|off]: the sandbox's network, for this session (on: each sandboxed run asks)",
+    "/model": "[NAME]: pick the model from those the server offers (a drop-down), or switch to NAME",
     "/skills": "list skills; * marks the ones in use",
     "/skill": "NAME on|off: use a blessed skill from the next message on, or stop",
     "/run": "[ID]: review and run a proposed command in the shell pane (the latest by default)",
@@ -497,6 +502,8 @@ class Model:
         self.quit = False
         self.shell = False         # a shell pane is there (inside genai-tui)
         self.shell_where = None
+        self.models = []           # the server's models, as genai last listed them
+        self.picking = False       # /model asked for that list, to show it as a drop-down
         self.skills = None         # genai's skill list, once asked for
         self.show_skills = False   # print the next skill list in the conversation (the user typed /skills)
         self.ask = None            # a question of ours in place of the input box: run or share
@@ -611,6 +618,27 @@ class Model:
         elif t == "coding":
             self.coding = bool(ev.get("on"))
             self.note(f"coding mode is {'on' if self.coding else 'off'}", W if self.coding else Q)
+        elif t == "models":
+            self.models = [m["id"] for m in ev.get("models") or []
+                           if isinstance(m, dict) and isinstance(m.get("id"), str) and MODEL_ID.fullmatch(m["id"])]
+            current = (self.hello or {}).get("endpoint", {}).get("model")
+            if not self.models:
+                self.note("the server lists no models genai can use", R)
+            elif self.picking and self.shell:
+                self.actions.append(("model_menu",))
+            else:
+                for mid in self.models:
+                    self.note(("* " if mid == current else "  ") + mid)
+                self.note("/model NAME switches")
+            self.picking = False
+        elif t == "model":
+            ep = ev.get("endpoint")
+            if isinstance(ep, dict) and self.hello is not None:
+                self.hello = {**self.hello, "endpoint": ep}
+            ctx = ev.get("context") or {}
+            if isinstance(ctx.get("used"), int) and isinstance(ctx.get("limit"), int):
+                self.context = (ctx["used"], ctx["limit"])
+            self.note(f"model: {clean(str((ep or {}).get('model', '?')))} from your next message", D)
         elif t == "network":
             self.runner = ev.get("runner")
             self.note(self.network_text(), W if (self.runner or {}).get("network") else Q)
@@ -701,7 +729,7 @@ class Model:
     def command(self, line):
         cmd, _, arg = line.partition(" ")
         arg = arg.strip()
-        to_genai = cmd in ("/coding", "/skills", "/skill", "/compact", "/network", "/clear")
+        to_genai = cmd in ("/coding", "/skills", "/skill", "/compact", "/network", "/model", "/clear")
         if to_genai and (self.busy or self.exited is not None):
             self.note(f"{cmd} has to wait until genai finishes this reply", W)
         elif cmd == "/help":
@@ -733,6 +761,14 @@ class Model:
             else:
                 self.note(f"skill {clean(name)}: {state} from your next message", Q)
                 self.send({"type": "skill", "name": name, "on": state == "on"})
+        elif cmd == "/model" and "models" not in ((self.hello or {}).get("features") or []):
+            self.note("this genai can't list or switch models", R)
+        elif cmd == "/model":
+            if arg:
+                self.send({"type": "model", "model": arg})
+            else:
+                self.picking = True
+                self.send({"type": "models"})
         elif cmd == "/compact":
             self.send({"type": "compact"})
         elif cmd in ("/run", "/share", "/shell", "/mark", "/commands") and not self.shell:
@@ -849,6 +885,10 @@ class Model:
             self.command(f"/raw {'' if msg['turn'] == 'last' else msg['turn']}".strip())
         elif t == "system":
             self.command("/system")
+        elif t == "models":
+            self.command("/model")
+        elif t == "model" and type(msg.get("n")) is int and 0 <= msg["n"] < len(self.models):
+            self.command(f"/model {self.models[msg['n']]}")      # the menu sent a position; the name is ours
         elif t == "share" and msg.get("what") in ("mark", "all", "last") and self.shell:
             self.actions.append(("share", msg["what"]))
         elif t == "command" and type(msg.get("n")) is int and self.shell:
@@ -1255,6 +1295,22 @@ class Shell:
                   "Put it at the shell prompt (you press Enter)", "p", pick("prompt"),
                   "Copy it", "c", pick("copy"),
                   "", "Cancel", "q", ""],
+                                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+
+    def model_menu(self, models, current):
+        """The /model drop-down: tmux's menu, in the middle of the screen. Names are checked against MODEL_ID first,
+        and each item sends back only its position."""
+        items = []
+        for i, mid in enumerate(models[:MODEL_MENU]):
+            if MODEL_ID.fullmatch(mid):
+                items += [("• " if mid == current else "  ") + mid, str((i + 1) % 10) if i < 10 else "",
+                          menu_item("model", str(i))]
+        if len(models) > MODEL_MENU:
+            items += ["", f"-  {len(models) - MODEL_MENU} more: /model NAME", "", ""]
+        items += ["", "Cancel", "q", ""]
+        self.menus = [p for p in getattr(self, "menus", []) if p.poll() is None]
+        self.menus.append(subprocess.Popen(["tmux", "display-menu", "-t", os.environ.get("TMUX_PANE", ""), "-x", "C",
+                                            "-y", "C", "-T", " model · ↑↓ Enter ", *items],
                                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
 
     def raw_menu(self, turn):
@@ -2118,7 +2174,7 @@ class App:
                 self.from_prompt(msg)
             elif role == "panel":
                 self.m.request(msg)
-            elif role == "menu" and msg.get("type") in ("share", "mark", "raw", "system"):
+            elif role == "menu" and msg.get("type") in ("share", "mark", "raw", "system", "model"):
                 self.m.request(msg)
             elif role == "menu" and msg.get("type") == "menu" and msg.get("action") == "open":
                 self.open_menu(msg.get("key"))
@@ -2134,6 +2190,8 @@ class App:
                 self.list_commands()
             elif action[0] == "show":
                 self.show_raw(action[1])
+            elif action[0] == "model_menu" and self.shell:
+                self.shell.model_menu(self.m.models, (self.m.hello or {}).get("endpoint", {}).get("model"))
             elif action[0] == "plan_cmd":
                 self.plan_cmd(action[1])
             elif action[0] == "mark_line":

@@ -1072,6 +1072,57 @@ class TestEndToEnd(Tmp):
             self.assertFalse(api.requests[0]["body"]["stream"])
             self.assertGreaterEqual(done["context"]["used"], 12)
 
+    MODELS = [{"id": "qwen3-coder", "max_model_len": 65536}, {"id": "llama-3.1-8b"}, {"id": "bad name"},
+              {"id": "x#{run}"}, {"id": "-flag"}, {"id": "qwen3-coder"}, {"no": "id"}, "junk"]
+
+    def test_models_listed_and_switched_on_the_same_server(self):
+        with FakeAPI([reply("one"), reply("two")], models=self.MODELS) as api:
+            home, path = make_home(self.tmp, api.url)
+            bless_path(home, path)
+            g = Proc(home, self.tmp, ["-e", "test"])
+            self.assertIn("models", g.until("hello")["features"])
+            g.send({"type": "models"})
+            m = g.until("models")
+            self.assertEqual(m["current"], "fake-model")
+            self.assertEqual(m["models"], [{"id": "qwen3-coder", "context": 65536}, {"id": "llama-3.1-8b", "context": None}])
+            g.send({"type": "user", "text": "hi"})
+            g.until("done")
+            g.send({"type": "model", "model": "bad name"})              # only a name the server listed, as listed
+            self.assertEqual(g.until("error")["code"], "unknown_model")
+            g.send({"type": "model", "model": "qwen3-coder"})
+            ev = g.until("model")
+            self.assertEqual((ev["endpoint"]["model"], ev["context"]["limit"]), ("qwen3-coder", 65536))
+            g.send({"type": "user", "text": "again"})
+            g.until("done")
+            g.close()
+            bodies = [r["body"] for r in api.requests if r.get("body")]
+            self.assertEqual([b["model"] for b in bodies], ["fake-model", "qwen3-coder"])
+            self.assertEqual(len(bodies[1]["messages"]), 4)              # the conversation went along
+            audit = [json.loads(ln) for ln in open(os.path.join(home, "audit.log"))]
+            self.assertIn(("model", "qwen3-coder", "fake-model"),
+                          [(a["event"], a.get("model"), a.get("before")) for a in audit])
+
+    def test_model_auto_takes_the_first_the_server_lists(self):
+        with FakeAPI([reply("hi")], models=self.MODELS) as api:
+            home, path = make_home(self.tmp, api.url, model="auto")
+            bless_path(home, path)
+            g = Proc(home, self.tmp, ["-e", "test"])
+            hello = g.until("hello")
+            self.assertEqual(hello["endpoint"]["model"], "qwen3-coder")
+            g.send({"type": "user", "text": "hi"})
+            g.until("done")
+            g.close()
+            self.assertEqual(api.requests[-1]["body"]["model"], "qwen3-coder")
+        with FakeAPI([], models=[{"id": "has space"}]) as api:
+            home2 = os.path.join(self.tmp, "h2")
+            os.makedirs(home2)
+            home, path = make_home(home2, api.url, model="auto")
+            bless_path(home, path)
+            g = Proc(home, self.tmp, ["-e", "test"])
+            err = g.until("error", "hello")
+            self.assertEqual((err["type"], err.get("code")), ("error", "unknown_model"))
+            g.close()
+
     def test_clear_starts_the_conversation_over(self):
         with FakeAPI([reply("noted"), reply("fresh")]) as api:
             home, path = make_home(self.tmp, api.url)
