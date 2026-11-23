@@ -260,14 +260,16 @@ class Note(Block):
 
 
 class UserMsg(Block):
-    def __init__(self, text, queued=False, attached=None):
+    def __init__(self, text, queued=False, attachments=()):
         super().__init__()
-        self.text, self.queued, self.attached = text, queued, attached
+        self.text, self.queued, self.attachments = text, queued, tuple(attachments)
 
     def lines(self, w):
         out = [[]] + para(clean(self.text), "", w, "› ", "  ", first_role=A)
-        if self.attached:
-            out.append([("  ", Q), (fit(f"[attached: {clean(self.attached)}]", w - 2), Q)])
+        for attachment in self.attachments:
+            label = clean(attachment["label"])
+            lines = attachment["text"].count("\n") + 1
+            out.append([("  ", Q), (fit(f"[attached: {label}, {lines} lines]", w - 2), Q)])
         if self.queued:
             out.append([("  queued: sends when the current reply ends", Q)])
         return out
@@ -466,6 +468,7 @@ class Model:
         self.busy = False          # a turn is running
         self.queued = []           # messages typed while busy
         self.outbox = []           # messages for genai
+        self.next_attachments = [] # reviewed shell context for the next prompt the user submits
         self.hello = None
         self.coding = False
         self.context = None        # (used, limit)
@@ -605,23 +608,21 @@ class Model:
             return
         if text.startswith("//"):
             text = text[1:]
-        self.say(text)
+        attachments, self.next_attachments = self.next_attachments, []
+        self.say(text, attachments=attachments)
 
-    def say(self, text, attached=None):
+    def say(self, text, attachments=()):
         if self.exited is not None:
             self.note("genai is not running", R)
         elif self.busy:
-            self.queued.append(self.add(UserMsg(text, queued=True, attached=attached)))
+            self.queued.append(self.add(UserMsg(text, queued=True, attachments=attachments)))
         else:
             self.turn += 1
-            self.add(UserMsg(text, attached=attached))
-            self.busy = True
-            self.send({"type": "user", "text": text})
+            self.send_turn(self.add(UserMsg(text, attachments=attachments)))
 
     def share(self, label, text, message):
         """Send reviewed output: as an attachment, so genai masks secrets in it, then a message about it."""
-        self.send({"type": "attach", "label": label, "text": text})
-        self.say(message, attached=f"{label}, {text.count(chr(10)) + 1} lines")
+        self.say(message, attachments=[{"type": "attach", "label": label, "text": text}])
 
     def next_queued(self):
         if self.queued and not self.busy:
@@ -631,8 +632,13 @@ class Model:
             msg.changed()
             self.blocks.remove(msg)
             self.add(msg)
-            self.busy = True
-            self.send({"type": "user", "text": msg.text})
+            self.send_turn(msg)
+
+    def send_turn(self, msg):
+        self.busy = True
+        for attachment in msg.attachments:
+            self.send(attachment)
+        self.send({"type": "user", "text": msg.text})
 
     def command(self, line):
         cmd, _, arg = line.partition(" ")
@@ -779,7 +785,7 @@ class Model:
 
     def attach(self, label, text):
         """Shell context the user reviewed: it goes with their next message, so they can ask about it."""
-        self.send({"type": "attach", "label": label, "text": text})
+        self.next_attachments.append({"type": "attach", "label": label, "text": text})
         self.note(f"attached {label}; it goes with your next message", D)
 
     def command_authorized(self, card):

@@ -4,6 +4,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import socket
 import shutil
 import subprocess
 import sys
@@ -241,6 +242,30 @@ class TestModel(unittest.TestCase):
         self.assertEqual(m.outbox, [{"type": "attach", "label": "output of p1 (exit 0)", "text": "line one\nline two"},
                                     {"type": "user", "text": "Here is the output of p1."}])
         self.assertIn("[attached: output of p1 (exit 0), 2 lines]", text_of(m.blocks[-1]))
+
+    def test_queued_share_stays_with_its_own_message(self):
+        m = C.Model()
+        m.submit("first")
+        m.submit("older queued prompt")
+        m.share("shell output", "reviewed", "share")
+        self.assertEqual(m.outbox, [{"type": "user", "text": "first"}])
+        m.handle({"type": "done"})
+        self.assertEqual(m.outbox[-1], {"type": "user", "text": "older queued prompt"})
+        m.handle({"type": "done"})
+        self.assertEqual(m.outbox[-2:], [{"type": "attach", "label": "shell output", "text": "reviewed"},
+                                         {"type": "user", "text": "share"}])
+
+    def test_reviewed_context_stays_with_the_next_submitted_prompt(self):
+        m = C.Model()
+        m.submit("first")
+        m.submit("older queued prompt")
+        m.attach("context", "reviewed")
+        m.submit("explain that context")
+        m.handle({"type": "done"})
+        self.assertEqual(m.outbox[-1], {"type": "user", "text": "older queued prompt"})
+        m.handle({"type": "done"})
+        self.assertEqual(m.outbox[-2:], [{"type": "attach", "label": "context", "text": "reviewed"},
+                                         {"type": "user", "text": "explain that context"}])
 
     def test_review_buffer_matches_genai(self):
         buf = C.review_buffer("ls", 2, "OUTSIDE any sandbox, directly on this host", "x")
@@ -531,6 +556,26 @@ class TestSocket(unittest.TestCase):
                 pass
             c.close()
         self.assertEqual(self.received(1, timeout=0.3), [])
+
+    def test_complete_oversize_line_is_rejected_before_decoding(self):
+        sender, receiver = socket.socketpair()
+        with sender, receiver, mock.patch.object(IPC, "MAX_LINE", 16):
+            sender.sendall(IPC.encode({"text": "a" * 32}))
+            sender.shutdown(socket.SHUT_WR)
+            self.assertEqual(list(IPC.messages(receiver)), [])
+
+    def test_incomplete_handshake_reserves_a_slot_until_deadline(self):
+        with mock.patch.object(IPC, "MAX_CLIENTS", 1), mock.patch.object(IPC, "HELLO_TIMEOUT", 0.5):
+            with socket.socket(socket.AF_UNIX) as first, socket.socket(socket.AF_UNIX) as excess:
+                first.settimeout(2)
+                excess.settimeout(2)
+                first.connect(IPC.socket_path(self.dir))
+                excess.connect(IPC.socket_path(self.dir))
+                self.assertEqual(excess.recv(1), b"")
+                self.assertEqual(first.recv(1), b"")
+            client = IPC.Client(self.dir, "menu")
+            self.addCleanup(client.close)
+            self.assertEqual(self.received(1), [("hello", "menu")])
 
     def test_views_reach_the_right_role(self):
         prompt, panel = IPC.Client(self.dir, "prompt"), IPC.Client(self.dir, "panel")
