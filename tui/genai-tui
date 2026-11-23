@@ -51,6 +51,10 @@ cols=${cols:-120}
 t -f /dev/null new-session -d -s genai -n genai -x "$cols" -y "${rows:-40}" -c "$PWD" \
   -e "GENAI_TUI_TOGGLE=$here/shell-toggle" "bash --rcfile $(q "$here/shellrc") -i"
 shell=$(t display -p -t genai '#{pane_id}')
+# tmux copies what the shell prints into a FIFO the conversation pane reads, in memory, to know each
+# command's output (tui/recorder.py). The shell waits for this before its first prompt.
+mkfifo -m 600 "$state/shell.out"
+t pipe-pane -O -t "$shell" "exec cat > $(q "$state/shell.out")"
 side=$(t split-window -d -h -f -l 42 -t "$shell" -e "GENAI_TUI_STATE=$state" -P -F '#{pane_id}' \
   "$(q "$py") $(q "$here/panel.py")")
 # Top to bottom: the shell, the conversation, the prompt. The shell is hidden once it all exists.
@@ -93,19 +97,19 @@ t set -p -t "$prompt" @genai_title 'you'
 t set -p -t "$side" @genai_title 'info · /panel hides it'
 
 # Right-click in the shell pane: tmux's own menu for shell context. Each request goes to the
-# conversation pane over the socket, through request.py; marking only records a line number in a
-# tmux option.
+# conversation pane over the socket, through request.py. Marking records the line clicked, which the
+# conversation pane at once turns into a count of logical lines, one that resizing doesn't change.
 req="$(q "$py") $(q "$here/request.py")"
 cat > "$state/menu.conf" <<EOF
 bind -n MouseDown3Pane {
   if -F "#{==:#{pane_id},$shell}" {
     display-menu -t= -x M -y M -T " shell context " \\
-      "Mark start of context here" m { set -gF @genai_ctx_mark "#{e|-:#{e|+:#{history_size},#{mouse_y}},#{?scroll_position,#{scroll_position},0}}" ; display-message "genai: shell context starts at this line" } \\
+      "Mark start of context here" m { set -gF @genai_ctx_mark "#{e|-:#{e|+:#{history_size},#{mouse_y}},#{?scroll_position,#{scroll_position},0}}" ; run-shell -b "$req mark" } \\
       "Share from the mark" s { run-shell -b "$req share mark" } \\
       "Share all shell history" a { run-shell -b "$req share all" } \\
       "Share the last command" l { run-shell -b "$req share last" } \\
       "" \\
-      "Clear the mark" c { set -gu @genai_ctx_mark ; display-message "genai: shell context mark cleared" }
+      "Clear the mark" c { set -gu @genai_ctx_mark ; run-shell -b "$req unmark" ; display-message "genai: shell context mark cleared" }
   } {
     select-pane -t= ; send-keys -M
   }

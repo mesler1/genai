@@ -28,6 +28,7 @@ C = load("conversation", os.path.join(REPO, "tui", "conversation.py"))
 sys.path.insert(0, os.path.join(REPO, "tui"))
 C_PROMPT = load("prompt", os.path.join(REPO, "tui", "prompt.py"))
 IPC = load("ipc", os.path.join(REPO, "tui", "ipc.py"))
+REC = load("recorder", os.path.join(REPO, "tui", "recorder.py"))
 G = load("genai_for_tui", os.path.join(REPO, "genai"))
 
 
@@ -217,12 +218,87 @@ class TestModel(unittest.TestCase):
     def test_share_and_mark_commands(self):
         m = C.Model()
         m.shell = True
-        for line in ("/share", "/share mark", "/share all", "/mark", "/share bogus"):
+        for line in ("/share", "/share mark", "/share all", "/mark", "/share 12", "/share #3", "/commands",
+                     "/share bogus"):
             m.submit(line)
-        self.assertEqual(m.actions, [("share", "last"), ("share", "mark"), ("share", "all"), ("mark",)])
+        self.assertEqual(m.actions, [("share", "last"), ("share", "mark"), ("share", "all"), ("mark",),
+                                     ("share_cmd", 12), ("share_cmd", 3), ("commands",)])
         self.assertIn("usage: /share", text_of(m.blocks[-1]))
-        m.request({"type": "share", "what": "mark"})
-        self.assertEqual(m.actions[-1], ("share", "mark"))
+        m.actions = []
+        for msg in ({"type": "share", "what": "mark"}, {"type": "command", "n": 4}, {"type": "command", "n": "4"},
+                    {"type": "command", "n": True}, {"type": "mark", "on": True}, {"type": "mark", "on": False}):
+            m.request(msg)
+        self.assertEqual(m.actions, [("share", "mark"), ("share_cmd", 4), ("mark_line",), ("unmark",)])
+
+
+def mark(kind, *args, nonce="0123456789abcdef"):
+    return f"\x1b]6973;{nonce};{kind}{''.join(';' + a for a in args)}\x07".encode()
+
+
+def done(rc, cmd, nonce="0123456789abcdef"):
+    import base64
+    return mark("D", str(rc), "1" if cmd is not None else "0", base64.b64encode((cmd or "").encode()).decode(), "1",
+                nonce=nonce)
+
+
+class TestRecorder(unittest.TestCase):
+    """What the shell pane printed, split into commands by the prompt hook's markers (tui/recorder.py)."""
+
+    def test_commands_and_their_output(self):
+        r = REC.Recorder()
+        r.feed(b"motd from bashrc\r\n" + mark("H") + b"$ " + done(0, None))   # the first prompt: nothing ran
+        r.feed(b"make\r\n" + mark("S") + b"building\r\nok\r\n" + done(0, "make") + b"$ ")
+        r.feed(b"\r\n" + done(130, None))                                     # Ctrl-C at an empty prompt
+        r.feed(mark("S") + b"secret stuff\r\n" + done(1, None))               # typed with a leading space
+        self.assertEqual([(c.n, c.cmd, c.in_history, c.rc, c.text()) for c in r.finished()],
+                         [(1, "make", True, 0, "building\nok"), (2, "", False, 1, "secret stuff")])
+        self.assertEqual(REC.label(r.get(2)), "(a command kept out of your history)")
+        self.assertEqual(r.done, 2)
+
+    def test_markers_split_across_reads(self):
+        r = REC.Recorder()
+        data = mark("H") + mark("S") + b"one\r\ntwo\r\n" + done(0, "echo")
+        for i in range(len(data)):
+            r.feed(data[i:i + 1])
+        self.assertEqual(r.last().text(), "one\ntwo")
+
+    def test_a_command_cannot_fake_markers(self):
+        r = REC.Recorder()
+        r.feed(mark("H") + mark("S") + b"real\r\n" + done(0, "x", nonce="ffffffffffffffff") + mark("H", nonce="ab" * 8)
+               + b"more\r\n" + done(0, "cat evil"))
+        self.assertEqual([(c.cmd, c.text()) for c in r.finished()], [("cat evil", "real\nmore")])
+
+    def test_markers_before_the_word_is_announced_are_output(self):
+        r = REC.Recorder()
+        r.feed(mark("S", nonce="ab" * 8) + mark("H", nonce="not hex") + mark("H"))
+        self.assertEqual(r.nonce, "0123456789abcdef")
+
+    def test_terminal_output_as_text(self):
+        self.assertEqual(REC.render(b"\x1b[1;31mred\x1b[0m\r\n"), "red\n")
+        self.assertEqual(REC.render(b"10%\r50%\r100%\r\n"), "100%\n")
+        self.assertEqual(REC.render(b"abc\x08\x08X\n"), "aXc\n")
+        self.assertEqual(REC.render(b"long line\rshort\x1b[K\n"), "short\n")
+        self.assertEqual(REC.render(b"\x1b]0;title\x07t\x07ab\x01\n"), "tab\n")
+
+    def test_full_screen_programs_are_left_out(self):
+        r = REC.Recorder()
+        r.feed(mark("H") + mark("S") + b"before\r\n\x1b[?1049h\x1b[Hlots of screen\x1b[?1049lafter\r\n" + done(0, "less f"))
+        self.assertEqual(r.last().text(), "before\nafter")
+        self.assertTrue(r.last().screen)
+
+    def test_huge_output_keeps_its_start_and_end(self):
+        r = REC.Recorder()
+        r.feed(mark("H") + mark("S"))
+        for i in range(40000):
+            r.feed(f"line {i:05d} {'x' * 30}\r\n".encode())
+        r.feed(done(0, "spam"))
+        text = r.last().text()
+        self.assertTrue(text.startswith("line 00000"))
+        self.assertTrue(text.endswith("line 39999 " + "x" * 30))
+        self.assertIn("bytes of output not kept", text)
+        trimmed = REC.trim(text)
+        self.assertIn("lines left out here", trimmed)
+        self.assertLess(trimmed.count("\n"), 400)
 
     def test_failed_turn_ends_busy(self):
         m = C.Model()
@@ -434,11 +510,15 @@ class TestGenaiTui(TmuxCase):
         self.proc.stdin.write(keys.encode())
         self.proc.stdin.flush()
 
-    def click(self, text):
-        """A left click (press and release, as a mouse sends them) on the first conversation row showing text."""
-        y = next(i for i, ln in enumerate(self.screen("genai").splitlines()) if text in ln)
+    def click(self, text, pane="genai"):
+        """A left click (press and release, as a mouse sends them) on the first row of a pane showing text."""
+        y = next(i for i, ln in enumerate(self.screen(pane).splitlines()) if text in ln)
         xy = [f"{33 + 4:02x}", f"{33 + y:02x}"]
-        self.tmux("send-keys", "-t", self.panes()["genai"], "-H", "1b", "5b", "4d", "20", *xy, "1b", "5b", "4d", "23", *xy)
+        self.tmux("send-keys", "-t", self.panes()[pane], "-H", "1b", "5b", "4d", "20", *xy, "1b", "5b", "4d", "23", *xy)
+
+    def shell(self, command):
+        self.tmux("send-keys", "-t", self.panes()["shell"], command, "Enter")
+        time.sleep(0.4)
 
     def sent(self, api):
         return [m for m in api.requests[-1]["body"]["messages"] if m["role"] == "user"][-1]["content"]
@@ -513,6 +593,47 @@ class TestGenaiTui(TmuxCase):
             time.sleep(0.5)
             self.assertNotIn("info", [t.split(" ")[0] for t in
                                       self.tmux("list-panes", "-t", "genai:0", "-F", "#{@genai_title}").split()])
+
+    def test_click_a_shell_command_in_the_panel_to_share_it(self):
+        with FakeAPI([reply("got it")]) as api:
+            self.start(api)
+            self.shell("echo first-out")
+            self.shell("printf 'a\\nb\\n'; (exit 2)")
+            self.wait_for("✗ printf", pane="info")
+            self.type("/commands")
+            self.wait_for("/share N reviews one")
+            self.assertIn("1 ✓ echo first-out", self.screen())
+            self.click("echo first-out", pane="info")
+            self.wait_for("Command 1 in the shell pane: echo first-out (exit 0, 1 line)")
+            self.key("y")
+            self.wait_for("got it")
+            self.assertIn("```\necho first-out\n```\nOutput:\n```\nfirst-out\n```", self.sent(api))
+
+    def test_a_mark_survives_resizing(self):
+        with FakeAPI([reply("seen it")]) as api:
+            self.start(api)
+            self.show_shell()
+            sh = self.panes()["shell"]
+            long = "x" * 150                                          # wraps in the shell pane, then won't
+            for c in ("echo before-mark", f"echo {long}", "echo in-context"):
+                self.shell(c)
+            y = next(i for i, ln in enumerate(self.screen("shell").splitlines()) if ln.endswith("echo in-context"))
+            top = int(self.tmux("display", "-p", "-t", sh, "#{pane_top}"))
+            self.at_terminal(f"\x1b[<2;5;{top + y + 1}M")
+            time.sleep(0.5)
+            self.at_terminal("m")
+            time.sleep(0.5)
+            self.tmux("resize-window", "-t", "genai:0", "-x", "220")
+            time.sleep(0.5)
+            self.type("/share mark")
+            self.wait_for("Share 2 lines of shell history from the mark with the model?")
+            self.key("y")
+            self.wait_for("attached 2 lines")
+            self.type("what happened?")
+            self.wait_for("seen it")
+            sent = self.sent(api)
+            self.assertIn("echo in-context\nin-context", sent)
+            self.assertNotIn("xxxx", sent)
 
     def test_right_click_marks_shell_context(self):
         with FakeAPI([reply("seen it")]) as api:
@@ -640,7 +761,7 @@ class TestGenaiTui(TmuxCase):
             self.tmux("send-keys", "-t", self.panes()["shell"], "echo by-hand", "Enter")
             time.sleep(0.5)
             self.type("/share")
-            self.wait_for("Last command in the shell pane: echo by-hand (exit 0)")
+            self.wait_for("Command 2 in the shell pane: echo by-hand (exit 0, 1 line)")
             self.key("y")
             self.wait_for("thanks")
             self.assertIn("```\necho by-hand\n```\nOutput:\n```\nby-hand\n```", self.sent(api))
