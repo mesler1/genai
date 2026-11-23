@@ -52,6 +52,7 @@ COMMANDS = {
     "/shell": "show the shell and move there (`` on its empty prompt hides it again)",
     "/panel": "show or hide the info panel on the right",
     "/plan": "[clear]: show the approved plan, or drop it so everything asks again",
+    "/copy": "[N]: copy your message and the reply to it, for the last turn or turn N (or right-click it)",
     "/raw": "[N|all]: what was sent to the endpoint and what came back, for the last turn, turn N, or all kept",
     "/system": "the system prompt and tool definitions sent with every request",
     "/compact": "shrink the conversation when the context is getting full",
@@ -784,6 +785,8 @@ class Model:
                               D if st.get("status") == "done" else Q if st.get("status") == "left out" else "")
         elif cmd == "/raw":
             self.raw(arg)
+        elif cmd == "/copy":
+            self.copy(arg)
         elif cmd == "/context":
             used, limit = self.context or (None, None)
             self.note(f"context: {used}/{limit} tokens" if used is not None else "context: not measured yet")
@@ -797,6 +800,31 @@ class Model:
             self.quit = True
         else:
             self.note(f"unknown command {cmd} (/help lists them)", R)
+
+    def turn_text(self, turn):
+        """Your message for a turn and the replies that followed it, as text to copy (escaped, as shown), or None."""
+        asked = [b for b in self.blocks if isinstance(b, UserMsg) and b.turn == turn and not b.queued]
+        if not turn or not asked:
+            return None
+        said = clean(asked[0].text).strip("\n")
+        parts = ["\n".join("> " + ln if ln else ">" for ln in said.split("\n"))]
+        parts += [clean(b.text).strip("\n") for b in self.blocks
+                  if isinstance(b, Reply) and b.turn == turn and b.text.strip()]
+        return "\n\n".join(parts) + "\n"
+
+    def copy(self, arg):
+        if arg and not arg.isdigit():
+            self.note("usage: /copy or /copy N (a turn)", R)
+            return
+        turns = [b.turn for b in self.blocks if isinstance(b, UserMsg) and not b.queued]
+        turn = int(arg) if arg else max(turns, default=0)
+        text = self.turn_text(turn)
+        if text is None:
+            self.note("nothing to copy yet" if not arg else f"turn {turn} isn't on screen", R)
+        elif not self.shell:
+            self.note("/copy needs tmux: start genai with genai-tui", R)
+        else:
+            self.actions.append(("copy", turn, text))
 
     def raw(self, arg):
         """Ask genai for a turn's exchanges with the endpoint: the latest turn that had any, turn N, or all."""
@@ -850,6 +878,8 @@ class Model:
             self.command(f"/raw {'' if msg['turn'] == 'last' else msg['turn']}".strip())
         elif t == "system":
             self.command("/system")
+        elif t == "copy" and type(msg.get("turn")) is int:
+            self.command(f"/copy {msg['turn']}")
         elif t == "share" and msg.get("what") in ("mark", "all", "last") and self.shell:
             self.actions.append(("share", msg["what"]))
         elif t == "command" and type(msg.get("n")) is int and self.shell:
@@ -1258,18 +1288,20 @@ class Shell:
                   "", "Cancel", "q", ""],
                                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
 
-    def raw_menu(self, turn):
-        """Right-click in the conversation: tmux's menu for looking behind it. Only fixed words and a number."""
+    def raw_menu(self, turn, copy=0):
+        """Right-click in the conversation: tmux's menu for copying a turn and looking behind it. Only fixed words
+        and numbers."""
         me = os.environ.get("TMUX_PANE", "")
         pick = menu_item
-        items = (["What was sent and received for this turn", "r", pick("raw", str(turn))] if turn else []) + [
+        items = (["Copy this message and its reply", "c", pick("copy", str(copy)), ""] if copy else []) + \
+            (["What was sent and received for this turn", "r", pick("raw", str(turn))] if turn else []) + [
             "What was sent and received last", "l", pick("raw", "last"),
             "Everything genai still has (last 30)", "a", pick("raw", "all"),
             "The system prompt and tools", "s", pick("system"),
             "", "Cancel", "q", ""]
         self.menus = [p for p in getattr(self, "menus", []) if p.poll() is None]
         self.menus.append(subprocess.Popen(["tmux", "display-menu", "-t", me, "-x", "M", "-y", "M", "-T",
-                                            f" raw view{f' · turn {turn}' if turn else ''} ", *items],
+                                            f" turn {copy or turn} " if copy or turn else " raw view ", *items],
                                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
 
     def title(self, text):
@@ -1710,7 +1742,7 @@ class App:
         elif b & (curses.BUTTON3_RELEASED | curses.BUTTON3_CLICKED) and self.shell:
             block = self.rows[y] if 0 <= y < len(self.rows) else None
             turn = getattr(block, "turn", 0)
-            self.shell.raw_menu(turn if turn in self.m.exchanges else 0)
+            self.shell.raw_menu(turn if turn in self.m.exchanges else 0, turn if self.m.turn_text(turn) else 0)
         elif 0 <= y < len(self.rows) and not self.m.pending and not self.m.ask:
             card = self.rows[y]
             if isinstance(card, Card) and card.ev.get("kind") == "command":
@@ -2124,7 +2156,7 @@ class App:
                 self.from_prompt(msg)
             elif role == "panel":
                 self.m.request(msg)
-            elif role == "menu" and msg.get("type") in ("share", "mark", "raw", "system"):
+            elif role == "menu" and msg.get("type") in ("share", "mark", "raw", "system", "copy"):
                 self.m.request(msg)
             elif role == "menu" and msg.get("type") == "menu" and msg.get("action") == "open":
                 self.open_menu(msg.get("key"))
@@ -2140,6 +2172,11 @@ class App:
                 self.list_commands()
             elif action[0] == "show":
                 self.show_raw(action[1])
+            elif action[0] == "copy":
+                self.shell.copy(action[2])
+                n = action[2].count("\n")
+                self.m.note(f"turn {action[1]} copied: your message and the reply, {n} lines (tmux buffer, and your "
+                            "clipboard if the terminal allows it)")
             elif action[0] == "plan_cmd":
                 self.plan_cmd(action[1])
             elif action[0] == "mark_line":
