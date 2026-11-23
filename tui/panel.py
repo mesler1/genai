@@ -60,6 +60,12 @@ def view(st, w, sel):
     coding = st.get("coding")
     add([("coding   ", Q), ("[on] " if coding else "[off]", W if coding else ""),
          (fit("  c switches" if not coding else "  reads without asking", w - 14), Q)], "coding")
+    run = st.get("runner")
+    if run and run.get("problem"):
+        add([("sandbox  ", Q), (fit("can't run here", w - 9), R)])
+    elif run:
+        add([("sandbox  ", Q), ("ONLINE" if run.get("network") else "offline", W if run.get("network") else D),
+             (fit("  each run asks · /network" if run.get("network") else "  /network switches", w - 16), Q)])
     head("CONTEXT")
     ctx = st.get("context") or [None, None]
     add(bar(ctx[0] or 0, ctx[1], w) if ctx[0] is not None else [("not measured yet", Q)])
