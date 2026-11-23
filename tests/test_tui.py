@@ -755,8 +755,11 @@ class TestInTmux(TmuxCase):
 class TestGenaiTui(TmuxCase):
     """tui/genai-tui itself: the conversation pane above a real bash pane, started through a pseudo-terminal."""
 
-    def start(self, api, editor="true", path=None):
+    def start(self, api, editor="true", path=None, args="-e test"):
         home = self.config(api)
+        if not args:        # genai then finds the endpoint the way a bare `genai` does
+            conf = dict(G.STARTER_CONFIG, default_endpoint="test")
+            G.write_private(os.path.join(home, "config.json"), json.dumps(conf))
         self.runtime = tempfile.mkdtemp(prefix="gr-", dir="/tmp")      # short: socket paths are limited
         os.chmod(self.runtime, 0o700)
         self.addCleanup(shutil.rmtree, self.runtime, True)
@@ -771,7 +774,7 @@ class TestGenaiTui(TmuxCase):
                    TERM="xterm-256color", GENAI_TUI_SOCKET=self.sock, EDITOR=editor, VISUAL=editor,
                    XDG_RUNTIME_DIR=self.runtime, PATH=f"{path}:{os.environ['PATH']}" if path else os.environ["PATH"])
         env.pop("TMUX", None)
-        self.proc = subprocess.Popen(["script", "-qfc", f"stty cols 110 rows 40; {REPO}/tui/genai-tui -e test",
+        self.proc = subprocess.Popen(["script", "-qfc", f"stty cols 110 rows 40; {REPO}/tui/genai-tui {args}",
                                       "/dev/null"], cwd=self.wd, env=env, stdin=subprocess.PIPE,
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.addCleanup(lambda: (self.tmux("kill-server"), self.proc.wait(10)))
@@ -818,6 +821,13 @@ class TestGenaiTui(TmuxCase):
 
     def sent(self, api):
         return [m for m in api.requests[-1]["body"]["messages"] if m["role"] == "user"][-1]["content"]
+
+    def test_starts_with_no_arguments(self):
+        with FakeAPI([reply("hello")]) as api:
+            self.start(api, args="")
+            self.assertNotIn("unrecognized arguments", self.screen())
+            self.type("hi")
+            self.wait_for("hello")
 
     def test_run_in_the_shell_pane_then_share(self):
         turns = [call("propose_command", command="echo from-shell; (exit 3)", reason="look"), reply("exit 3, I see.")]

@@ -60,7 +60,8 @@ side=$(t split-window -d -h -f -l 42 -t "$shell" -e "GENAI_TUI_STATE=$state" -P 
 # Top to bottom: the shell, the conversation, the prompt. The shell is hidden once it all exists.
 prompt=$(t split-window -d -v -l 3 -t "$shell" -e "GENAI_TUI_STATE=$state" -e "GENAI_TUI_SHELL=$shell" \
   -e "GENAI_TUI_TOGGLE=$here/shell-toggle" -P -F '#{pane_id}' "$(q "$py") $(q "$here/prompt.py")")
-conv_cmd="$(q "$py") $(q "$here/conversation.py") $(printf '%q ' "$@")"
+conv_cmd="$(q "$py") $(q "$here/conversation.py")"
+[ $# -eq 0 ] || conv_cmd+=" $(printf '%q ' "$@")"     # printf with no arguments would still print ''
 conv=$(t split-window -d -v -l 60% -t "$shell" -c "$PWD" -e "GENAI_TUI_SHELL=$shell" -e "GENAI_TUI_PANEL=$side" \
   -e "GENAI_TUI_TOGGLE=$here/shell-toggle" \
   -e "GENAI_TUI_STATE=$state" -e "GENAI_TUI_PROMPT=$prompt" -P -F '#{pane_id}' \
