@@ -587,6 +587,8 @@ class TestEndToEnd(Tmp):
             g.send({"type": "decision", "id": p["id"], "decision": "decline"})
             g.until("done")
             g.close()
+            system = [r["body"]["messages"][0]["content"] for r in api.requests]
+            self.assertEqual(["# Coding mode is on" in t for t in system], [True, True, False, False])
             coding = [a for a in self.audit() if a["event"] == "coding"]
             self.assertEqual([(a["on"], a["source"]) for a in coding], [(True, "wrapper"), (False, "wrapper")])
 
