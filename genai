@@ -2029,7 +2029,8 @@ class Engine:
             return
         steps = [st for st in self.plan["steps"] if st["approved"]]
         if p.kind == "command":
-            hit = next((st for st in steps if st["kind"] == "command" and st["command"] == p.fields["command"]), None)
+            hit = next((st for st in steps if st["kind"] == "command" and st["status"] == "todo"
+                        and st["command"] == p.fields["command"]), None)
         else:
             try:
                 where = "/".join(split_rel(p.fields["path"])) if p.fields["path"] not in (".", "./", "") else ""
@@ -2044,6 +2045,7 @@ class Engine:
         p.fields["plan_step"] = hit["n"]
         if p.kind == "command":
             p.fields["preapproved"] = True
+            p.fields["plan_id"] = self.plan["id"]
             hit["status"] = "done"
         elif p.kind in ("read", "list") and not p.auto:
             parts = split_rel(p.fields["path"]) if hit["_where"] else []
