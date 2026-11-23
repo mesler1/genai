@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """genai: a small client for OpenAI-compatible APIs.
 
-The model never executes anything. It proposes a command or a file operation,
+The model never executes anything on your system. It proposes a command or a file operation,
 the scaffold (this REPL, or a wrapper speaking JSON Lines) presents it, and a
-human decides. Standard library only; Python 3.10 or newer.
+human decides. The one exception is opt-in: in coding mode, a profile's sandbox lets the
+model run commands in an offline container on a throwaway copy of the project.
+Standard library only; Python 3.10 or newer.
 """
 
 import argparse
@@ -46,16 +48,17 @@ WARN_FRACTION = 0.8
 KEEP_TURNS = 2                 # user turns kept word for word by :compact
 SUMMARY_WORDS = 300
 HOOK_TIMEOUT = 10              # seconds a notify hook may run before it is killed
+TTY_OUTPUT_LINES = 40          # last lines of a sandboxed command's output shown at a terminal
 TRACE_KEEP = 30                # exchanges with the endpoint kept in memory, for a wrapper to show
 
 EXIT_OK, EXIT_ERROR, EXIT_USAGE, EXIT_PROFILE, EXIT_API, EXIT_CONTEXT = 0, 1, 2, 3, 4, 5
 EXIT_INTERRUPT = 130
 
-INTRINSICS = ("propose_command", "read_file", "list_dir", "write_file", "edit_file", "propose_plan")
+INTRINSICS = ("propose_command", "read_file", "list_dir", "write_file", "edit_file", "propose_plan", "run_in_sandbox")
 PLAN_STEPS = 30                # steps one plan may have
 ENDPOINT_KEYS = {"name", "base_url", "model", "key_env", "key_file", "context_limit", "timeout",
                  "ca_bundle", "headers", "params", "allow_http", "proxy", "description"}
-PROFILE_KEYS = {"name", "description", "endpoint", "persona", "skills", "params", "coding"}
+PROFILE_KEYS = {"name", "description", "endpoint", "persona", "skills", "params", "coding", "sandbox"}
 NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
 ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
@@ -375,6 +378,223 @@ def command_fingerprint(cmd):
 
 def where_runs(sb):
     return f"inside the {sb['name']} sandbox" if sb else "OUTSIDE any sandbox, directly on this host"
+
+
+# --------------------------------------------------------------------------
+# Sandbox runner: commands the model runs itself, in a container, on a throwaway copy of the project
+
+SANDBOX_KEYS = {"engine", "image", "network", "timeout", "memory", "pids"}
+SANDBOX_TIMEOUT = 300          # seconds a sandboxed command may run before it is killed
+SANDBOX_TMP = "1g"             # size of the sandbox's /tmp, which is also its HOME
+SANDBOX_MEMORY = "4g"
+SANDBOX_PIDS = 1024
+SANDBOX_MASKS = 500            # files and directories one run may hide; more refuses the run
+SANDBOX_SCAN = 50000           # entries checked for secrets; a larger project refuses the run
+SECRET_NAMES = {".env", ".envrc", ".netrc", ".npmrc", ".pypirc", ".pgpass", ".git-credentials", ".vault-token",
+                ".aws", ".ssh", ".gnupg", ".docker", ".kube", ".password-store", ".azure", ".config"}
+SECRET_PREFIXES = (".env.", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519")
+SECRET_SUFFIXES = (".key", ".p12", ".pfx", ".jks", ".keystore")
+SCAN_SKIP = {"node_modules", "__pycache__", ".tox", ".nox", ".mypy_cache", ".pytest_cache", ".ruff_cache"}
+_GUARD_EXIT = 97
+# Runs first inside the container: every hidden path must really be empty, or the command doesn't run.
+_GUARD = ('for p in "$@"; do if [ -d "$p" ]; then [ -z "$(ls -A "$p")" ] || { echo "$GENAI_GUARD $p"; exit 97; }; '
+          'elif [ -s "$p" ]; then echo "$GENAI_GUARD $p"; exit 97; fi; done; '
+          'c=$GENAI_CMD; unset GENAI_CMD GENAI_GUARD; exec /bin/sh -c "$c"')
+
+
+def parse_sandbox(data, path):
+    """A profile's "sandbox" object, checked. The image is required: offline, the project's tools and
+    dependencies have to be in it already."""
+    if not isinstance(data, dict):
+        raise GenaiError(f"{path}: 'sandbox' must be an object", EXIT_PROFILE)
+    unknown = set(data) - SANDBOX_KEYS
+    if unknown:
+        raise GenaiError(f"{path}: unknown sandbox fields: {', '.join(sorted(unknown))}", EXIT_PROFILE)
+    box = {"engine": data.get("engine", "auto"), "image": data.get("image"), "network": data.get("network", False),
+           "timeout": data.get("timeout", SANDBOX_TIMEOUT), "memory": data.get("memory", SANDBOX_MEMORY),
+           "pids": data.get("pids", SANDBOX_PIDS)}
+    if box["engine"] not in ("auto", "podman"):
+        raise GenaiError(f"{path}: sandbox 'engine' must be \"auto\" or \"podman\" (apptainer is not supported yet)",
+                         EXIT_PROFILE)
+    if not isinstance(box["image"], str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/:@+-]{0,255}", box["image"]):
+        raise GenaiError(f"{path}: sandbox 'image' is required: the container image commands run in", EXIT_PROFILE)
+    if not isinstance(box["network"], bool):
+        raise GenaiError(f"{path}: sandbox 'network' must be true or false", EXIT_PROFILE)
+    if type(box["timeout"]) is not int or not 1 <= box["timeout"] <= 3600:
+        raise GenaiError(f"{path}: sandbox 'timeout' must be seconds, from 1 to 3600", EXIT_PROFILE)
+    if not isinstance(box["memory"], str) or not re.fullmatch(r"[0-9]+[kmg]?", box["memory"]):
+        raise GenaiError(f"{path}: sandbox 'memory' must be a size such as \"4g\"", EXIT_PROFILE)
+    if type(box["pids"]) is not int or not 16 <= box["pids"] <= 100000:
+        raise GenaiError(f"{path}: sandbox 'pids' must be a number of processes, from 16 to 100000", EXIT_PROFILE)
+    return box
+
+
+def secret_name(name):
+    return name in SECRET_NAMES or name.startswith(SECRET_PREFIXES) or name.endswith(SECRET_SUFFIXES)
+
+
+class Sandbox:
+    """Runs one command in a podman container: the project is a copy-on-write overlay whose changes are
+    discarded, files that look like secrets are hidden, there is no network unless switched on, nothing from
+    the home directory, a time limit, and memory and process limits where the host allows them."""
+
+    def __init__(self, conf, root, notice):
+        self.conf, self.root, self.notice = conf, os.path.realpath(root), notice
+        self.podman = shutil.which("podman")
+        self.network = conf["network"]      # the switch; starts as the profile says, never saved with a session
+        self.limits = True                  # False once the host refused memory and process limits
+        self.cache = {}                     # (path, identity) -> looks secret
+        self.counter = 0
+
+    def problem(self):
+        """Why the sandbox can't run anything here, or None."""
+        if not self.podman:
+            return "podman is not installed"
+        if any(c in self.root for c in ":,"):
+            return "the project's path contains ':' or ',', which podman can't mount"
+        return None
+
+    def info(self):
+        return {"engine": "podman", "image": self.conf["image"], "network": self.network,
+                "timeout": self.conf["timeout"], "problem": self.problem()}
+
+    def masks(self, values=()):
+        """Files and directories to hide in the sandbox, relative to the project: secret-looking names, and
+        files whose contents look like secrets. Virtual environments and dependency caches are not scanned;
+        a .git directory only has its config checked. Raises GenaiError if the project is too big to check."""
+        files, dirs, seen = [], [], 0
+        stack = [""]
+        while stack:
+            rel = stack.pop()
+            try:
+                with os.scandir(os.path.join(self.root, rel)) as it:
+                    entries = sorted(it, key=lambda e: e.name)
+            except OSError:
+                continue                    # unreadable here is unreadable in the sandbox too
+            for e in entries:
+                seen += 1
+                if seen > SANDBOX_SCAN:
+                    raise GenaiError(f"the project has more than {SANDBOX_SCAN} files, too many to check for "
+                                     "secrets before a sandboxed run", kind="sandbox")
+                r = f"{rel}/{e.name}" if rel else e.name
+                try:
+                    if e.is_symlink():
+                        continue
+                    if e.is_dir():
+                        if secret_name(e.name):
+                            dirs.append(r)
+                        elif e.name == ".git":
+                            if self.secret_file(os.path.join(e.path, "config"), values):
+                                files.append(r + "/config")
+                        elif e.name not in SCAN_SKIP and not os.path.exists(os.path.join(e.path, "pyvenv.cfg")):
+                            stack.append(r)
+                    elif e.is_file() and (secret_name(e.name) or self.secret_file(e.path, values)):
+                        files.append(r)
+                except OSError:
+                    continue
+        return files, dirs
+
+    def secret_file(self, path, values):
+        try:
+            st = os.stat(path, follow_symlinks=False)
+            if not stat.S_ISREG(st.st_mode):
+                return False
+            key = (path, st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, tuple(values))
+            if key not in self.cache:
+                with open(path, "rb") as f:
+                    text = f.read(READ_CAP).decode("utf-8", "replace")
+                self.cache[key] = looks_secret(text) or any(v and v in text for v in values)
+            return self.cache[key]
+        except OSError:
+            return False
+
+    def argv(self, name, command, files, dirs, empty, guard):
+        net = ["--network=none", "--http-proxy=false"] if not self.network else []
+        limits = [f"--memory={self.conf['memory']}", f"--pids-limit={self.conf['pids']}"] if self.limits else []
+        mounts = [f"--volume={self.root}:/work:O"]
+        mounts += [f"--volume=/dev/null:/work/{f}:ro" for f in files]
+        mounts += [f"--volume={empty}:/work/{d}:ro" for d in dirs]
+        return ([self.podman, "--log-level=error", "run", "--rm", f"--name={name}", "--pull=never", "--init",
+                 "--userns=keep-id", "--read-only", f"--tmpfs=/tmp:rw,size={SANDBOX_TMP},mode=1777",
+                 "--cap-drop=all", "--security-opt=no-new-privileges", "--workdir=/work",
+                 "--env=HOME=/tmp", f"--env=GENAI_CMD={command}", f"--env=GENAI_GUARD={guard}"]
+                + net + limits + mounts + [self.conf["image"], "/bin/sh", "-c", _GUARD, "genai-guard"]
+                + [f"/work/{p}" for p in files + dirs])
+
+    def run(self, command, values=(), cap=OUTPUT_CAP * 8):
+        """Run command; returns (ran, exit code or None, output, note). ran is False when the command never
+        started; the exit code is None when it was killed at the time limit. Ctrl-C stops the container and is
+        raised again."""
+        problem = self.problem()
+        if problem:
+            return False, None, "", problem
+        files, dirs = self.masks(values)
+        bad = [p for p in files + dirs if any(c in p for c in ":,")]
+        if bad:
+            return False, None, "", f"can't hide {show_exact(bad[0])}: its name contains ':' or ','"
+        if len(files) + len(dirs) > SANDBOX_MASKS:
+            return False, None, "", f"more than {SANDBOX_MASKS} files look like secrets, too many to hide"
+        self.counter += 1
+        name = f"genai-{os.getpid()}-{self.counter}-{secrets.token_hex(6)}"
+        guard = "genai-guard-" + secrets.token_hex(6)
+        with tempfile.TemporaryDirectory(prefix="genai-empty-") as empty:
+            os.chmod(empty, 0o500)
+            for attempt in (1, 2):
+                rc, out = self._podman(self.argv(name, command, files, dirs, empty, guard), name, cap)
+                if attempt == 1 and self.limits and rc in (125, 126) and "cgroup" in out:
+                    self.limits = False
+                    self.notice("this host doesn't let podman limit memory or processes (cgroups aren't delegated "
+                                "to you); sandboxed commands are limited only by time and the size of /tmp")
+                    continue
+                break
+        hidden = len(files) + len(dirs)
+        if rc == _GUARD_EXIT and out.startswith(guard):
+            return False, None, "", (f"refused: {out[len(guard):].strip()} should have been hidden in the sandbox but "
+                              "wasn't, so the command did not run")
+        if rc == "timeout":
+            return True, None, out, f"killed after {self.conf['timeout']} s"
+        if rc in (125, 126, 127) and out.startswith("Error:"):
+            hint = f" (podman pull {self.conf['image']} first)" if "image not known" in out else ""
+            return False, None, "", f"the sandbox could not start: {one_line(out.strip())[0]}{hint}"
+        return True, rc, out, f"{hidden} secret-looking path{'s' if hidden != 1 else ''} hidden" if hidden else ""
+
+    def _podman(self, argv, name, cap):
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        chunks, size = [], [0]
+
+        def drain():
+            for chunk in iter(lambda: proc.stdout.read1(65536), b""):
+                if size[0] < cap:
+                    chunks.append(chunk)
+                size[0] += len(chunk)
+
+        reader = threading.Thread(target=drain, daemon=True)
+        reader.start()
+        try:
+            rc = proc.wait(timeout=self.conf["timeout"])
+        except subprocess.TimeoutExpired:
+            self._kill(name, proc)
+            rc = "timeout"
+        except KeyboardInterrupt:
+            self._kill(name, proc)
+            raise
+        reader.join(5)
+        proc.stdout.close()
+        out = strip_ansi(b"".join(chunks).decode("utf-8", "replace"))
+        if size[0] > cap:
+            out += f"\n[... {size[0] - cap} more bytes of output not kept ...]"
+        return rc, out
+
+    def _kill(self, name, proc):
+        subprocess.run([self.podman, "--log-level=error", "kill", name], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=30, check=False)
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+
 
 
 # --------------------------------------------------------------------------
@@ -761,7 +981,8 @@ class Endpoint:
 
 
 class Profile:
-    """A persona: which endpoint, what to tell the model, which skills, sampling params, coding mode."""
+    """A persona: which endpoint, what to tell the model, which skills, sampling params, coding mode, and the
+    sandbox the model may run commands in."""
 
     def __init__(self, data, path):
         self.path, self.data = path, data
@@ -793,6 +1014,7 @@ class Profile:
                 raise GenaiError(f"{path}: params may not set '{k}'", EXIT_PROFILE)
         if not isinstance(self.coding, bool):
             raise GenaiError(f"{path}: 'coding' must be true or false", EXIT_PROFILE)
+        self.sandbox = parse_sandbox(data["sandbox"], path) if "sandbox" in data else None
 
     @classmethod
     def load(cls, path):
@@ -825,6 +1047,13 @@ class Profile:
         if self.coding:
             lines.append("  [!] grants coding mode: the model reads and lists files in your working directory "
                          "without asking (writes still ask)")
+        if self.sandbox:
+            b = self.sandbox
+            lines.append(f"  sandbox:  podman, image {one(b['image'])}, {b['timeout']} s limit: in coding mode the model "
+                         "runs commands on a throwaway copy of the project, without asking")
+            if b["network"]:
+                lines.append("  [!] the sandbox starts with the network ON: code the model writes could send your "
+                             "project anywhere, so each run asks first")
         if self.persona:
             lines.append("  persona (sent to the model with every request):")
             lines += ["    | " + ln for ln in show_exact(self.persona).splitlines()]
@@ -1433,6 +1662,13 @@ TOOLS = [
           ["goal", "steps"]),
 ]
 
+# Offered only in coding mode, when the profile gives a sandbox that can run here.
+RUN_TOOL = _tool("run_in_sandbox", "Run ONE shell command (build, test, lint, try something) in a sandbox and get its "
+                 "exit code and output back. It runs in /work, a throwaway copy of the working directory: changes it "
+                 "makes are discarded, so change files with edit_file or write_file. No home directory; files that "
+                 "look like secrets are hidden. Use it to check your work, then fix what fails.",
+                 {"command": {"type": "string"}, "reason": _REASON}, ["command", "reason"])
+
 SYSTEM_PROMPT = """You are genai, an assistant working alongside a human in their terminal.
 
 Rules you work under:
@@ -1450,8 +1686,16 @@ CODING_RULES = """
 - read_file and list_dir run without asking inside the working directory (hidden and secret-looking files still ask). Look before you change: list and read the files involved before proposing an edit. Never guess at a file's contents or at an API you haven't read.
 - Change an existing file with edit_file, not write_file. old_text must match exactly once, so include a few unchanged lines around the change. Prefer several small edits to one large one.
 - Writes and edits are shown to the user as diffs and may be declined; if one is, ask rather than retrying the same change.
-- You still cannot run anything. When a change is ready, propose ONE command that builds or tests it. That ends your turn, and the user may send you the output.
+{run}
 - For a task of more than two or three steps, call propose_plan first and wait for approval. Then follow the plan: propose planned commands exactly as approved. If you need to go outside it, say why, or propose a new plan."""
+
+CODING_NO_RUN = ("- You still cannot run anything. When a change is ready, propose ONE command that builds or tests it. "
+                 "That ends your turn, and the user may send you the output.")
+SANDBOX_NET = {False: "offline: there is no network, so nothing can be downloaded; if a tool or dependency is missing, say "
+                      "so rather than working around it",
+               True: "online, so the user is asked before each run"}
+CODING_RUN = """- The one exception to "you never execute anything": you can run commands yourself with run_in_sandbox: build and test there after each change, read the output, and fix what fails before you call the work done. The sandbox is {net}. Its changes are discarded: edit files only with edit_file and write_file.
+- Use propose_command only for what the sandbox can't do: anything that must change the real system or needs the user's own environment. That ends your turn."""
 
 
 # --------------------------------------------------------------------------
@@ -1789,6 +2033,7 @@ class Proposal:
         self.result = None
         self.error = None          # set when the request is invalid and never shown for a decision
         self.reply = None          # what the model is told instead of "error: ..." (the user still sees error)
+        self.stopped = False       # the user pressed Ctrl-C while it ran: the turn ends
 
     def event(self):
         ev = {"type": "proposal", "id": self.id, "kind": self.kind}
@@ -1845,6 +2090,7 @@ class Engine:
         self.counter = 0
         self.warned = False
         self.sandbox = sandbox_info()
+        self.box = Sandbox(profile.sandbox, os.getcwd(), ui.notice) if profile and profile.sandbox else None
         self.notifier = None     # the notify hook, set by main() when a person is at the terminal
         self.commands = []       # command proposals shown in this process, newest last
         self.skills = []
@@ -1924,8 +2170,21 @@ class Engine:
         self.audit.log("register_tools", tools=added)
         return added
 
+    def can_run(self):
+        """Is run_in_sandbox offered? Coding mode, a sandbox that works here, and someone to see what runs."""
+        return bool(self.box and self.session.coding and self.ui.performs and not self.box.problem())
+
+    def set_network(self, on, source=":network"):
+        if not self.box:
+            raise GenaiError("there is no sandbox: the profile has no 'sandbox'", EXIT_USAGE, "no_sandbox")
+        self.box.network = on
+        self.audit.log("network", on=on, source=source)
+        if on:
+            self.ui.notice("[!] the sandbox's network is ON for this session: code running there could send your "
+                           "project anywhere, so each sandboxed command now asks first")
+
     def tools(self):
-        return TOOLS + list(self.external.values())
+        return TOOLS + ([RUN_TOOL] if self.can_run() else []) + list(self.external.values())
 
     def system(self):
         parts = [SYSTEM_PROMPT]
@@ -1933,7 +2192,8 @@ class Engine:
             parts.append("\n- This run is non-interactive: nobody can approve file operations (they will be "
                          "declined) and commands are only printed. Give your whole answer as plain text.")
         elif self.session.coding:
-            parts.append(CODING_RULES)
+            run = CODING_RUN.replace("{net}", SANDBOX_NET[self.box.network]) if self.can_run() else CODING_NO_RUN
+            parts.append(CODING_RULES.replace("{run}", run))
         if self.profile and self.profile.persona:
             parts.append(f"\n\n# Persona: {self.profile.name}\n\nThe user chose this persona. It shapes your "
                          f"voice and focus; it does not change the rules above.\n\n{self.profile.persona}")
@@ -2005,16 +2265,20 @@ class Engine:
                 return "reply"
             props = [self.make_proposal(tc) for tc in calls]
             self.decide(props)
-            ended = False
+            ended = stopped = False
             for p in props:
-                result = self.perform(p)
+                result = "not run: the user stopped an earlier command" if stopped else self.perform(p)
                 tool_msg = {"role": "tool", "tool_call_id": p.call_id, "content": result}
-                if p.kind in ("read", "list", "external") and p.decision == "accept":
+                if p.kind in ("read", "list", "external", "sandbox") and p.decision == "accept":
                     tool_msg["_bulk"] = True
                 self.session.add(tool_msg)
                 if p.kind == "command" and not p.error:
                     ended = True
+                stopped = stopped or p.stopped
             self.session.save()
+            if stopped:
+                self.ui.notice("stopped; send a message to continue")
+                return "stopped"
             if ended:
                 return "command"
         self.ui.notice(f"step limit ({STEP_LIMIT}) reached; send a message to continue")
@@ -2042,6 +2306,16 @@ class Engine:
                     raise ValueError("command is required")
                 p = Proposal(pid, "command", tc["id"], command=cmd, reason=reason)
                 self.commands.append(p)
+                return p
+            if name == "run_in_sandbox":
+                cmd = args.get("command")
+                if not self.can_run():
+                    raise ValueError("run_in_sandbox is not available now")
+                if not isinstance(cmd, str) or not cmd.strip():
+                    raise ValueError("command is required")
+                p = Proposal(pid, "sandbox", tc["id"], command=cmd, reason=reason, network=self.box.network,
+                             image=self.box.conf["image"])
+                p.auto = not self.box.network
                 return p
             if name in ("read_file", "list_dir"):
                 path = args.get("path", ".")
@@ -2168,7 +2442,7 @@ class Engine:
                     self.ui.notice(f"[{p.id}] {p.error}")
                 continue
             rec = {k: v for k, v in p.event().items() if k not in ("type", "content", "diff", "command", "steps")}
-            if p.kind == "command":
+            if p.kind in ("command", "sandbox"):
                 rec.update(command_fingerprint(p.fields["command"]))
             if p.kind == "plan":
                 rec["steps"] = [audit_step(st) for st in p.fields["steps"]]
@@ -2285,6 +2559,8 @@ class Engine:
             return f"{status}" + (f":\n{clip(out)}" if out else "")
         if p.decision != "accept":
             return "declined by the user"
+        if p.kind == "sandbox":
+            return self.run_sandboxed(p)
         try:
             if p.kind == "read":
                 if p.auto and "_read_error" in p.fields:
@@ -2328,6 +2604,36 @@ class Engine:
                     st["status"] = "done"
             self.ui.plan(self.plan)
         return result
+
+    def run_sandboxed(self, p):
+        """Run an accepted run_in_sandbox call. The model gets the exit code and the output, redacted and clipped;
+        the user sees the same."""
+        where = "online" if p.fields["network"] else "offline"
+        started = time.monotonic()
+        try:
+            ran, rc, out, note = self.box.run(p.fields["command"], self.secrets())
+        except KeyboardInterrupt:
+            p.stopped = True
+            self.audit.log("sandbox_exit", id=p.id, exit=None, stopped=True)
+            self.ui.result(p, "error", "stopped by you")
+            return "stopped by the user before it finished"
+        except GenaiError as e:
+            ran, rc, out, note = False, None, "", str(e)
+        secs = time.monotonic() - started
+        out, counts = redact(out, self.secrets())
+        out = clip(out)
+        self.audit.log("sandbox_exit", id=p.id, exit=rc, network=p.fields["network"], seconds=round(secs, 1),
+                       chars=len(out), redacted=counts, note=note)
+        if not ran:
+            self.ui.result(p, "error", f"not run: {note}", output="", exit=None)
+            return f"error: not run: {note}"
+        head = f"exit {rc}" if rc is not None else note
+        extra = [note] if note and rc is not None else []
+        if counts:
+            extra.append(f"redacted {redaction_note(counts)}")
+        self.ui.result(p, "ok" if rc == 0 else "error", "; ".join([f"{head} in {secs:.1f} s"] + extra),
+                       output=out, exit=rc)
+        return f"{head} (sandbox, {where}, {secs:.1f} s). Output:\n" + (out if out.strip() else "(none)")
 
     # -- sharing output and compaction
 
@@ -2438,7 +2744,7 @@ class PlainUI:
             what = p.fields.get("path") or p.fields.get("tool") or p.fields.get("goal")
             self.notice(f"{p.kind} proposal {p.id} ({one_line(str(what))[0]}) declined: no terminal")
 
-    def result(self, p, status, note):
+    def result(self, p, status, note, **extra):
         pass
 
     def plan(self, plan):
@@ -2466,7 +2772,10 @@ class TtyUI(PlainUI):
         self.out.flush()
 
     def show_auto(self, p):
-        eprint(f"  (coding mode) {p.kind} {one_line(p.fields['path'])[0]}")
+        if p.kind == "sandbox":
+            eprint(f"  [{p.id}] sandbox, offline: {one_line(p.fields['reason'])[0]}\n    $ {show_exact(p.fields['command'])}")
+        else:
+            eprint(f"  (coding mode) {p.kind} {one_line(p.fields['path'])[0]}")
 
     def decide(self, pending):
         for p in pending:
@@ -2490,6 +2799,9 @@ class TtyUI(PlainUI):
                     head = f"New file {path}, {f['lines']} lines:\n{margin(f['content'])}"
             elif p.kind == "edit":
                 head = f"Edit {path}:\n{margin(f['diff'])}"
+            elif p.kind == "sandbox":
+                head = (f"Run in the sandbox, with the network ON:\n    $ {show_exact(f['command'])}\n"
+                        "It works on a throwaway copy of the project, but it could send what it reads anywhere.")
             elif p.kind == "plan":
                 self.out.write(f"\n\033[1m[{p.id}] plan\033[0m — {one_line(f['goal'])[0]}\n{margin(plan_steps(f['steps']))}\n"
                                "Planned reads won't ask again; a planned command proposed exactly as shown is "
@@ -2503,7 +2815,12 @@ class TtyUI(PlainUI):
             self.out.flush()
             p.decision = "accept" if ask_yes(f"Accept {p.id}?") else "decline"
 
-    def result(self, p, status, note):
+    def result(self, p, status, note, output=None, **extra):
+        if output:
+            lines = output.rstrip("\n").splitlines()
+            if len(lines) > TTY_OUTPUT_LINES:
+                eprint(f"    | ... {len(lines) - TTY_OUTPUT_LINES} earlier lines (the model sees them)")
+            eprint(margin("\n".join(lines[-TTY_OUTPUT_LINES:])))
         eprint(f"  [{p.id}] {status}: {one_line(note)[0]}")
 
 
@@ -2653,8 +2970,10 @@ class JsonUI:
         self.queue.append((label, red, msg.get("ref")))
         self.emit({"type": "attached", "label": label, "chars": len(red), "redacted": counts})
 
-    def result(self, p, status, note):
-        self.emit({"type": "result", "id": p.id, "status": status, "detail": note})
+    def result(self, p, status, note, **extra):
+        ev = {"type": "result", "id": p.id, "status": status, "detail": note}
+        ev.update(extra)
+        self.emit(ev)
 
     def read(self):
         while True:
@@ -2741,6 +3060,7 @@ Commands (on an empty buffer):
   :sh             open a subshell; :capture on|off to share its output afterwards
   :attach PATH    attach a file to your next message
   :coding on|off  let the model read and list files here without asking
+  :network [on|off]  the sandbox's network, for this session (on: each sandboxed run asks)
   :plan [clear]   show the approved plan and how far it has got, or drop it
   :compact [-e]   prune old file contents and output; summarize if still large
   :context        show how full the context is
@@ -2774,9 +3094,21 @@ class Repl:
             if self.e.coding_override:
                 print(f"  [!] this is {self.e.coding_override}; --coding-anywhere allowed it")
         print(f"sandbox: commands you :run or :sh execute {where_runs(self.e.sandbox)}")
+        if self.e.box:
+            print("  " + self.box_line())
         if self.e.notifier:
             print("  " + HOOK_BANNER.format(short_path(self.e.notifier.path)))
         print("Type :help for commands. A line with only '..' sends.")
+
+    def box_line(self):
+        b = self.e.box
+        problem = b.problem()
+        if problem:
+            return f"the profile's sandbox can't run here: {problem}"
+        state = ("the model runs commands there itself, without asking" if self.e.can_run() else
+                 "it is used in coding mode")
+        return (f"podman sandbox ({one_line(b.conf['image'])[0]}), network {'ON: each run asks' if b.network else 'off'}"
+                f"; {state}")
 
     def run(self):
         try:
@@ -2849,6 +3181,13 @@ class Repl:
                 self.e.set_coding(arg == "on")
                 self.e.session.save()
                 print(f"coding mode is {'ON' if self.e.session.coding else 'off'}")
+            elif cmd == "network":
+                if arg in ("on", "off"):
+                    self.e.set_network(arg == "on")
+                if not self.e.box:
+                    print("no sandbox: the profile has no 'sandbox'")
+                else:
+                    print(self.box_line())
             elif cmd == "compact":
                 self.do_compact(arg == "-e")
             elif cmd == "context":
@@ -3001,7 +3340,7 @@ def run_json(engine, ui, first_prompt, attachments):
     ui.engine = engine
     ui.emit({"type": "hello", "protocol": PROTOCOL, "version": VERSION,
              "features": ["proposals", "decisions", "attach", "register_tools", "compact", "context", "coding",
-                          "set_coding", "skills", "files", "trace", "system", "plan"],
+                          "set_coding", "skills", "files", "trace", "system", "plan", "network"],
              "endpoint": engine.endpoint.info(),
              "profile": {"name": engine.profile.name, "description": engine.profile.description}
              if engine.profile else None,
@@ -3010,6 +3349,7 @@ def run_json(engine, ui, first_prompt, attachments):
              "coding_from": engine.coding_from if engine.session.coding else None,
              "coding_override": engine.coding_override if engine.session.coding else None, "cwd": os.getcwd(),
              "sandbox": engine.sandbox,
+             "runner": engine.box.info() if engine.box else None,
              "skills": [s.name for s in engine.skills],
              "tools": list(INTRINSICS)})
     engine.audit.log("start", mode="json", endpoint=engine.endpoint.info(),
@@ -3075,6 +3415,18 @@ def run_json(engine, ui, first_prompt, attachments):
                 ui.error(str(err), "coding_refused")
             ui.emit({"type": "coding", "on": engine.session.coding, "coding_from": engine.coding_from,
                      "coding_override": engine.coding_override if engine.session.coding else None})
+        elif t == "network":
+            on = msg.get("on")
+            if on is not None and not isinstance(on, bool):
+                ui.error("network needs 'on': true or false, or nothing to ask", "bad_message")
+                continue
+            try:
+                if on is not None:
+                    engine.set_network(on, "wrapper")
+            except GenaiError as err:
+                ui.error(str(err), err.kind)
+            ui.emit({"type": "network", "runner": engine.box.info() if engine.box else None,
+                     "available": engine.can_run()})
         elif t == "skills":
             ui.emit({"type": "skills", "skills": skill_rows(engine.cfg, [s.name for s in engine.skills])})
         elif t == "skill":
