@@ -3599,6 +3599,9 @@ def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()
             if not isinstance(name, str) or not isinstance(on, bool):
                 ui.error("skill needs 'name' and 'on': true or false", "bad_message")
                 continue
+            if remote:          # skills blessed on this host aren't ones the user's own machine vouched for
+                ui.error("skills aren't available in remote mode yet", "remote")
+                continue
             try:
                 engine.set_skill(name, on)
                 engine.session.save()

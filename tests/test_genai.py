@@ -1569,6 +1569,14 @@ class TestRemoteConfig(Tmp):
             with open(os.path.join(self.home, "audit.log")) as f:
                 self.assertNotIn(self.TOKEN, f.read())
 
+    def test_skills_on_the_remote_host_are_not_loaded(self):
+        with FakeAPI([]) as api:
+            g = self.start(self.config(api))
+            g.until("hello")
+            g.send({"type": "skill", "name": "anything", "on": True})
+            self.assertEqual(g.until("error")["code"], "remote")
+            g.close()
+
     def test_trace_does_not_show_the_token(self):
         with FakeAPI([reply("hello")]) as api:
             g = self.start(self.config(api))
