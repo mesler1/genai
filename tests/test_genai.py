@@ -237,6 +237,32 @@ def bless_path(home, path):
     cfg.set_blessed(os.path.abspath(path), {"kind": kind, "name": name, "hash": h})
 
 
+class TestStatePermissions(Tmp):
+    def test_group_writable_state_parent_is_refused(self):
+        home, _ = make_home(self.tmp, "https://local.example/v1")
+        os.chmod(os.path.dirname(home), 0o770)
+        with self.assertRaisesRegex(G.GenaiError, "unsafe genai state directory"):
+            G.Config(home)
+
+    def test_group_writable_trust_database_is_refused(self):
+        home, path = make_home(self.tmp, "https://local.example/v1")
+        bless_path(home, path)
+        cfg = G.Config(home)
+        os.chmod(cfg.blessed_path, 0o660)
+        with self.assertRaisesRegex(G.GenaiError, "unsafe genai state file"):
+            G.select_endpoint(cfg, "test")
+
+    def test_symlinked_trust_database_is_refused(self):
+        home, path = make_home(self.tmp, "https://local.example/v1")
+        bless_path(home, path)
+        cfg = G.Config(home)
+        target = self.path("copied-blessings.json")
+        os.rename(cfg.blessed_path, target)
+        os.symlink(target, cfg.blessed_path)
+        with self.assertRaisesRegex(G.GenaiError, "cannot read genai state file"):
+            G.select_endpoint(cfg, "test")
+
+
 class TestEndpoints(Tmp):
     def prof(self, **kw):
         d = {"name": "x", "base_url": "https://llm.example/v1", "model": "m"}
