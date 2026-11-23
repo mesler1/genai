@@ -681,6 +681,15 @@ class Endpoint:
     def parse(cls, raw, path):
         return cls(parse_json_bytes(raw, path), os.path.abspath(path))
 
+    def destination_id(self):
+        """Fingerprint where a conversation goes, without storing endpoint headers or proxy credentials: the server
+        (scheme, host and port), and the proxy, CA bundle and headers that reach it. Not the model or the URL's
+        path, so switching models on the same server doesn't need consent each time."""
+        u = urllib.parse.urlsplit(self.base_url)
+        port = u.port or {"https": 443, "http": 80}.get(u.scheme)
+        fields = [u.scheme, (u.hostname or "").lower(), port, self.proxy, self.ca_bundle, self.headers]
+        return hash_bytes(json.dumps(fields, sort_keys=True).encode())
+
     def key_source(self):
         """Where the key comes from, escaped for one line. Returns (text, flagged)."""
         if self.key_env:
@@ -1551,6 +1560,7 @@ class Session:
         self.id = sid
         self.path = os.path.join(cfg.sessions, f"{sid}.json") if sid else None
         self.endpoint = None
+        self.destination_id = None
         self.profile = None      # persona profile name, or None
         self.coding = False
         self.cwd = os.getcwd()
@@ -1575,6 +1585,7 @@ class Session:
                 s.endpoint, s.profile = data.get("endpoint"), data.get("profile")
             else:                # sessions from before the split stored the endpoint as "profile"
                 s.endpoint = data.get("profile")
+            s.destination_id = data.get("destination_id")
             s.coding = bool(data.get("coding"))
             s.cwd = data.get("cwd", s.cwd)
             s.skills = data.get("skills", [])
@@ -1616,7 +1627,7 @@ class Session:
         if not self.path:
             return
         data = {"id": self.id, "endpoint": self.endpoint, "profile": self.profile, "coding": self.coding, "cwd": self.cwd,
-                "skills": self.skills, "created": self.created, "updated": now(),
+                "destination_id": self.destination_id, "skills": self.skills, "created": self.created, "updated": now(),
                 "messages": self.messages, "history": self.history}
         write_private(self.path, json.dumps(data, ensure_ascii=False) + "\n")
 
@@ -3021,6 +3032,8 @@ def parse_args(argv):
     ap.add_argument("-f", "--file", action="append", default=[], help="attach a file (repeatable)")
     ap.add_argument("-k", "--skill", action="append", default=[], help="use a blessed skill (repeatable)")
     ap.add_argument("-S", "--session", help="keep the conversation in a named session (created or resumed)")
+    ap.add_argument("--allow-session-endpoint-change", action="store_true",
+                    help="allow this invocation to send saved context to a changed or unrecorded destination")
     ap.add_argument("--coding", action="store_true", help="let the model read and list files here without asking")
     ap.add_argument("--coding-anywhere", action="store_true",
                     help="--coding, also where it is normally refused (your home directory, credential "
@@ -3077,9 +3090,17 @@ def main(argv=None):
         persona = select_named(cfg, "profile", pname) if pname else None
         endpoint = select_endpoint(cfg, args.endpoint or (persona.endpoint if persona else None)
                                    or session.endpoint or cfg.default_endpoint)
-        if session.resumed and session.endpoint and session.endpoint != endpoint.name:
-            notices.append(f"warning: session '{session.id}' was used with endpoint '{session.endpoint}', "
-                           f"now '{endpoint.name}'")
+        destination_id = endpoint.destination_id()
+        if session.messages and session.destination_id != destination_id:
+            reason = ("has a different destination" if session.destination_id else
+                      "was saved before its destination was recorded")
+            msg = f"session '{session.id}' {reason}. Saved context would go to {endpoint.base_url}."
+            if not args.allow_session_endpoint_change:
+                raise GenaiError(msg + " To approve this transfer, rerun with --allow-session-endpoint-change.",
+                                 EXIT_USAGE, "session_endpoint_changed")
+            notices.append(msg)
+            cfg.audit.log("session_endpoint_change", session=session.id, endpoint=endpoint.info())
+        session.destination_id = destination_id
         if session.resumed and args.profile and session.profile != args.profile:
             notices.append(f"session '{session.id}' was used with profile '{session.profile or '-'}', "
                            f"now '{args.profile}'")
