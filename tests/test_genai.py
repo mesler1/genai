@@ -79,7 +79,9 @@ class TestWorkdir(Tmp):
         self.assertEqual(self.wd.read("./a.txt"), "hello\n")
         self.wd.write("sub/deeper/b.sh", "echo hi\n")
         self.assertEqual(open(self.path("wd", "sub", "deeper", "b.sh")).read(), "echo hi\n")
-        names = [n for n, _, _ in self.wd.list(".")]
+        entries, truncated = self.wd.list(".")
+        self.assertFalse(truncated)
+        names = [n for n, _, _ in entries]
         self.assertEqual(names, ["a.txt", "sub"])
         self.assertEqual([x for x in os.listdir(self.path("wd", "sub", "deeper")) if x.startswith(".genai")], [])
 
@@ -91,6 +93,59 @@ class TestWorkdir(Tmp):
         self.wd.write("x.sh", "new")
         self.assertEqual(stat.S_IMODE(os.stat(p).st_mode), 0o750)
         self.assertEqual(open(p).read(), "new")
+
+    def test_write_stages_under_a_private_directory(self):
+        target = self.path("wd", "a.txt")
+        os.chmod(target, 0o600)
+        fsync = os.fsync
+
+        def check_staging(fd):
+            (stage,) = [name for name in os.listdir(self.root) if name.startswith(".genai-tmp-")]
+            self.assertEqual(stat.S_IMODE(os.stat(self.path("wd", stage)).st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(os.fstat(fd).st_mode), 0o600)
+            return fsync(fd)
+
+        with mock.patch.object(G.os, "fsync", side_effect=check_staging):
+            self.wd.write("a.txt", "replacement")
+        self.assertEqual(self.wd.read("a.txt"), "replacement")
+
+    def test_rejects_changes_during_staging(self):
+        expected, _ = self.wd.snapshot("a.txt")
+        fsync = os.fsync
+
+        def concurrent_update(fd):
+            with open(self.path("wd", "a.txt"), "w") as f:
+                f.write("concurrent update")
+            return fsync(fd)
+
+        with mock.patch.object(G.os, "fsync", side_effect=concurrent_update):
+            with self.assertRaises(G.StaleApproval):
+                self.wd.write("a.txt", "replacement", expected=expected)
+        self.assertEqual(self.wd.read("a.txt"), "concurrent update")
+
+    def test_new_file_publication_refuses_a_concurrent_creator(self):
+        link = os.link
+
+        def concurrent_create(*args, **kwargs):
+            with open(self.path("wd", "new.txt"), "x") as f:
+                f.write("concurrent update")
+            return link(*args, **kwargs)
+
+        with mock.patch.object(G.os, "link", side_effect=concurrent_create):
+            with self.assertRaises(G.StaleApproval):
+                self.wd.write("new.txt", "replacement", expected=None)
+        self.assertEqual(self.wd.read("new.txt"), "concurrent update")
+
+    def test_existing_file_snapshot_is_bounded(self):
+        with mock.patch.object(G, "SNAPSHOT_CAP", 4):
+            with self.assertRaisesRegex(G.DiskError, "overwrite limit"):
+                self.wd.snapshot("a.txt")
+
+    def test_directory_listing_is_bounded(self):
+        with mock.patch.object(G, "LIST_CAP", 1):
+            entries, truncated = self.wd.list(".")
+        self.assertEqual(len(entries), 1)
+        self.assertTrue(truncated)
 
     def test_binary_fifo_and_caps(self):
         with open(self.path("wd", "bin"), "wb") as f:
