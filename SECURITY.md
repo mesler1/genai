@@ -74,6 +74,12 @@ advice is to remove one of the three, or put a human in front of it.
   sequences are escaped like any other control sequence).
 - The only network destination is the blessed endpoint. Redirects are refused and nothing more
   is sent. `OPENAI_BASE_URL` and the proxy environment variables are ignored.
+- Switching models (`"model": "auto"`, `:model`, genai-tui's `/model`) stays on that server: only
+  a model it lists can be chosen, and every switch is in the audit log. The list comes from the
+  server, so it is treated as untrusted text. A name with anything outside letters, digits and
+  `._:/@+=-` is left out rather than cleaned, the list is capped at 1 MB and 200 names, and
+  genai-tui checks each name again before it shows it in a tmux menu (whose item names tmux
+  expands as formats). Each menu item sends back only its position, never the name.
 - Anything else that leaves the machine goes through a command you chose to run.
 - A sandboxed run (section 5) has no network unless you switch it on for the session, and then
   each run asks first. Its output goes to the endpoint, like a file the model reads, after the

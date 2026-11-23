@@ -20,8 +20,9 @@ def calls(*pairs):
 class FakeAPI:
     """Serves the scripted turns in order. Each turn is reply(...) or call(...)."""
 
-    def __init__(self, turns, stream=True, usage=None, status=200, redirect=None, error_message="nope"):
+    def __init__(self, turns, stream=True, usage=None, status=200, redirect=None, error_message="nope", models=None):
         self.turns = list(turns)
+        self.models = models if models is not None else [{"id": "fake-model"}]
         self.requests = []
         self.stream = stream
         self.usage = usage
@@ -36,7 +37,7 @@ class FakeAPI:
 
             def do_GET(self):
                 api.requests.append({"path": self.path, "headers": dict(self.headers)})
-                self._json(200, {"data": [{"id": "fake-model"}]})
+                self._json(200, {"object": "list", "data": api.models})
 
             def do_POST(self):
                 n = int(self.headers.get("Content-Length", 0))
