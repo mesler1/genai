@@ -212,9 +212,21 @@ on, and nothing is installed there. The session has a key of its own that never 
 command line or on screen; see SECURITY.md, section 7. Plain `ssh` still works, but genai-tui
 can't follow it, and `/run` refuses while it runs.
 
+### File tree
+
+`/files` shows or hides a file tree of the working directory on the left (`genai-tui --files` starts
+with it shown). Move with the arrow keys; Right or Enter opens a directory and Left closes it; `.`
+shows or hides hidden files and `r` refreshes. On a file, Enter views it in the pager, `a` attaches it
+to your next message and `i` puts its path in the input box. A `⚠` marks a file genai thinks holds
+secrets, `⚿` one the model would have to ask about first, and `↪` a symlink, which is not followed.
+
+Browsing sends nothing to the model. Listings and files come through genai, which applies its usual
+checks and masks secrets it recognises. `a` opens the file in your editor first, like shell context:
+what you save goes with your next message, and nothing does if you save an empty file.
+
 ### Features
 
-genai-tui's `/model`, `/copy`, `/decline`, `/raw` and `/system`, and the `genai-ssh` handshake, are
+genai-tui's `/model`, `/copy`, `/decline`, `/raw`, `/system` and `/files`, and the `genai-ssh` handshake, are
 features, each in its own module under `tui/features/`. To switch some off, list them in
 `~/.config/genai/tui.json` (`$XDG_CONFIG_HOME/genai/tui.json`):
 
@@ -222,8 +234,8 @@ features, each in its own module under `tui/features/`. To switch some off, list
 {"disable": ["copy", "model"]}
 ```
 
-or set `GENAI_TUI_DISABLE=copy,model` for one run. Names are `model`, `copy`, `decline`, `raw`
-and `ssh`. A disabled feature has no command, help line or menu item, and genai-tui's socket
+or set `GENAI_TUI_DISABLE=copy,model` for one run. Names are `model`, `copy`, `decline`, `raw`,
+`ssh` and `files`. A disabled feature has no command, help line or menu item, and genai-tui's socket
 refuses its requests. Without `ssh`, a genai-ssh session isn't followed. No file means
 everything is on; a file that can't be read is ignored, with a note in the conversation.
 

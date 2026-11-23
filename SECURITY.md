@@ -267,6 +267,9 @@ shared filesystem; never an abstract socket, which has no permissions).
 - An answer names the question it answers. One meant for a question that has gone, or not yet
   appeared, is ignored, and keys typed within 0.3 s of a question appearing count as typing.
 - Messages are size-limited; a line that is too long or not JSON ends the connection.
+- The file tree pane can only ask the conversation pane to list, view, attach or insert the path of a file.
+  Listings and views go through genai's checks, and nothing goes to the model except an attachment you
+  reviewed in your editor first.
 - No text from the model goes into a tmux menu, pane title or popup command, where tmux would
   run a `#(...)`.
 - The shell pane's output reaches the conversation pane through a FIFO in that same directory

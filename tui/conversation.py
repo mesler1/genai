@@ -509,6 +509,7 @@ class Model:
         self.show_skills = False   # print the next skill list in the conversation (the user typed /skills)
         self.ask = None            # a question of ours in place of the input box: run or share
         self.actions = []          # things for the screen to do: ("share", "last"), ("focus_shell",)
+        self.panes = []            # messages for the other panes: (role, message)
         self.recent = []           # the shell pane's latest commands, for the info panel
         self.turn = 0              # turns sent to genai so far
         self.exchanges = {}        # turn: [first, last] exchange with the endpoint, for /raw
@@ -622,6 +623,8 @@ class Model:
             self.next_queued()
         elif t == "context":
             self.context = (ev.get("used"), ev.get("limit"))
+        elif t == "error" and any(f.error(self, ev) for f in self.features):
+            pass                           # a feature's own request failed, and it has said so
         elif t == "error":
             if ev.get("exchanges"):
                 self.exchanges[self.turn] = ev["exchanges"]
@@ -1366,6 +1369,7 @@ class App:
         self.rows = []             # the block drawn on each screen row of the conversation
         self.state_dir = os.environ.get("GENAI_TUI_STATE") if shell else None
         self.panel = os.environ.get("GENAI_TUI_PANEL") if shell else None
+        self.files = os.environ.get("GENAI_TUI_FILES") if shell else None
         self.prompt = os.environ.get("GENAI_TUI_PROMPT") if shell else None   # input happens in that pane
         # the other panes connect here; a feature that is off has no requests, so the Hub refuses them
         self.hub = Hub(self.state_dir, feature_requests(on)) if self.state_dir else None
@@ -1716,16 +1720,20 @@ class App:
         return True
 
     def toggle_panel(self):
-        if not self.panel:
-            self.m.note("there is no info panel in this session", R)
+        self.toggle_pane(self.panel, "panel", ["-l", "42"], "info panel")
+
+    def toggle_pane(self, pane, name, join, what):
+        """Show a side pane beside this one, or break it out to a window of its own again."""
+        if not pane:
+            self.m.note(f"there is no {what} in this session", R)
             return
         me = os.environ.get("TMUX_PANE", "")
         here = self.shell.tmux("display", "-p", "-t", me, "#{window_id}").strip()
-        there = self.shell.tmux("display", "-p", "-t", self.panel, "#{window_id}").strip()
+        there = self.shell.tmux("display", "-p", "-t", pane, "#{window_id}").strip()
         if here == there:
-            self.shell.tmux("break-pane", "-d", "-s", self.panel, "-n", "panel")
+            self.shell.tmux("break-pane", "-d", "-s", pane, "-n", name)
         else:
-            self.shell.tmux("join-pane", "-d", "-h", "-f", "-l", "42", "-s", self.panel, "-t", me)
+            self.shell.tmux("join-pane", "-d", "-h", "-f", *join, "-s", pane, "-t", me)
 
     def click(self):
         """The wheel scrolls; a click on a command card opens its menu; a right-click anywhere opens the raw view's.
@@ -2160,7 +2168,7 @@ class App:
                 self.sent.pop(msg, None)                  # a pane (re)connected: send it everything
             elif role == "prompt":
                 self.from_prompt(msg)
-            elif role == "panel":
+            elif role in ("panel", "files"):
                 self.m.request(msg, role)
             elif role == "menu" and (msg.get("type") in ("share", "mark") or self.m.takes(role, msg.get("type"))):
                 self.m.request(msg, role)
@@ -2211,6 +2219,10 @@ class App:
         for msg in self.m.outbox:
             self.child.send(msg)
         self.m.outbox = []
+        for role, msg in self.m.panes:
+            if self.hub:
+                self.hub.send(role, msg)
+        self.m.panes = []
         if self.shell:
             self.m.recent = self.recent()
             ask = self.m.ask
@@ -2233,6 +2245,7 @@ def parse_args(argv):
     ap.add_argument("--coding-anywhere", action="store_true",
                     help="--coding, also where it is normally refused; genai says what that exposes")
     ap.add_argument("--no-panel", action="store_true", help="start without the info panel (/panel shows it)")
+    ap.add_argument("--files", action="store_true", help="start with the file tree shown (/files shows or hides it)")
     ap.add_argument("--check", action="store_true", help=argparse.SUPPRESS)
     return ap.parse_args(argv)
 
