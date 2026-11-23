@@ -234,3 +234,7 @@ has the model write a bash script to stdout,
 redirected to a file with `>`, then checks it with `bash -n` without running it. It also runs the
 JSON proposal/decision round trip, and checks that a persona profile picks its endpoint and that
 its persona text reaches the model.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
