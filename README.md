@@ -230,6 +230,12 @@ says (`"network": true` starts it on, which blessing flags). While it is on, **e
 command asks first**, because code that can read the project and reach the network could send the
 project anywhere.
 
+**Not in your home directory.** The sandbox never runs where coding mode is refused (your home
+directory, a directory above it, `~/.ssh` and other credential directories, genai's config
+directory), even with `--coding-anywhere`: the copy would hold everything there, and offline runs
+don't ask. `run_in_sandbox` is then not offered, and the banner says why. Start genai in the
+project's own directory.
+
 The image is used as it is (`--pull=never`); pull or build it yourself. Podman is the only engine
 so far (`"engine": "podman"` or `"auto"`).
 
