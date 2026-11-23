@@ -91,7 +91,7 @@ much permission and too much autonomy.
   anywhere in it is refused. Reads refuse FIFOs, devices and binary files. New files are
   created without execute permission.
 - **Autonomy.** A turn ends when a command is proposed. A turn is capped at 10 model steps.
-  Reads are capped at 256 KB, writes at 1 MB, listings at 500 entries. Without a terminal and
+  Reads are capped at 256 KiB, writes at 1 MiB, overwrite snapshots at 8 MiB, and directory scans at 500 entries plus a truncation check. Without a terminal and
   outside JSON mode, nothing is performed at all.
 
 ### 4. Identity, privilege and credentials
@@ -194,7 +194,7 @@ safe and prompts are rare enough to be read.
   a saved session and the model cannot. genai then prints what the model can read without asking
   and which URL it goes to, and the banner, the `hello` event and the audit log record it.
 - In coding mode a file that looks like it holds secrets is not read automatically. It asks,
-  like any read outside coding mode.
+  like any read outside coding mode. Automatic reads share the same bytes that were checked.
 - A plan (`propose_plan`) lets you approve steps before they come, and is held to what you
   approved:
   - A planned read needs no further approval, unless the file is hidden or looks like it holds
@@ -259,6 +259,13 @@ descriptions that changed after approval.
 - Blessing records a sha256 of exactly the bytes shown. Each use reads the file once and
   hashes and parses the same bytes. Skills are hashed across every file, with symlinks
   refused. Any change means refusal until you bless again.
+- genai's own state (`config.json`, the blessings, sessions, the audit log) must be yours and
+  not writable by other users, and so must every directory above it, up to one owned by root.
+  A sticky directory such as `/tmp` may hold it. Group write counts as safe only when the group
+  is your personal one (named after you, with no other members), as with `umask 002` on
+  user-private-group systems. State files must be regular files, not symlinks. A first run
+  creates any missing parent, such as `~/.config`, private. Each refusal says which `chmod`
+  fixes it.
 - Blessing a skill scans every file for hidden and control characters and lists what it found
   (`U+E0049 x3`), and says which files are binary and so could not be checked. A skill's text
   goes to the model, so text you cannot see is the risk.

@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import pwd
 import re
 import shlex
 import shutil
@@ -79,7 +80,9 @@ class TestWorkdir(Tmp):
         self.assertEqual(self.wd.read("./a.txt"), "hello\n")
         self.wd.write("sub/deeper/b.sh", "echo hi\n")
         self.assertEqual(open(self.path("wd", "sub", "deeper", "b.sh")).read(), "echo hi\n")
-        names = [n for n, _, _ in self.wd.list(".")]
+        entries, truncated = self.wd.list(".")
+        self.assertFalse(truncated)
+        names = [n for n, _, _ in entries]
         self.assertEqual(names, ["a.txt", "sub"])
         self.assertEqual([x for x in os.listdir(self.path("wd", "sub", "deeper")) if x.startswith(".genai")], [])
 
@@ -91,6 +94,78 @@ class TestWorkdir(Tmp):
         self.wd.write("x.sh", "new")
         self.assertEqual(stat.S_IMODE(os.stat(p).st_mode), 0o750)
         self.assertEqual(open(p).read(), "new")
+
+    def test_write_stages_under_a_private_directory(self):
+        target = self.path("wd", "a.txt")
+        os.chmod(target, 0o600)
+        fsync = os.fsync
+
+        def check_staging(fd):
+            (stage,) = [name for name in os.listdir(self.root) if name.startswith(".genai-tmp-")]
+            self.assertEqual(stat.S_IMODE(os.stat(self.path("wd", stage)).st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(os.fstat(fd).st_mode), 0o600)
+            return fsync(fd)
+
+        with mock.patch.object(G.os, "fsync", side_effect=check_staging):
+            self.wd.write("a.txt", "replacement")
+        self.assertEqual(self.wd.read("a.txt"), "replacement")
+
+    def test_rejects_changes_during_staging(self):
+        expected, _ = self.wd.snapshot("a.txt")
+        fsync = os.fsync
+
+        def concurrent_update(fd):
+            with open(self.path("wd", "a.txt"), "w") as f:
+                f.write("concurrent update")
+            return fsync(fd)
+
+        with mock.patch.object(G.os, "fsync", side_effect=concurrent_update):
+            with self.assertRaises(G.StaleApproval):
+                self.wd.write("a.txt", "replacement", expected=expected)
+        self.assertEqual(self.wd.read("a.txt"), "concurrent update")
+
+    def test_new_file_publication_refuses_a_concurrent_creator(self):
+        link = os.link
+
+        def concurrent_create(*args, **kwargs):
+            with open(self.path("wd", "new.txt"), "x") as f:
+                f.write("concurrent update")
+            return link(*args, **kwargs)
+
+        with mock.patch.object(G.os, "link", side_effect=concurrent_create):
+            with self.assertRaises(G.StaleApproval):
+                self.wd.write("new.txt", "replacement", expected=None)
+        self.assertEqual(self.wd.read("new.txt"), "concurrent update")
+
+    def test_new_files_without_hard_links(self):
+        def no_links(*args, **kwargs):
+            raise OSError(G.errno.EPERM, "Operation not permitted")
+
+        with mock.patch.object(G.os, "link", side_effect=no_links):
+            self.wd.write("fresh.txt", "made anyway", expected=None)
+        self.assertEqual(self.wd.read("fresh.txt"), "made anyway")
+
+        def creator_wins(*args, **kwargs):          # someone creates the name just before we do
+            with open(self.path("wd", "taken.txt"), "x") as f:
+                f.write("someone else's")
+            no_links()
+
+        with mock.patch.object(G.os, "link", side_effect=creator_wins):
+            with self.assertRaises(G.StaleApproval):
+                self.wd.write("taken.txt", "replacement", expected=None)
+        self.assertEqual(self.wd.read("taken.txt"), "someone else's")
+        self.assertEqual([n for n in os.listdir(self.path("wd")) if n.startswith(".genai")], [])
+
+    def test_existing_file_snapshot_is_bounded(self):
+        with mock.patch.object(G, "SNAPSHOT_CAP", 4):
+            with self.assertRaisesRegex(G.DiskError, "overwrite limit"):
+                self.wd.snapshot("a.txt")
+
+    def test_directory_listing_is_bounded(self):
+        with mock.patch.object(G, "LIST_CAP", 1):
+            entries, truncated = self.wd.list(".")
+        self.assertEqual(len(entries), 1)
+        self.assertTrue(truncated)
 
     def test_binary_fifo_and_caps(self):
         with open(self.path("wd", "bin"), "wb") as f:
@@ -161,6 +236,67 @@ def bless_path(home, path):
     kind = "skill" if os.path.isdir(path) else ("endpoint" if "base_url" in json.load(open(path)) else "profile")
     name = os.path.basename(path) if kind == "skill" else json.load(open(path))["name"]
     cfg.set_blessed(os.path.abspath(path), {"kind": kind, "name": name, "hash": h})
+
+
+class TestStatePermissions(Tmp):
+    """A group-writable mode is unsafe unless the group is your personal one. Which it is depends on the
+    machine, so each test says."""
+
+    def test_group_writable_state_parent_is_refused(self):
+        home, _ = make_home(self.tmp, "https://local.example/v1")
+        os.chmod(os.path.dirname(home), 0o770)
+        with mock.patch.object(G, "own_group", return_value=False):
+            with self.assertRaisesRegex(G.GenaiError, "other users can write to it. If it is yours: chmod go-w"):
+                G.Config(home)
+        with mock.patch.object(G, "own_group", return_value=True):     # a user-private group, as with umask 002
+            G.Config(home)
+
+    def test_group_writable_trust_database_is_refused(self):
+        home, path = make_home(self.tmp, "https://local.example/v1")
+        bless_path(home, path)
+        cfg = G.Config(home)
+        os.chmod(cfg.blessed_path, 0o660)
+        with mock.patch.object(G, "own_group", return_value=False):
+            with self.assertRaisesRegex(G.GenaiError, "chmod 600"):
+                G.select_endpoint(cfg, "test")
+        with mock.patch.object(G, "own_group", return_value=True):
+            G.select_endpoint(cfg, "test")
+        os.chmod(cfg.blessed_path, 0o606)                               # others: never
+        with mock.patch.object(G, "own_group", return_value=True):
+            with self.assertRaisesRegex(G.GenaiError, "chmod 600"):
+                G.select_endpoint(cfg, "test")
+
+    def test_own_group_means_named_after_you_with_no_other_members(self):
+        me = pwd.getpwuid(os.getuid()).pw_name
+        group = lambda name, members: mock.Mock(gr_name=name, gr_mem=members)      # noqa: E731
+        with mock.patch("grp.getgrgid", return_value=group(me, [])):
+            self.assertTrue(G.own_group(os.getgid()))
+            self.assertFalse(G.own_group(os.getgid() + 1))
+        with mock.patch("grp.getgrgid", return_value=group(me, [me, "someone"])):
+            self.assertFalse(G.own_group(os.getgid()))
+        with mock.patch("grp.getgrgid", return_value=group("users", [])):
+            self.assertFalse(G.own_group(os.getgid()))
+
+    def test_first_run_creates_private_parents_whatever_the_umask(self):
+        home = self.path("fresh", ".config", "genai")
+        old = os.umask(0o002)
+        try:
+            with mock.patch.object(G, "own_group", return_value=False):
+                G.Config(home).ensure()
+                G.Config(home)                                           # and accepts them afterwards
+        finally:
+            os.umask(old)
+        self.assertEqual(stat.S_IMODE(os.stat(self.path("fresh", ".config")).st_mode), 0o700)
+
+    def test_symlinked_trust_database_is_refused(self):
+        home, path = make_home(self.tmp, "https://local.example/v1")
+        bless_path(home, path)
+        cfg = G.Config(home)
+        target = self.path("copied-blessings.json")
+        os.rename(cfg.blessed_path, target)
+        os.symlink(target, cfg.blessed_path)
+        with self.assertRaisesRegex(G.GenaiError, "cannot read genai state file"):
+            G.select_endpoint(cfg, "test")
 
 
 class TestEndpoints(Tmp):
