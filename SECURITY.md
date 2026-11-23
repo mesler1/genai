@@ -248,7 +248,7 @@ safe and prompts are rare enough to be read.
     for character; there are no patterns. genai still runs nothing: in genai-tui it is typed
     into your shell without another question only if you chose that for this plan, and
     genai-tui checks the command against its own record of what you approved, so it does not
-    rely on genai's word alone. Its output is still reviewed before the model sees it.
+    rely on genai's word alone. Its output still goes to the model only when you share it.
   - A command, edit or write the plan doesn't name is flagged "not in the plan" and asks as
     usual. A new plan needs a new approval.
   - A plan is never saved with a session, so it doesn't survive a resume. `/plan clear` (or
@@ -273,8 +273,36 @@ shared filesystem; never an abstract socket, which has no permissions).
   (tmux `pipe-pane`), and is kept in memory only, never written to disk. Commands are told apart
   by invisible markers the prompt hook prints, each carrying a random word the shell keeps in an
   unexported variable; a program you run can't read it, so it can't fake where a command ends or
-  add one to the list. Nothing from the shell reaches the model until you have reviewed it in
-  your editor.
+  add one to the list. Nothing from the shell reaches the model until you say so: you review it
+  in your editor first (`y`), or send it as it is (`s`), which shows nothing more than the
+  question did. Either way genai masks the secrets it recognises, such as the endpoint key.
+
+**Another host: `genai-ssh`.** In the shell pane, `genai-ssh [ssh options] HOST` connects with your
+own ssh (your config, keys and agent; genai makes no connection) and starts bash there with the
+same prompt hook, so genai-tui can follow commands on that host and `/run` can send one there. On
+a shared login node other users can watch the process list, and anything on that host may print
+text, so the session gets a key of its own and the key travels only where they can't see it:
+
+- The local shell announces the session with a marker carrying its own word: a random id and the
+  destination. genai-tui then makes a fresh 128-bit key, in memory. No program can announce one.
+- On the other host, before your start-up files run, the shell turns the terminal's echo off and
+  asks for the key with that id. Only the session just announced, only once, and only within
+  20 seconds; any other ask is ignored. genai-tui types the key back through ssh's encrypted
+  connection. With echo off it is not shown or recorded, and it is never on a command line, in
+  the environment, in shell history or in a file. The remote bash keeps it in an unexported
+  variable. (The id is on the command line for a moment while bash starts; it is not secret.)
+- Remote prompts and command boundaries count only with that key, so a program run there can't
+  fake them. When the local prompt comes back, the session and its key are forgotten.
+- A command sent there asks first like any other, and the question says it runs ON ANOTHER HOST,
+  naming it, in red; so does the info panel. Shared output says which host it came from. An
+  automatic plan stops at a change of host, because the reviewed host and directory no longer
+  match. Host names and directories reported from there are reduced to printable text.
+- Plain `ssh` still works, but genai-tui can't follow it: `/run` refuses and says to use
+  `genai-ssh`. Nothing is installed on the other host; it needs bash.
+
+What remains: anyone who can read your processes' memory on that host (root, or a program
+running as you there) can read the key, as on this one, and could then fake that session's
+command list. The key only ever lets a program fake markers; it approves nothing.
 
 What this cannot do is keep out a program running as you: it can connect to the socket, or send
 keys through tmux, exactly as you can. The shell pane runs as you, on the host unless genai-tui
@@ -425,6 +453,7 @@ Still open:
 - Run coding mode only in a project directory you would share with the endpoint, and use
   `--coding-anywhere` only when you have read what it says it exposes.
 - Use a sandbox for commands you would not run as yourself.
+- Read the host in a run question before you answer it: with `genai-ssh` it may be another one.
 - Keep secrets out of skills and out of files you attach.
 
 ## Reporting a problem

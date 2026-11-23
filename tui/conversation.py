@@ -50,12 +50,15 @@ COMMANDS = {
     "/skills": "list skills; * marks the ones in use",
     "/skill": "NAME on|off: use a blessed skill from the next message on, or stop",
     "/run": "[ID]: review and run a proposed command in the shell pane (the latest by default)",
-    "/share": "[N|mark|all]: review shell output, then send it: the last command, command N, from the mark, or all",
+    "/decline": "[ID]: decline a proposed command (the latest by default); the model hears with your next message",
+    "/share": "[N|mark|all]: send shell output, reviewed first or as it is: the last command, command N, from the "
+              "mark, or all",
     "/commands": "list the commands run in the shell pane, numbered for /share N (also in the info panel)",
     "/mark": "shell context starts at the shell's current prompt (or right-click a line in the shell)",
     "/shell": "show the shell and move there (`` on its empty prompt hides it again)",
     "/panel": "show or hide the info panel on the right",
     "/plan": "[clear]: show the approved plan, or drop it so everything asks again",
+    "/copy": "[N]: copy your message and the reply to it, for the last turn or turn N (or right-click it)",
     "/raw": "[N|all]: what was sent to the endpoint and what came back, for the last turn, turn N, or all kept",
     "/system": "the system prompt and tool definitions sent with every request",
     "/compact": "shrink the conversation when the context is getting full",
@@ -304,7 +307,7 @@ class Banner(Block):
 
     def lines(self, w):
         h, ep = self.h, self.h.get("endpoint") or {}
-        rows = [(f"genai {h.get('version', '?')}", A),
+        rows = [(f"◆ genai {h.get('version', '?')}", A),
                 (f"{ep.get('name', '?')}: {ep.get('model', '?')} at {ep.get('base_url', '?')}", "")]
         prof = h.get("profile")
         if prof:
@@ -375,6 +378,11 @@ def parse_plan_edit(text, steps):
             return set(), {}, f"step {st['n']}'s path was changed; leave the step out instead"
         keep.add(st["n"])
     return keep, edits, None
+
+
+MARK = {R: "✗", W: "⚠", D: "✓"}      # notes: the symbol before one in that role (a plain note has none)
+STATE_MARK = {"waiting": "◆", "shown": "▸", "running": "…", "accepted": "✓", "done": "✓", "ran": "✓",
+              "declined": "⊘", "cancelled": "⊘", "error": "✗", "auto": "↳"}
 
 
 class Card(Block):
@@ -461,7 +469,7 @@ class Card(Block):
         role = self.STATE_ROLE.get(self.state, Q)
         inner = max(w - 4, 8)
         head = f"─ {self.id} · {self.title()}{f' · Alt+{self.key}' if self.key else ''} "
-        tail = f" {self.state} ─"
+        tail = f" {STATE_MARK.get(self.state, '·')} {self.state} ─"
         head = fit(head, w - 2 - width(tail) - 1)
         fill = max(w - 2 - width(head) - width(tail), 1)
         out = [[], [("╭" + head + "─" * fill + tail + "╮", role)]]
@@ -504,6 +512,7 @@ class Model:
         self.shell_where = None
         self.models = []           # the server's models, as genai last listed them
         self.picking = False       # /model asked for that list, to show it as a drop-down
+        self.remote_host = None    # the host of a genai-ssh session in the shell pane, while it is up
         self.skills = None         # genai's skill list, once asked for
         self.show_skills = False   # print the next skill list in the conversation (the user typed /skills)
         self.ask = None            # a question of ours in place of the input box: run or share
@@ -523,13 +532,15 @@ class Model:
         return block
 
     def note(self, text, role=Q):
-        self.add(Note(text, role))
+        self.add(Note(text, role, MARK[role] + " " if role in MARK else "  "))
 
     def number_commands(self):
         """Alt+1 for the newest command proposal, Alt+2 for the one before, up to MENU_KEYS."""
         cmds = [c for c in self.cards.values() if c.ev.get("kind") == "command"]
-        for i, c in enumerate(reversed(cmds)):
-            key = i + 1 if i < MENU_KEYS else None
+        live = [c for c in cmds if c.state != "declined"]          # a declined one keeps /run, not a key
+        keys = {id(c): i + 1 for i, c in enumerate(reversed(live)) if i < MENU_KEYS}
+        for c in cmds:
+            key = keys.get(id(c))
             if c.key != key:
                 c.key = key
                 c.changed()
@@ -723,7 +734,7 @@ class Model:
     def send_turn(self, msg):
         self.busy = True
         for attachment in msg.attachments:
-            self.send(attachment)
+            self.send({k: v for k, v in attachment.items() if k != "decline"})
         self.send({"type": "user", "text": msg.text})
 
     def command(self, line):
@@ -737,6 +748,8 @@ class Model:
                 self.note(f"{c:9} {d}")
             self.note("Enter sends · Alt+Enter or \\ then Enter adds a line · ↑↓ earlier messages · "
                       "PgUp/PgDn scroll · // starts a message with /")
+            self.note("In the shell pane, genai-ssh [ssh options] HOST connects so commands on that host can be "
+                      "followed and /run can send them there (plain ssh can't be)")
             self.note("Alt+1 … Alt+9 open the menu of a command proposal, Alt+1 the newest (as its card says); "
                       "↑↓ and Enter, or the letter shown, choose")
         elif cmd == "/coding":
@@ -773,6 +786,8 @@ class Model:
             self.send({"type": "compact"})
         elif cmd in ("/run", "/share", "/shell", "/mark", "/commands") and not self.shell:
             self.note(f"{cmd} needs the shell pane: start genai with genai-tui", R)
+        elif cmd == "/decline":
+            self.decline(arg)
         elif cmd == "/run":
             cards = [c for c in self.cards.values() if c.ev.get("kind") == "command"]
             card = self.cards.get(arg) if arg else (cards[-1] if cards else None)
@@ -819,6 +834,8 @@ class Model:
                               D if st.get("status") == "done" else Q if st.get("status") == "left out" else "")
         elif cmd == "/raw":
             self.raw(arg)
+        elif cmd == "/copy":
+            self.copy(arg)
         elif cmd == "/context":
             used, limit = self.context or (None, None)
             self.note(f"context: {used}/{limit} tokens" if used is not None else "context: not measured yet")
@@ -832,6 +849,31 @@ class Model:
             self.quit = True
         else:
             self.note(f"unknown command {cmd} (/help lists them)", R)
+
+    def turn_text(self, turn):
+        """Your message for a turn and the replies that followed it, as text to copy (escaped, as shown), or None."""
+        asked = [b for b in self.blocks if isinstance(b, UserMsg) and b.turn == turn and not b.queued]
+        if not turn or not asked:
+            return None
+        said = clean(asked[0].text).strip("\n")
+        parts = ["\n".join("> " + ln if ln else ">" for ln in said.split("\n"))]
+        parts += [clean(b.text).strip("\n") for b in self.blocks
+                  if isinstance(b, Reply) and b.turn == turn and b.text.strip()]
+        return "\n\n".join(parts) + "\n"
+
+    def copy(self, arg):
+        if arg and not arg.isdigit():
+            self.note("usage: /copy or /copy N (a turn)", R)
+            return
+        turns = [b.turn for b in self.blocks if isinstance(b, UserMsg) and not b.queued]
+        turn = int(arg) if arg else max(turns, default=0)
+        text = self.turn_text(turn)
+        if text is None:
+            self.note("nothing to copy yet" if not arg else f"turn {turn} isn't on screen", R)
+        elif not self.shell:
+            self.note("/copy needs tmux: start genai with genai-tui", R)
+        else:
+            self.actions.append(("copy", turn, text))
 
     def raw(self, arg):
         """Ask genai for a turn's exchanges with the endpoint: the latest turn that had any, turn N, or all."""
@@ -858,7 +900,7 @@ class Model:
         return {
             "session": {"endpoint": ep.get("name"), "model": ep.get("model"), "profile": prof.get("name"),
                         "session": h.get("session"), "sandbox": sb.get("name") if sb else None,
-                        "shell_where": self.shell_where},
+                        "shell_where": remote_where(self.remote_host) if self.remote_host else self.shell_where},
             "coding": self.coding, "busy": self.busy, "context": list(self.context or (None, None)),
             "runner": self.runner and {"network": bool(self.runner.get("network")), "problem": self.runner.get("problem"),
                                        "image": self.runner.get("image")},
@@ -889,12 +931,36 @@ class Model:
             self.command("/model")
         elif t == "model" and type(msg.get("n")) is int and 0 <= msg["n"] < len(self.models):
             self.command(f"/model {self.models[msg['n']]}")      # the menu sent a position; the name is ours
+        elif t == "copy" and type(msg.get("turn")) is int:
+            self.command(f"/copy {msg['turn']}")
         elif t == "share" and msg.get("what") in ("mark", "all", "last") and self.shell:
             self.actions.append(("share", msg["what"]))
         elif t == "command" and type(msg.get("n")) is int and self.shell:
             self.actions.append(("share_cmd", msg["n"]))
         elif t == "mark" and isinstance(msg.get("on"), bool) and self.shell:
             self.actions.append(("mark_line",) if msg["on"] else ("unmark",))
+
+    def decline(self, arg):
+        """/decline [ID], or Decline in a command's menu: the card says so, and the model hears with the next
+        message, so it doesn't assume the command ran."""
+        cards = [c for c in self.cards.values() if c.ev.get("kind") == "command" and c.state == "shown"]
+        card = self.cards.get(arg) if arg else (cards[-1] if cards else None)
+        if not card or card.ev.get("kind") != "command":
+            self.note("no command proposal to decline" + (f" with id {arg}" if arg else ""), R)
+        elif card.state != "shown":
+            self.note(f"{card.id} is {card.state}; only a command that hasn't run can be declined", R)
+        else:
+            card.state, card.detail = "declined", "you declined it; the model hears with your next message"
+            card.changed()
+            self.next_attachments.append({"type": "attach", "label": f"declined {card.id}", "decline": card.id,
+                                          "text": f"I declined the command you proposed as {card.id}, and did not "
+                                                  f"run it:\n{card.ev.get('command', '')}"})
+            self.number_commands()
+            self.note(f"{card.id} declined", Q)
+
+    def undecline(self, card):
+        """A declined command is run after all: the model is no longer told it was declined."""
+        self.next_attachments = [a for a in self.next_attachments if a.get("decline") != card.id]
 
     def attach(self, label, text):
         """Shell context the user reviewed: it goes with their next message, so they can ask about it."""
@@ -1094,6 +1160,10 @@ def strip_comments(text):
     return "\n".join(ln for ln in text.split("\n") if not ln.startswith("#")).strip("\n")
 
 
+def remote_where(host):
+    return f"ON ANOTHER HOST, {host}, over ssh, OUTSIDE any sandbox"
+
+
 def review_buffer(command, rc, where, output):
     """What /run and /share open for review: the same layout as genai's own :run."""
     return ("# EVERYTHING below is sent to the model as saved, the command included.\n"
@@ -1182,6 +1252,7 @@ class Shell:
     def __init__(self, pane):
         self.pane = pane
         self.primary_prompt = None
+        self.remote_prompt = None      # (host, directory) while a genai-ssh shell is at its prompt, from the recorder
 
     @classmethod
     def from_env(cls):
@@ -1226,6 +1297,16 @@ class Shell:
         context, (command, mode, paste) = self.context()
         if mode == "1":
             raise Busy("it is in copy mode; press q there")
+        remote = self.remote_prompt() if self.remote_prompt else None
+        if remote:
+            # A genai-ssh session's shell, at its prompt: its markers carry the key only it was given (recorder.py),
+            # so that is the proof, whatever runs ssh here (ssh itself, or a wrapper).
+            if paste == "0":
+                raise Busy("the shell on the other host has bracketed input turned off")
+            return context[0], f"{remote[0]}:{remote[1]}"
+        if command == "ssh":
+            raise Busy("ssh is running, and genai-tui can't follow it; to send commands to another host, connect "
+                       "with genai-ssh [ssh options] HOST instead")
         if command != "bash":
             raise Busy(f"{command or 'something'} is running")
         # tmux before 3.4 can't report bracketed paste (an empty format). Our shellrc turns it on, and the recorder's
@@ -1294,6 +1375,7 @@ class Shell:
                   "Edit it, then run", "e", pick("edit"),
                   "Put it at the shell prompt (you press Enter)", "p", pick("prompt"),
                   "Copy it", "c", pick("copy"),
+                  "Decline it (the model hears with your next message)", "d", pick("decline"),
                   "", "Cancel", "q", ""],
                                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
 
@@ -1313,18 +1395,20 @@ class Shell:
                                             "-y", "C", "-T", " model · ↑↓ Enter ", *items],
                                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
 
-    def raw_menu(self, turn):
-        """Right-click in the conversation: tmux's menu for looking behind it. Only fixed words and a number."""
+    def raw_menu(self, turn, copy=0):
+        """Right-click in the conversation: tmux's menu for copying a turn and looking behind it. Only fixed words
+        and numbers."""
         me = os.environ.get("TMUX_PANE", "")
         pick = menu_item
-        items = (["What was sent and received for this turn", "r", pick("raw", str(turn))] if turn else []) + [
+        items = (["Copy this message and its reply", "c", pick("copy", str(copy)), ""] if copy else []) + \
+            (["What was sent and received for this turn", "r", pick("raw", str(turn))] if turn else []) + [
             "What was sent and received last", "l", pick("raw", "last"),
             "Everything genai still has (last 30)", "a", pick("raw", "all"),
             "The system prompt and tools", "s", pick("system"),
             "", "Cancel", "q", ""]
         self.menus = [p for p in getattr(self, "menus", []) if p.poll() is None]
         self.menus.append(subprocess.Popen(["tmux", "display-menu", "-t", me, "-x", "M", "-y", "M", "-T",
-                                            f" raw view{f' · turn {turn}' if turn else ''} ", *items],
+                                            f" turn {copy or turn} " if copy or turn else " raw view ", *items],
                                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
 
     def title(self, text):
@@ -1395,6 +1479,7 @@ class App:
         self.rec = Recorder(fifo if fifo and os.path.exists(fifo) else None)   # each shell command and its output
         if shell:
             shell.primary_prompt = self.rec.at_primary_prompt
+            shell.remote_prompt = self.rec.remote_prompt
         self.ctx_line = None       # where shell context starts, in logical lines (see Shell.lines)
         self.sent = {}             # the last view sent to each role
         self.ask_obj, self.ask_serial = None, 0
@@ -1460,7 +1545,7 @@ class App:
                 cwd = clean(here[1]) if here else "the shell pane's (it is busy)"
                 verb = "Paste" if ask.get("paste_only") else "Run"
                 lines = [[(f"{verb} {c.id}{' (edited)' if ask['edited'] else ''} in the shell pane? ", A),
-                          (f"It runs {where}, in your shell, as you.", R if where.startswith("OUTSIDE") else "")],
+                          (f"It runs {where}, in your shell, as you.", R if "OUTSIDE" in where else "")],
                          [(f"in {cwd}", Q)]]
                 shown = command_text(ask["command"]).split("\n")
                 lines += [[("    $ " if i == 0 else "      ", Q), (fit(ln, w - 6), "")]
@@ -1473,8 +1558,9 @@ class App:
                               (" view it in full first   ", ""), ("e", A), (" edit   ", ""), ("n", A), (" cancel", "")])
                 return lines, None, "y or v view the whole command first · e edit · n or Esc cancel"
             lines = [[(ask["question"], A)],
-                     [("  y", A), (" review it in your editor, then send   ", ""), ("n", A), (" keep it to yourself", "")]]
-            return lines, None, "y review and send · n or Esc don't share"
+                     [("  y", A), (" review it in your editor, then send   ", ""), ("s", A), (" send it as it is   ", ""),
+                      ("n", A), (" keep it to yourself", "")]]
+            return lines, None, "y review, then send · s send as it is · n or Esc don't share"
         if self.m.pending and self.m.pending[0].ev.get("kind") == "plan":
             c = self.m.pending[0]
             n = len(c.ev.get("steps") or [])
@@ -1487,7 +1573,7 @@ class App:
                       ("v", A), (" view it all", "")]]
             if self.plan_review and self.plan_review[0] == c.id:
                 lines[1][-1] = (" press a again to approve automatic runs", "")
-            if cmds and self.where().startswith("OUTSIDE"):
+            if cmds and "OUTSIDE" in self.where():
                 lines.append([(f"  Commands run {self.where()}, in your shell, as you.", R)])
             return lines, None, "y approve · a review automatic runs · e edit · n or Esc no · v view"
         if self.m.pending:
@@ -1764,7 +1850,7 @@ class App:
         elif b & (curses.BUTTON3_RELEASED | curses.BUTTON3_CLICKED) and self.shell:
             block = self.rows[y] if 0 <= y < len(self.rows) else None
             turn = getattr(block, "turn", 0)
-            self.shell.raw_menu(turn if turn in self.m.exchanges else 0)
+            self.shell.raw_menu(turn if turn in self.m.exchanges else 0, turn if self.m.turn_text(turn) else 0)
         elif 0 <= y < len(self.rows) and not self.m.pending and not self.m.ask:
             card = self.rows[y]
             if isinstance(card, Card) and card.ev.get("kind") == "command":
@@ -1799,12 +1885,20 @@ class App:
             self.answer("e")
         elif what == "prompt":
             self.m.ask = {"kind": "run", "card": card, "command": command, "edited": False, "paste_only": True}
+        elif what == "decline":
+            self.m.decline(pid)
         elif what == "copy":
             self.shell.copy(command)
             self.m.note(f"{card.id} copied (tmux buffer, and your clipboard if the terminal allows it)")
 
     def where(self):
-        return self.m.shell_where or "OUTSIDE any sandbox, directly on this host"
+        """Where a command typed into the shell pane now runs: here, or on the host of a genai-ssh session."""
+        host = self.rec.remote_host() if self.shell else None
+        return remote_where(host) if host else self.m.shell_where or "OUTSIDE any sandbox, directly on this host"
+
+    def ran_where(self, c):
+        """Where a command the recorder saw ran."""
+        return remote_where(c.host) if c.host else self.m.shell_where or "OUTSIDE any sandbox, directly on this host"
 
     def fits(self, command):
         """Is all of the command visible in the question? Then reading it there is the review."""
@@ -1895,14 +1989,18 @@ class App:
                 m.note(f"{card.id}: not run")
         else:
             m.ask = None
-            if k == "y":
+            if k in ("y", "s"):                             # y: review it in your editor first; s: send it as it is
                 if ask.get("context"):
                     text = ("# EVERYTHING below is sent to the model as saved. Remove anything you don't want it to "
                             f"see.\nMy shell session{ask['from']}:\n```\n{ask['output']}\n```\n")
                 else:
-                    text = review_buffer(ask["command"], ask["rc"], self.where(), ask["output"])
-                kept = self.edit(text, ask["label"], "sent to the model exactly as saved; nothing is added",
-                                 "send nothing")
+                    text = review_buffer(ask["command"], ask["rc"], ask.get("where") or self.where(), ask["output"])
+                if k == "s":                                # the same text, without the editor's # lines on top
+                    kept = text.split("\n", 1 if ask.get("context") else 2)[-1].strip("\n")
+                    m.note(f"{ask['label']}: sent without review (genai still masks the secrets it recognises)", Q)
+                else:
+                    kept = self.edit(text, ask["label"], "sent to the model exactly as saved; nothing is added",
+                                     "send nothing")
                 if kept is None or not kept.strip():
                     m.note("nothing sent")
                 elif ask.get("context"):
@@ -1931,7 +2029,9 @@ class App:
             self.m.note(f"{card.id} not run: tmux failed ({e})", R)
             return
         self.shell.show()                                # so the command can be watched as it runs
+        self.m.undecline(card)
         card.state, card.detail = "running", "typed into the shell pane"
+        self.m.number_commands()
         card.changed()
         self.running = {"card": card, "command": command, "done": done}
 
@@ -1946,7 +2046,23 @@ class App:
         card.changed()
         self.m.ask = {"kind": "share", "label": f"{card.id} finished (exit {c.rc})", "what": card.id,
                       "question": f"{card.id} finished (exit {c.rc}). Share the output with the model?",
-                      "command": r["command"], "rc": c.rc, "output": self.output_of(c)}
+                      "command": r["command"], "rc": c.rc, "output": self.output_of(c), "where": self.ran_where(c)}
+
+    def poll_handshake(self):
+        """A genai-ssh shell on another host asks for its key: type it in now, once (see recorder.py). Its echo is
+        off, so the key isn't shown; it goes through ssh's encrypted connection, and nowhere else."""
+        self.m.remote_host = self.rec.remote_host()
+        key = self.rec.take_handshake()
+        if key and self.shell:
+            try:
+                self.shell.tmux("send-keys", "-t", self.shell.pane, "-l", key, check=True)
+                self.shell.tmux("send-keys", "-t", self.shell.pane, "Enter", check=True)
+            except (OSError, subprocess.SubprocessError) as e:
+                self.m.note(f"genai-ssh: could not answer the other host ({e}); genai-tui won't follow that session",
+                            R)
+                return
+            self.m.note("genai-ssh: following the shell on the other host. Commands sent there run on that host, "
+                        "and each still asks first.", W)
 
     def output_of(self, c):
         out = trim(c.text())
@@ -1965,7 +2081,8 @@ class App:
         n = c.lines()
         label_ = f"Command {c.n} in the shell pane: {name} (exit {c.rc}, {n} line{'s' if n != 1 else ''})"
         self.m.ask = {"kind": "share", "label": label_, "what": f"command {c.n}", "command": cmd, "rc": c.rc,
-                      "output": self.output_of(c), "question": f"{label_}. Share the output with the model?"}
+                      "output": self.output_of(c), "question": f"{label_}. Share the output with the model?",
+                      "where": self.ran_where(c)}
 
     def list_commands(self):
         cmds = self.rec.finished()
@@ -2163,6 +2280,7 @@ class App:
 
     def pump(self):
         self.poll_run()
+        self.poll_handshake()
         while self.hub:
             try:
                 role, msg = self.hub.inbox.get_nowait()
@@ -2174,12 +2292,12 @@ class App:
                 self.from_prompt(msg)
             elif role == "panel":
                 self.m.request(msg)
-            elif role == "menu" and msg.get("type") in ("share", "mark", "raw", "system", "model"):
+            elif role == "menu" and msg.get("type") in ("share", "mark", "raw", "system", "copy", "model"):
                 self.m.request(msg)
             elif role == "menu" and msg.get("type") == "menu" and msg.get("action") == "open":
                 self.open_menu(msg.get("key"))
             elif role == "menu" and msg.get("type") == "menu" and isinstance(msg.get("id"), str):
-                if msg.get("action") in ("run", "edit", "prompt", "copy"):
+                if msg.get("action") in ("run", "edit", "prompt", "copy", "decline"):
                     self.menu_action(msg["action"], msg["id"])
         for action in self.m.actions:
             if action == ("share", "last"):
@@ -2192,6 +2310,11 @@ class App:
                 self.show_raw(action[1])
             elif action[0] == "model_menu" and self.shell:
                 self.shell.model_menu(self.m.models, (self.m.hello or {}).get("endpoint", {}).get("model"))
+            elif action[0] == "copy":
+                self.shell.copy(action[2])
+                n = action[2].count("\n")
+                self.m.note(f"turn {action[1]} copied: your message and the reply, {n} lines (tmux buffer, and your "
+                            "clipboard if the terminal allows it)")
             elif action[0] == "plan_cmd":
                 self.plan_cmd(action[1])
             elif action[0] == "mark_line":
