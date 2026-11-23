@@ -10,6 +10,7 @@ import argparse
 import collections
 import datetime
 import difflib
+import errno
 import hashlib
 import ipaddress
 import json
@@ -1078,6 +1079,9 @@ class DiskError(ValueError):
     """A failure that reveals something about what is on disk (a symlink, a file where a directory was expected)."""
 
 
+NO_HARD_LINKS = {errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP, errno.ENOSYS}
+
+
 class StaleApproval(ValueError):
     """The target no longer matches the approved snapshot."""
 
@@ -1244,6 +1248,19 @@ class Workdir:
             os.close(dfd)
         return len(data)
 
+    @staticmethod
+    def _create_new(dfd, name, data):
+        """Where the filesystem has no hard links (CIFS, some FUSE mounts): create the name only if it is still
+        free, then write. Never replaces a file, but another program could see it half-written."""
+        try:
+            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o666, dir_fd=dfd)
+        except FileExistsError as e:
+            raise StaleApproval("the target now exists") from e
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+
     def _publish(self, dfd, stage, name, data, st, expected):
         staging_fd = os.open(stage, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dfd)
         try:
@@ -1264,6 +1281,10 @@ class Workdir:
                         os.link("file", name, src_dir_fd=staging_fd, dst_dir_fd=dfd)
                     except FileExistsError as e:
                         raise StaleApproval("the target now exists") from e
+                    except OSError as e:
+                        if e.errno not in NO_HARD_LINKS:
+                            raise
+                        self._create_new(dfd, name, data)
                 else:
                     if expected is not _UNCHECKED:
                         try:
@@ -2028,10 +2049,14 @@ class Engine:
         return rows, truncated
 
     def prepare_auto_read(self, proposal):
+        """Read the file now, so what is sent is exactly what was checked for secrets. A read that fails (a missing,
+        binary or oversized file) stays automatic and reports its error: there is nothing secret to ask about."""
         path = proposal.fields["path"]
         try:
             text = self.wd.read(path)
-        except (ValueError, OSError):
+        except (ValueError, OSError) as e:
+            proposal.fields["_read_error"] = e
+            proposal.auto = True
             return
         if looks_secret(text) or any(key and key in text for key in self.secrets()):
             proposal.fields["secret"] = True
@@ -2168,6 +2193,8 @@ class Engine:
             return "declined by the user"
         try:
             if p.kind == "read":
+                if p.auto and "_read_error" in p.fields:
+                    raise p.fields["_read_error"]
                 text = p.fields["_read_text"] if p.auto else self.wd.read(p.fields["path"])
                 result = text
                 note = f"read {len(text)} characters"
