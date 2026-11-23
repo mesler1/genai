@@ -34,6 +34,7 @@ GENAI = os.environ.get("GENAI_BIN") or os.path.join(os.path.dirname(os.path.dirn
                                                     "genai")
 CARD_BODY_LINES = 12
 INPUT_MAX_LINES = 8
+CMD_LINES = 4                  # lines of a command shown in a run question; a longer one is viewed in full first
 
 COMMANDS = {
     "/help": "show this help",
@@ -82,7 +83,17 @@ def clean(text):
 
 
 def command_text(command):
-    return clean(command.replace("\\", "\\\\").replace("\t", "\\t"))
+    """A command as it is shown for review: exactly as it runs, backslashes and all, with tabs as ⇥. Characters
+    that would show as escapes are never sent to the shell (see unsafe_chars), so an escape on screen can't stand
+    for something else."""
+    return clean(command.replace("\t", "⇥"))
+
+
+def unsafe_chars(command):
+    """Control, bidi and invisible characters: clean() shows them as escapes, so the command shown would not be
+    the command typed. Such a command is never sent to the shell pane."""
+    return [ch for ch in command if ch not in "\n\t" and (ord(ch) < 0x20 or 0x7F <= ord(ch) < 0xA0 or ord(ch) in _INVISIBLE
+            or unicodedata.category(ch) in ("Cf", "Cs", "Co", "Cn", "Zl", "Zp"))]
 
 
 def cells(ch):
@@ -375,6 +386,8 @@ class Card(Block):
         ev, k, out = self.ev, self.ev.get("kind"), []
         if ev.get("preapproved"):
             out.append((f"step {ev.get('plan_step')} of the plan you approved", D))
+        elif ev.get("plan_repeat"):
+            out.append((f"step {ev.get('plan_step')} of the plan, already run once: it asks again", Q))
         elif ev.get("plan_step"):
             out.append((f"step {ev.get('plan_step')} of the plan", Q))
         elif ev.get("off_plan"):
@@ -1096,14 +1109,17 @@ class Shell:
             raise Busy("it is in copy mode; press q there")
         if command != "bash":
             raise Busy(f"{command or 'something'} is running")
-        if paste != "1" or self.primary_prompt is None or not self.primary_prompt():
+        # tmux before 3.4 can't report bracketed paste (an empty format). Our shellrc turns it on, and the recorder's
+        # prompt marker proves that shellrc is what is at the prompt; a 0 from a newer tmux means it was turned off.
+        if paste == "0" or self.primary_prompt is None or not self.primary_prompt():
             raise Busy("Bash is not at its primary prompt with bracketed input enabled")
         return context
 
     def type(self, command, enter=True, expected=None):
         """Type only into a Bash pane accepting bracketed input."""
-        if any(unicodedata.category(ch) in ("Cc", "Cs") and ch not in "\n\t" for ch in command):
-            raise Busy("the command contains terminal control characters")
+        if unsafe_chars(command):
+            raise Busy("the command contains control or invisible characters (shown as escapes); "
+                       "copy it and check it yourself")
         context = self.ready()
         if expected is not None and context != expected:
             raise Busy("the shell or working directory changed since review")
@@ -1304,18 +1320,22 @@ class App:
             if ask["kind"] == "run":
                 c = ask["card"]
                 where = self.where()
-                cwd = clean(ask["context"][1]) if ask.get("context") else "shown in the full preview"
+                here = ask.get("context") or ask.get("peek")
+                cwd = clean(here[1]) if here else "the shell pane's (it is busy)"
                 verb = "Paste" if ask.get("paste_only") else "Run"
                 lines = [[(f"{verb} {c.id}{' (edited)' if ask['edited'] else ''} in the shell pane? ", A),
                           (f"It runs {where}, in your shell, as you.", R if where.startswith("OUTSIDE") else "")],
-                         [(f"Directory: {cwd}", Q)]]
-                if ask.get("context"):
-                    lines.append([("  y", A), (f" {verb.lower()}   ", ""), ("v", A), (" view again   ", ""),
+                         [(f"in {cwd}", Q)]]
+                shown = command_text(ask["command"]).split("\n")
+                lines += [[("    $ " if i == 0 else "      ", Q), (fit(ln, w - 6), "")]
+                          for i, ln in enumerate(shown[:CMD_LINES])]
+                if ask.get("context") or self.fits(ask["command"]):
+                    lines.append([("  y", A), (f" {verb.lower()}   ", ""), ("v", A), (" view in full   ", ""),
                                   ("e", A), (" edit   ", ""), ("n", A), (" cancel", "")])
-                    return lines, None, f"y {verb.lower()} · v view again · e edit · n or Esc cancel"
-                lines.append([("  v", A), (" review full command   ", ""), ("e", A), (" edit   ", ""),
-                              ("n", A), (" cancel", "")])
-                return lines, None, "v or y review full command · e edit · n or Esc cancel"
+                    return lines, None, f"y {verb.lower()} · v view in full · e edit · n or Esc cancel"
+                lines.append([("  It doesn't all fit here: ", W), ("y", A), (" or ", ""), ("v", A),
+                              (" view it in full first   ", ""), ("e", A), (" edit   ", ""), ("n", A), (" cancel", "")])
+                return lines, None, "y or v view the whole command first · e edit · n or Esc cancel"
             lines = [[(ask["question"], A)],
                      [("  y", A), (" review it in your editor, then send   ", ""), ("n", A), (" keep it to yourself", "")]]
             return lines, None, "y review and send · n or Esc don't share"
@@ -1632,6 +1652,26 @@ class App:
     def where(self):
         return self.m.shell_where or "OUTSIDE any sandbox, directly on this host"
 
+    def fits(self, command):
+        """Is all of the command visible in the question? Then reading it there is the review."""
+        rows = command_text(command).split("\n")
+        if len(rows) > CMD_LINES:
+            return False
+        w = self.scr.getmaxyx()[1]
+        if self.prompt:
+            try:
+                w = int(self.shell.tmux("display", "-p", "-t", self.prompt, "#{pane_width}").strip() or w)
+            except (ValueError, OSError, subprocess.SubprocessError):
+                pass
+        return all(width(r) <= w - 6 for r in rows)
+
+    def peek(self, ask):
+        """The shell's directory, to show with a run question; None while the shell is busy."""
+        try:
+            return self.shell.ready()
+        except (Busy, OSError, subprocess.SubprocessError):
+            return None
+
     def review_context(self):
         try:
             context = self.shell.ready()
@@ -1671,7 +1711,15 @@ class App:
         ask, m = self.m.ask, self.m
         if ask["kind"] == "run":
             card = ask["card"]
-            if k == "v" or (k == "y" and not ask.get("context")):
+            if k == "y" and not ask.get("context") and self.fits(ask["command"]):
+                context = self.review_context()             # all of it is on screen: that was the review
+                if context:
+                    m.ask = None
+                    if ask.get("paste_only"):
+                        self.paste_run(card, ask["command"], context)
+                    else:
+                        self.start_run(card, ask["command"], context=context)
+            elif k == "v" or (k == "y" and not ask.get("context")):
                 self.review_run(ask)
             elif k == "y":
                 m.ask = None
@@ -2018,6 +2066,9 @@ class App:
         self.m.outbox = []
         if self.shell:
             self.m.recent = self.recent()
+            ask = self.m.ask
+            if ask and ask.get("kind") == "run" and "peek" not in ask:
+                ask["peek"] = self.peek(ask)
         self.publish()
 
 

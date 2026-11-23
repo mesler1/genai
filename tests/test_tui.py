@@ -80,6 +80,29 @@ class TestApprovalDisplay(unittest.TestCase):
 
 
 class TestShellDispatch(unittest.TestCase):
+    def test_commands_are_shown_exactly_as_they_run(self):
+        for cmd in ("make \\\n  all", "printf 'a\\nb'", "grep -E '\\bfoo\\b' x"):
+            self.assertEqual(C.command_text(cmd), cmd)
+        self.assertEqual(C.command_text("a\tb"), "a⇥b")
+        self.assertEqual(C.unsafe_chars("echo 'ok' \\x1b"), [])
+        for bad in ("echo \x1b[2J", "echo \u202eevil", "rm \u200b-rf", "a\u2028b"):
+            self.assertTrue(C.unsafe_chars(bad), repr(bad))
+            with self.assertRaisesRegex(C.Busy, "control or invisible"):
+                C.Shell("%1").type(bad)
+
+    def test_bracketed_paste_unknown_on_older_tmux(self):
+        shell = C.Shell("%1")
+        shell.primary_prompt = lambda: True
+        for flag, ok in (("1", True), ("", True), ("0", False)):         # tmux 3.2 and 3.3 report nothing
+            with mock.patch.object(shell, "tmux", return_value=f"123 bash 0 {flag} /work\n"):
+                if ok:
+                    self.assertEqual(shell.ready(), ("123", "/work"))
+                else:
+                    self.assertRaises(C.Busy, shell.ready)
+        shell.primary_prompt = lambda: False                               # a continuation prompt, or a program
+        with mock.patch.object(shell, "tmux", return_value="123 bash 0  /work\n"):
+            self.assertRaises(C.Busy, shell.ready)
+
     def test_failed_paste_never_sends_enter(self):
         shell = C.Shell("%1")
         with mock.patch.object(shell, "ready", return_value=("123", "/work")), \
@@ -841,7 +864,7 @@ class TestGenaiTui(TmuxCase):
             self.assertIn("planned-new", self.sent(api))
             self.type("check again")
             self.wait_for("click it, or /run p5")
-            self.wait_for("NOT in the plan", pane="genai")
+            self.wait_for("step 3 of the plan, already run once", pane="genai")
             self.assertEqual(self.screen("shell").count("cat a.txt"), 1)
 
     def test_a_mark_survives_resizing(self):
@@ -988,8 +1011,7 @@ class TestGenaiTui(TmuxCase):
             self.wait_for("Run p1")
             self.key("e")
             self.wait_for("Run p1 (edited)")
-            self.key("v")
-            self.wait_for("y run")
+            self.wait_for("$ echo edited")                 # all of it is in the question: y runs it
             self.key("y")
             self.wait_for("Share the output")
             self.key("n")
