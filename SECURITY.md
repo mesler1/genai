@@ -227,10 +227,15 @@ descriptions that changed after approval.
   its endpoint, tools or behaviour. Configuration comes only from `~/.config/genai`.
 - Nothing is sent anywhere until an endpoint has been blessed. Blessing needs a terminal.
 - Blessing records a sha256 of exactly the bytes shown. Each use reads the file once and
-  hashes and parses the same bytes. Local trust state must be owned by the current user
-  and protected against writes and directory replacement by other users. Sticky system
-  directories can contain private user directories. Skills are hashed across every file, with symlinks
+  hashes and parses the same bytes. Skills are hashed across every file, with symlinks
   refused. Any change means refusal until you bless again.
+- genai's own state (`config.json`, the blessings, sessions, the audit log) must be yours and
+  not writable by other users, and so must every directory above it, up to one owned by root.
+  A sticky directory such as `/tmp` may hold it. Group write counts as safe only when the group
+  is your personal one (named after you, with no other members), as with `umask 002` on
+  user-private-group systems. State files must be regular files, not symlinks. A first run
+  creates any missing parent, such as `~/.config`, private. Each refusal says which `chmod`
+  fixes it.
 - Blessing a skill scans every file for hidden and control characters and lists what it found
   (`U+E0049 x3`), and says which files are binary and so could not be checked. A skill's text
   goes to the model, so text you cannot see is the risk.
