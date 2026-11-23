@@ -14,7 +14,7 @@ import os
 import queue
 import sys
 
-from conversation import A, D, Q, R, W, clean, fit, width
+from conversation import A, D, Q, R, STATE_MARK, W, clean, fit, width
 from ipc import Client
 
 STATE = os.environ.get("GENAI_TUI_STATE", "")
@@ -70,7 +70,7 @@ def view(st, w, sel):
     ctx = st.get("context") or [None, None]
     add(bar(ctx[0] or 0, ctx[1], w) if ctx[0] is not None else [("not measured yet", Q)])
     if st.get("busy"):
-        add([("genai is replying", W)])
+        add([("… genai is replying", W)])
     plan = st.get("plan")
     if plan:
         head("PLAN")
@@ -120,7 +120,8 @@ def view(st, w, sel):
     for p in props[-12:]:
         role = {"waiting": W, "error": R, "declined": Q, "done": D, "ran": D, "running": A}.get(p.get("state"), "")
         title = fit(clean(p.get("title", "")), max(w - 20, 4))
-        status = clean(p.get("state", "") + (f" · {p['detail']}" if p.get("detail") else ""))
+        status = clean(STATE_MARK.get(p.get("state"), "·") + " " + p.get("state", "")
+                       + (f" · {p['detail']}" if p.get("detail") else ""))
         add([(f"{clean(p.get('id', '?')):4} ", Q), (title, ""), (" ", ""), (fit(status, max(w - 6 - width(title), 1)), role)])
     return lines, acts
 
