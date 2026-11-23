@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -76,6 +77,24 @@ class TestApprovalDisplay(unittest.TestCase):
         card = C.Card({"kind": "edit", "diff": "--- a/x\n+++ b/x\n@@ -1 +1 @@\n---remove\n+++add"})
         self.assertIn("---remove\n+++add", card.full_text())
         self.assertNotIn("--- a/x", card.full_text())
+
+
+class TestShellDispatch(unittest.TestCase):
+    def test_failed_paste_never_sends_enter(self):
+        shell = C.Shell("%1")
+        with mock.patch.object(shell, "ready", return_value=("123", "/work")), \
+                mock.patch.object(shell, "tmux", side_effect=["", "", subprocess.CalledProcessError(1, "paste")]) as tmux:
+            with self.assertRaises(subprocess.CalledProcessError):
+                shell.type("echo reviewed", expected=("123", "/work"))
+        self.assertNotIn(mock.call("send-keys", "-t", "%1", "Enter", check=True), tmux.call_args_list)
+
+    def test_changed_directory_prevents_paste(self):
+        shell = C.Shell("%1")
+        with mock.patch.object(shell, "ready", return_value=("123", "/another")), \
+                mock.patch.object(shell, "tmux") as tmux:
+            with self.assertRaisesRegex(C.Busy, "changed since review"):
+                shell.type("echo reviewed", expected=("123", "/work"))
+        tmux.assert_not_called()
 
 
 class TestEditor(unittest.TestCase):
@@ -713,7 +732,11 @@ class TestGenaiTui(TmuxCase):
             self.assertEqual(self.tmux("show-buffer", "-b", "genai-copy"), "echo at-prompt")
             self.click("echo at-prompt")
             time.sleep(0.5)
-            self.at_terminal("p")                                  # "Put it at the shell prompt"
+            self.at_terminal("p")
+            self.wait_for("Paste p2 in the shell pane?")
+            self.key("v")
+            self.wait_for("y paste")
+            self.key("y")
             self.wait_for("p2 is at the shell prompt")
             time.sleep(0.3)
             last = [ln for ln in self.screen("shell").splitlines() if ln.strip()][-1]
@@ -796,7 +819,8 @@ class TestGenaiTui(TmuxCase):
                  {"kind": "command", "command": "cat a.txt", "why": "check"}]
         turns = [call("propose_plan", goal="fix a", steps=steps), call("read_file", path="a.txt", reason="r"),
                  call("edit_file", path="a.txt", old_text="old", new_text="planned-new", reason="r"),
-                 call("propose_command", command="cat a.txt", reason="r"), reply("all good")]
+                 call("propose_command", command="cat a.txt", reason="r"), reply("all good"),
+                 call("propose_command", command="cat a.txt", reason="repeat")]
         with FakeAPI(turns) as api:
             self.start(api)
             with open(os.path.join(self.wd, "a.txt"), "w") as f:
@@ -815,6 +839,10 @@ class TestGenaiTui(TmuxCase):
             self.key("y")
             self.wait_for("all good")
             self.assertIn("planned-new", self.sent(api))
+            self.type("check again")
+            self.wait_for("click it, or /run p5")
+            self.wait_for("NOT in the plan", pane="genai")
+            self.assertEqual(self.screen("shell").count("cat a.txt"), 1)
 
     def test_a_mark_survives_resizing(self):
         with FakeAPI([reply("seen it")]) as api:

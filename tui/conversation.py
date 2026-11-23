@@ -277,9 +277,9 @@ class Reply(Block):
 
 
 class Banner(Block):
-    def __init__(self, hello):
+    def __init__(self, hello, shell_where=None):
         super().__init__()
-        self.h = hello
+        self.h, self.shell_where = hello, shell_where
 
     def lines(self, w):
         h, ep = self.h, self.h.get("endpoint") or {}
@@ -295,10 +295,10 @@ class Banner(Block):
                          "without asking, except hidden and secret-looking ones", W))
             if h.get("coding_override"):
                 rows.append((f"this is {h['coding_override']}; --coding-anywhere allowed it", R))
-        sb = h.get("sandbox")
-        rows.append(("commands are only shown: you run them yourself, "
-                     + (f"inside the {sb['name']} sandbox" if sb else "OUTSIDE any sandbox, directly on this host"),
-                     "" if sb else W))
+        if self.shell_where:
+            rows.append((f"Approved commands run {self.shell_where}.", W))
+        else:
+            rows.append(("Commands are shown for you to run in your own shell.", W))
         if h.get("skills"):
             rows.append((f"skills: {', '.join(h['skills'])}", ""))
         rows.append(("Type a message and press Enter. /help lists commands.", Q))
@@ -459,6 +459,7 @@ class Model:
         self.exited = None         # genai's exit code once it has gone
         self.quit = False
         self.shell = False         # a shell pane is there (inside genai-tui)
+        self.shell_where = None
         self.skills = None         # genai's skill list, once asked for
         self.show_skills = False   # print the next skill list in the conversation (the user typed /skills)
         self.ask = None            # a question of ours in place of the input box: run or share
@@ -491,7 +492,7 @@ class Model:
             self.reply = None
         if t == "hello":
             self.hello, self.coding = ev, bool(ev.get("coding"))
-            self.add(Banner(ev))
+            self.add(Banner(ev, self.shell_where))
             if "skills" in (ev.get("features") or []):
                 self.send({"type": "skills"})          # for the info panel; not printed
         elif t == "text":
@@ -730,7 +731,8 @@ class Model:
         ep, sb, prof = h.get("endpoint") or {}, h.get("sandbox"), h.get("profile") or {}
         return {
             "session": {"endpoint": ep.get("name"), "model": ep.get("model"), "profile": prof.get("name"),
-                        "session": h.get("session"), "sandbox": sb.get("name") if sb else None},
+                        "session": h.get("session"), "sandbox": sb.get("name") if sb else None,
+                        "shell_where": self.shell_where},
             "coding": self.coding, "busy": self.busy, "context": list(self.context or (None, None)),
             "skills": self.skills,
             "proposals": [{"id": c.id, "title": c.title(), "state": c.state, "detail": clean(c.detail)}
@@ -1074,12 +1076,13 @@ class Shell:
             raise Busy("the shell pane's working directory is unavailable")
         return (pid, cwd), (command, mode, paste)
 
-    def execution_where(self):
+    def execution_where(self, pid=None):
         """Describe the shell pane itself, independently of the genai child."""
-        try:
-            (pid, _), _ = self.context()
-        except (Busy, OSError, subprocess.SubprocessError):
-            return "with unverified isolation"
+        if pid is None:
+            try:
+                (pid, _), _ = self.context()
+            except (Busy, OSError, subprocess.SubprocessError):
+                return "with unverified isolation"
         root = f"/proc/{pid}/root"
         if os.path.exists(f"{root}/run/.containerenv"):
             return "inside the podman sandbox"
@@ -1229,7 +1232,7 @@ class App:
         self.scr, self.child, self.shell = scr, child, shell
         self.m, self.ed = Model(), Editor()
         self.m.shell = shell is not None
-        self.shell_where = shell.execution_where() if shell else "OUTSIDE any sandbox, directly on this host"
+        self.m.shell_where = shell.execution_where() if shell else None
         self.plan_review = None
         self.running = None        # a /run command in the shell pane: card, command, commands done before it
         self.rows = []             # the block drawn on each screen row of the conversation
@@ -1302,13 +1305,14 @@ class App:
                 c = ask["card"]
                 where = self.where()
                 cwd = clean(ask["context"][1]) if ask.get("context") else "shown in the full preview"
-                lines = [[(f"Run {c.id}{' (edited)' if ask['edited'] else ''} in the shell pane? ", A),
+                verb = "Paste" if ask.get("paste_only") else "Run"
+                lines = [[(f"{verb} {c.id}{' (edited)' if ask['edited'] else ''} in the shell pane? ", A),
                           (f"It runs {where}, in your shell, as you.", R if where.startswith("OUTSIDE") else "")],
                          [(f"Directory: {cwd}", Q)]]
                 if ask.get("context"):
-                    lines.append([("  y", A), (" run   ", ""), ("v", A), (" view again   ", ""),
+                    lines.append([("  y", A), (f" {verb.lower()}   ", ""), ("v", A), (" view again   ", ""),
                                   ("e", A), (" edit   ", ""), ("n", A), (" cancel", "")])
-                    return lines, None, "y run · v view again · e edit · n or Esc cancel"
+                    return lines, None, f"y {verb.lower()} · v view again · e edit · n or Esc cancel"
                 lines.append([("  v", A), (" review full command   ", ""), ("e", A), (" edit   ", ""),
                               ("n", A), (" cancel", "")])
                 return lines, None, "v or y review full command · e edit · n or Esc cancel"
@@ -1526,7 +1530,9 @@ class App:
         """An id for the question showing in the prompt pane. An answer must name it, so an answer meant for a
         question that has since gone (or not yet come) is ignored, however late or early it arrives."""
         if self.m.pending:
-            return f"approve:{self.m.pending[0].id}"
+            pid = self.m.pending[0].id
+            reviewed = self.plan_review and self.plan_review[0] == pid
+            return f"approve:{pid}:reviewed" if reviewed else f"approve:{pid}"
         if self.m.ask:
             return f"ask:{self.ask_serial}"
         return None
@@ -1554,6 +1560,7 @@ class App:
             if msg.get("q") != self.question() or self.question() is None:
                 return True                                # an answer to a question that isn't showing
             k = msg["key"]
+            self.sent.pop("prompt", None)
             if k == "esc":
                 if self.m.pending:
                     self.m.decide(False)
@@ -1617,22 +1624,19 @@ class App:
             self.m.ask = {"kind": "run", "card": card, "command": command, "edited": False}
             self.answer("e")
         elif what == "prompt":
-            try:
-                self.shell.type(command, enter=False)
-                self.shell.focus()
-                self.m.note(f"{card.id} is at the shell prompt; press Enter there to run it, then /share")
-            except (Busy, OSError, subprocess.SubprocessError) as e:
-                self.m.note(f"{card.id}: could not use the shell pane ({e})", R)
+            self.m.ask = {"kind": "run", "card": card, "command": command, "edited": False, "paste_only": True}
         elif what == "copy":
             self.shell.copy(command)
             self.m.note(f"{card.id} copied (tmux buffer, and your clipboard if the terminal allows it)")
 
     def where(self):
-        return self.shell_where
+        return self.m.shell_where or "OUTSIDE any sandbox, directly on this host"
 
     def review_context(self):
         try:
-            return self.shell.ready()
+            context = self.shell.ready()
+            self.m.shell_where = self.shell.execution_where(context[0])
+            return context
         except (Busy, OSError, subprocess.SubprocessError) as e:
             self.m.note(f"the shell pane is busy ({e})", R)
             return None
@@ -1671,7 +1675,10 @@ class App:
                 self.review_run(ask)
             elif k == "y":
                 m.ask = None
-                self.start_run(card, ask["command"], context=ask["context"])
+                if ask.get("paste_only"):
+                    self.paste_run(card, ask["command"], ask["context"])
+                else:
+                    self.start_run(card, ask["command"], context=ask["context"])
             elif k == "e":
                 reason = " ".join(clean(card.ev.get("reason", "")).split())
                 edited = self.edit(ask["command"], f"Proposed command [{card.id}]: {reason}",
@@ -1700,6 +1707,15 @@ class App:
                     m.attach(ask["label"], kept)
                 else:
                     m.share(f"output of {ask['what']} (exit {ask['rc']})", kept, f"Here is the output of {ask['what']}.")
+
+    def paste_run(self, card, command, context):
+        try:
+            self.shell.type(command, enter=False, expected=context)
+            self.shell.focus()
+        except (Busy, OSError, subprocess.SubprocessError) as e:
+            self.m.note(f"{card.id}: could not use the shell pane ({e})", R)
+            return
+        self.m.note(f"{card.id} is at the shell prompt; press Enter there to run it, then /share")
 
     def start_run(self, card, command, context):
         done = self.rec.done
@@ -1910,7 +1926,7 @@ class App:
             f.write(text)
         curses.endwin()
         try:
-            pager = ["less", "-+F", path] if shutil.which("less") else ["more", path]
+            pager = ["less", "-+F", "-+S", path] if shutil.which("less") else ["more", path, os.devnull]
             return self.run_here(pager) == 0
         except OSError as e:
             self.m.note(f"could not open the full preview: {e}", R)
