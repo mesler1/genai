@@ -2197,12 +2197,18 @@ class Engine:
         """Hold a proposal to the approved plan. A planned read needs no approval (unless the file is hidden or
         looks secret); a planned command, word for word as approved, is marked preapproved, for the wrapper to run
         without asking again; a planned edit or write is labelled, and still asks. A command, edit or write the
-        plan doesn't name is flagged off_plan. genai still runs nothing itself."""
+        plan doesn't name is flagged off_plan. Each approved command step is preapproved once; proposed again, it is
+        marked plan_repeat and asks. genai still runs nothing itself."""
         if not self.plan or p.kind not in ("command", "read", "list", "edit", "write"):
             return
         steps = [st for st in self.plan["steps"] if st["approved"]]
         if p.kind == "command":
-            hit = next((st for st in steps if st["kind"] == "command" and st["command"] == p.fields["command"]), None)
+            same = [st for st in steps if st["kind"] == "command" and st["command"] == p.fields["command"]]
+            hit = next((st for st in same if st["status"] == "todo"), None)
+            if hit is None and same:            # run once already: in the plan, but it asks again
+                p.fields["plan_step"], p.fields["plan_repeat"] = same[0]["n"], True
+                self.audit.log("plan_repeat", id=p.id, step=same[0]["n"])
+                return
         else:
             try:
                 where = "/".join(split_rel(p.fields["path"])) if p.fields["path"] not in (".", "./", "") else ""
@@ -2217,6 +2223,7 @@ class Engine:
         p.fields["plan_step"] = hit["n"]
         if p.kind == "command":
             p.fields["preapproved"] = True
+            p.fields["plan_id"] = self.plan["id"]
             hit["status"] = "done"
         elif p.kind in ("read", "list") and not p.auto:
             parts = split_rel(p.fields["path"]) if hit["_where"] else []
