@@ -50,6 +50,11 @@ SUMMARY_WORDS = 300
 HOOK_TIMEOUT = 10              # seconds a notify hook may run before it is killed
 TTY_OUTPUT_LINES = 40          # last lines of a sandboxed command's output shown at a terminal
 TRACE_KEEP = 30                # exchanges with the endpoint kept in memory, for a wrapper to show
+MODELS_KEEP = 200              # models taken from the server's list
+MODELS_CAP = 1024 * 1024       # bytes of that list
+# A model name from the server, as genai will use and show it. The server is trusted only as blessed, so a name
+# with anything else in it (spaces, quotes, '#', control characters) is left out, not cleaned.
+MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+=-]{0,199}")
 
 EXIT_OK, EXIT_ERROR, EXIT_USAGE, EXIT_PROFILE, EXIT_API, EXIT_CONTEXT = 0, 1, 2, 3, 4, 5
 EXIT_INTERRUPT = 130
@@ -1765,7 +1770,25 @@ class Client:
 
     def models(self):
         with self._request("/models") as r:
-            return json.load(r)
+            data = r.read(MODELS_CAP + 1)
+        if len(data) > MODELS_CAP:
+            raise GenaiError("the server's model list is too large", EXIT_API, "api")
+        try:
+            return json.loads(data)
+        except ValueError:
+            raise GenaiError("the server's model list is not JSON", EXIT_API, "api") from None
+
+    def model_list(self):
+        """The models the server lists (GET /models), as [(name, context length or None)]. Names outside MODEL_ID
+        are left out; vLLM's max_model_len (or a context_length) is taken as the context limit."""
+        data = self.models()
+        out = []
+        for m in (data.get("data") if isinstance(data, dict) else None) or []:
+            mid = m.get("id") if isinstance(m, dict) else None
+            if isinstance(mid, str) and MODEL_ID.fullmatch(mid) and mid not in (x for x, _ in out):
+                n = m.get("max_model_len", m.get("context_length"))
+                out.append((mid, n if type(n) is int and n > 0 else None))
+        return out[:MODELS_KEEP]
 
     def _got(self, text):
         """Keep what the endpoint sent, as it came, up to the reply cap."""
@@ -2114,6 +2137,27 @@ class Engine:
                 if not coding.startswith("profile"):
                     raise
                 ui.notice(f"{coding} asks for coding mode, but {e}; it is off")
+        if endpoint.model == "auto":
+            self.set_model(None, "auto")
+
+    def set_model(self, name, source):
+        """Use another model on the same server: one it lists now, or with name None ("model": "auto") the first.
+        The destination is the same, so the conversation needs no consent to go there (see destination_id)."""
+        listed = self.client.model_list()
+        if not listed:
+            raise GenaiError(f"{self.endpoint.base_url} lists no models genai can use; set 'model' in the endpoint",
+                             EXIT_API, "unknown_model")
+        hit = listed[0] if name is None else next((m for m in listed if m[0] == name), None)
+        if hit is None:
+            raise GenaiError(f"the server doesn't list a model named '{one_line(name)[0]}' (:models lists them)",
+                             EXIT_USAGE, "unknown_model")
+        before = self.endpoint.model
+        self.endpoint.model = hit[0]
+        if hit[1]:
+            self.endpoint.context_limit = hit[1]
+        self.session.usage = None
+        self.audit.log("model", model=hit[0], before=before, source=source, context_limit=self.endpoint.context_limit)
+        return hit[0]
 
     # -- setup
 
@@ -3078,6 +3122,7 @@ Commands (on an empty buffer):
   :plan [clear]   show the approved plan and how far it has got, or drop it
   :compact [-e]   prune old file contents and output; summarize if still large
   :context        show how full the context is
+  :models         list the models the server offers   :model NAME   use one of them from now on
   :clear          start over: the model forgets this conversation (the saved session keeps it)
   :skills         list skills, marking the ones in use
   :skill NAME on|off  use a blessed skill from the next message on, or stop using it
@@ -3209,6 +3254,15 @@ class Repl:
                 n = self.e.clear()
                 print(f"context cleared: the model starts over ({n} messages dropped; "
                       f"{'the saved session keeps them' if self.e.session.path else 'they were not saved'})")
+            elif cmd == "models":
+                for mid, n in self.e.client.model_list():
+                    mark = "*" if mid == self.e.endpoint.model else " "
+                    print(f" {mark} {mid}" + (f"  ({n} tokens)" if n else ""))
+            elif cmd == "model":
+                if not arg:
+                    print(f"model: {self.e.endpoint.model} (:models lists the others, :model NAME switches)")
+                else:
+                    print(f"model: {self.e.set_model(arg, ':model')} from your next message")
             elif cmd == "context":
                 print(f"context: {self.e.used()}/{self.e.endpoint.context_limit} tokens (estimated)")
             elif cmd == "skills":
@@ -3359,7 +3413,7 @@ def run_json(engine, ui, first_prompt, attachments):
     ui.engine = engine
     ui.emit({"type": "hello", "protocol": PROTOCOL, "version": VERSION,
              "features": ["proposals", "decisions", "attach", "register_tools", "compact", "context", "coding",
-                          "set_coding", "skills", "files", "trace", "system", "plan", "network", "clear"],
+                          "set_coding", "skills", "files", "trace", "system", "plan", "network", "clear", "models"],
              "endpoint": engine.endpoint.info(),
              "profile": {"name": engine.profile.name, "description": engine.profile.description}
              if engine.profile else None,
@@ -3420,6 +3474,23 @@ def run_json(engine, ui, first_prompt, attachments):
                 r = engine.compact()
                 ui.emit({"type": "compacted", "pruned": r["pruned"], "before": r["before"], "after": r["after"],
                          "summary": r["summary"]})
+            except GenaiError as err:
+                ui.error(str(err), err.kind)
+        elif t == "models":
+            try:
+                ui.emit({"type": "models", "current": engine.endpoint.model,
+                         "models": [{"id": mid, "context": n} for mid, n in engine.client.model_list()]})
+            except GenaiError as err:
+                ui.error(str(err), "models")
+        elif t == "model":
+            name = msg.get("model")
+            if not isinstance(name, str):
+                ui.error("model needs 'model': a name from the models message", "bad_message")
+                continue
+            try:
+                engine.set_model(name, "wrapper")
+                ui.emit({"type": "model", "endpoint": engine.endpoint.info(),
+                         "context": {"used": engine.used(), "limit": engine.endpoint.context_limit}})
             except GenaiError as err:
                 ui.error(str(err), err.kind)
         elif t == "clear":

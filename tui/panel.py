@@ -51,6 +51,9 @@ def view(st, w, sel):
     for label, value, role in (("endpoint", h.get("endpoint"), ""), ("model", h.get("model"), ""),
                                ("profile", h.get("profile") or "none", "" if h.get("profile") else Q),
                                ("session", h.get("session") or "not saved", "" if h.get("session") else Q)):
+        if label == "model":                             # a click opens the /model drop-down
+            add([(f"{label:9}", Q), (fit(clean(value or "?"), w - 11), role), (" ▾", A)], "model")
+            continue
         add([(f"{label:9}", Q), (fit(clean(value or "?"), w - 9), role)])
     where = h.get("shell_where")
     if where:
@@ -186,6 +189,8 @@ class Panel:
         st = self.st or {}
         if what == "coding":
             ok = self.request({"type": "coding", "on": not st.get("coding")})
+        elif what == "model":
+            ok = self.request({"type": "models"})
         elif isinstance(what, tuple) and what[0] == "cmd" and type(what[1]) is int:
             ok = self.request({"type": "command", "n": what[1]})
         elif isinstance(what, int) and what < len(self.skills()):
