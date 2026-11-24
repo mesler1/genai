@@ -293,6 +293,20 @@ class TestModel(unittest.TestCase):
         self.assertIn("Approved commands run ON ANOTHER HOST, login1, over ssh", banner)
         self.assertNotIn("directly on this host", banner)
 
+    def test_trusted_command_card_shows_what_ran_and_its_output(self):
+        m = C.Model()
+        self.hello(m)
+        m.submit("nodes?")
+        m.handle({"type": "proposal", "id": "p1", "kind": "trusted", "auto": True, "plugin": "slurm",
+                  "command": "down_nodes", "read_only": True, "argv": "sinfo -R -h", "reason": "down nodes"})
+        card = m.cards["p1"]
+        self.assertEqual(card.state, "running")
+        m.handle({"type": "result", "id": "p1", "status": "ok", "output": "cn042|down*\x1b[2J", "exit": 0})
+        text = text_of(card, 80)
+        self.assertIn("p1 · slurm · down_nodes · read-only", text)
+        self.assertIn("$ sinfo -R -h", text)
+        self.assertIn("│ cn042|down*\\x1b[2J", text)                     # output escaped, as everywhere
+
     def test_messages_typed_while_busy_are_queued(self):
         m = C.Model()
         m.submit("one")
