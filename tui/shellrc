@@ -89,7 +89,7 @@ bind -x '"``": __genai_hide' 2>/dev/null
 # installed there and no key is on the command line: see tui/recorder.py. Only here, in genai-tui's shell pane.
 if [ -n "${__genai_rc:-}" ]; then
   genai-ssh() {
-    local a dest= skip= n=0 at=0 id rc
+    local a dest= skip= n=0 at=0 id rc inner via=()
     for a in "$@"; do                      # the destination: the first argument that isn't an option or its value
       n=$((n + 1))
       if [ -n "$skip" ]; then skip=; continue; fi
@@ -110,6 +110,26 @@ if [ -n "${__genai_rc:-}" ]; then
     id=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
     rc=$({ printf '__genai_remote=%s\n' "$id"; cat "$__genai_rc"; } | base64 -w0)
     printf '\e]6973;%s;X;%s;%s\a' "$__genai_nonce" "$id" "$(printf %s "$dest" | base64 -w0)"
-    command ssh -t "$@" "exec bash -c 'exec bash --rcfile <(printf %s \"\$1\" | base64 -d) -i' genai-ssh $rc"
+    # genai-tui --remote: reuse its ssh connection (no new login), in its directory, as its user. sudo closes
+    # the descriptors a process substitution would use, so bash makes it itself, inside the sudo.
+    inner="bash -c 'exec bash --rcfile <(printf %s \"\$1\" | base64 -d) -i' genai-ssh $rc"
+    [ -z "${GENAI_TUI_SSH_CM:-}" ] || via=(-S "$GENAI_TUI_SSH_CM")
+    [ -z "${GENAI_TUI_SSH_AS:-}" ] || inner="sudo -n -H -u $(printf %q "$GENAI_TUI_SSH_AS") -- $inner"
+    inner="exec $inner"
+    [ -z "${GENAI_TUI_SSH_DIR:-}" ] || inner="cd -- $(printf %q "$GENAI_TUI_SSH_DIR") && $inner"
+    command ssh -t ${via[@]+"${via[@]}"} "$@" "$inner"
   }
+  # genai-tui --remote starts this at once: the shell pane is a genai-ssh session to the host genai runs on, and
+  # when it ends (the connection drops, or you type exit there) it says so and offers to reconnect, rather than
+  # leaving a prompt on this machine while genai works on the other.
+  if [ -n "${GENAI_TUI_REMOTE_DEST:-}" ]; then
+    __genai_remote_shell() {
+      local _
+      while :; do
+        genai-ssh "$GENAI_TUI_REMOTE_DEST"
+        printf '\ndisconnected from %s — Enter reconnects, Ctrl-D closes this pane\n' "$GENAI_TUI_REMOTE_DEST"
+        read -r _ || exit 0
+      done
+    }
+  fi
 fi

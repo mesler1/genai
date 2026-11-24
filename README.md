@@ -212,6 +212,49 @@ on, and nothing is installed there. The session has a key of its own that never 
 command line or on screen; see SECURITY.md, section 7. Plain `ssh` still works, but genai-tui
 can't follow it, and `/run` refuses while it runs.
 
+### Remote mode
+
+```
+genai-tui --remote me@devbox --dir /srv/project                    # genai runs on devbox, in that directory
+genai-tui --remote me@devbox --dir /srv/project --as svc           # ... as another user, through sudo -n
+genai-tui --remote me@devbox -e work -p coder -- -J me@bastion     # a bastion; more ssh options after --
+```
+
+The screen, your endpoint's API key and your blessed configuration stay on your machine. genai runs on the
+host, in PATH, as you or as `--as USER` (which needs `sudo -n -u USER` to work without a password there; the
+launcher checks). The shell pane is a followed session on the same host, as the same user, in the same directory,
+and says `disconnected from HOST` and offers to reconnect if it drops. Prefer ProxyJump (`-J`, or `ProxyJump` in
+`~/.ssh/config`) to agent forwarding for a bastion: the connection never offers your agent to the host, and genai-tui
+passes `-a` to ssh so a config file can't either.
+
+What happens, before tmux starts (so a password or second factor is asked for in your own terminal):
+
+1. `genai --remote-config` resolves `-e` and `-p` exactly as a normal start would (default endpoint and profile,
+   blessing checks, a changed file is refused) and prints the endpoint and profile *without* `key_env`, `key_file`,
+   `proxy`, `headers` or `ca_bundle`. `-S` and `-k` are not available with `--remote` yet.
+2. An ssh master connection (`ssh -M -S STATE/cm -fN`, then the host's checks: Python 3.10 or newer as the target user,
+   `sudo -n` for `--as`, the directory) whose control socket lives in genai-tui's private 0700 state directory.
+3. `tui/keyproxy.py` starts here on a Unix socket, with a random token on its stdin.
+4. `ssh -O forward -R 127.0.0.1:0:STATE/kp.sock` opens a loopback port on the host that leads to that proxy.
+5. The conversation pane runs genai there over the same connection: a short Python program reads genai's own source
+   from stdin (it is too big for a command line), runs it, and genai then reads a config line (the endpoint, whose
+   `base_url` is that loopback port, the profile and the token) and the usual protocol. Nothing is installed or
+   left on the host, and it is always the same genai version as yours.
+
+The proxy accepts only `GET /v1/models` and `POST /v1/chat/completions` with the token, adds the key and the
+endpoint's headers, and sends the request on through the endpoint's own TLS and proxy settings. On exit the proxy,
+the forward and the ssh connection are closed; detaching tmux keeps the launcher running to hold them, so Ctrl-C there
+ends the session.
+
+You can see where it runs: the banner and the info panel say `genai runs ON host AS user in dir` (red as root), the
+status line names the host, and the banner gives the audit log's path on the host (`hello`'s `audit`). The sessions,
+audit log and `~/.config/genai` that genai uses are those of the user it runs as on the host; its endpoint is not
+blessed there, because the blessing happened here. Test it against a SLES container with `tests/remote_sshd.sh test`.
+
+Limits: the host's login shell must be POSIX-like, its sshd must allow TCP forwarding (`AllowTcpForwarding`), and
+`python3`, `python3.13` ... `python3.10` is searched in that order for 3.10 or newer (SLES: `zypper install python311`).
+Another user of that host can reach the forwarded port, which is why the token matters (SECURITY.md).
+
 ### File tree
 
 `/files` shows or hides a file tree of the working directory on the left (`genai-tui --files` starts
@@ -305,8 +348,16 @@ genai's first line is `hello`. It has `protocol` (1), `version`, `features`, `en
 later.
 
 `hello` also says where genai runs: `host` (its host name), `user` (the effective user's name, or the uid
-if it has none), `uid`, and `remote` (true with `--config-stdin`). They are always present. As root, the REPL
+if it has none), `uid`, `remote` (true with `--config-stdin`) and `audit` (the path of its audit log). They are
+always present. As root, the REPL
 banner adds a `[!]` line saying every command it proposes would run as root.
+
+`--remote-config [-e NAME] [-p NAME]` prints, as one JSON line and then exits, what genai-tui's remote mode sends:
+`{"endpoint": {...}, "profile": {...} or null, "endpoint_name": "...", "base_path": "/v1"}`. The endpoint and profile
+are resolved and checked as for a normal start (default endpoint and profile, blessing, files changed since
+blessing are refused with the usual error and status 3), and the endpoint has no `key_env`, `key_file`, `proxy`,
+`headers` or `ca_bundle`: no key, and nothing that could carry a secret. The key proxy on your machine uses the
+endpoint's own proxy and headers.
 
 `--config-stdin` (with `--json` only; not with `-e`, `-p`, `-S` or `-k`) is for genai-tui's remote mode, where genai
 runs on another host over ssh. genai first reads one line from stdin, before `hello`:

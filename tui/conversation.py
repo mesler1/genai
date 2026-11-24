@@ -30,6 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from features import disabled_names, load as load_features  # noqa: E402
 from ipc import Hub  # noqa: E402
 from recorder import Recorder, ago, fifo_path, label, trim  # noqa: E402
+import remote  # noqa: E402
 
 GENAI = os.environ.get("GENAI_BIN") or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                                     "genai")
@@ -294,6 +295,15 @@ class Reply(Block):
         return [[]] + [[("● " if i == 0 else "  ", D)] + ln for i, ln in enumerate(body)]
 
 
+def genai_where(h):
+    """Where genai itself runs, from its hello, when that is another host: (text, role), red for root. Else None."""
+    if not h.get("remote"):
+        return None
+    user, root = clean(str(h.get("user", "?"))), h.get("uid") == 0 or h.get("user") == "root"
+    return (f"genai runs ON {clean(str(h.get('host', '?')))} AS {user} in {clean(str(h.get('cwd', '?')))}"
+            + (" (root)" if root else ""), R if root else W)
+
+
 class Banner(Block):
     def __init__(self, hello, shell_where=None):
         super().__init__()
@@ -303,6 +313,10 @@ class Banner(Block):
         h, ep = self.h, self.h.get("endpoint") or {}
         rows = [(f"◆ genai {h.get('version', '?')}", A),
                 (f"{ep.get('name', '?')}: {ep.get('model', '?')} at {ep.get('base_url', '?')}", "")]
+        where = genai_where(h)
+        if where:
+            rows.append(where)
+            rows.append((f"it keeps its audit log there: {h.get('audit') or '?'}", ""))
         prof = h.get("profile")
         if prof:
             rows.append((f"profile {prof.get('name')}" + (f": {prof['description']}" if prof.get("description") else ""), ""))
@@ -836,7 +850,7 @@ class Model:
         view = {
             "session": {"endpoint": ep.get("name"), "model": ep.get("model"), "profile": prof.get("name"),
                         "session": h.get("session"), "sandbox": sb.get("name") if sb else None,
-                        "shell_where": self.shell_where},
+                        "shell_where": self.shell_where, "genai_where": genai_where(h)},
             "coding": self.coding, "busy": self.busy, "context": list(self.context or (None, None)),
             "runner": self.runner and {"network": bool(self.runner.get("network")), "problem": self.runner.get("problem"),
                                        "image": self.runner.get("image")},
@@ -1320,14 +1334,46 @@ class Shell:
 # genai as a child process
 
 class Child:
-    def __init__(self, args):
-        cmd = [GENAI] if os.environ.get("GENAI_BIN") else [sys.executable, GENAI]
-        self.p = subprocess.Popen(cmd + ["--json"] + args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+    def __init__(self, args, remote_info=None):
+        """genai --json ARGS, here, or (remote_info is remote.json) on the remote host over the ssh master. Remote,
+        what genai reads first is its own source, then the config line, then the protocol (see remote.py); a
+        thread writes it all so a slow or dead ssh can't freeze the screen."""
+        self.writes = None
+        if remote_info:
+            with open(GENAI, "rb") as f:
+                source = f.read()
+            cmd = remote_info["ssh"] + [remote.bootstrap_command(remote_info, len(source), args)]
+            args = []
+            self.writes = queue.Queue()
+            self.writes.put(source)
+            self.writes.put(json.dumps(remote_info["config"]).encode() + b"\n")
+        else:
+            cmd = ([GENAI] if os.environ.get("GENAI_BIN") else [sys.executable, GENAI]) + ["--json"]
+        self.p = subprocess.Popen(cmd + args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", bufsize=1)
         self.events = queue.Queue()
         self.err = []
         threading.Thread(target=self._read, daemon=True).start()
         threading.Thread(target=self._read_err, daemon=True).start()
+        if self.writes:
+            self.writer = threading.Thread(target=self._write, daemon=True)
+            self.writer.start()
+
+    def _write(self):
+        out = self.p.stdin.buffer
+        while True:
+            data = self.writes.get()
+            if data is None:
+                break
+            try:
+                out.write(data)
+                out.flush()
+            except (OSError, ValueError):
+                break
+        try:
+            self.p.stdin.close()
+        except (OSError, ValueError):
+            pass
 
     def _read(self):
         for line in self.p.stdout:
@@ -1343,6 +1389,9 @@ class Child:
             self.err.append(line.rstrip("\n"))
 
     def send(self, msg):
+        if self.writes:
+            self.writes.put((json.dumps(msg) + "\n").encode())
+            return
         try:
             self.p.stdin.write(json.dumps(msg) + "\n")
             self.p.stdin.flush()
@@ -1351,7 +1400,11 @@ class Child:
 
     def close(self):
         try:
-            self.p.stdin.close()
+            if self.writes:
+                self.writes.put(None)
+                self.writer.join(5)
+            else:
+                self.p.stdin.close()
             self.p.wait(5)
         except (OSError, subprocess.TimeoutExpired):
             self.p.kill()
@@ -2259,19 +2312,39 @@ def parse_args(argv):
                     help="--coding, also where it is normally refused; genai says what that exposes")
     ap.add_argument("--no-panel", action="store_true", help="start without the info panel (/panel shows it)")
     ap.add_argument("--files", action="store_true", help="start with the file tree shown (/files shows or hides it)")
+    ap.add_argument("--remote", metavar="[USER@]HOST",
+                    help="run genai on that host over ssh, keeping this screen and the API key here. Options for ssh "
+                         "go after a lone --, such as: -- -J bastion")
+    ap.add_argument("--dir", metavar="PATH", help="with --remote: the directory on that host to work in")
+    ap.add_argument("--as", dest="as_user", metavar="USER",
+                    help="with --remote: run genai and the shell there as USER, through sudo -n (no password)")
     ap.add_argument("--check", action="store_true", help=argparse.SUPPRESS)
-    return ap.parse_args(argv)
+    argv, ssh_opts = (argv[:argv.index("--")], argv[argv.index("--") + 1:]) if "--" in argv else (argv, [])
+    args = ap.parse_args(argv)
+    args.ssh_opts = ssh_opts
+    for name, given in (("--dir", args.dir), ("--as", args.as_user), ("ssh options after --", ssh_opts)):
+        if given and not args.remote:
+            ap.error(f"{name} needs --remote")
+    if args.remote:
+        if args.session or args.skill:
+            ap.error("--remote can't use -S or -k yet: sessions and skills stay on the host genai runs on, and "
+                     "genai refuses them there")
+        why = remote.check_destination(args.remote, args.as_user, args.dir)
+        if why:
+            ap.error(why)
+    return args
 
 
 def genai_args(a):
-    """The options genai itself gets; everything else is the TUI's."""
+    """The options genai itself gets; everything else is the TUI's. Remote, the endpoint and profile travel in
+    the config line instead (the launcher resolved them here, with -e and -p)."""
     out = []
     for flag, value in (("-p", a.profile), ("-e", a.endpoint), ("-S", a.session)):
-        if value:
+        if value and not a.remote:
             out += [flag, value]
     for k in a.skill:
         out += ["-k", k]
-    if a.allow_session_endpoint_change:
+    if a.allow_session_endpoint_change and not a.remote:
         out.append("--allow-session-endpoint-change")
     if a.coding_anywhere:
         out.append("--coding-anywhere")
@@ -2283,10 +2356,24 @@ def genai_args(a):
 def main(argv):
     args = parse_args(argv)
     if args.check:
+        if args.remote:           # what the launcher needs, one per line (values have no newlines: checked)
+            for k, v in (("dest", args.remote), ("as", args.as_user), ("dir", args.dir), ("profile", args.profile),
+                         ("endpoint", args.endpoint)):
+                print(f"{k}={v or ''}")
+            for o in args.ssh_opts:
+                print(f"ssh={o}")
         return 0
     locale.setlocale(locale.LC_ALL, "")
     os.environ.setdefault("ESCDELAY", "25")
-    child = Child(genai_args(args))
+    info = None
+    if args.remote:
+        try:
+            info = remote.load(os.environ.get("GENAI_TUI_REMOTE", ""))
+        except (OSError, ValueError) as e:
+            print(f"genai-tui: --remote needs the launcher (genai-tui) to set up the connection first: {e}",
+                  file=sys.stderr)
+            return 2
+    child = Child(genai_args(args), info)
     try:
         curses.wrapper(lambda scr: App(scr, child, Shell.from_env()).run())
     finally:
