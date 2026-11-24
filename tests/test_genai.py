@@ -1709,14 +1709,13 @@ class TestRemoteConfig(Tmp):
                                input="")
             self.assertEqual(r.returncode, G.EXIT_USAGE, args)
 
-    def test_profile_persona_and_skills_notice(self):
+    def test_profile_persona_and_skills_by_name_are_not_loaded_here(self):
         with FakeAPI([reply("ok")]) as api:
             msg = self.config(api)
             msg["profile"] = {"name": "ops", "persona": "You are the zebra of ops.", "skills": ["anything"],
                               "endpoint": "ignored"}
             g = self.start(msg)
-            g.until("hello")
-            self.assertEqual(g.until("notice")["message"], "skills aren't available in remote mode yet")
+            self.assertEqual(g.until("hello")["skills"], [])   # only skills sent in the config line are used
             g.send({"type": "user", "text": "hi"})
             g.until("done")
             g.close()
@@ -1734,6 +1733,35 @@ class TestRemoteConfig(Tmp):
             with mock.patch.object(os, "geteuid", return_value=uid), mock.patch("sys.stdout", out):
                 G.Repl(e).banner()
             self.assertEqual("every command it proposes would run as root" in out.getvalue(), shown)
+
+    def test_repl_sandbox_markers(self):
+        home = self.path("home", "genai")
+        cfg = G.Config(home)
+        cfg.ensure()
+        ep = G.Endpoint({"name": "t", "base_url": "https://llm.invalid/v1", "model": "m"}, "t.json")
+        for name, inside in (("podman", True), ("", False)):
+            with self.subTest(sandbox=inside):
+                env = {"GENAI_SANDBOX": name, "GENAI_SANDBOX_WORK_HOST": "/host/w\x1b[31m"}
+                with mock.patch.dict(os.environ, env), mock.patch.object(G.os.path, "exists", return_value=False):
+                    eng = G.Engine(cfg, ep, G.Session(cfg), G.PlainUI())
+                    repl, out = G.Repl(eng), io.StringIO()
+                    prompts = []
+                    with mock.patch.object(sys, "stdout", out), \
+                            mock.patch("builtins.input", side_effect=lambda p: prompts.append(p) or ":quit"):
+                        repl.run()
+                        repl.command(":sandbox")
+                        repl.command(":help")
+                text = out.getvalue()
+                self.assertEqual(prompts, ["(sandbox) > " if inside else "> "])
+                self.assertIn(":sandbox ", text)
+                self.assertEqual("IN THE PODMAN SANDBOX: /work = /host/w" in text, inside)
+                self.assertNotIn("\x1b", text)                          # the host path is escaped
+                self.assertEqual("genai runs inside the podman sandbox" in text, inside)
+                self.assertEqual("genai runs OUTSIDE any sandbox, directly on this host" in text, not inside)
+                self.assertEqual("/opt/genai, read-only" in text, inside)
+                self.assertEqual("sandbox/run shell opens a shell in it" in text, inside)
+                self.assertEqual("network:" in text, inside)
+                self.assertEqual("sandbox/run genai runs genai in a podman sandbox" in text, not inside)
 
     def test_model_auto(self):
         with FakeAPI([reply("ok")], models=[{"id": "qwen3-coder"}]) as api:

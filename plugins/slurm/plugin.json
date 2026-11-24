@@ -3,6 +3,7 @@
   "description": "Slurm cluster status: nodes, queue, jobs, accounting (read-only)",
   "search": ["/usr/bin", "/usr/local/bin", "/opt/slurm/bin"],
   "env": ["SLURM_CONF"],
+  "pane": "slurm.py",
   "commands": {
     "down_nodes": {
       "describe": "nodes that are down, drained or failing, with reasons (node|state|reason|user|time)",

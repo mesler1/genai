@@ -30,10 +30,10 @@ fi
 for a in "$@"; do
   case $a in -h|--help) exec "$py" "$here/conversation.py" --help ;; esac
 done
-# For --remote it prints what the launcher needs, one value per line (dest=, as=, dir=, profile=, endpoint=, ssh=).
+# For --remote it prints what the launcher needs, one value per line (dest=, as=, dir=, profile=, endpoint=, skill=, ssh=).
 chk=$("$py" "$here/conversation.py" --check "$@") || exit 2
 remote= r_as= r_dir= r_profile= r_endpoint=
-ssh_opts=()
+ssh_opts=() r_skills=()
 while IFS= read -r line; do
   case $line in
     dest=*) remote=${line#dest=} ;;
@@ -41,6 +41,7 @@ while IFS= read -r line; do
     dir=*) r_dir=${line#dir=} ;;
     profile=*) r_profile=${line#profile=} ;;
     endpoint=*) r_endpoint=${line#endpoint=} ;;
+    skill=*) r_skills+=("${line#skill=}") ;;
     ssh=*) ssh_opts+=("${line#ssh=}") ;;
   esac
 done <<<"$chk"
@@ -73,7 +74,8 @@ q() { printf '%q' "$1"; }
 
 # Remote mode. Everything that can ask you something (ssh's password or second factor) happens here, in your own
 # terminal, before tmux starts. What is set up, and why it keeps the API key on this machine (SECURITY.md):
-#   1. genai --remote-config: your endpoint and profile, checked and blessed here, without any key.
+#   1. genai --remote-config: your endpoint and profile, and the skills and plugins in use, checked and blessed
+#      here, without any key.
 #   2. an ssh master connection, whose control socket lives in the private state directory.
 #   3. tui/keyproxy.py on a Unix socket there: it adds the key to requests that carry this session's token.
 #   4. a reverse forward: a port on the remote host's loopback leads to that socket.
@@ -91,12 +93,13 @@ if [ -n "$remote" ]; then
   trap 'exit 130' INT TERM HUP
   sudo_as=
   [ -z "$r_as" ] || sudo_as="sudo -n -H -u $(q "$r_as") -- "
-  echo "genai-tui: checking your endpoint and profile (genai --remote-config)" >&2
+  echo "genai-tui: checking your endpoint, profile, skills and plugins (genai --remote-config)" >&2
   gcmd=("$py" "$here/../genai")
   [ -z "${GENAI_BIN:-}" ] || gcmd=("$GENAI_BIN")
   gargs=(--remote-config)
   [ -z "$r_profile" ] || gargs+=(-p "$r_profile")
   [ -z "$r_endpoint" ] || gargs+=(-e "$r_endpoint")
+  for k in ${r_skills[@]+"${r_skills[@]}"}; do gargs+=(-k "$k"); done
   "${gcmd[@]}" "${gargs[@]}" > "$state/export.json" || exit 3
   chmod 600 "$state/export.json"
   epname=$("$py" -c 'import json, sys; print(json.load(open(sys.argv[1]))["endpoint_name"])' "$state/export.json")
@@ -196,13 +199,13 @@ t set -g status-style 'bg=default,fg=default'
 t set -g status-left ' genai │ '
 t set -g status-left-length 20
 if [ -n "$remote" ]; then       # the host that matters is the one genai runs on
-  t set -g status-right " genai on ${remote//#/##} │ \`\` shows the shell │ Ctrl-b o: other pane │ Ctrl-b d: detach "
+  t set -g status-right "#{@genai_sandbox} genai on ${remote//#/##} │ \`\` shows the shell │ Ctrl-b o: other pane │ Ctrl-b d: detach "
 else
-  t set -g status-right ' #H │ `` shows the shell │ Ctrl-b o: other pane │ Ctrl-b d: detach '
+  t set -g status-right '#{@genai_sandbox} #H │ `` shows the shell │ Ctrl-b o: other pane │ Ctrl-b d: detach '
 fi
 t set -g window-status-format ''          # hidden panes live in other windows; don't list them
 t set -g window-status-current-format ''
-t set -g status-right-length 100
+t set -g status-right-length 130
 t set -g @genai_prompt_pane "$prompt"
 t set -g @genai_shell_pane "$shell"
 t set -g @genai_conv_pane "$conv"
