@@ -280,7 +280,11 @@ What happens, before tmux starts (so a password or second factor is asked for in
 
 1. `genai --remote-config` resolves `-e` and `-p` exactly as a normal start would (default endpoint and profile,
    blessing checks, a changed file is refused) and prints the endpoint and profile *without* `key_env`, `key_file`,
-   `proxy`, `headers` or `ca_bundle`. `-S` and `-k` are not available with `--remote` yet.
+   `proxy`, `headers` or `ca_bundle`. The skills and plugins in use (the profile's, or `default_skills` and
+   `default_plugins`, plus `-k`) go with their files, if they are blessed here; one that isn't is left out, with a
+   message. On the host they are checked against the hashes blessed here, the plugins' programs are looked for there
+   (a command whose program is missing there is left out, as locally), and nothing blessed only on the host can be
+   used. So the Slurm plugin's commands run on the cluster. `-S` is not available with `--remote` yet.
 2. An ssh master connection (`ssh -M -S STATE/cm -fN`, then the host's checks: Python 3.10 or newer as the target user,
    `sudo -n` for `--as`, the directory) whose control socket lives in genai-tui's private 0700 state directory.
 3. `tui/keyproxy.py` starts here on a Unix socket, with a random token on its stdin.
@@ -405,19 +409,23 @@ if it has none), `uid`, `remote` (true with `--config-stdin`) and `audit` (the p
 always present. As root, the REPL
 banner adds a `[!]` line saying every command it proposes would run as root.
 
-`--remote-config [-e NAME] [-p NAME]` prints, as one JSON line and then exits, what genai-tui's remote mode sends:
-`{"endpoint": {...}, "profile": {...} or null, "endpoint_name": "...", "base_path": "/v1"}`. The endpoint and profile
+`--remote-config [-e NAME] [-p NAME] [-k NAME] [--plugin NAME]` prints, as one JSON line and then exits, what
+genai-tui's remote mode sends: `{"endpoint": {...}, "profile": {...} or null, "endpoint_name": "...", "base_path":
+"/v1", "skills": [...], "plugins": [...]}`. Each skill and plugin is `{"name", "hash", "files"}`: its blessed hash
+and every file of its directory, base64 (at most 1 MiB in all). Those in use are sent (the profile's skills and
+plugins, or `default_skills` and `default_plugins`, plus `-k` and `--plugin`); one that is missing, not blessed,
+changed or too big is left out with a message on stderr. The endpoint and profile
 are resolved and checked as for a normal start (default endpoint and profile, blessing, files changed since
 blessing are refused with the usual error and status 3), and the endpoint has no `key_env`, `key_file`, `proxy`,
 `headers` or `ca_bundle`: no key, and nothing that could carry a secret. The key proxy on your machine uses the
 endpoint's own proxy and headers.
 
-`--config-stdin` (with `--json` only; not with `-e`, `-p`, `-S` or `-k`; plugins aren't sent
-there yet) is for genai-tui's remote mode, where genai
+`--config-stdin` (with `--json` only; not with `-e`, `-p`, `-S` or `-k`) is for genai-tui's remote mode, where genai
 runs on another host over ssh. genai first reads one line from stdin, before `hello`:
 
 ```
-{"type": "config", "endpoint": {...}, "profile": {...} or null, "token": "<32 to 128 hex characters>"}
+{"type": "config", "endpoint": {...}, "profile": {...} or null, "token": "<32 to 128 hex characters>",
+ "skills": [...], "plugins": [...]}
 ```
 
 The endpoint and profile are the fields of an endpoint file and a profile file, checked the same way. Here they
@@ -425,8 +433,12 @@ come from the wrapper, which checked the user's blessed files on its side, so ge
 for them; the audit log records a `remote_config` event with their hashes. The endpoint may not name a key
 (`key_env`, `key_file`) or a `proxy`, and its `base_url` must be `http://127.0.0.1:PORT`, with an optional path:
 the key stays on the user's machine, and the port is a tunnel to a proxy there. genai sends the token in an
-`X-Genai-Token` header and never shows it. The profile's `endpoint` is ignored, and its skills are not available
-yet (a `notice` after `hello` says so). A bad line ends genai with exit status 3 and an `error` with code
+`X-Genai-Token` header and never shows it. The profile's `endpoint` is ignored. `skills` and `plugins` (optional)
+are as `--remote-config` prints them: genai hashes each one's files again and refuses the line unless the hash is
+the one sent, and makes the skill or plugin from those bytes, never from this host's files. They are all on at the
+start, and they are the only ones there are: the `skill` and `plugin` messages can switch them off and on again,
+and get the error `remote` for any other name. A plugin's programs are looked for on this host, with the usual
+checks, and `--plugin` is ignored. A bad line ends genai with exit status 3 and an `error` with code
 `bad_config`, and nothing is sent to any endpoint.
 
 **Messages a wrapper sends**
@@ -444,9 +456,9 @@ yet (a `notice` after `hello` says so). A bad line ends genai with exit status 3
 | `clear` | | Starts the conversation over: the model gets none of it from now on, and an approved plan is dropped. The saved session's history keeps it. Answered by `cleared` (`dropped`: how many messages, `context`). |
 | `coding` | `on` (true or false) | Turns coding mode on or off. The same places are refused as for `--coding` (error `coding_refused`), and `--coding-anywhere` stays a command-line flag. Always answered by a `coding` event with the state now. |
 | `skills` | | Answered by `skills`: every skill, its blessing `status`, and whether it is `active`. |
-| `skill` | `name`, `on` (true or false) | Uses a skill from the next request on, or stops using it. Only a blessed skill can be turned on (errors `unknown_skill`, `not_blessed`). Always answered by a fresh `skills` list. |
+| `skill` | `name`, `on` (true or false) | Uses a skill from the next request on, or stops using it. Only a blessed skill can be turned on (errors `unknown_skill`, `not_blessed`; `remote` with `--config-stdin` for a skill the wrapper didn't send). Always answered by a fresh `skills` list. |
 | `plugins` | | Answered by `plugins`: every plugin found, each `{name, description, enabled, blessed, status, pane, dir, commands}`; a command has `name`, `describe`, `params` (each `{pattern or enum or int, describe}`), `read_only` and `argv` (with `{placeholders}`). genai also sends it once after `hello`. |
-| `plugin` | `name`, `on` (true or false) | Turns a plugin's trusted commands on or off. Only a blessed plugin whose programs pass the checks can be turned on (errors `unknown_plugin`, `not_blessed`, `bad_plugin`; `remote` with `--config-stdin`). Always answered by a fresh `plugins` event. |
+| `plugin` | `name`, `on` (true or false) | Turns a plugin's trusted commands on or off. Only a blessed plugin whose programs pass the checks can be turned on (errors `unknown_plugin`, `not_blessed`, `bad_plugin`; `remote` with `--config-stdin` for a plugin the wrapper didn't send). Always answered by a fresh `plugins` event. |
 | `run` | `id` (a string or number), `plugin`, `command`, `params` | Runs one command of an enabled plugin for the user, with the same checks, limits, cache and rate limits as the model's calls (source `user` in the audit log). Answered by `ran`: `id`, then `exit` (`null` if killed), `output`, `note`, `cached`, `ms`, `redacted`, or `id` and `error`. Between turns only; while proposals wait it gets `busy`. |
 | `files` | optional `path` (default `.`) | Lists one directory under the working directory, for a file tree. The response includes `truncated` when the scan reaches its limit. Each entry has `name`, `kind` (`file`, `dir`, `symlink`, `other`), `size` and `hidden`. A file also has `secret` (it looks like it holds secrets; `null` if genai would not read it at all, such as a binary or a file over the read limit) and `asks` (reading it would need your OK, even in coding mode). Contents are read only to classify them and never reach the model. Symlinks are listed, not followed; a bad path gets the error `bad_path`. |
 | `read` | `path` | Shows one file to the user, for a file viewer. It is read through the same checks as the model's reads (no symlinks, regular files only, the read limit, no binary), answered by `file` with `path`, `text`, `size` (bytes), `secret` (it looks like it holds secrets) and `redacted` (counts, as for `attached`: the endpoint key and common secret patterns are masked in `text`). The text goes to the wrapper only, never to the model or the session, and each read is written to the audit log (no content). A file that cannot be read gets the error `bad_path` with the `path`. |

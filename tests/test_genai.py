@@ -1642,14 +1642,13 @@ class TestRemoteConfig(Tmp):
                                input="")
             self.assertEqual(r.returncode, G.EXIT_USAGE, args)
 
-    def test_profile_persona_and_skills_notice(self):
+    def test_profile_persona_and_skills_by_name_are_not_loaded_here(self):
         with FakeAPI([reply("ok")]) as api:
             msg = self.config(api)
             msg["profile"] = {"name": "ops", "persona": "You are the zebra of ops.", "skills": ["anything"],
                               "endpoint": "ignored"}
             g = self.start(msg)
-            g.until("hello")
-            self.assertEqual(g.until("notice")["message"], "skills aren't available in remote mode yet")
+            self.assertEqual(g.until("hello")["skills"], [])   # only skills sent in the config line are used
             g.send({"type": "user", "text": "hi"})
             g.until("done")
             g.close()
