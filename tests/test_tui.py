@@ -524,10 +524,181 @@ class TestSandboxRuns(unittest.TestCase):
         self.assertEqual(snap["runner"]["network"], True)
         PANEL = load("panel", os.path.join(REPO, "tui", "panel.py"))
         lines, _ = PANEL.view(snap, 42, None)
-        self.assertIn("sandbox  ONLINE", "\n".join("".join(t for t, _ in ln) for ln in lines))
+        self.assertIn("model's  ready · ONLINE · dev:1", "\n".join("".join(t for t, _ in ln) for ln in lines))
         m.submit("go")
         m.submit("/network off")
         self.assertNotEqual(m.outbox[-1], {"type": "network", "on": False})   # waits until the reply ends
+
+
+class TestSandboxStatus(unittest.TestCase):
+    """The SANDBOX panel section, tmux's status line, a running card's clock, and stopping a run."""
+    RUNNER = TestSandboxRuns.RUNNER
+
+    def model(self, sandbox=None, runner=RUNNER, features=("interrupt",), remote=False):
+        m = C.Model()
+        m.handle({"type": "hello", "version": "1", "endpoint": {"name": "e", "model": "m", "base_url": "u"},
+                  "sandbox": sandbox, "coding": True, "runner": runner, "features": list(features), "remote": remote,
+                  "host": "h", "user": "u", "uid": 1000, "cwd": "/w"})
+        m.outbox.clear()
+        return m
+
+    def panel(self, m):
+        PANEL = load("panel", os.path.join(REPO, "tui", "panel.py"))
+        lines, _ = PANEL.view(m.snapshot(), 42, None)
+        return "\n".join("".join(t for t, _ in ln) for ln in lines)
+
+    def start(self, m, pid="p3"):
+        m.submit("test it")
+        m.handle({"type": "proposal", "id": pid, "kind": "sandbox", "command": "make", "reason": "r",
+                  "network": False, "image": "dev:1", "auto": True})
+        return m.cards[pid]
+
+    def test_panel_states(self):
+        self.assertIn("genai    in the podman sandbox", self.panel(self.model(sandbox={"name": "podman"})))
+        text = self.panel(self.model())
+        self.assertIn("genai    NOT sandboxed", text)
+        self.assertIn("model's  ready · offline · dev:1", text)
+        self.assertIn("model's  none", self.panel(self.model(runner=None)))
+        self.assertIn("model's  can't run: no podman", self.panel(self.model(runner=dict(self.RUNNER, problem="no podman"))))
+        m = self.model()
+        card = self.start(m)
+        card.started -= 12
+        text = self.panel(m)
+        self.assertIn("model's  RUNNING p3 · 12s", text)
+        self.assertIn("Ctrl-C or /stop stops it", text)
+        m.handle({"type": "result", "id": "p3", "status": "ok", "detail": "exit 0"})
+        self.assertIn("model's  ready", self.panel(m))
+
+    def test_tmux_status_holds_only_fixed_words_and_a_checked_id(self):
+        self.assertEqual(C.Model().tmux_status(), "")
+        self.assertIn("NO SANDBOX", self.model().tmux_status())
+        self.assertIn("⊡ sandbox", self.model(sandbox={"name": "podman"}).tmux_status())
+        m = self.model()
+        card = self.start(m)
+        card.started -= 5
+        self.assertIn("⏵ sandbox p3 5s", m.tmux_status())
+        m2 = self.model()
+        self.start(m2, pid="#[fg=red]x")                       # not an id genai would send: left out
+        status = m2.tmux_status()
+        self.assertNotIn("x", status.replace("fg=yellow", "").replace("#[default]", "").replace("box", ""))
+        self.assertIn("⏵ sandbox 0s", status)
+
+    def test_running_card_shows_its_clock_and_ends_stopped(self):
+        m = self.model()
+        card = self.start(m)
+        self.assertIn("running 0s · Ctrl-C (or /stop) stops it", text_of(card, 80))
+        card.started -= 7
+        self.assertIn("running 7s", text_of(card, 80))
+        m.handle({"type": "result", "id": "p3", "status": "stopped", "detail": "the container was killed"})
+        self.assertEqual(card.state, "stopped")
+        self.assertNotIn("running", text_of(card, 80))
+        self.assertIn("■ stopped", text_of(card, 80))
+
+    def test_an_approved_online_run_is_running(self):
+        m = self.model(runner=dict(self.RUNNER, network=True))
+        m.submit("go")
+        m.handle({"type": "proposal", "id": "p1", "kind": "sandbox", "command": "pip install x", "reason": "r",
+                  "network": True, "image": "dev:1"})
+        self.assertIsNone(m.running_card())
+        m.decide(True)
+        self.assertIs(m.running_card(), m.cards["p1"])
+
+    def test_stop_asks_for_an_interrupt_only_when_it_can(self):
+        m = self.model()
+        m.submit("/stop")
+        self.assertIn("nothing is running", text_of(m.blocks[-1]))
+        self.start(m)
+        m.submit("/stop")                                     # works while genai is busy
+        self.assertEqual(m.actions, [("interrupt",)])
+        self.assertIn("stopping the sandboxed run p3", text_of(m.blocks[-1]))
+        m = self.model(features=())
+        self.start(m)
+        m.submit("/stop")
+        self.assertEqual(m.actions, [])
+        self.assertIn("can't stop a sandboxed run", text_of(m.blocks[-1], 80))
+        m = self.model(remote=True)
+        card = self.start(m)
+        m.submit("/stop")
+        self.assertEqual(m.actions, [])
+        self.assertIn("isn't available in remote mode yet", text_of(m.blocks[-1], 120))
+        self.assertIn("can't be stopped from here in remote mode", text_of(card, 120))
+
+    def test_prompt_pane_ctrl_c_stops_a_run(self):
+        p = C_PROMPT.Prompt.__new__(C_PROMPT.Prompt)
+        sent = []
+        p.send = lambda msg: sent.append(msg) or True
+        p.view, p.ctrl_c, p.paste = {"running": True}, 0.0, None
+        p.ed = C.Editor()
+        p.key("\x03")
+        p.key("\x03")
+        self.assertEqual(sent, [{"type": "stop"}, {"type": "stop"}])   # never a quit while a run is going
+        self.assertIn("stop", IPC.ROLES["prompt"])
+
+    def test_sandbox_command_prints_the_details(self):
+        m = self.model(runner=dict(self.RUNNER, memory="4g", pids=1024))
+        card = self.start(m)
+        m.submit("/sandbox")
+        text = "\n".join(text_of(b, 200) for b in m.blocks)
+        self.assertIn("genai: NOT sandboxed", text)
+        self.assertIn("sandbox/run genai runs it in a podman sandbox", text)
+        self.assertIn("image dev:1, offline, 300s time limit, 4g memory, 1024 processes", text)
+        self.assertIn(f"RUNNING {card.id}", text)
+        m = self.model(sandbox={"name": "podman"}, runner=None)
+        m.submit("/sandbox")
+        text = "\n".join(text_of(b, 200) for b in m.blocks)
+        self.assertIn("genai: in the podman sandbox", text)
+        self.assertIn("the model's sandbox: none", text)
+
+
+class TestEditsFeature(unittest.TestCase):
+    def model(self, edits=None, features=("edits",)):
+        m = C.Model()
+        m.handle({"type": "hello", "version": "1", "endpoint": {"name": "e", "model": "m", "base_url": "u"},
+                  "sandbox": None, "features": list(features), "edits": edits or {"mode": "ask", "files": []}})
+        m.outbox.clear()
+        return m
+
+    def panel(self, m):
+        PANEL = load("panel", os.path.join(REPO, "tui", "panel.py"))
+        lines, _ = PANEL.view(m.snapshot(), 42, None)
+        return "\n".join("".join(t for t, _ in ln) for ln in lines)
+
+    def test_commands_send_and_show(self):
+        m = self.model()
+        m.submit("/edits")
+        self.assertIn("every edit and write asks", text_of(m.blocks[-1], 200))
+        self.assertNotIn("EDITS", self.panel(m))
+        m.submit("/edits approved-files")
+        self.assertEqual(m.outbox[-1], {"type": "edits", "mode": "approved-files"})
+        m.handle({"type": "edits", "mode": "approved-files", "files": []})
+        self.assertIn("none yet", text_of(m.blocks[-1], 200))
+        m.handle({"type": "edits", "mode": "approved-files", "files": ["src/a.py", "b\x1b[2J"]})
+        text = self.panel(m)
+        self.assertIn("EDITS", text)
+        self.assertIn("  src/a.py", text)
+        self.assertNotIn("\x1b", text)
+        self.assertIn("/edits reset forgets them", text)
+        m.submit("/edits reset")
+        self.assertEqual(m.outbox[-1], {"type": "edits", "reset": True})
+        m.submit("/edits maybe")
+        self.assertIn("usage: /edits", text_of(m.blocks[-1], 200))
+        m = self.model(features=())
+        m.submit("/edits ask")
+        self.assertEqual(m.outbox, [])
+        self.assertIn("this genai can't", text_of(m.blocks[-1], 200))
+
+    def test_an_auto_applied_edit_is_shown_in_full(self):
+        m = self.model({"mode": "approved-files", "files": ["a.txt"]})
+        m.submit("go")
+        m.handle({"type": "proposal", "id": "p2", "kind": "edit", "path": "a.txt", "diff": "@@ -1 +1 @@\n-two\n+three\n",
+                  "reason": "r", "auto": True, "approved_file": True})
+        card = m.cards["p2"]
+        self.assertEqual((card.state, m.pending), ("accepted", []))
+        shown = text_of(card, 100)
+        self.assertIn("+three", shown)
+        self.assertIn("applied without asking", shown)
+        m.handle({"type": "result", "id": "p2", "status": "ok", "detail": "edited a.txt"})
+        self.assertEqual(card.state, "done")
 
 
 class TestPlan(unittest.TestCase):
@@ -794,17 +965,17 @@ class TestFeatures(unittest.TestCase):
 
     def test_all_built_in_features_load(self):
         on = F.load(core=C.CORE)
-        self.assertEqual([f.name for f in on], ["model", "copy", "decline", "raw", "ssh", "files"])
+        self.assertEqual([f.name for f in on], ["model", "copy", "decline", "raw", "ssh", "files", "sandbox", "edits"])
         m = C.Model()
         self.assertEqual([f.name for f in m.features], [f.name for f in on])
-        self.assertEqual(list(m.commands())[-6:], ["/model", "/copy", "/decline", "/raw", "/system", "/files"])
+        self.assertEqual(list(m.commands())[-8:], ["/model", "/copy", "/decline", "/raw", "/system", "/files", "/sandbox", "/edits"])
         self.assertEqual(C.feature_requests(on), {"panel": {"models"}, "menu": {"model", "copy", "raw", "system"},
                           "files": {"list", "view", "attach", "insert"}})
 
     def test_environment_disables_a_feature(self):
         m, warning = self.model(self.environ(GENAI_TUI_DISABLE="copy, model"))
         self.assertIsNone(warning)
-        self.assertEqual([f.name for f in m.features], ["decline", "raw", "ssh", "files"])
+        self.assertEqual([f.name for f in m.features], ["decline", "raw", "ssh", "files", "sandbox", "edits"])
         m.submit("/copy")
         self.assertIn("unknown command /copy (/help lists them)", text_of(m.blocks[-1]))
         m.submit("/help")
@@ -820,7 +991,7 @@ class TestFeatures(unittest.TestCase):
         self.write_config('{"disable": ["decline", "raw"]}')
         m, warning = self.model(self.environ())
         self.assertIsNone(warning)
-        self.assertEqual([f.name for f in m.features], ["model", "copy", "ssh", "files"])
+        self.assertEqual([f.name for f in m.features], ["model", "copy", "ssh", "files", "sandbox", "edits"])
         m.submit("/decline")
         self.assertIn("unknown command /decline", text_of(m.blocks[-1]))
 
@@ -832,7 +1003,7 @@ class TestFeatures(unittest.TestCase):
         for text in ("{not json", '{"disable": "copy"}', '["copy"]', '{"disable": [1]}'):
             self.write_config(text)
             m, warning = self.model(self.environ())
-            self.assertEqual(len(m.features), 6, text)
+            self.assertEqual(len(m.features), 8, text)
             self.assertIn("was ignored, so every feature is on", warning)
 
     def test_the_hub_refuses_the_requests_of_a_disabled_feature(self):
@@ -1279,6 +1450,48 @@ class TestGenaiTui(TmuxCase):
 
     def sent(self, api):
         return [m for m in api.requests[-1]["body"]["messages"] if m["role"] == "user"][-1]["content"]
+
+    def test_a_sandboxed_run_shows_it_is_running_and_ctrl_c_stops_it(self):
+        from test_sandbox_runner import FAKE_PODMAN
+        path = os.path.join(self.tmp, "test-bin")
+        os.mkdir(path)
+        for name, body in (("less", "#!/bin/sh\nexit 0\n"), ("podman", FAKE_PODMAN)):
+            with open(os.path.join(path, name), "w") as f:
+                f.write(body)
+            os.chmod(os.path.join(path, name), 0o700)
+        log = os.path.join(self.tmp, "podman.log")
+        plain = self.config
+
+        def config(api):                                   # and a blessed coding profile with a sandbox
+            home = plain(api)
+            prof = os.path.join(home, "profiles", "coder.json")
+            os.makedirs(os.path.dirname(prof), exist_ok=True)
+            with open(prof, "w") as f:
+                json.dump({"name": "coder", "endpoint": "test", "coding": True, "sandbox": {"image": "img:1"}}, f)
+            G.Config(home).set_blessed(prof, {"kind": "profile", "name": "coder", "hash": G.hash_file(prof)})
+            return home
+        self.config = config
+        turns = [call("run_in_sandbox", command="echo started; sleep 30", reason="t"), reply("it was stopped")]
+        with FakeAPI(turns) as api, mock.patch.dict(os.environ, {"FAKE_PODMAN_LOG": log}):
+            self.start(api, path=path, args="-p coder")
+            self.assertIn("NO SANDBOX", self.tmux("show", "-gv", "@genai_sandbox"))
+            self.type("go")
+            self.wait_for("Ctrl-C (or /stop) stops it", pane="genai")
+            self.wait_for("RUNNING p", pane="info")
+            end = time.time() + 10
+            while not os.path.exists(log + ".pid") and time.time() < end:
+                time.sleep(0.05)
+            self.assertRegex(self.tmux("show", "-gv", "@genai_sandbox"), r"⏵ sandbox p[0-9]+ [0-9]+s")
+            self.tmux("send-keys", "-t", self.panes()["you"], "C-c")
+            self.wait_for("■ stopped", pane="genai")
+            self.wait_for("stopped; send a message to continue", pane="genai")
+            self.type("carry on")                               # genai is still there
+            self.wait_for("it was stopped", pane="genai")
+            self.assertTrue(any("stopped by the user" in str(m.get("content"))
+                                for m in api.requests[-1]["body"]["messages"]))
+            self.assertTrue(any("kill" in ln for ln in open(log)))
+            self.assertIn("NO SANDBOX", self.tmux("show", "-gv", "@genai_sandbox"))
+            self.assertNotIn("genai exited", self.screen())
 
     def test_starts_with_no_arguments(self):
         with FakeAPI([reply("hello")]) as api:
