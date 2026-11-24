@@ -119,7 +119,9 @@ class Prompt:
                 x += width(text)
         v = self.view
         hints = v.get("hints") or "Enter send · Alt+Enter new line · ↑ earlier · `` shell · /help"
-        if v.get("mode", "input") == "input" and v.get("busy"):
+        if v.get("mode", "input") == "input" and v.get("running"):
+            hints = f"{SPIN[int(time.time() * 10) % len(SPIN)]} a sandboxed run is going · Ctrl-C or /stop stops it"
+        elif v.get("mode", "input") == "input" and v.get("busy"):
             hints = f"{SPIN[int(time.time() * 10) % len(SPIN)]} genai is replying · type ahead, Enter queues it"
         try:
             self.scr.addstr(h - 1, 0, fit(hints, w - 1), self.roles[Q])
@@ -200,6 +202,9 @@ class Prompt:
             now = time.time()
             if ed.text:
                 ed.take()
+            elif self.view.get("running"):
+                self.send({"type": "stop"})       # stops the sandboxed run; it doesn't count towards quitting
+                now = 0.0
             elif now - self.ctrl_c < 2:
                 self.send({"type": "quit"})
             self.ctrl_c = now
