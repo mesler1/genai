@@ -5,7 +5,13 @@
 # what it printed, and right-clicking the shell marks where shell context starts. Clicking a proposed
 # command, or Alt+1..Alt+9 (Alt+1 the newest), opens its menu: run it, edit it, paste it or copy it.
 # In the shell, genai-ssh [ssh options] HOST connects to another host in a way genai-tui can follow.
-# Usage: genai-tui [-h] [-p PROFILE] [-e ENDPOINT] [-S SESSION] [-k SKILL] [--coding] [--no-panel]
+# Features (/model, /copy, /decline, /raw, /system and /files, genai-ssh's handshake) can be switched off: {"disable":
+# ["copy", "model"]} in ${XDG_CONFIG_HOME:-~/.config}/genai/tui.json, or GENAI_TUI_DISABLE=copy,model.
+# /files shows or hides a file tree on the left (--files starts with it shown): browsing sends nothing to the model.
+# --remote [USER@]HOST [--dir PATH] [--as USER] [-- ssh options] keeps this screen and the API key here and runs genai
+# (and the shell pane) on that host over ssh; see "Remote mode" in the README.
+# Usage: genai-tui [-h] [-p PROFILE] [-e ENDPOINT] [-S SESSION] [-k SKILL] [--coding] [--no-panel] [--files]
+#                  [--remote [USER@]HOST [--dir PATH] [--as USER] [-- SSH-OPTION...]]
 set -euo pipefail
 here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 die() { echo "genai-tui: $*" >&2; exit 1; }
@@ -24,9 +30,26 @@ fi
 for a in "$@"; do
   case $a in -h|--help) exec "$py" "$here/conversation.py" --help ;; esac
 done
-"$py" "$here/conversation.py" --check "$@" || exit 2
+# For --remote it prints what the launcher needs, one value per line (dest=, as=, dir=, profile=, endpoint=, ssh=).
+chk=$("$py" "$here/conversation.py" --check "$@") || exit 2
+remote= r_as= r_dir= r_profile= r_endpoint=
+ssh_opts=()
+while IFS= read -r line; do
+  case $line in
+    dest=*) remote=${line#dest=} ;;
+    as=*) r_as=${line#as=} ;;
+    dir=*) r_dir=${line#dir=} ;;
+    profile=*) r_profile=${line#profile=} ;;
+    endpoint=*) r_endpoint=${line#endpoint=} ;;
+    ssh=*) ssh_opts+=("${line#ssh=}") ;;
+  esac
+done <<<"$chk"
 panel=1
-for a in "$@"; do [ "$a" = --no-panel ] && panel=0; done
+files=0
+for a in "$@"; do
+  [ "$a" = --no-panel ] && panel=0
+  [ "$a" = --files ] && files=1
+done
 
 command -v tmux >/dev/null || die "tmux is not installed"
 read -r maj min < <(tmux -V | sed -nE 's/[^0-9]*([0-9]+)\.([0-9]+).*/\1 \2/p') || true
@@ -48,29 +71,113 @@ state=$(mktemp -d "$base/genai-tui.XXXXXX")
 chmod 700 "$state"
 q() { printf '%q' "$1"; }
 
+# Remote mode. Everything that can ask you something (ssh's password or second factor) happens here, in your own
+# terminal, before tmux starts. What is set up, and why it keeps the API key on this machine (SECURITY.md):
+#   1. genai --remote-config: your endpoint and profile, checked and blessed here, without any key.
+#   2. an ssh master connection, whose control socket lives in the private state directory.
+#   3. tui/keyproxy.py on a Unix socket there: it adds the key to requests that carry this session's token.
+#   4. a reverse forward: a port on the remote host's loopback leads to that socket.
+#   5. $state/remote.json: how the conversation pane starts genai over the master, with the config it reads first.
+remote_q() { ssh -S "$state/cm" ${ssh_opts[@]+"${ssh_opts[@]}"} "$remote" "$@"; }
+remote_cleanup() {
+  [ -z "${kpfd:-}" ] || exec {kpfd}>&-         # the key proxy ends when its stdin does
+  [ -z "${kp_pid:-}" ] || kill "$kp_pid" 2>/dev/null || true
+  [ -z "${started:-}" ] || tmux -L "$sock" kill-server 2>/dev/null || true
+  [ ! -S "$state/cm" ] || ssh -S "$state/cm" -O exit "$remote" >/dev/null 2>&1 || true
+  rm -rf "$state"
+}
+if [ -n "$remote" ]; then
+  trap remote_cleanup EXIT
+  trap 'exit 130' INT TERM HUP
+  sudo_as=
+  [ -z "$r_as" ] || sudo_as="sudo -n -H -u $(q "$r_as") -- "
+  echo "genai-tui: checking your endpoint and profile (genai --remote-config)" >&2
+  gcmd=("$py" "$here/../genai")
+  [ -z "${GENAI_BIN:-}" ] || gcmd=("$GENAI_BIN")
+  gargs=(--remote-config)
+  [ -z "$r_profile" ] || gargs+=(-p "$r_profile")
+  [ -z "$r_endpoint" ] || gargs+=(-e "$r_endpoint")
+  "${gcmd[@]}" "${gargs[@]}" > "$state/export.json" || exit 3
+  chmod 600 "$state/export.json"
+  epname=$("$py" -c 'import json, sys; print(json.load(open(sys.argv[1]))["endpoint_name"])' "$state/export.json")
+  echo "genai-tui: connecting to $remote (ssh asks here if it needs a password or a second factor)" >&2
+  # -a: never forward your ssh agent to that host (use ProxyJump, -J, for a bastion). ControlPersist=no: the master
+  # lasts as long as this launcher does, and not a moment longer.
+  ssh -M -S "$state/cm" -o ControlPersist=no -a -x -fN ${ssh_opts[@]+"${ssh_opts[@]}"} "$remote" \
+    || die "could not connect to $remote"
+  ssh -S "$state/cm" -O check "$remote" >/dev/null 2>&1 || die "the ssh connection to $remote is not up"
+  if [ -n "$r_as" ]; then
+    remote_q "sudo -n -u $(q "$r_as") true" >/dev/null 2>&1 \
+      || die "--as needs sudo to $r_as without a password on $remote (sudo -n)"
+  fi
+  # The first of these that is Python 3.10 or newer, as the user genai will run as (their PATH may differ).
+  probe='for c in python3 python3.13 python3.12 python3.11 python3.10; do command -v $c >/dev/null 2>&1 && '
+  probe+='$c -c "import sys; sys.exit(sys.version_info < (3, 10))" 2>/dev/null && { echo $c; exit 0; }; done; exit 1'
+  rpy=$(remote_q "${sudo_as}sh -c $(q "$probe")" 2>/dev/null | tail -n 1) || true
+  [[ $rpy =~ ^python3(\.[0-9]+)?$ ]] || die "genai needs Python 3.10+ on $remote${r_as:+ (as $r_as)}"
+  if [ -n "$r_dir" ]; then
+    remote_q "${sudo_as}test -d $(q "$r_dir")" >/dev/null 2>&1 \
+      || die "$r_dir is not a directory on $remote${r_as:+ (as $r_as)}"
+  fi
+  # The token is what lets a request through the key proxy: 32 random bytes, only in memory and in 0600 files.
+  token=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
+  mkfifo -m 600 "$state/kp.in"
+  "$py" "$here/keyproxy.py" "$epname" "$state/kp.sock" < "$state/kp.in" > "$state/kp.out" 2> "$state/kp.err" &
+  kp_pid=$!
+  exec {kpfd}> "$state/kp.in"                  # held open until we exit
+  printf '%s\n' "$token" >&"$kpfd"
+  for _ in $(seq 100); do
+    grep -qx ready "$state/kp.out" 2>/dev/null && break
+    kill -0 "$kp_pid" 2>/dev/null || die "the key proxy did not start: $(cat "$state/kp.err")"
+    sleep 0.1
+  done
+  grep -qx ready "$state/kp.out" 2>/dev/null || die "the key proxy did not start in time"
+  fwd=$(ssh -S "$state/cm" -O forward -R "127.0.0.1:0:$state/kp.sock" "$remote" 2>&1) \
+    || die "$remote would not forward a port back to this machine ($fwd). Is AllowTcpForwarding off there?"
+  port=$(printf '%s\n' "$fwd" | sed -nE 's/^(Allocated port )?([0-9]+)( for remote forward.*)?$/\2/p' | head -n 1)
+  [[ $port =~ ^[0-9]+$ ]] || die "could not read the forwarded port from ssh's answer: $fwd"
+  printf '%s\n' "$token" | "$py" "$here/remote.py" write "$state" "$remote" "$r_as" "$r_dir" "$port" "$rpy" -- \
+    ${ssh_opts[@]+"${ssh_opts[@]}"}
+  unset token
+  echo "genai-tui: genai will run on $remote${r_as:+ as $r_as}${r_dir:+ in $r_dir}, using $rpy there" >&2
+fi
+
 read -r rows cols < <(stty size 2>/dev/null) || true
 cols=${cols:-120}
+# In remote mode the shell pane is a genai-ssh session to the same host, as the same user, in the same directory,
+# started below: see __genai_remote_shell in shellrc.
+shell_env=()
+[ -z "$remote" ] || shell_env=(-e "GENAI_TUI_REMOTE_DEST=$remote" -e "GENAI_TUI_SSH_CM=$state/cm"
+  -e "GENAI_TUI_SSH_AS=$r_as" -e "GENAI_TUI_SSH_DIR=$r_dir")
 # The panes' TERM. screen-256color, not tmux-256color: an ssh from the shell pane takes TERM with it, and
 # many hosts (SLES among them) have no tmux-256color, where the shell then draws erased characters as
 # blanks. It has to be set before the first pane starts, so the server starts first.
 t -f /dev/null start-server \; set -g default-terminal screen-256color \; \
   new-session -d -s genai -n genai -x "$cols" -y "${rows:-40}" -c "$PWD" \
-  -e "GENAI_TUI_TOGGLE=$here/shell-toggle" "bash --rcfile $(q "$here/shellrc") -i"
+  -e "GENAI_TUI_TOGGLE=$here/shell-toggle" ${shell_env[@]+"${shell_env[@]}"} "bash --rcfile $(q "$here/shellrc") -i"
+started=1
 shell=$(t display -p -t genai '#{pane_id}')
 # tmux copies what the shell prints into a FIFO the conversation pane reads, in memory, to know each
 # command's output (tui/recorder.py). The shell waits for this before its first prompt.
 mkfifo -m 600 "$state/shell.out"
 t pipe-pane -O -t "$shell" "exec cat > $(q "$state/shell.out")"
+# The file tree, on the left of everything. It starts in a window of its own, made first so that
+# leaving it doesn't resize the other panes.
+tree=$(t split-window -d -h -b -f -l 34 -t "$shell" -e "GENAI_TUI_STATE=$state" -P -F '#{pane_id}' \
+  "$(q "$py") $(q "$here/files.py")")
+[ "$files" = 1 ] || t break-pane -d -s "$tree" -n files
 side=$(t split-window -d -h -f -l 42 -t "$shell" -e "GENAI_TUI_STATE=$state" -P -F '#{pane_id}' \
   "$(q "$py") $(q "$here/panel.py")")
 # Top to bottom: the shell, the conversation, the prompt. The shell is hidden once it all exists.
 prompt=$(t split-window -d -v -l 3 -t "$shell" -e "GENAI_TUI_STATE=$state" -e "GENAI_TUI_SHELL=$shell" \
   -e "GENAI_TUI_TOGGLE=$here/shell-toggle" -P -F '#{pane_id}' "$(q "$py") $(q "$here/prompt.py")")
+conv_env=()
+[ -z "$remote" ] || conv_env=(-e "GENAI_TUI_REMOTE=$state/remote.json")
 conv_cmd="$(q "$py") $(q "$here/conversation.py")"
 [ $# -eq 0 ] || conv_cmd+=" $(printf '%q ' "$@")"     # printf with no arguments would still print ''
 conv=$(t split-window -d -v -l 60% -t "$shell" -c "$PWD" -e "GENAI_TUI_SHELL=$shell" -e "GENAI_TUI_PANEL=$side" \
-  -e "GENAI_TUI_TOGGLE=$here/shell-toggle" \
-  -e "GENAI_TUI_STATE=$state" -e "GENAI_TUI_PROMPT=$prompt" -P -F '#{pane_id}' \
+  -e "GENAI_TUI_FILES=$tree" -e "GENAI_TUI_TOGGLE=$here/shell-toggle" \
+  -e "GENAI_TUI_STATE=$state" -e "GENAI_TUI_PROMPT=$prompt" ${conv_env[@]+"${conv_env[@]}"} -P -F '#{pane_id}' \
   "$conv_cmd; rc=\$?; if [ \$rc -ne 0 ]; then echo; echo \"genai-tui: the conversation ended with code \$rc. Press Enter.\"; read -r _; fi; tmux kill-server")
 if [ "$panel" = 0 ] || [ "$cols" -lt 100 ]; then
   t break-pane -d -s "$side" -n panel
@@ -88,7 +195,11 @@ t set -g pane-active-border-style 'fg=blue,bold'
 t set -g status-style 'bg=default,fg=default'
 t set -g status-left ' genai │ '
 t set -g status-left-length 20
-t set -g status-right ' #H │ `` shows the shell │ Ctrl-b o: other pane │ Ctrl-b d: detach '
+if [ -n "$remote" ]; then       # the host that matters is the one genai runs on
+  t set -g status-right " genai on ${remote//#/##} │ \`\` shows the shell │ Ctrl-b o: other pane │ Ctrl-b d: detach "
+else
+  t set -g status-right ' #H │ `` shows the shell │ Ctrl-b o: other pane │ Ctrl-b d: detach '
+fi
 t set -g window-status-format ''          # hidden panes live in other windows; don't list them
 t set -g window-status-current-format ''
 t set -g status-right-length 100
@@ -99,6 +210,7 @@ t set -p -t "$conv" @genai_title 'genai'
 t set -p -t "$shell" @genai_title 'shell · `` hides it · right-click: shell context'
 t set -p -t "$prompt" @genai_title 'you'
 t set -p -t "$side" @genai_title 'info · /panel hides it'
+t set -p -t "$tree" @genai_title 'files · /files hides it'
 
 # Right-click in the shell pane: tmux's own menu for shell context. -O keeps it open when the button is
 # released off an item (tmux 3.2 has it); a click chooses. Each request goes to the
@@ -129,9 +241,18 @@ t source-file "$state/menu.conf"
 t set-environment -g GENAI_TUI_TOGGLE "$here/shell-toggle"
 t run-shell "$(q "$here/shell-toggle") hide"
 t select-pane -t "$prompt"
+# The shell pane runs genai-ssh to the host at once, as a command, so it is followed like any genai-ssh session.
+[ -z "$remote" ] || t send-keys -t "$shell" -l ' __genai_remote_shell' \; send-keys -t "$shell" Enter
 t attach -t genai || true
 if t has-session 2>/dev/null; then
-  echo "genai-tui is still running in the background. Reattach: tmux -L $sock attach"
-else
-  rm -rf "$state"
+  if [ -n "$remote" ]; then
+    # Leaving would close the key proxy and the ssh connection with it, so the session can't outlive this command.
+    echo "genai-tui: detached. This command keeps the ssh connection and the key proxy up: Ctrl-C ends the session." >&2
+    echo "Reattach from another terminal: tmux -L $sock attach" >&2
+    while t has-session 2>/dev/null; do sleep 1; done
+  else
+    echo "genai-tui is still running in the background. Reattach: tmux -L $sock attach"
+  fi
 fi
+# (Remote mode removes it in its exit trap, after it has closed the ssh master whose socket is in it.)
+[ -n "$remote" ] || t has-session 2>/dev/null || rm -rf "$state"

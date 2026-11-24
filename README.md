@@ -59,13 +59,14 @@ model, default skills, sampling settings and coding mode:
 | --- | --- |
 | Attach files | `genai -p NAME -f app.log -f app.conf "why is it crashing?"` |
 | Skills | `genai -p NAME -k slurm` (skills must be blessed) |
+| Plugins (trusted commands) | `genai -p NAME --plugin slurm` (plugins must be blessed; [Plugins and trusted commands](#plugins-and-trusted-commands)) |
 | Sessions | `genai -p NAME -S nightly "summarize" > out.txt` |
 | Coding mode | `genai -e NAME --coding` (reads stop asking, except files that look like secrets; writes still ask) |
 | Coding mode where it is refused | `genai -e NAME --coding-anywhere` (prints what that exposes) |
 | Builds and tests the model runs itself | a profile with `"coding": true` and a `"sandbox"` ([Sandboxed runs](#sandboxed-runs)) |
 | Start over, keeping the session | `:clear` in the REPL, `/clear` in genai-tui (the model forgets the conversation; the saved session keeps it) |
 | Wrappers | `genai -p NAME --json` (JSON Lines over stdio) |
-| Lists | `genai --list-endpoints`, `--list-profiles`, `--list-skills`, `--list-sessions` (each with `--json`) |
+| Lists | `genai --list-endpoints`, `--list-profiles`, `--list-skills`, `--list-plugins`, `--list-sessions` (each with `--json`) |
 
 Exit codes: 0 ok, 1 error, 2 usage, 3 endpoint or profile (none, unblessed, changed, key missing),
 4 endpoint request failed, 5 context full, 130 interrupted.
@@ -81,6 +82,7 @@ skills/genai-profile/      helps you write a profile (persona)
 skills/genai-skill/        helps you write a skill
 skills/bash-scripts/       conventions for small, safe bash scripts
 skills/hpc/                working on a Slurm cluster: login nodes, srun/sbatch, modules, scratch
+plugins/slurm/             trusted read-only Slurm commands: sinfo, squeue, scontrol show, sacct
 sandbox/run                podman sandbox for running genai and its tests, on this machine's OS
 sandbox/hooks/modules.sh   sandbox hook: makes loaded environment modules work inside the sandbox
 hooks/notify-desktop       example notify hook: a desktop notification when genai waits for you
@@ -90,7 +92,7 @@ tests/                     offline suite, live endpoint test, harness self-check
 ## Configuration
 
 On first run genai creates `~/.config/genai` (or `$XDG_CONFIG_HOME/genai`), mode 0700, with
-`endpoints/`, `profiles/`, `skills/`, `sessions/` and a `config.json` that lists every setting at its
+`endpoints/`, `profiles/`, `skills/`, `plugins/`, `sessions/` and a `config.json` that lists every setting at its
 default. It says so once on stderr and never changes what is already there.
 
 | Setting | Default | Meaning |
@@ -98,9 +100,11 @@ default. It says so once on stderr and never changes what is already there.
 | `default_profile` | `null` | Profile used when `-p` is not given. |
 | `default_endpoint` | `null` | Endpoint used when neither `-e` nor the profile names one. |
 | `default_skills` | `[]` | Skills used when the profile doesn't list its own. |
+| `default_plugins` | `[]` | Plugins used when the profile doesn't list its own (`--plugin` adds more). |
 | `endpoint_dirs` | `[]` | Extra directories searched for endpoints, after `~/.config/genai/endpoints/`. |
 | `profile_dirs` | `[]` | Extra directories searched for profiles, after `~/.config/genai/profiles/`. |
 | `skill_dirs` | `[]` | Extra directories searched for skills, after `~/.config/genai/skills/`. |
+| `plugin_dirs` | `[]` | Extra directories searched for plugins, after `~/.config/genai/plugins/`. |
 
 Keys starting with `_` are comments. Any other unknown key gets a warning, so a typo isn't silently
 ignored. A blessed endpoint or profile is also found by name wherever it lives, so you can bless the
@@ -114,6 +118,51 @@ repo's files in place. For example, to use the coder persona by default and the 
 genai --bless /path/to/genai/profiles/coder.json
 genai --bless /path/to/genai/skills/bash-scripts
 ```
+
+## Plugins and trusted commands
+
+A plugin is a directory with a `plugin.json` (and, for genai-tui, optionally a pane program). It defines
+**trusted commands**: narrow, shell-free programs with named inputs, such as `squeue -h -u {user}`. You bless
+the whole directory once, like a skill (`genai --bless plugins/slurm` shows every command, what each input
+may be, which program it would run, and which ones ask every time), and genai refuses it again if any file in
+it changes. Then `--plugin slurm`, `default_plugins`, a profile's `plugins`, or a `plugin` message from a
+wrapper turns it on.
+
+Each enabled command is a tool for the model, named `slurm__queue_user`. A command marked `"read_only": true`
+runs without asking, like an automatic read in coding mode: you see what ran and its output, and the audit log
+records it. Any other command asks every time, like a write. You (a genai-tui pane, through the `run` message)
+can run the same commands with the same checks and limits. You decided once, at blessing time, exactly these
+commands with exactly these inputs.
+
+```json
+{"name": "slurm", "description": "Slurm cluster status", "search": ["/usr/bin", "/opt/slurm/bin"], "env": ["SLURM_CONF"],
+ "commands": {"queue_user": {"describe": "jobs of one user", "argv": ["squeue", "-h", "-u", "{user}"],
+   "params": {"user": {"pattern": "^[a-z_][a-z0-9_-]{0,31}$"}}, "read_only": true, "min_interval": 5, "cache": 15}}}
+```
+
+- `name` is the directory's name (`a-z`, digits, `-`); commands are `a-z`, digits, `_`. Unknown fields anywhere
+  refuse the plugin. `pane` (optional) names a file in the directory for genai-tui; genai only reports it.
+- `argv`: a program name without `/` (found only in `search`, default `/usr/local/bin`, `/usr/bin`, `/bin`;
+  your `PATH` is never used) or an absolute path, then arguments. `{param}` may be a whole argument or part of
+  one (`--user={user}`); every placeholder needs a declared param and every param must be used. `{{` and `}}`
+  are literal braces. A value never splits into several arguments and is never seen by a shell.
+- `params` (all required): `pattern` (a regular expression the whole value must match; one that matches the
+  empty string is refused), `enum` (a list), or `int` (`[min, max]`); optional `describe`. A value that doesn't
+  fit is refused, never cleaned. At most 256 characters, one line, whatever the pattern says.
+- Per command: `read_only` (default `false`), `timeout` (seconds, 15, at most 120), `max_output` (bytes,
+  65536, at most 1 MiB; more is dropped and the program is killed), `min_interval` (seconds, 2: a call of the
+  same command sooner than this after its last real run is refused with "rate limited"), `cache` (seconds, 0:
+  the same command with the same values returns its last result, marked cached). genai also allows 30 real
+  runs a minute across all plugins.
+- `env`: names of environment variables passed on. The program otherwise gets only `PATH` (the `search`
+  directories), `LANG=C.UTF-8`, `HOME`, `USER` and `LOGNAME`. `PATH` and `LD_*` can't be listed.
+- The program must be a regular executable file, and neither it nor its directory may be writable by group or
+  others or owned by another user than you or root. genai records which file it found at start and refuses to
+  run it if it changed ("restart genai").
+
+The model's output from a command is redacted for your endpoint key and common secret patterns, cut like
+sandbox output, and escaped wherever it is shown. `plugins/slurm/` has `sinfo`, `squeue`, `scontrol show` and
+`sacct` commands, all read-only. Over JSON, see the `plugins`, `plugin` and `run` messages below.
 
 ## Sandbox
 
@@ -212,6 +261,76 @@ on, and nothing is installed there. The session has a key of its own that never 
 command line or on screen; see SECURITY.md, section 7. Plain `ssh` still works, but genai-tui
 can't follow it, and `/run` refuses while it runs.
 
+### Remote mode
+
+```
+genai-tui --remote me@devbox --dir /srv/project                    # genai runs on devbox, in that directory
+genai-tui --remote me@devbox --dir /srv/project --as svc           # ... as another user, through sudo -n
+genai-tui --remote me@devbox -e work -p coder -- -J me@bastion     # a bastion; more ssh options after --
+```
+
+The screen, your endpoint's API key and your blessed configuration stay on your machine. genai runs on the
+host, in PATH, as you or as `--as USER` (which needs `sudo -n -u USER` to work without a password there; the
+launcher checks). The shell pane is a followed session on the same host, as the same user, in the same directory,
+and says `disconnected from HOST` and offers to reconnect if it drops. Prefer ProxyJump (`-J`, or `ProxyJump` in
+`~/.ssh/config`) to agent forwarding for a bastion: the connection never offers your agent to the host, and genai-tui
+passes `-a` to ssh so a config file can't either.
+
+What happens, before tmux starts (so a password or second factor is asked for in your own terminal):
+
+1. `genai --remote-config` resolves `-e` and `-p` exactly as a normal start would (default endpoint and profile,
+   blessing checks, a changed file is refused) and prints the endpoint and profile *without* `key_env`, `key_file`,
+   `proxy`, `headers` or `ca_bundle`. `-S` and `-k` are not available with `--remote` yet.
+2. An ssh master connection (`ssh -M -S STATE/cm -fN`, then the host's checks: Python 3.10 or newer as the target user,
+   `sudo -n` for `--as`, the directory) whose control socket lives in genai-tui's private 0700 state directory.
+3. `tui/keyproxy.py` starts here on a Unix socket, with a random token on its stdin.
+4. `ssh -O forward -R 127.0.0.1:0:STATE/kp.sock` opens a loopback port on the host that leads to that proxy.
+5. The conversation pane runs genai there over the same connection: a short Python program reads genai's own source
+   from stdin (it is too big for a command line), runs it, and genai then reads a config line (the endpoint, whose
+   `base_url` is that loopback port, the profile and the token) and the usual protocol. Nothing is installed or
+   left on the host, and it is always the same genai version as yours.
+
+The proxy accepts only `GET /v1/models` and `POST /v1/chat/completions` with the token, adds the key and the
+endpoint's headers, and sends the request on through the endpoint's own TLS and proxy settings. On exit the proxy,
+the forward and the ssh connection are closed; detaching tmux keeps the launcher running to hold them, so Ctrl-C there
+ends the session.
+
+You can see where it runs: the banner and the info panel say `genai runs ON host AS user in dir` (red as root), the
+status line names the host, and the banner gives the audit log's path on the host (`hello`'s `audit`). The sessions,
+audit log and `~/.config/genai` that genai uses are those of the user it runs as on the host; its endpoint is not
+blessed there, because the blessing happened here. Test it against a SLES container with `tests/remote_sshd.sh test`.
+
+Limits: the host's login shell must be POSIX-like, its sshd must allow TCP forwarding (`AllowTcpForwarding`), and
+`python3`, `python3.13` ... `python3.10` is searched in that order for 3.10 or newer (SLES: `zypper install python311`).
+Another user of that host can reach the forwarded port, which is why the token matters (SECURITY.md).
+
+### File tree
+
+`/files` shows or hides a file tree of the working directory on the left (`genai-tui --files` starts
+with it shown). Move with the arrow keys; Right or Enter opens a directory and Left closes it; `.`
+shows or hides hidden files and `r` refreshes. On a file, Enter views it in the pager, `a` attaches it
+to your next message and `i` puts its path in the input box. A `⚠` marks a file genai thinks holds
+secrets, `⚿` one the model would have to ask about first, and `↪` a symlink, which is not followed.
+
+Browsing sends nothing to the model. Listings and files come through genai, which applies its usual
+checks and masks secrets it recognises. `a` opens the file in your editor first, like shell context:
+what you save goes with your next message, and nothing does if you save an empty file.
+
+### Features
+
+genai-tui's `/model`, `/copy`, `/decline`, `/raw`, `/system` and `/files`, and the `genai-ssh` handshake, are
+features, each in its own module under `tui/features/`. To switch some off, list them in
+`~/.config/genai/tui.json` (`$XDG_CONFIG_HOME/genai/tui.json`):
+
+```json
+{"disable": ["copy", "model"]}
+```
+
+or set `GENAI_TUI_DISABLE=copy,model` for one run. Names are `model`, `copy`, `decline`, `raw`,
+`ssh` and `files`. A disabled feature has no command, help line or menu item, and genai-tui's socket
+refuses its requests. Without `ssh`, a genai-ssh session isn't followed. No file means
+everything is on; a file that can't be read is ignored, with a note in the conversation.
+
 ## Sandboxed runs
 
 In coding mode the model can only propose commands, so you run every build and test yourself. A
@@ -274,8 +393,37 @@ arrives as it is, so the wrapper must escape it before it displays it.
 genai's first line is `hello`. It has `protocol` (1), `version`, `features`, `endpoint`,
 `profile`, `session`, `resumed`, `coding`, `coding_from`, `coding_override`, `cwd`, `sandbox`,
 `runner` (the profile's sandbox for `run_in_sandbox`: `engine`, `image`, `network`, `timeout` and
-`problem`, or `null`), the active `skills`, and the model's `tools`. Check `features` before you use a message added
+`problem`, or `null`), the active `skills` and `plugins`, and the model's `tools`. Check `features` before you use a message added
 later.
+
+`hello` also says where genai runs: `host` (its host name), `user` (the effective user's name, or the uid
+if it has none), `uid`, `remote` (true with `--config-stdin`) and `audit` (the path of its audit log). They are
+always present. As root, the REPL
+banner adds a `[!]` line saying every command it proposes would run as root.
+
+`--remote-config [-e NAME] [-p NAME]` prints, as one JSON line and then exits, what genai-tui's remote mode sends:
+`{"endpoint": {...}, "profile": {...} or null, "endpoint_name": "...", "base_path": "/v1"}`. The endpoint and profile
+are resolved and checked as for a normal start (default endpoint and profile, blessing, files changed since
+blessing are refused with the usual error and status 3), and the endpoint has no `key_env`, `key_file`, `proxy`,
+`headers` or `ca_bundle`: no key, and nothing that could carry a secret. The key proxy on your machine uses the
+endpoint's own proxy and headers.
+
+`--config-stdin` (with `--json` only; not with `-e`, `-p`, `-S` or `-k`; plugins aren't sent
+there yet) is for genai-tui's remote mode, where genai
+runs on another host over ssh. genai first reads one line from stdin, before `hello`:
+
+```
+{"type": "config", "endpoint": {...}, "profile": {...} or null, "token": "<32 to 128 hex characters>"}
+```
+
+The endpoint and profile are the fields of an endpoint file and a profile file, checked the same way. Here they
+come from the wrapper, which checked the user's blessed files on its side, so genai blesses nothing on this host
+for them; the audit log records a `remote_config` event with their hashes. The endpoint may not name a key
+(`key_env`, `key_file`) or a `proxy`, and its `base_url` must be `http://127.0.0.1:PORT`, with an optional path:
+the key stays on the user's machine, and the port is a tunnel to a proxy there. genai sends the token in an
+`X-Genai-Token` header and never shows it. The profile's `endpoint` is ignored, and its skills are not available
+yet (a `notice` after `hello` says so). A bad line ends genai with exit status 3 and an `error` with code
+`bad_config`, and nothing is sent to any endpoint.
 
 **Messages a wrapper sends**
 
@@ -293,7 +441,11 @@ later.
 | `coding` | `on` (true or false) | Turns coding mode on or off. The same places are refused as for `--coding` (error `coding_refused`), and `--coding-anywhere` stays a command-line flag. Always answered by a `coding` event with the state now. |
 | `skills` | | Answered by `skills`: every skill, its blessing `status`, and whether it is `active`. |
 | `skill` | `name`, `on` (true or false) | Uses a skill from the next request on, or stops using it. Only a blessed skill can be turned on (errors `unknown_skill`, `not_blessed`). Always answered by a fresh `skills` list. |
+| `plugins` | | Answered by `plugins`: every plugin found, each `{name, description, enabled, blessed, status, pane, dir, commands}`; a command has `name`, `describe`, `params` (each `{pattern or enum or int, describe}`), `read_only` and `argv` (with `{placeholders}`). genai also sends it once after `hello`. |
+| `plugin` | `name`, `on` (true or false) | Turns a plugin's trusted commands on or off. Only a blessed plugin whose programs pass the checks can be turned on (errors `unknown_plugin`, `not_blessed`, `bad_plugin`; `remote` with `--config-stdin`). Always answered by a fresh `plugins` event. |
+| `run` | `id` (a string or number), `plugin`, `command`, `params` | Runs one command of an enabled plugin for the user, with the same checks, limits, cache and rate limits as the model's calls (source `user` in the audit log). Answered by `ran`: `id`, then `exit` (`null` if killed), `output`, `note`, `cached`, `ms`, `redacted`, or `id` and `error`. Between turns only; while proposals wait it gets `busy`. |
 | `files` | optional `path` (default `.`) | Lists one directory under the working directory, for a file tree. The response includes `truncated` when the scan reaches its limit. Each entry has `name`, `kind` (`file`, `dir`, `symlink`, `other`), `size` and `hidden`. A file also has `secret` (it looks like it holds secrets; `null` if genai would not read it at all, such as a binary or a file over the read limit) and `asks` (reading it would need your OK, even in coding mode). Contents are read only to classify them and never reach the model. Symlinks are listed, not followed; a bad path gets the error `bad_path`. |
+| `read` | `path` | Shows one file to the user, for a file viewer. It is read through the same checks as the model's reads (no symlinks, regular files only, the read limit, no binary), answered by `file` with `path`, `text`, `size` (bytes), `secret` (it looks like it holds secrets) and `redacted` (counts, as for `attached`: the endpoint key and common secret patterns are masked in `text`). The text goes to the wrapper only, never to the model or the session, and each read is written to the audit log (no content). A file that cannot be read gets the error `bad_path` with the `path`. |
 | `trace` | optional `from`, `to` (exchange numbers) | Answered by `trace`: the exchanges with the endpoint in that range (default: the latest), exactly as sent and received. Each has `n`, `time`, `method`, `url`, `headers` (the API key and the endpoint's own header values are not shown), `request` (the body, as sent), `http`, `stream`, `response` (the reply as it arrived: each streamed line, or the whole body), `status` (`ok` or `error`, with `error`), `message` (the reply as genai put it together), `usage` and `ms`. genai keeps the last 30, in memory only; `kept` gives the range it still has. |
 | `system` | | Answered by `system`: the system prompt and the tool definitions the next request will carry, with `model` and `params`. |
 | `plan` | optional `clear: true` | Answered by `plan`: the approved plan, or `null`. With `clear`, drops it first, so everything asks again. |
@@ -308,14 +460,14 @@ decision.
 | `type` | Meaning |
 |---|---|
 | `text` | A piece of the model's reply. |
-| `proposal` | `id`, `kind` (`read`, `list`, `write`, `edit`, `command`, `sandbox`, `external`, `invalid`), and the proposal's fields, such as `path`, `content`, `diff`, `command` and `reason`. `auto: true` means it needed no approval: coding mode, or a read the approved plan names. A `plan` proposal has `goal` and numbered `steps` (`n`, `kind`: `read`, `edit`, `write` or `command`, a `path` or the exact `command`, and `why`). While a plan is approved, a proposal it covers has `plan_step`; a command matching an approved step character for character also has `preapproved: true`, so the wrapper may run it without asking again; a command, edit or write the plan doesn't cover has `off_plan: true`. Edits and writes always ask. `secret: true` means the file looks like it holds secrets. A command is only shown: the wrapper runs it, if the user wants to, and can share the output with `attach`. A `sandbox` proposal (`command`, `reason`, `network`, `image`) is genai running the command in the sandbox: offline it has `auto: true` and runs at once; online it waits for a `decision`. |
-| `result` | `id`, `status`, `detail`: what happened to a proposal that was performed. For a `sandbox` run, also `exit` (`null` if it was killed at the time limit or never ran) and `output`, exactly what the model is sent. |
+| `proposal` | `id`, `kind` (`read`, `list`, `write`, `edit`, `command`, `sandbox`, `trusted`, `external`, `invalid`), and the proposal's fields, such as `path`, `content`, `diff`, `command` and `reason`. `auto: true` means it needed no approval: coding mode, or a read the approved plan names. A `plan` proposal has `goal` and numbered `steps` (`n`, `kind`: `read`, `edit`, `write` or `command`, a `path` or the exact `command`, and `why`). While a plan is approved, a proposal it covers has `plan_step`; a command matching an approved step character for character also has `preapproved: true`, so the wrapper may run it without asking again; a command, edit or write the plan doesn't cover has `off_plan: true`. Edits and writes always ask. `secret: true` means the file looks like it holds secrets. A command is only shown: the wrapper runs it, if the user wants to, and can share the output with `attach`. A `sandbox` proposal (`command`, `reason`, `network`, `image`) is genai running the command in the sandbox: offline it has `auto: true` and runs at once; online it waits for a `decision`. A `trusted` proposal (`plugin`, `command`, `params`, `argv`, `read_only`) is a plugin's trusted command: `read_only` ones have `auto: true` and run at once; others wait for a `decision`. |
+| `result` | `id`, `status`, `detail`: what happened to a proposal that was performed. For a `sandbox` or `trusted` run, also `exit` (`null` if it was killed at the time limit or never ran) and `output`, exactly what the model is sent. |
 | `done` | The turn ended. `reason` is `reply`, `command`, `stopped` (Ctrl-C during a sandboxed run) or `step_limit`; `context` gives `used` and `limit`; `exchanges` gives the first and last exchange numbers of this turn, for `trace` (also on an `error` that ends a turn). |
 | `context` | The conversation is getting near the context limit. |
 | `notice` | Something the user should know. |
 | `error` | `code` and `message`. |
 | `plan` | The approved plan changed: approved, a step done, or dropped. `plan` has `id`, `goal` and `steps`, each with `approved`, `status` (`todo`, `done`, `left out`) and `edited` when the user changed its command; `null` when there is none. A plan is never saved with the session. |
-| `attached`, `registered`, `compacted`, `cleared`, `models`, `model`, `coding`, `skills`, `files`, `trace`, `system`, `network` | Answers to the messages above. |
+| `attached`, `registered`, `compacted`, `cleared`, `models`, `model`, `coding`, `skills`, `files`, `file`, `trace`, `system`, `network`, `plugins`, `ran` | Answers to the messages above. |
 
 When stdin closes, every waiting proposal is declined and genai exits.
 
