@@ -97,7 +97,7 @@ much permission and too much autonomy.
 
 - **Functionality.** Six tools: propose a command, read a file, list a directory, write a
   file, edit a file, propose a plan. No delete, no fetch, no execute on your system. A seventh,
-  `run_in_sandbox`, exists only in coding mode with a profile's sandbox (section 5).
+  `run_in_sandbox`, exists only in coding mode with a profile's sandbox (section 5). Plugins you bless and enable add their trusted commands as tools (below).
 - **Permission.** File tools take relative paths only. `..`, absolute paths and `~` are
   rejected, and each path is walked one component at a time with `O_NOFOLLOW`, so a symlink
   anywhere in it is refused. Reads refuse FIFOs, devices and binary files. New files are
@@ -106,6 +106,37 @@ much permission and too much autonomy.
   which also caps how many sandboxed runs one turn makes.
   Reads are capped at 256 KiB, writes at 1 MiB, overwrite snapshots at 8 MiB, and directory scans at 500 entries plus a truncation check. Without a terminal and
   outside JSON mode, nothing is performed at all.
+
+#### Trusted commands (plugins)
+
+A plugin is blessed as a directory, like a skill: its hash covers every file, and a changed plugin is refused
+until you bless it again. What you bless is a list of commands, each a fixed argument list with named inputs
+and the rules for each input (a regular expression matched against the whole value, a list, or a number
+range). Together they are the whole of what the model and the user's panes can run.
+
+- **No shell.** The program is started directly with an argument list. A value fills one argument and is
+  never split, expanded or re-read, so `;`, `$(...)` and quotes in a value are only characters. Values that
+  break the rules (or are over 256 characters, or have a NUL or a newline) are refused, never cleaned.
+- **Fixed programs.** The program is found only in the plugin's `search` directories (or by an absolute path),
+  never through your `PATH`. It must be a regular executable file that neither group nor others can write, as
+  must its directory, owned by you or root. genai records the file it found and refuses to run it if it was
+  replaced afterwards.
+- **Minimal environment.** The program gets `PATH` (the search directories), `LANG`, `HOME`, `USER`, `LOGNAME`
+  and the variables the plugin lists; `PATH` and `LD_*` can't be listed. Standard input is empty.
+- **Limits.** A time limit (at most 120 s), an output cap (at most 1 MiB, then the program is killed), its own
+  process group (killed whole), at least `min_interval` seconds between real runs of one command, a cache so a
+  repeated question is answered from the last result, and 30 real runs a minute across all plugins.
+- **Auto-run versus asking.** Only commands the plugin marks `read_only` run without asking, and the blessing
+  screen lists them separately; they work only where someone can see what runs (not in plain, non-interactive
+  mode), like automatic reads. Every other command asks, in the normal approval flow, each time.
+- **Audit.** Each run (or refusal) is logged as `trusted_run`: plugin, command, the validated values, who asked
+  (`model` or `user`), exit code, time, bytes, whether it was cached or rate limited, and the program's path.
+  Output is masked for the endpoint key and secret patterns, cut, and escaped wherever it is shown.
+
+What remains: a read-only command's output goes to the endpoint like any file the model reads, and cluster
+data can be sensitive (other users' names, job names, node names, paths in job details). Read the commands
+before you bless them; a pattern that allows `-` first, or anything broad, lets the model pass options to the
+program. Plugins are not available through `--config-stdin` yet.
 
 ### 4. Identity, privilege and credentials
 
