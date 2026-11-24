@@ -66,12 +66,26 @@ def view(st, w, sel):
     coding = st.get("coding")
     add([("coding   ", Q), ("[on] " if coding else "[off]", W if coding else ""),
          (fit("  c switches" if not coding else "  reads without asking", w - 14), Q)], "coding")
-    run = st.get("runner")
-    if run and run.get("problem"):
-        add([("sandbox  ", Q), (fit("can't run here", w - 9), R)])
+    head("SANDBOX")
+    if h.get("sandbox"):
+        add([("genai    ", Q), (fit(f"in the {clean(h['sandbox'])} sandbox", w - 9), D)])
+    else:
+        add([("genai    ", Q), (fit("NOT sandboxed", w - 9), R)])
+    run, going = st.get("runner"), st.get("running")
+    if going:
+        add([("model's  ", Q), (fit(f"RUNNING {clean(going.get('id', '?'))} · {going.get('secs', 0)}s", w - 9), W)])
+        add([(fit("  Ctrl-C or /stop stops it" if going.get("stoppable") else "  can't be stopped in remote mode yet",
+                  w), Q)])
+    elif run and run.get("problem"):
+        add([("model's  ", Q), (fit(f"can't run: {clean(run['problem'])}", w - 9), R)])
     elif run:
-        add([("sandbox  ", Q), ("ONLINE" if run.get("network") else "offline", W if run.get("network") else D),
-             (fit("  each run asks · /network" if run.get("network") else "  /network switches", w - 16), Q)])
+        add([("model's  ", Q), ("ready · ", D), ("ONLINE" if run.get("network") else "offline",
+                                                 W if run.get("network") else D),
+             (fit(f" · {clean(run.get('image') or '?')}", max(w - 24, 4)), Q)])
+        add([(fit("  each run asks · /network" if run.get("network") else "  /network switches", w), Q)])
+    else:
+        add([("model's  ", Q), ("none", Q)])
+    add([(fit("/sandbox shows the details", w), Q)])
     head("CONTEXT")
     ctx = st.get("context") or [None, None]
     add(bar(ctx[0] or 0, ctx[1], w) if ctx[0] is not None else [("not measured yet", Q)])

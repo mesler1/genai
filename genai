@@ -449,6 +449,8 @@ class Sandbox:
     discarded, files that look like secrets are hidden, there is no network unless switched on, nothing from
     the home directory, a time limit, and memory and process limits where the host allows them."""
 
+    running = False            # a container is running now: --json mode turns SIGINT into Ctrl-C only then
+
     def __init__(self, conf, root, notice):
         self.conf, self.root, self.notice = conf, os.path.realpath(root), notice
         self.podman = shutil.which("podman")
@@ -470,7 +472,8 @@ class Sandbox:
 
     def info(self):
         return {"engine": "podman", "image": self.conf["image"], "network": self.network,
-                "timeout": self.conf["timeout"], "problem": self.problem()}
+                "timeout": self.conf["timeout"], "memory": self.conf.get("memory"), "pids": self.conf.get("pids"),
+                "problem": self.problem()}
 
     def masks(self, values=()):
         """Files and directories to hide in the sandbox, relative to the project: secret-looking names, and
@@ -584,6 +587,7 @@ class Sandbox:
 
         reader = threading.Thread(target=drain, daemon=True)
         reader.start()
+        Sandbox.running = True
         try:
             rc = proc.wait(timeout=self.conf["timeout"])
         except subprocess.TimeoutExpired:
@@ -592,6 +596,8 @@ class Sandbox:
         except KeyboardInterrupt:
             self._kill(name, proc)
             raise
+        finally:
+            Sandbox.running = False
         reader.join(5)
         proc.stdout.close()
         out = strip_ansi(b"".join(chunks).decode("utf-8", "replace"))
@@ -3297,7 +3303,7 @@ class Engine:
         except KeyboardInterrupt:
             p.stopped = True
             self.audit.log("sandbox_exit", id=p.id, exit=None, stopped=True)
-            self.ui.result(p, "error", "stopped by you")
+            self.ui.result(p, "stopped", "the container was killed")
             return "stopped by the user before it finished"
         except GenaiError as e:
             ran, rc, out, note = False, None, "", str(e)
@@ -3869,10 +3875,16 @@ Commands (on an empty buffer):
   :skills         list skills, marking the ones in use
   :skill NAME on|off  use a blessed skill from the next message on, or stop using it
   :bless PATH     bless a skill, endpoint or profile
+  :sandbox        where genai and your commands run: in a sandbox or on this host
   :help           this text            :quit         leave"""
 
 
 HOOK_BANNER = "hook: notify (runs {} when genai waits for you)"
+
+
+def sandbox_work_host():
+    """The host path of /work, as sandbox/run reported it. Display only, so it is escaped."""
+    return one_line(os.environ.get("GENAI_SANDBOX_WORK_HOST", "").strip())[0]
 
 
 class Repl:
@@ -3881,9 +3893,19 @@ class Repl:
         self.capture = False
         self.attachments = []
 
+    def in_sandbox(self):
+        """Is genai itself running in a sandbox? Then the prompt and banner say so."""
+        return bool(getattr(self.e, "sandbox", None))
+
     def banner(self):
         p = self.e.endpoint
         print(f"genai {VERSION} — {one_line(p.name)[0]}: {one_line(p.model)[0]} at {one_line(p.base_url)[0]}")
+        if self.in_sandbox():
+            name = one_line(self.e.sandbox["name"])[0]
+            host = sandbox_work_host()
+            line = (f"IN THE {name.upper()} SANDBOX: /work" + (f" = {host}" if host else "") +
+                    ", no host home (:sandbox for details)")
+            print(f"\033[1m{line}\033[0m" if sys.stdout.isatty() else line)
         if os.geteuid() == 0:
             print(f"  [!] running as root on {one_line(socket.gethostname())[0]}: "
                   "every command it proposes would run as root")
@@ -3905,6 +3927,29 @@ class Repl:
             print("  " + HOOK_BANNER.format(short_path(self.e.notifier.path)))
         print("Type :help for commands. A line with only '..' sends.")
 
+    def do_sandbox(self):
+        sb = self.e.sandbox
+        print(f"genai runs {where_runs(sb)}")
+        if sb:
+            host = sandbox_work_host()
+            print(f"  working directory: {one_line(os.getcwd())[0]}"
+                  + (f" (/work is {host} on the host, writable)" if host else ""))
+            print("  the repo is at /opt/genai, read-only; the host's /usr and /etc are read-only; "
+                  "nothing else from your home")
+            print(f"  config: {one_line(short_path(self.e.cfg.home))[0]} (the sandbox's own, not your real one)")
+            print("  changes outside /work and the config directory are discarded when it exits")
+            try:
+                host_name = urllib.parse.urlsplit(self.e.endpoint.base_url).hostname
+                socket.getaddrinfo(host_name, None)
+                print(f"  network: the endpoint's host {one_line(host_name)[0]} resolves, so the network looks available")
+            except (OSError, ValueError, TypeError):
+                print("  network: the endpoint's host does not resolve here, so the network looks off")
+            print("  sandbox/run shell opens a shell in it (from the host)")
+        else:
+            print("  sandbox/run genai runs genai in a podman sandbox instead (see the README)")
+        if self.e.box:
+            print("  profile sandbox: " + self.box_line())
+
     def box_line(self):
         b = self.e.box
         problem = b.problem()
@@ -3924,7 +3969,8 @@ class Repl:
         buf = []
         while True:
             try:
-                line = input("> " if not buf else ". ")
+                mark = "(sandbox) " if self.in_sandbox() else ""
+                line = input(mark + ("> " if not buf else ". "))
             except EOFError:
                 print()
                 if buf:
@@ -3965,6 +4011,8 @@ class Repl:
                 return "quit"
             elif cmd == "help":
                 print(HELP)
+            elif cmd == "sandbox":
+                self.do_sandbox()
             elif cmd == "run":
                 self.do_run(arg)
             elif cmd == "sh":
@@ -4176,12 +4224,19 @@ def whoami():
 
 def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()):
     ui.engine = engine
+
+    # SIGINT stops a sandboxed run, as Ctrl-C does in the REPL, and is ignored otherwise: the default would end
+    # genai, and with it the conversation, wherever it happened to arrive.
+    def on_sigint(signum, frame):
+        if Sandbox.running:
+            raise KeyboardInterrupt
+    signal.signal(signal.SIGINT, on_sigint)
     user, uid = whoami()
     ui.emit({"type": "hello", "protocol": PROTOCOL, "version": VERSION,
              "host": socket.gethostname(), "user": user, "uid": uid, "remote": remote,
              "features": ["proposals", "decisions", "attach", "register_tools", "compact", "context", "coding",
                           "set_coding", "skills", "files", "read", "trace", "system", "plan", "network", "clear",
-                          "models", "plugins", "edits"],
+                          "models", "plugins", "interrupt", "edits"],
              "endpoint": engine.endpoint.info(),
              "profile": {"name": engine.profile.name, "description": engine.profile.description}
              if engine.profile else None,

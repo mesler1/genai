@@ -175,7 +175,12 @@ in between.
   `no-new-privileges` is set, processes and memory are limited, the repo is read-only, one
   directory is writable, and genai uses its own config rather than yours.
 - The banner, the `:run` confirmation, the `hello` event and the audit log all say whether
-  commands run inside a sandbox or directly on the host.
+  commands run inside a sandbox or directly on the host. Inside `sandbox/run genai` the REPL also
+  marks itself: a `(sandbox) ` prompt, a bold banner line, and `:sandbox` for details. This is
+  display only, from `GENAI_SANDBOX` and `GENAI_SANDBOX_WORK_HOST`.
+- `sandbox/run shell` opens a bash in the same sandbox (same root, `/work`, config, flags and hooks).
+  It has `--network=none` unless you pass `--net`, and the endpoint's key variable is not passed in.
+  Its prompt carries a `[sandbox:podman /work]` marker, and its banner lists what is mounted.
 - Sandbox hooks ([HOOKS.md](HOOKS.md)) can only add read-only mounts and pass variables.
   They cannot make anything writable, change the container's flags, or pass `LD_PRELOAD`.
   They cannot mount your home directory, or anything under `/proc`, `/sys`, `/dev` or `/run`.
@@ -198,6 +203,9 @@ in between.
     checks each of them is empty before the command starts, and the run is refused if one
     isn't, so a mount that silently failed doesn't expose it. (A `tmpfs` over a path inside the
     overlay was found not to hide it, which is why the guard exists.)
+  - genai `--json` ignores SIGINT, except during a sandboxed run, which it stops (the container is
+    killed and the turn ends `stopped`). genai-tui sends it one for Ctrl-C or `/stop`, only to its
+    own local child; a stray signal can't end the conversation.
   - `--network=none` and no proxy variables, unless you switch the network on for the session;
     then every run asks first.
   - No home directory, `/tmp` or `/run` from the host, so no SSH agent, tmux or genai-tui
