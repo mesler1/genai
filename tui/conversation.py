@@ -411,8 +411,11 @@ class Card(Block):
         ev, k = self.ev, self.ev.get("kind")
         path = clean(ev.get("path", ""))
         return {"read": f"read {path}", "list": f"list {path or '.'}", "edit": f"edit {path}",
+                "search": f"search {clean(str(ev.get('pattern', '')))!r} in {path or '.'}"
+                          + (f" ({clean(str(ev['glob']))})" if ev.get("glob") else ""),
                 "write": f"{'overwrite' if ev.get('exists') else 'create'} {path}",
                 "command": "command", "external": f"tool {clean(ev.get('tool', ''))}",
+                "agent": "subagent · " + fit(clean(str(ev.get("task", ""))).split("\n")[0], 50),
                 "sandbox": f"sandbox · {'ONLINE' if ev.get('network') else 'offline'}",
                 "trusted": f"{clean(str(ev.get('plugin', '?')))} · {clean(str(ev.get('command', '?')))}"
                            + (" · read-only" if ev.get("read_only") else ""),
@@ -440,7 +443,10 @@ class Card(Block):
                 out.append((("$ " if i == 0 else "  ") + ln, ""))
         elif k == "trusted":                             # a plugin's trusted command: what runs, as genai shows it
             out.append(("$ " + command_text(str(ev.get("argv", ""))).replace("\n", " "), ""))
-        if k in ("sandbox", "trusted") and self.output is not None:
+        elif k == "agent":
+            task = clean(str(ev.get("task", ""))).split("\n")
+            out += [(ln, "") for ln in (task if full or len(task) <= 6 else task[:6] + ["…"])]
+        if k in ("sandbox", "trusted", "agent") and self.output is not None:
             lines = clean(self.output).rstrip("\n").split("\n") if self.output.strip() else ["(no output)"]
             if not full and len(lines) > OUTPUT_LINES:
                 out.append((f"… {len(lines) - OUTPUT_LINES} earlier lines of output (v views it all)", Q))
@@ -597,7 +603,7 @@ class Model:
         elif t == "proposal":
             card = self.add(Card(ev))
             self.cards[card.id] = card
-            if ev.get("auto") and ev.get("kind") in ("sandbox", "trusted"):
+            if ev.get("auto") and ev.get("kind") in ("sandbox", "trusted", "agent"):
                 card.state = "running"
             elif ev.get("auto"):
                 card.state = "auto"
