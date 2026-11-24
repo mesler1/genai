@@ -4,6 +4,8 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import queue
+import re
 import socket
 import shutil
 import subprocess
@@ -31,6 +33,8 @@ sys.path.insert(0, os.path.join(REPO, "tui"))
 C_PROMPT = load("prompt", os.path.join(REPO, "tui", "prompt.py"))
 IPC = load("ipc", os.path.join(REPO, "tui", "ipc.py"))
 REC = load("recorder", os.path.join(REPO, "tui", "recorder.py"))
+RAW = C.Model().feature("raw")
+F = importlib.import_module("features")
 G = load("genai_for_tui", os.path.join(REPO, "genai"))
 
 
@@ -156,6 +160,25 @@ class TestModel(unittest.TestCase):
         m.handle(dict({"type": "hello", "version": "1", "endpoint": {"name": "e", "model": "m", "base_url": "u"},
                        "sandbox": None}, **extra))
 
+    def test_clear_asks_genai_to_start_over(self):
+        m = C.Model()
+        self.hello(m, features=["clear"])
+        m.submit("hi")
+        m.handle({"type": "proposal", "id": "p1", "kind": "command", "command": "ls"})
+        m.handle({"type": "done", "reason": "reply", "context": {"used": 900, "limit": 1000}})
+        m.outbox.clear()
+        m.submit("/clear")
+        self.assertEqual(m.outbox, [{"type": "clear"}])
+        m.handle({"type": "cleared", "dropped": 3, "context": {"used": 40, "limit": 1000}})
+        self.assertEqual((m.cards, m.context), ({}, (40, 1000)))
+        self.assertEqual(len(m.blocks), 1)
+        self.assertIn("context cleared", text_of(m.blocks[0]))
+        old = C.Model()
+        self.hello(old)                                      # a genai without "clear": only the screen clears
+        old.submit("/clear")
+        self.assertNotIn({"type": "clear"}, old.outbox)
+        self.assertIn("only the screen", text_of(old.blocks[-1]))
+
     def test_reply_streams_into_one_block(self):
         m = C.Model()
         self.hello(m)
@@ -169,6 +192,106 @@ class TestModel(unittest.TestCase):
         self.assertEqual(m.context, (10, 100))
         self.assertEqual(sum(isinstance(b, C.Reply) for b in m.blocks), 1)
         self.assertIn("Hello", text_of(m.blocks[-1]))
+
+    def test_decline_a_command(self):
+        m = C.Model()
+        self.hello(m)
+        m.submit("go")
+        for i in (1, 2):
+            m.handle({"type": "proposal", "id": f"p{i}", "kind": "command", "command": f"rm -rf build{i}"})
+        m.handle({"type": "done", "reason": "command", "context": {"used": 1, "limit": 9}})
+        m.submit("/decline")                                   # the latest
+        self.assertEqual((m.cards["p2"].state, m.cards["p1"].state), ("declined", "shown"))
+        self.assertEqual((m.cards["p2"].key, m.keyed(1).id), (None, "p1"))   # Alt+1 moves to what's still open
+        self.assertIn("p2 · command", text_of(m.cards["p2"]))
+        self.assertNotIn("/run p2", text_of(m.cards["p2"]))
+        m.submit("/decline p2")
+        self.assertIn("p2 is declined", text_of(m.blocks[-1]))
+        m.submit("/decline p1")
+        m.run_started(m.cards["p1"])                             # run after all: the model isn't told
+        m.outbox.clear()
+        m.submit("ok, something else")
+        self.assertEqual([x["type"] for x in m.outbox], ["attach", "user"])
+        self.assertEqual(m.outbox[0]["label"], "declined p2")
+        self.assertIn("did not run it:\nrm -rf build2", m.outbox[0]["text"])
+        self.assertNotIn("decline", m.outbox[0])
+
+    def test_copy_a_message_and_its_reply(self):
+        m = C.Model()
+        self.hello(m)
+        m.shell = object()
+        for text, answer in (("first\nquestion", "one"), ("second", "two\x1b[2J")):
+            m.submit(text)
+            m.handle({"type": "text", "text": "Here is "})
+            m.handle({"type": "text", "text": answer})
+            m.handle({"type": "proposal", "id": f"p{m.turn}", "kind": "read", "path": "x", "auto": True})
+            m.handle({"type": "text", "text": "and more"})
+            m.handle({"type": "done", "reason": "reply", "context": {"used": 1, "limit": 9}})
+        self.assertEqual(m.feature("copy").turn_text(m, 1), "> first\n> question\n\nHere is one\n\nand more\n")
+        self.assertEqual(m.feature("copy").turn_text(m, 2),
+                         "> second\n\nHere is two\\x1b[2J\n\nand more\n")                 # escaped, as shown
+        self.assertIsNone(m.feature("copy").turn_text(m, 3))
+        m.submit("/copy")
+        self.assertEqual(m.actions[-1][:2], ("copy", 2))
+        m.submit("/copy 1")
+        self.assertEqual(m.actions[-1], ("copy", 1, m.feature("copy").turn_text(m, 1)))
+        m.submit("/copy 7")
+        self.assertIn("turn 7 isn't on screen", text_of(m.blocks[-1]))
+
+    def test_newest_commands_get_alt_keys(self):
+        m = C.Model()
+        self.hello(m)
+        for i in range(1, 12):
+            m.handle({"type": "proposal", "id": f"p{i}", "kind": "command", "command": f"echo {i}"})
+            m.handle({"type": "proposal", "id": f"r{i}", "kind": "read", "path": "x", "auto": True})
+        self.assertEqual([m.keyed(n).id for n in (1, 2, 9)], ["p11", "p10", "p3"])
+        self.assertIsNone(m.cards["p2"].key)
+        self.assertIsNone(m.keyed(10))
+        head = text_of(m.cards["p11"])
+        self.assertIn("p11 · command · Alt+1", head)
+        self.assertIn("click it, press Alt+1, or /run p11", head)
+
+    def test_model_picker(self):
+        m = C.Model()
+        self.hello(m, features=["models"])
+        m.shell = object()
+        m.submit("/model")
+        self.assertEqual(m.outbox[-1], {"type": "models"})
+        m.handle({"type": "models", "current": "m", "models": [{"id": "qwen3-coder"}, {"id": "x#{evil}"},
+                                                                 {"id": "llama"}, "junk"]})
+        self.assertEqual((m.feature("model").models, m.actions[-1]), (["qwen3-coder", "llama"], ("model_menu",)))
+        m.request({"type": "model", "n": 1})                       # the menu sends a position, never a name
+        self.assertEqual(m.outbox[-1], {"type": "model", "model": "llama"})
+        m.request({"type": "model", "n": 7})
+        self.assertEqual(m.outbox[-1], {"type": "model", "model": "llama"})       # out of range: nothing
+        m.handle({"type": "model", "endpoint": {"name": "e", "model": "llama", "base_url": "u"},
+                  "context": {"used": 5, "limit": 8000}})
+        self.assertEqual((m.snapshot()["session"]["model"], m.context), ("llama", (5, 8000)))
+        self.assertIn("model: llama", text_of(m.blocks[-1]))
+        old = C.Model()
+        self.hello(old)
+        old.submit("/model")
+        self.assertIn("can't list or switch models", text_of(old.blocks[-1]))
+
+    def test_model_menu_items_carry_only_positions(self):
+        sh = C.Shell("%1")
+        with mock.patch.object(C.subprocess, "Popen") as popen:
+            C.Model().feature("model").menu(sh, ["qwen3-coder", "bad#{x}"] + [f"m{i}" for i in range(25)], "qwen3-coder")
+        argv = popen.call_args[0][0]
+        self.assertIn("• qwen3-coder", argv)
+        self.assertNotIn("bad#{x}", " ".join(argv))
+        self.assertIn("-  7 more: /model NAME", argv)
+        picks = [a for a in argv if "request.py" in a]
+        self.assertEqual(len(picks), 19)
+        self.assertTrue(all(re.search(r"model [0-9]+\\?\"$", a) for a in picks), picks[:2])
+
+    def test_remote_banner_says_where_commands_run(self):
+        m = C.Model()
+        m.shell_where = "OUTSIDE any sandbox, directly on this host"
+        self.hello(m, remote=True, host="login1", user="svc")
+        banner = text_of(m.blocks[0], 120)
+        self.assertIn("Approved commands run ON ANOTHER HOST, login1, over ssh", banner)
+        self.assertNotIn("directly on this host", banner)
 
     def test_messages_typed_while_busy_are_queued(self):
         m = C.Model()
@@ -271,6 +394,8 @@ class TestModel(unittest.TestCase):
         buf = C.review_buffer("ls", 2, "OUTSIDE any sandbox, directly on this host", "x")
         self.assertIn("I ran this command OUTSIDE any sandbox, directly on this host (exit 2):\n```\nls\n```\nOutput:", buf)
         self.assertEqual(C.strip_comments("# a\nkeep\n#b\n"), "keep")
+        self.assertEqual(C.strip_comments("# header\n# more\nline\n## A heading\n# kept\n", top_only=True),
+                         "line\n## A heading\n# kept")
 
     def test_session_destination_confirmation_is_forwarded(self):
         args = C.parse_args(["-S", "saved", "--allow-session-endpoint-change"])
@@ -487,7 +612,7 @@ class TestRawView(unittest.TestCase):
             "request": json.dumps({"messages": [{"role": "user", "content": "hi\u202e"}]}),
             "response": ['data: {"choices":[{"delta":{"content":"he\u001b[2Jllo"}}]}', "data: [DONE]"],
             "status": "ok", "message": {"role": "assistant", "content": "hello"}, "usage": {"total_tokens": 9}}]}
-        text = C.render_trace(ev, {2: [3, 3]})
+        text = RAW.render_trace(ev, {2: [3, 3]})
         self.assertIn("Exchange 3 · turn 2 · t · 1.5 s · ok", text)
         self.assertIn("Authorization: Bearer (your API key, not shown)", text)
         self.assertIn('"content": "hi\\u202e"', text)          # escaped, never raw
@@ -495,8 +620,8 @@ class TestRawView(unittest.TestCase):
         self.assertIn('"total_tokens": 9', text)
         self.assertNotIn("\u202e", text)
         self.assertNotIn("\x1b", text)
-        self.assertIn("no longer has", C.render_trace({"exchanges": [], "kept": [5, 34]}, {}))
-        sys_text = C.render_system({"system": "You are genai", "tools": [{"name": "t"}], "model": "m"})
+        self.assertIn("no longer has", RAW.render_trace({"exchanges": [], "kept": [5, 34]}, {}))
+        sys_text = RAW.render_system({"system": "You are genai", "tools": [{"name": "t"}], "model": "m"})
         self.assertIn("You are genai", sys_text)
 
 
@@ -523,6 +648,62 @@ class TestRecorder(unittest.TestCase):
                          [(1, "make", True, 0, "building\nok"), (2, "", False, 1, "secret stuff")])
         self.assertEqual(REC.label(r.get(2)), "(a command kept out of your history)")
         self.assertEqual(r.done, 2)
+
+    def remote_session(self, r, sid="5" * 32, dest="me@hpc1"):
+        """The local shell announces a genai-ssh session, and the remote shell asks for its key."""
+        import base64
+        r.feed(mark("H") + mark("S") + mark("X", sid, base64.b64encode(dest.encode()).decode()))
+        r.feed(mark("R", sid, nonce="ssh"))
+        return r.take_handshake()
+
+    def rdone(self, rc, cmd, key, cwd="/scratch/me", host="login1\x1b[2J"):
+        import base64
+        b = lambda t: base64.b64encode(t.encode()).decode()   # noqa: E731
+        return mark("D", str(rc), "1" if cmd else "0", b(cmd or ""), "1", b(cwd), b(host), nonce=key)
+
+    def test_genai_ssh_follows_the_remote_shell_with_its_own_key(self):
+        r = REC.Recorder()
+        key = self.remote_session(r)
+        self.assertRegex(key, r"^[0-9a-f]{32}$")
+        self.assertIsNone(r.take_handshake())                          # typed once
+        self.assertIsNone(r.remote_prompt())                           # not until the remote prompt comes
+        r.feed(b"Welcome to hpc1\r\n" + self.rdone(0, None, key))
+        self.assertEqual(r.remote_prompt(), ("login1[2J", "/scratch/me"))   # what the other host says, printable
+        r.feed(b"make\r\n" + mark("S", nonce=key) + b"built\r\n" + self.rdone(2, "make", key))
+        c = r.last()
+        self.assertEqual((c.host, c.cmd, c.rc, c.text()), ("login1[2J", "make", 2, "built"))
+        self.assertEqual(REC.label(c), "login1[2J: make")
+        r.feed(mark("S", nonce=key) + b"long job\r\n")
+        self.assertIsNone(r.remote_prompt())                           # busy there: nothing can be sent
+        self.assertEqual(r.running().text(), "long job")
+        r.feed(b"Connection closed\r\n" + done(255, "genai-ssh hpc1"))     # ssh ended: the local prompt is back
+        self.assertIsNone(r.remote)
+        self.assertEqual((r.last().host, r.last().cmd), (None, "genai-ssh hpc1"))
+        self.assertNotIn(key, "".join(c.text() for c in r.finished()))
+
+    def test_genai_ssh_handshake_is_once_for_the_session_announced_and_in_time(self):
+        import base64
+        r = REC.Recorder()
+        r.feed(mark("H") + mark("S") + mark("R", "5" * 32, nonce="ssh"))         # nothing announced
+        self.assertIsNone(r.take_handshake())
+        r.feed(mark("X", "5" * 32, "aG9zdA==", nonce="ab" * 8))                   # announced without the word
+        r.feed(mark("R", "5" * 32, nonce="ssh"))
+        self.assertIsNone(r.take_handshake())
+        r.feed(mark("X", "5" * 32, base64.b64encode(b"hpc1").decode()))
+        r.feed(mark("R", "6" * 32, nonce="ssh"))                                  # another session's id
+        self.assertIsNone(r.take_handshake())
+        r.feed(mark("R", "5" * 32, nonce="ssh"))
+        key = r.take_handshake()
+        r.feed(mark("R", "5" * 32, nonce="ssh"))                                  # a second ask gets nothing
+        self.assertIsNone(r.take_handshake())
+        r.feed(mark("S", nonce="cd" * 16) + b"forged\r\n" + self.rdone(0, "rm -rf /", "cd" * 16))   # not the key
+        self.assertEqual([c.cmd for c in r.finished() if c.host], [])
+        self.assertIsNotNone(key)
+        late = REC.Recorder()
+        late.feed(mark("H") + mark("S") + mark("X", "7" * 32, "aG9zdA=="))
+        late.remote.until = 0                                                     # REMOTE_WAIT has passed
+        late.feed(mark("R", "7" * 32, nonce="ssh"))
+        self.assertIsNone(late.take_handshake())
 
     def test_markers_split_across_reads(self):
         r = REC.Recorder()
@@ -576,6 +757,262 @@ class TestRecorder(unittest.TestCase):
         self.assertFalse(m.busy)
         m.submit("again")
         self.assertTrue(m.busy)
+
+
+class TestFeatures(unittest.TestCase):
+    """tui/features: the registry, and switching features off."""
+
+    def setUp(self):
+        self.config = tempfile.mkdtemp(prefix="genai-config-")
+        self.addCleanup(shutil.rmtree, self.config, True)
+        os.makedirs(os.path.join(self.config, "genai"))
+
+    def environ(self, **extra):
+        return dict({"XDG_CONFIG_HOME": self.config}, **extra)
+
+    def write_config(self, text):
+        with open(os.path.join(self.config, "genai", "tui.json"), "w") as f:
+            f.write(text)
+
+    def model(self, environ):
+        names, warning = F.disabled_names(environ)
+        return C.Model(F.load(names, C.CORE)), warning
+
+    def test_all_built_in_features_load(self):
+        on = F.load(core=C.CORE)
+        self.assertEqual([f.name for f in on], ["model", "copy", "decline", "raw", "ssh", "files"])
+        m = C.Model()
+        self.assertEqual([f.name for f in m.features], [f.name for f in on])
+        self.assertEqual(list(m.commands())[-6:], ["/model", "/copy", "/decline", "/raw", "/system", "/files"])
+        self.assertEqual(C.feature_requests(on), {"panel": {"models"}, "menu": {"model", "copy", "raw", "system"},
+                          "files": {"list", "view", "attach", "insert"}})
+
+    def test_environment_disables_a_feature(self):
+        m, warning = self.model(self.environ(GENAI_TUI_DISABLE="copy, model"))
+        self.assertIsNone(warning)
+        self.assertEqual([f.name for f in m.features], ["decline", "raw", "ssh", "files"])
+        m.submit("/copy")
+        self.assertIn("unknown command /copy (/help lists them)", text_of(m.blocks[-1]))
+        m.submit("/help")
+        helped = "\n".join(text_of(b) for b in m.blocks)
+        self.assertNotIn("/copy", helped.replace("unknown command /copy", ""))
+        self.assertNotIn("/model", helped)
+        self.assertIn("/raw", helped)
+        m.handle({"type": "models", "models": [{"id": "x"}]})                # its events are ignored too
+        self.assertEqual(m.actions, [])
+        self.assertEqual(C.complete("/mo", C.command_list(m.features)), "/mo")
+
+    def test_config_file_disables_a_feature(self):
+        self.write_config('{"disable": ["decline", "raw"]}')
+        m, warning = self.model(self.environ())
+        self.assertIsNone(warning)
+        self.assertEqual([f.name for f in m.features], ["model", "copy", "ssh", "files"])
+        m.submit("/decline")
+        self.assertIn("unknown command /decline", text_of(m.blocks[-1]))
+
+    def test_no_config_file_means_everything_is_on(self):
+        names, warning = F.disabled_names(self.environ())
+        self.assertEqual((names, warning), (set(), None))
+
+    def test_a_malformed_config_is_ignored_with_one_warning(self):
+        for text in ("{not json", '{"disable": "copy"}', '["copy"]', '{"disable": [1]}'):
+            self.write_config(text)
+            m, warning = self.model(self.environ())
+            self.assertEqual(len(m.features), 6, text)
+            self.assertIn("was ignored, so every feature is on", warning)
+
+    def test_the_hub_refuses_the_requests_of_a_disabled_feature(self):
+        names, _ = F.disabled_names(self.environ(GENAI_TUI_DISABLE="copy"))
+        d = tempfile.mkdtemp(prefix="genai-ipc-")
+        os.chmod(d, 0o700)
+        self.addCleanup(shutil.rmtree, d, True)
+        hub = IPC.Hub(d, C.feature_requests(F.load(names, C.CORE)))
+        self.addCleanup(hub.close)
+        menu = IPC.Client(d, "menu")
+        self.addCleanup(menu.close)
+        menu.send({"type": "copy", "turn": 1})
+        menu.send({"type": "model", "n": 0})
+        got = []
+        end = time.time() + 2
+        while len(got) < 2 and time.time() < end:
+            try:
+                got.append(hub.inbox.get(timeout=0.1))
+            except Exception:
+                pass
+        self.assertEqual(got, [("hello", "menu"), ("menu", {"type": "model", "n": 0})])
+
+    def test_features_cannot_be_given_the_power_to_answer(self):
+        roles = {r: set(k) for r, k in IPC.ROLES.items()}
+        for role, kind in (("prompt", "copy"), ("menu", "key"), ("panel", "decision"), ("menu", "share"),
+                           ("root", "copy")):
+            with self.assertRaises(ValueError):
+                IPC.allow(roles, role, [kind])
+        self.assertEqual(roles, IPC.ROLES)
+
+    def test_a_model_request_from_a_role_it_does_not_allow_does_nothing(self):
+        m = C.Model()
+        m.request({"type": "copy", "turn": 1}, "panel")
+        self.assertEqual((m.blocks, m.actions), ([], []))
+
+    def test_menu_items_from_features_keep_only_fixed_words_and_numbers(self):
+        sh = C.Shell("%1")
+        m = C.Model()
+        m.shell = object()
+        m.add(C.UserMsg("hi"))
+        m.blocks[-1].turn = m.turn = 1
+        m.exchanges[1] = [1, 1]
+        here = [f.turn_menu(m, 1) for f in m.features]
+        self.assertTrue(any(here))
+        evil = [[("Copy #{x}", "c", "copy", "1"), ("ok", "c", "copy", "1; rm"), ("ok", "cc", "copy", "1"),
+                 ("fine", "f", "copy", "7")]]
+        with mock.patch.object(C.subprocess, "Popen") as popen:
+            sh.turn_menu(1, here + evil)
+            argv = popen.call_args[0][0]
+            sh.menu("p1", "here", extra=[("Decline it", "d", "decline"), ("bad#", "x", "decline"),
+                                         ("ok", "k", "rm -rf"), ("ok", "k", "$(x)")])
+            card = popen.call_args[0][0]
+        self.assertIn("Copy this message and its reply", argv)
+        self.assertIn("fine", argv)
+        self.assertNotIn("Copy #{x}", argv)
+        self.assertNotIn("ok", argv)
+        picks = [a for a in argv if "request.py" in a]
+        self.assertTrue(all(re.search(r"request.py (copy [0-9]+|raw (last|all|[0-9]+)|system)\\?\"$", a) for a in picks),
+                        picks)
+        self.assertIn("Decline it", card)
+        self.assertEqual(sum("request.py" in a for a in card), 5)         # run, edit, prompt, copy, decline
+        self.assertNotIn("bad#", card)
+
+
+class TestFilesFeature(unittest.TestCase):
+    """tui/features/files.py: what the file tree pane may ask for, and how genai's answers come back."""
+
+    def model(self, **extra):
+        m = C.Model()
+        m.handle({"type": "hello", "version": "1", "endpoint": {"name": "e", "model": "m", "base_url": "u"},
+                  "sandbox": None, "features": ["files", "read"]} | extra)
+        return m
+
+    def panes(self, m):
+        out, m.panes = m.panes, []
+        return out
+
+    def test_a_listing_is_asked_for_and_answered_for_the_same_path(self):
+        m = self.model()
+        m.request({"type": "list", "path": "src"}, "files")
+        self.assertEqual(m.outbox, [{"type": "files", "path": "src"}])
+        m.handle({"type": "files", "path": "elsewhere", "entries": []})          # nobody asked for that one
+        self.assertEqual(self.panes(m), [])
+        entries = [{"name": "app.py", "kind": "file"}]
+        m.handle({"type": "files", "path": "src", "entries": entries, "truncated": True})
+        self.assertEqual(self.panes(m), [("files", {"type": "listing", "path": "src", "entries": entries,
+                                                    "truncated": True})])
+
+    def test_a_refused_listing_or_read_is_attributed_by_its_path(self):
+        m = self.model()
+        m.request({"type": "list", "path": "a/b"}, "files")
+        m.request({"type": "view", "path": "x.txt"}, "files")
+        m.handle({"type": "error", "code": "bad_path", "message": "cannot list a/b: no such directory"})
+        self.assertEqual(self.panes(m), [("files", {"type": "listing", "path": "a/b", "error": "no such directory"})])
+        m.handle({"type": "error", "code": "bad_path", "message": "cannot read x.txt: too big", "path": "x.txt"})
+        self.assertIn("cannot view x.txt: cannot read x.txt: too big", text_of(m.blocks[-1]))
+        n = len(m.blocks)
+        m.handle({"type": "error", "code": "bad_path", "message": "cannot list zzz: no"})        # not ours
+        m.handle({"type": "error", "code": "bad_path", "message": "cannot read q: no", "path": "q"})
+        m.handle({"type": "error", "code": "bad_message", "message": "cannot list a/b: x"})
+        self.assertEqual(len(m.blocks), n + 3)                                   # the core reported each one
+
+    def test_view_and_attach_read_the_file_and_remember_why(self):
+        m = self.model()
+        m.request({"type": "view", "path": "README.md"}, "files")
+        m.request({"type": "attach", "path": "src/app.py"}, "files")
+        self.assertEqual(m.outbox, [{"type": "read", "path": "README.md"}, {"type": "read", "path": "src/app.py"}])
+        m.handle({"type": "file", "path": "src/app.py", "text": "x = 1\n", "size": 6, "secret": False, "redacted": {}})
+        m.handle({"type": "file", "path": "README.md", "text": "hi", "size": 2, "secret": False, "redacted": {}})
+        m.handle({"type": "file", "path": "other", "text": "hi", "size": 2, "secret": False, "redacted": {}})
+        self.assertEqual([a[:2] for a in m.actions], [("file", "attach"), ("file", "view")])
+
+    def test_view_shows_cleaned_text_with_a_warning_for_secrets(self):
+        app, feature = mock.Mock(), self.model().feature("files")
+        feature.view(app, {"path": "a.env", "size": 12, "secret": True, "redacted": {"api_key": 1},
+                           "text": "KEY=\x1b[31mred\x07\n"})
+        shown = app.view_text.call_args[0][0]
+        self.assertTrue(shown.startswith("a.env · 12 bytes\ngenai thinks this file holds secrets; masked: 1 api_key"))
+        self.assertNotIn("\x1b", shown)
+        self.assertNotIn("\x07", shown)
+        self.assertIn("\\x1b[31mred\\x07", shown)
+
+    def test_attach_opens_a_review_buffer_and_attaches_what_is_saved(self):
+        app, feature = mock.Mock(), self.model().feature("files")
+        app.m = C.Model()
+        app.edit.return_value = "File a.env:\n```\nKEY=1\n```"
+        feature.attach(app, {"path": "a.env", "size": 5, "secret": True, "redacted": {"api_key": 1}, "text": "KEY=1"})
+        buffer = app.edit.call_args[0][0]
+        self.assertTrue(buffer.startswith("# genai thinks this file holds secrets"))
+        self.assertIn("# EVERYTHING below is sent to the model as saved", buffer)
+        self.assertIn("File a.env:\n```\nKEY=1\n```", buffer)
+        self.assertEqual(app.m.next_attachments, [{"type": "attach", "label": "file a.env",
+                                                   "text": "File a.env:\n```\nKEY=1\n```"}])
+        app.edit.return_value = " \n"
+        feature.attach(app, {"path": "b", "text": "x"})
+        self.assertEqual(len(app.m.next_attachments), 1)                         # an empty save sends nothing
+
+    def test_insert_goes_to_the_prompt_pane_and_bad_paths_are_ignored(self):
+        m = self.model()
+        m.request({"type": "insert", "path": "src/app.py"}, "files")
+        self.assertEqual(self.panes(m), [("prompt", {"type": "insert", "text": "src/app.py"})])
+        self.assertEqual(m.actions, [("insert",)])                # and the input box gets the focus
+        m.actions.clear()
+        for bad in ("../x", "/etc/passwd", "a/../b", "a//b", "a\0b", "", "x" * 4097, 7, None, "./a", "a/"):
+            for kind in ("list", "view", "attach", "insert"):
+                m.request({"type": kind, "path": bad}, "files")
+        self.assertEqual((m.outbox, self.panes(m), m.actions), ([], [], []))
+
+    def test_a_genai_without_files_says_so(self):
+        m = self.model(features=[])
+        m.request({"type": "list", "path": "."}, "files")
+        self.assertEqual((m.outbox, self.panes(m)),
+                         ([], [("files", {"type": "unavailable", "reason": "this genai can't list files"})]))
+        m.submit("/files")
+        self.assertIn("this genai can't list files", text_of(m.blocks[-1]))
+
+    def test_the_files_command_shows_or_hides_the_pane(self):
+        m = self.model()
+        m.submit("/files")
+        self.assertEqual(m.actions, [("files",)])
+        self.assertIn("/files", m.commands())
+
+    def test_a_disabled_files_feature_has_no_command_and_the_hub_refuses_its_requests(self):
+        m = C.Model(F.load({"files"}, C.CORE))
+        m.submit("/files")
+        self.assertIn("unknown command /files", text_of(m.blocks[-1]))
+        d = tempfile.mkdtemp(prefix="genai-ipc-")
+        os.chmod(d, 0o700)
+        self.addCleanup(shutil.rmtree, d, True)
+        hub = IPC.Hub(d, C.feature_requests(m.features))
+        self.addCleanup(hub.close)
+        client = IPC.Client(d, "files")
+        self.addCleanup(client.close)
+        client.send({"type": "list", "path": "."})
+        self.assertEqual(hub.inbox.get(timeout=2), ("hello", "files"))
+        with self.assertRaises(queue.Empty):
+            hub.inbox.get(timeout=0.5)
+
+    def test_the_files_role_can_never_answer(self):
+        roles = {r: set(k) for r, k in IPC.ROLES.items()}
+        self.assertEqual(roles["files"], set())
+        for kind in ("decision", "answer", "key", "input", "hello"):
+            with self.assertRaises(ValueError):
+                IPC.allow(roles, "files", [kind])
+
+    def test_the_prompt_pane_inserts_only_plain_text_in_input_mode(self):
+        pane = C_PROMPT.Prompt.__new__(C_PROMPT.Prompt)
+        pane.ed, pane.view = C.Editor(), {"mode": "input"}
+        for text in ("src/a.py", "x\x1b[2Jy", "a\nb", "", "y" * 4097, 5):
+            pane.insert(text)
+        self.assertEqual(pane.ed.text, "src/a.py")
+        pane.view = {"mode": "ask"}
+        pane.insert("more")
+        self.assertEqual(pane.ed.text, "src/a.py")
 
 
 class TestSocket(unittest.TestCase):
@@ -755,8 +1192,11 @@ class TestInTmux(TmuxCase):
 class TestGenaiTui(TmuxCase):
     """tui/genai-tui itself: the conversation pane above a real bash pane, started through a pseudo-terminal."""
 
-    def start(self, api, editor="true", path=None):
+    def start(self, api, editor="true", path=None, args="-e test"):
         home = self.config(api)
+        if not args:        # genai then finds the endpoint the way a bare `genai` does
+            conf = dict(G.STARTER_CONFIG, default_endpoint="test")
+            G.write_private(os.path.join(home, "config.json"), json.dumps(conf))
         self.runtime = tempfile.mkdtemp(prefix="gr-", dir="/tmp")      # short: socket paths are limited
         os.chmod(self.runtime, 0o700)
         self.addCleanup(shutil.rmtree, self.runtime, True)
@@ -771,7 +1211,7 @@ class TestGenaiTui(TmuxCase):
                    TERM="xterm-256color", GENAI_TUI_SOCKET=self.sock, EDITOR=editor, VISUAL=editor,
                    XDG_RUNTIME_DIR=self.runtime, PATH=f"{path}:{os.environ['PATH']}" if path else os.environ["PATH"])
         env.pop("TMUX", None)
-        self.proc = subprocess.Popen(["script", "-qfc", f"stty cols 110 rows 40; {REPO}/tui/genai-tui -e test",
+        self.proc = subprocess.Popen(["script", "-qfc", f"stty cols 110 rows 40; {REPO}/tui/genai-tui {args}",
                                       "/dev/null"], cwd=self.wd, env=env, stdin=subprocess.PIPE,
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.addCleanup(lambda: (self.tmux("kill-server"), self.proc.wait(10)))
@@ -806,11 +1246,16 @@ class TestGenaiTui(TmuxCase):
         self.proc.stdin.write(keys.encode())
         self.proc.stdin.flush()
 
-    def click(self, text, pane="genai"):
-        """A left click (press and release, as a mouse sends them) on the first row of a pane showing text."""
+    def click(self, text, pane="genai", button=0, hold=0.3):
+        """A click on the first row of a pane showing text, at the terminal as a mouse sends it: the press, the
+        button held a moment (long enough for a menu to open), then the release."""
         y = next(i for i, ln in enumerate(self.screen(pane).splitlines()) if text in ln)
-        xy = [f"{33 + 4:02x}", f"{33 + y:02x}"]
-        self.tmux("send-keys", "-t", self.panes()[pane], "-H", "1b", "5b", "4d", "20", *xy, "1b", "5b", "4d", "23", *xy)
+        top, left = (int(v) for v in self.tmux("display", "-p", "-t", self.panes()[pane],
+                                                 "#{pane_top} #{pane_left}").split())
+        at = f"{button};{left + 5};{top + y + 1}"
+        self.at_terminal(f"\x1b[<{at}M")
+        time.sleep(hold)
+        self.at_terminal(f"\x1b[<{at}m")
 
     def shell(self, command):
         self.tmux("send-keys", "-t", self.panes()["shell"], command, "Enter")
@@ -819,12 +1264,19 @@ class TestGenaiTui(TmuxCase):
     def sent(self, api):
         return [m for m in api.requests[-1]["body"]["messages"] if m["role"] == "user"][-1]["content"]
 
+    def test_starts_with_no_arguments(self):
+        with FakeAPI([reply("hello")]) as api:
+            self.start(api, args="")
+            self.assertNotIn("unrecognized arguments", self.screen())
+            self.type("hi")
+            self.wait_for("hello")
+
     def test_run_in_the_shell_pane_then_share(self):
         turns = [call("propose_command", command="echo from-shell; (exit 3)", reason="look"), reply("exit 3, I see.")]
         with FakeAPI(turns) as api:
             self.start(api)
             self.type("look around")
-            self.wait_for("click it, or /run p1")
+            self.wait_for("or /run p1, to send")
             self.type("/run")
             where = G.where_runs(G.sandbox_info())
             self.wait_for("Run p1 in the shell pane?")
@@ -841,13 +1293,37 @@ class TestGenaiTui(TmuxCase):
             self.assertIn("Output:\n```\nfrom-shell\n```", sent)
             self.assertIn("[output of p1 (exit 3)]", sent)
 
+    def test_share_without_review(self):
+        turns = [call("propose_command", command="echo '# kept'; echo plain", reason="look"), reply("got it")]
+        with FakeAPI(turns) as api:
+            self.start(api, editor="false")                       # an editor that fails: s must not open it
+            self.type("look around")
+            self.wait_for("or /run p1, to send")
+            self.type("/run")
+            self.wait_for("Run p1 in the shell pane?")
+            self.key("y")
+            self.wait_for("s send it as it is")
+            self.key("s")
+            self.wait_for("got it")
+            sent = self.sent(api)
+            self.assertIn("I ran this command ", sent)
+            self.assertIn("Output:\n```\n# kept\nplain\n```", sent)   # a line starting with # stays
+            self.assertNotIn("EVERYTHING below", sent)
+            self.assertIn("sent without review", self.screen())
+
+    def test_panes_get_a_term_that_remote_hosts_know(self):
+        with FakeAPI([reply("hi")]) as api:
+            self.start(api)
+            self.shell("echo T=$TERM")
+            self.assertIn("T=screen-256color", self.screen("shell"))
+
     def test_click_a_command_for_its_menu(self):
         turns = [call("propose_command", command="echo via-menu", reason="r"),   # a command ends the turn
                  call("propose_command", command="echo at-prompt", reason="r")]
         with FakeAPI(turns) as api:
             self.start(api)
             self.type("go")
-            self.wait_for("click it, or /run p1")
+            self.wait_for("or /run p1, to send")
             self.click("echo via-menu")
             time.sleep(0.5)
             self.at_terminal("r")
@@ -861,7 +1337,12 @@ class TestGenaiTui(TmuxCase):
             self.assertEqual(self.window()[0], ["shell", "genai", "you"])     # shown, to watch it run
             self.key("n")
             self.type("again")
-            self.wait_for("click it, or /run p2")
+            self.wait_for("or /run p2, to send")
+            self.at_terminal("\x1b2")                              # Alt+2: p1, now that p2 has Alt+1
+            time.sleep(0.5)
+            self.at_terminal("c")
+            self.wait_for("p1 copied")
+            self.assertEqual(self.tmux("show-buffer", "-b", "genai-copy"), "echo via-menu")
             self.click("echo at-prompt")
             time.sleep(0.5)
             self.at_terminal("c")                                  # "Copy it"
@@ -916,6 +1397,119 @@ class TestGenaiTui(TmuxCase):
             self.wait_for("got it")
             self.assertIn("```\necho first-out\n```\nOutput:\n```\nfirst-out\n```", self.sent(api))
 
+    def test_switch_model_from_the_drop_down(self):
+        with FakeAPI([reply("from fake"), reply("from qwen")],
+                     models=[{"id": "fake-model"}, {"id": "qwen3-coder", "max_model_len": 65536}]) as api:
+            self.start(api)
+            self.type("hi")
+            self.wait_for("from fake")
+            self.type("/model")
+            time.sleep(0.5)
+            env = dict(os.environ, GENAI_TUI_STATE=self.runtime_state())
+            subprocess.run([sys.executable, os.path.join(REPO, "tui", "request.py"), "model", "1"], env=env, check=True)
+            self.wait_for("model: qwen3-coder from your next message")
+            self.wait_for("qwen3-coder ▾", pane="info")
+            self.type("and now?")
+            self.wait_for("from qwen")
+            self.assertEqual([r["body"]["model"] for r in api.requests if r.get("body")], ["fake-model", "qwen3-coder"])
+
+    def fake_ssh(self):
+        """A PATH with an ssh that runs the remote command here through sh, as sshd runs it through your login
+        shell, in a "remote" home of its own; with no command, a plain shell genai-tui can't follow."""
+        bindir = os.path.join(self.tmp, "ssh-bin")
+        remote = os.path.join(self.tmp, "remote-home")
+        os.makedirs(bindir)
+        os.makedirs(remote)
+        named = os.path.join(self.tmp, "named")                       # a shell tmux reports as "ssh"
+        os.makedirs(named)
+        os.symlink(shutil.which("bash"), os.path.join(named, "ssh"))
+        with open(os.path.join(bindir, "ssh"), "w") as f:
+            f.write(f'#!/bin/sh\nfor a; do last=$a; done\ncd {remote}\n'
+                    f'case $last in exec*) exec env HOME={remote} sh -c "$last" ;; esac\n'
+                    f'exec env HOME={remote} {named}/ssh --norc -i\n')
+        with open(os.path.join(bindir, "less"), "w") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        for n in ("ssh", "less"):
+            os.chmod(os.path.join(bindir, n), 0o700)
+        return bindir, remote
+
+    def test_genai_ssh_runs_and_shares_commands_on_the_other_host(self):
+        turns = [call("propose_command", command="echo on-$PWD", reason="where am I"), reply("seen it")]
+        with FakeAPI(turns) as api:
+            bindir, remote = self.fake_ssh()
+            self.start(api, path=bindir)
+            self.shell("genai-ssh -p 2222 me@hpc1")
+            self.wait_for("following the shell on the other host")
+            self.wait_for("ON ANOTHER HOST", pane="info")                # the panel says where commands run now
+            time.sleep(0.5)
+            shown = self.screen("shell")
+            self.assertNotRegex(shown, r"[0-9a-f]{32}")                  # the key was typed with echo off
+            self.type("where am I?")
+            self.wait_for("/run p1, to send")
+            self.type("/run")
+            self.wait_for("ON ANOTHER HOST")
+            self.assertIn(f":{remote}", self.screen())                   # host:directory, as the remote reports
+            self.key("y")
+            self.wait_for("Share the output")
+            self.assertIn(f"on-{remote}", self.screen("shell"))
+            self.key("y")                                                 # EDITOR=true sends it as shown
+            self.wait_for("seen it")
+            sent = self.sent(api)
+            self.assertIn("I ran this command ON ANOTHER HOST, ", sent)
+            self.assertIn(f"on-{remote}", sent)
+            self.wait_for(": echo on-$PWD", pane="info")
+            self.shell("exit")                                            # back here: commands run here again
+            time.sleep(0.5)
+            self.type("/run p1")
+            self.wait_for("directly on this host")
+            self.key("n")
+
+    def test_plain_ssh_is_not_followed_and_says_how(self):
+        turns = [call("propose_command", command="hostname", reason="r")]
+        with FakeAPI(turns) as api:
+            bindir, _ = self.fake_ssh()
+            self.start(api, path=bindir)
+            self.shell("ssh hpc1")
+            time.sleep(0.5)
+            self.type("go")
+            self.wait_for("/run p1, to send")
+            self.type("/run")
+            self.wait_for("Run p1 in the shell pane?")
+            self.key("y")
+            self.wait_for("genai-ssh [ssh options] HOST")               # refused, and told how
+            self.assertNotIn("hostname\n", self.screen("shell"))
+
+    def test_decline_from_the_menu(self):
+        turns = [call("propose_command", command="echo not-wanted", reason="r"), reply("fine, something else")]
+        with FakeAPI(turns) as api:
+            self.start(api)
+            self.type("go")
+            self.wait_for("or /run p1, to send")
+            env = dict(os.environ, GENAI_TUI_STATE=self.runtime_state())
+            subprocess.run([sys.executable, os.path.join(REPO, "tui", "request.py"), "menu", "decline", "p1"],
+                           env=env, check=True)
+            self.wait_for("you declined it")
+            self.type("then what?")
+            self.wait_for("fine, something else")
+            self.assertIn("I declined the command you proposed as p1", self.sent(api))
+            self.assertNotIn("not-wanted", self.screen("shell"))
+
+    def test_copy_a_turn_from_the_menu_and_by_command(self):
+        with FakeAPI([reply("the answer")]) as api:
+            self.start(api)
+            self.type("the question")
+            self.wait_for("the answer")
+            env = dict(os.environ, GENAI_TUI_STATE=self.runtime_state())
+            subprocess.run([sys.executable, os.path.join(REPO, "tui", "request.py"), "copy", "1"], env=env, check=True)
+            self.wait_for("turn 1 copied")
+            self.assertEqual(self.tmux("show-buffer", "-b", "genai-copy"), "> the question\n\nthe answer\n")
+            self.tmux("delete-buffer", "-b", "genai-copy")
+            self.type("/copy")
+            end = time.time() + 5
+            while time.time() < end and not self.tmux("show-buffer", "-b", "genai-copy"):
+                time.sleep(0.1)
+            self.assertIn("the answer", self.tmux("show-buffer", "-b", "genai-copy"))
+
     def test_raw_view_from_the_menu_and_by_command(self):
         bindir = tempfile.mkdtemp(prefix="genai-tui-bin-")
         self.addCleanup(shutil.rmtree, bindir, True)
@@ -927,10 +1521,7 @@ class TestGenaiTui(TmuxCase):
             self.start(api, path=bindir)
             self.type("say hi")
             self.wait_for("hello there")
-            y = next(i for i, ln in enumerate(self.screen("genai").splitlines()) if "hello there" in ln)
-            top = int(self.tmux("display", "-p", "-t", self.panes()["genai"], "#{pane_top}"))
-            left = int(self.tmux("display", "-p", "-t", self.panes()["genai"], "#{pane_left}"))
-            self.at_terminal(f"\x1b[<2;{left + 5};{top + y + 1}M")       # right-click the reply
+            self.click("hello there", button=2)                          # right-click the reply
             time.sleep(0.5)
             self.at_terminal("r")                                         # "What was sent and received for this turn"
             end = time.time() + 10
@@ -947,6 +1538,46 @@ class TestGenaiTui(TmuxCase):
                 time.sleep(0.1)
             self.assertIn("You are genai", slurp(seen))
             self.assertEqual([n for n in os.listdir(self.runtime_state()) if n.startswith("raw-")], [])
+
+    def test_the_file_tree_browses_views_attaches_and_inserts(self):
+        bindir = tempfile.mkdtemp(prefix="genai-tui-bin-")
+        self.addCleanup(shutil.rmtree, bindir, True)
+        seen = os.path.join(bindir, "seen")
+        with open(os.path.join(bindir, "less"), "w") as f:                 # a pager that keeps what it was shown
+            f.write(f'#!/bin/sh\nfor a; do last=$a; done\ncat "$last" >> {seen}\n')
+        os.chmod(os.path.join(bindir, "less"), 0o700)
+        with FakeAPI([reply("ok")]) as api:
+            self.start(api, path=bindir, args="-e test --no-panel")
+            os.makedirs(os.path.join(self.wd, "src"))
+            for name, text in (("src/app.py", "print('hi')\n"), ("README.md", "# Title\nsome words\n"),
+                               (".env", "API_KEY=sk-abcdefghijklmnopqrstuvwxyz0123456789\n")):
+                with open(os.path.join(self.wd, name), "w") as f:
+                    f.write(text)
+            os.symlink("README.md", os.path.join(self.wd, "link"))
+            self.type("/files")
+            end = time.time() + 10
+            while time.time() < end and "README.md" not in self.screen("files"):
+                self.tmux("send-keys", "-t", self.panes()["files"], "r")      # it listed the empty directory at start
+                time.sleep(0.5)
+            self.wait_for("README.md", pane="files")
+            self.wait_for("src/", pane="files")
+            self.assertRegex(self.screen("files"), r"⚠ \.env")
+            self.assertRegex(self.screen("files"), r"↪ link")
+            send = lambda *keys: self.tmux("send-keys", "-t", self.panes()["files"], *keys)
+            send("Enter")                                                     # src/ is selected first: open it
+            self.wait_for("app.py", pane="files")
+            send("Down", "Down", "Down", "Down")                              # app.py, .env, link, README.md
+            send("i")
+            self.wait_for("README.md", pane="you")
+            send("Enter")                                                     # view it
+            end = time.time() + 10
+            while time.time() < end and not os.path.exists(seen):
+                time.sleep(0.1)
+            time.sleep(0.3)
+            self.assertIn("README.md · 19 bytes", slurp(seen))
+            self.assertIn("some words", slurp(seen))
+            send("a")
+            self.wait_for("attached file README.md")
 
     def runtime_state(self):
         return next(os.path.join(self.runtime, d) for d in os.listdir(self.runtime) if d.startswith("genai-tui."))
@@ -977,7 +1608,7 @@ class TestGenaiTui(TmuxCase):
             self.wait_for("all good")
             self.assertIn("planned-new", self.sent(api))
             self.type("check again")
-            self.wait_for("click it, or /run p5")
+            self.wait_for("or /run p5, to send")
             self.wait_for("step 3 of the plan, already run once", pane="genai")
             self.assertEqual(self.screen("shell").count("cat a.txt"), 1)
 
@@ -1015,9 +1646,7 @@ class TestGenaiTui(TmuxCase):
             for c in ("echo before-mark", "echo in-context"):
                 self.tmux("send-keys", "-t", sh, c, "Enter")
                 time.sleep(0.3)
-            y = next(i for i, ln in enumerate(self.screen("shell").splitlines()) if ln.endswith("echo in-context"))
-            top = int(self.tmux("display", "-p", "-t", sh, "#{pane_top}"))
-            self.at_terminal(f"\x1b[<2;5;{top + y + 1}M")              # a right-click, as the terminal reports it
+            self.click("echo in-context", pane="shell", button=2)            # held, then released on the same spot
             time.sleep(0.5)
             self.at_terminal("m")                                   # "Mark start of context here"
             time.sleep(0.5)
@@ -1102,7 +1731,7 @@ class TestGenaiTui(TmuxCase):
         with FakeAPI([call("propose_command", command="echo should-not-run", reason="r")]) as api:
             self.start(api)
             self.type("go")
-            self.wait_for("click it, or /run p1")
+            self.wait_for("or /run p1, to send")
             self.tmux("send-keys", "-t", self.panes()["shell"], "sleep 5", "Enter")
             time.sleep(0.5)
             self.type("/run p1")
@@ -1120,7 +1749,7 @@ class TestGenaiTui(TmuxCase):
         with FakeAPI(turns) as api:
             self.start(api, editor=editor)
             self.type("go")
-            self.wait_for("click it, or /run p1")
+            self.wait_for("or /run p1, to send")
             self.type("/run")
             self.wait_for("Run p1")
             self.key("e")

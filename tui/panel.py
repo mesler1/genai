@@ -14,7 +14,7 @@ import os
 import queue
 import sys
 
-from conversation import A, D, Q, R, W, clean, fit, width
+from conversation import A, D, Q, R, STATE_MARK, W, clean, fit, width
 from ipc import Client
 
 STATE = os.environ.get("GENAI_TUI_STATE", "")
@@ -51,7 +51,13 @@ def view(st, w, sel):
     for label, value, role in (("endpoint", h.get("endpoint"), ""), ("model", h.get("model"), ""),
                                ("profile", h.get("profile") or "none", "" if h.get("profile") else Q),
                                ("session", h.get("session") or "not saved", "" if h.get("session") else Q)):
+        if label == "model":                             # a click opens the /model drop-down
+            add([(f"{label:9}", Q), (fit(clean(value or "?"), w - 11), role), (" ▾", A)], "model")
+            continue
         add([(f"{label:9}", Q), (fit(clean(value or "?"), w - 9), role)])
+    gw = h.get("genai_where")
+    if gw:
+        add([("genai    ", Q), (fit(clean(gw[0].removeprefix("genai runs ")), w - 9), R if gw[1] == R else W)])
     where = h.get("shell_where")
     if where:
         add([("commands ", Q), (fit("run " + clean(where), w - 9), D if where.startswith("inside") else R)])
@@ -70,7 +76,7 @@ def view(st, w, sel):
     ctx = st.get("context") or [None, None]
     add(bar(ctx[0] or 0, ctx[1], w) if ctx[0] is not None else [("not measured yet", Q)])
     if st.get("busy"):
-        add([("genai is replying", W)])
+        add([("… genai is replying", W)])
     plan = st.get("plan")
     if plan:
         head("PLAN")
@@ -120,7 +126,8 @@ def view(st, w, sel):
     for p in props[-12:]:
         role = {"waiting": W, "error": R, "declined": Q, "done": D, "ran": D, "running": A}.get(p.get("state"), "")
         title = fit(clean(p.get("title", "")), max(w - 20, 4))
-        status = clean(p.get("state", "") + (f" · {p['detail']}" if p.get("detail") else ""))
+        status = clean(STATE_MARK.get(p.get("state"), "·") + " " + p.get("state", "")
+                       + (f" · {p['detail']}" if p.get("detail") else ""))
         add([(f"{clean(p.get('id', '?')):4} ", Q), (title, ""), (" ", ""), (fit(status, max(w - 6 - width(title), 1)), role)])
     return lines, acts
 
@@ -185,6 +192,8 @@ class Panel:
         st = self.st or {}
         if what == "coding":
             ok = self.request({"type": "coding", "on": not st.get("coding")})
+        elif what == "model":
+            ok = self.request({"type": "models"})
         elif isinstance(what, tuple) and what[0] == "cmd" and type(what[1]) is int:
             ok = self.request({"type": "command", "n": what[1]})
         elif isinstance(what, int) and what < len(self.skills()):
