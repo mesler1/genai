@@ -39,7 +39,7 @@ class Edits(Approvals):
                 return props
             props.append(ev)
             if not ev.get("auto"):
-                g.send({"type": "decision", "id": ev["id"], "decision": answers.pop(0)})
+                g.send({"type": "decision", "id": ev["id"], "digest": ev["digest"], "decision": answers.pop(0)})
 
     def audit(self):
         home = os.path.join(self.tmp, "home", "genai")

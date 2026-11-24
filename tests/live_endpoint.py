@@ -138,7 +138,7 @@ class Json:
             if ev["type"] == "proposal":
                 props.append(ev)
                 if ev["kind"] != "command" and not ev.get("auto"):
-                    self.send({"type": "decision", "id": ev["id"], "decision": decide(ev)})
+                    self.send({"type": "decision", "id": ev["id"], "digest": ev["digest"], "decision": decide(ev)})
             elif ev["type"] in ("done", "error"):
                 return props, ev
 
