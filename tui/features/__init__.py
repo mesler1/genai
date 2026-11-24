@@ -14,7 +14,7 @@ import importlib
 import json
 import os
 
-BUILTIN = ("model", "copy", "decline", "raw", "ssh", "files")
+BUILTIN = ("model", "copy", "decline", "raw", "ssh", "files", "sandbox", "edits")
 
 
 class Feature:

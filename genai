@@ -68,7 +68,9 @@ ENDPOINT_KEYS = {"name", "base_url", "model", "key_env", "key_file", "context_li
 REMOTE_URL = re.compile(r"http://127\.0\.0\.1:([0-9]{1,5})((?:/[A-Za-z0-9._~-]+)*)")
 TOKEN_RE = re.compile(r"[0-9A-Fa-f]{32,128}")
 TOKEN_HEADER = "X-Genai-Token"
-PROFILE_KEYS = {"name", "description", "endpoint", "persona", "skills", "plugins", "params", "coding", "sandbox"}
+PROFILE_KEYS = {"name", "description", "endpoint", "persona", "skills", "plugins", "params", "coding", "sandbox",
+                "edits"}
+EDITS_MODES = ("ask", "approved-files")   # "approved-files": a further edit to a file you approved applies
 NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
 ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
@@ -448,6 +450,8 @@ class Sandbox:
     discarded, files that look like secrets are hidden, there is no network unless switched on, nothing from
     the home directory, a time limit, and memory and process limits where the host allows them."""
 
+    running = False            # a container is running now: --json mode turns SIGINT into Ctrl-C only then
+
     def __init__(self, conf, root, notice):
         self.conf, self.root, self.notice = conf, os.path.realpath(root), notice
         self.podman = shutil.which("podman")
@@ -469,7 +473,8 @@ class Sandbox:
 
     def info(self):
         return {"engine": "podman", "image": self.conf["image"], "network": self.network,
-                "timeout": self.conf["timeout"], "problem": self.problem()}
+                "timeout": self.conf["timeout"], "memory": self.conf.get("memory"), "pids": self.conf.get("pids"),
+                "problem": self.problem()}
 
     def masks(self, values=()):
         """Files and directories to hide in the sandbox, relative to the project: secret-looking names, and
@@ -583,6 +588,7 @@ class Sandbox:
 
         reader = threading.Thread(target=drain, daemon=True)
         reader.start()
+        Sandbox.running = True
         try:
             rc = proc.wait(timeout=self.conf["timeout"])
         except subprocess.TimeoutExpired:
@@ -591,6 +597,8 @@ class Sandbox:
         except KeyboardInterrupt:
             self._kill(name, proc)
             raise
+        finally:
+            Sandbox.running = False
         reader.join(5)
         proc.stdout.close()
         out = strip_ansi(b"".join(chunks).decode("utf-8", "replace"))
@@ -1454,6 +1462,9 @@ class Profile:
                 raise GenaiError(f"{path}: params may not set '{k}'", EXIT_PROFILE)
         if not isinstance(self.coding, bool):
             raise GenaiError(f"{path}: 'coding' must be true or false", EXIT_PROFILE)
+        self.edits = data.get("edits", "ask")
+        if self.edits not in EDITS_MODES:
+            raise GenaiError(f"{path}: 'edits' must be \"ask\" or \"approved-files\"", EXIT_PROFILE)
         self.sandbox = parse_sandbox(data["sandbox"], path) if "sandbox" in data else None
 
     @classmethod
@@ -1490,6 +1501,9 @@ class Profile:
         if self.coding:
             lines.append("  [!] grants coding mode: the model reads and lists files in your working directory "
                          "without asking (writes still ask)")
+        if self.edits == "approved-files":
+            lines.append("  [!] edits: approved-files: after you approve an edit or write to a file, further edits to "
+                         "it apply without asking, for the rest of the session")
         if self.sandbox:
             b = self.sandbox
             lines.append(f"  sandbox:  podman, image {one(b['image'])}, {b['timeout']} s limit: in coding mode the model "
@@ -2722,6 +2736,8 @@ class Engine:
         self.anywhere = anywhere
         self.coding_override = None     # the refused place coding mode is on in, when --coding-anywhere allowed it
         self.plan = None                # the plan the user approved, if any; never saved with the session
+        self.edits = profile.edits if profile else "ask"
+        self.approved_files = set()     # files an edit or write was approved for, this process only; never saved
         self.coding_from = "session" if session.coding else None
         refused = coding_refusal(os.getcwd()) if session.coding else None
         if refused and not anywhere:    # an override is per run: a resumed session needs the flag again
@@ -2856,6 +2872,52 @@ class Engine:
     def can_run(self):
         """Is run_in_sandbox offered? Coding mode, a sandbox that works here, and someone to see what runs."""
         return bool(self.box and self.session.coding and self.ui.performs and not self.box.problem())
+
+    def set_edits(self, mode, source=":edits"):
+        """"ask": every edit and write asks. "approved-files": a further edit or write to a file you approved one for,
+        in this process, applies without asking (still shown, logged and bound to the file as it was)."""
+        if mode not in EDITS_MODES:
+            raise GenaiError(f"edits must be one of: {', '.join(EDITS_MODES)}", EXIT_USAGE, "bad_message")
+        self.edits = mode
+        self.audit.log("edits", mode=mode, source=source)
+        if mode == "ask" and self.approved_files:          # off forgets them: on again starts from none
+            self.reset_approved_files(source)
+        if mode == "approved-files":
+            self.ui.notice("[!] edits: approved-files: a further edit or write to a file you approved one for applies "
+                           "without asking, for the rest of this session; :edits reset forgets those files")
+
+    def reset_approved_files(self, source=":edits reset"):
+        self.audit.log("edits_reset", files=sorted(self.approved_files), source=source)
+        self.approved_files.clear()
+
+    def edits_info(self):
+        return {"mode": self.edits, "files": sorted(self.approved_files)}
+
+    @staticmethod
+    def file_key(path):
+        try:
+            return "/".join(split_rel(path))
+        except ValueError:
+            return None
+
+    def auto_edit(self, p):
+        """Would this edit or write apply without asking? Only with edits "approved-files", for a file already in the
+        approved set, and never for a new file, a hidden or secret-looking one, or a whole replacement."""
+        if self.edits != "approved-files" or p.kind not in ("edit", "write") or not self.ui.performs:
+            return False
+        key = self.file_key(p.fields.get("path"))
+        if key is None or key not in self.approved_files or is_hidden(key.split("/")):
+            return False
+        f = p.fields
+        if p.kind == "write" and (not f.get("exists") or f.get("undiffable")):
+            return False
+        new = f.get("_content") if p.kind == "edit" else f.get("content")
+        try:
+            old = self.wd.read(f["path"])
+        except (ValueError, OSError):
+            return False
+        secrets_ = [k for k in self.secrets() if k]
+        return not any(looks_secret(t) or any(k in t for k in secrets_) for t in (old, new or ""))
 
     def set_network(self, on, source=":network"):
         if not self.box:
@@ -3156,6 +3218,10 @@ class Engine:
             self.audit.log("proposal", **rec)
         live = [p for p in props if not p.error]
         for p in live:
+            if p.kind in ("edit", "write") and not p.auto and self.auto_edit(p):
+                p.auto, p.fields["approved_file"] = True, True
+                self.audit.log("auto_edit", id=p.id, kind=p.kind, path=p.fields["path"])
+        for p in live:
             if p.kind == "command":
                 self.ui.show_command(p)
             elif p.auto:
@@ -3171,6 +3237,16 @@ class Engine:
             if p.kind != "external":
                 p.decision = p.decision if p.decision in ("accept", "decline") else "decline"
                 self.audit.log("decision", id=p.id, decision=p.decision)
+            if p.kind in ("edit", "write") and self.edits == "approved-files":
+                key = self.file_key(p.fields.get("path"))
+                if p.decision == "accept" and key and key not in self.approved_files:
+                    self.approved_files.add(key)
+                    self.audit.log("edits_remember", path=key, id=p.id)
+                    self.ui.edits(self.edits_info())
+                elif p.decision != "accept" and key in self.approved_files:
+                    self.approved_files.discard(key)        # a decline: that file asks again
+                    self.audit.log("edits_forget", path=key, id=p.id)
+                    self.ui.edits(self.edits_info())
             if p.kind == "plan" and p.decision == "accept":
                 self.adopt_plan(p)
 
@@ -3304,7 +3380,8 @@ class Engine:
             self.audit.log("file_op", id=p.id, kind=p.kind, path=p.fields.get("path"), status="error", error=str(e))
             self.ui.result(p, "error", str(e))
             return f"error: {e}"
-        self.audit.log("file_op", id=p.id, kind=p.kind, path=p.fields.get("path"), status="ok", auto=p.auto)
+        self.audit.log("file_op", id=p.id, kind=p.kind, path=p.fields.get("path"), status="ok", auto=p.auto,
+                       **({"approved_file": True} if p.fields.get("approved_file") else {}))
         self.ui.result(p, "ok", note)
         step = p.fields.get("plan_step")
         if step and self.plan:
@@ -3324,7 +3401,7 @@ class Engine:
         except KeyboardInterrupt:
             p.stopped = True
             self.audit.log("sandbox_exit", id=p.id, exit=None, stopped=True)
-            self.ui.result(p, "error", "stopped by you")
+            self.ui.result(p, "stopped", "the container was killed")
             return "stopped by the user before it finished"
         except GenaiError as e:
             ran, rc, out, note = False, None, "", str(e)
@@ -3544,6 +3621,9 @@ class PlainUI:
     def show_auto(self, p):
         pass
 
+    def edits(self, info):
+        pass
+
     def decide(self, pending):
         for p in pending:
             p.decision = "decline" if p.kind != "external" else "declined"
@@ -3585,6 +3665,12 @@ class TtyUI(PlainUI):
                    f"{show_exact(f['argv'])}")
         elif p.kind == "sandbox":
             eprint(f"  [{p.id}] sandbox, offline: {one_line(p.fields['reason'])[0]}\n    $ {show_exact(p.fields['command'])}")
+        elif p.fields.get("approved_file"):
+            what = "Edit" if p.kind == "edit" else "Overwrite"
+            self.out.write(f"\n\033[1m[{p.id}] {p.kind}\033[0m — {one_line(p.fields.get('reason', ''))[0]}\n"
+                           f"{what} {one_line(p.fields['path'])[0]} (without asking: you approved an edit to it "
+                           f"earlier; :edits ask stops that):\n{margin(p.fields.get('diff') or '(no changes)')}\n")
+            self.out.flush()
         else:
             eprint(f"  (coding mode) {p.kind} {one_line(p.fields['path'])[0]}")
 
@@ -3724,6 +3810,9 @@ class JsonUI:
 
     def show_auto(self, p):
         self.emit(p.event())
+
+    def edits(self, info):
+        self.emit({"type": "edits", **info})
 
     def plan(self, plan):
         self.emit({"type": "plan", "plan": None if plan is None else {
@@ -3875,6 +3964,7 @@ Commands (on an empty buffer):
   :attach PATH    attach a file to your next message
   :coding on|off  let the model read and list files here without asking
   :network [on|off]  the sandbox's network, for this session (on: each sandboxed run asks)
+  :edits [ask|approved-files|reset]  approved-files: a further edit to a file you approved applies without asking
   :plan [clear]   show the approved plan and how far it has got, or drop it
   :compact [-e]   prune old file contents and output; summarize if still large
   :context        show how full the context is
@@ -3883,10 +3973,16 @@ Commands (on an empty buffer):
   :skills         list skills, marking the ones in use
   :skill NAME on|off  use a blessed skill from the next message on, or stop using it
   :bless PATH     bless a skill, endpoint or profile
+  :sandbox        where genai and your commands run: in a sandbox or on this host
   :help           this text            :quit         leave"""
 
 
 HOOK_BANNER = "hook: notify (runs {} when genai waits for you)"
+
+
+def sandbox_work_host():
+    """The host path of /work, as sandbox/run reported it. Display only, so it is escaped."""
+    return one_line(os.environ.get("GENAI_SANDBOX_WORK_HOST", "").strip())[0]
 
 
 class Repl:
@@ -3895,9 +3991,19 @@ class Repl:
         self.capture = False
         self.attachments = []
 
+    def in_sandbox(self):
+        """Is genai itself running in a sandbox? Then the prompt and banner say so."""
+        return bool(getattr(self.e, "sandbox", None))
+
     def banner(self):
         p = self.e.endpoint
         print(f"genai {VERSION} — {one_line(p.name)[0]}: {one_line(p.model)[0]} at {one_line(p.base_url)[0]}")
+        if self.in_sandbox():
+            name = one_line(self.e.sandbox["name"])[0]
+            host = sandbox_work_host()
+            line = (f"IN THE {name.upper()} SANDBOX: /work" + (f" = {host}" if host else "") +
+                    ", no host home (:sandbox for details)")
+            print(f"\033[1m{line}\033[0m" if sys.stdout.isatty() else line)
         if os.geteuid() == 0:
             print(f"  [!] running as root on {one_line(socket.gethostname())[0]}: "
                   "every command it proposes would run as root")
@@ -3919,6 +4025,29 @@ class Repl:
             print("  " + HOOK_BANNER.format(short_path(self.e.notifier.path)))
         print("Type :help for commands. A line with only '..' sends.")
 
+    def do_sandbox(self):
+        sb = self.e.sandbox
+        print(f"genai runs {where_runs(sb)}")
+        if sb:
+            host = sandbox_work_host()
+            print(f"  working directory: {one_line(os.getcwd())[0]}"
+                  + (f" (/work is {host} on the host, writable)" if host else ""))
+            print("  the repo is at /opt/genai, read-only; the host's /usr and /etc are read-only; "
+                  "nothing else from your home")
+            print(f"  config: {one_line(short_path(self.e.cfg.home))[0]} (the sandbox's own, not your real one)")
+            print("  changes outside /work and the config directory are discarded when it exits")
+            try:
+                host_name = urllib.parse.urlsplit(self.e.endpoint.base_url).hostname
+                socket.getaddrinfo(host_name, None)
+                print(f"  network: the endpoint's host {one_line(host_name)[0]} resolves, so the network looks available")
+            except (OSError, ValueError, TypeError):
+                print("  network: the endpoint's host does not resolve here, so the network looks off")
+            print("  sandbox/run shell opens a shell in it (from the host)")
+        else:
+            print("  sandbox/run genai runs genai in a podman sandbox instead (see the README)")
+        if self.e.box:
+            print("  profile sandbox: " + self.box_line())
+
     def box_line(self):
         b = self.e.box
         problem = b.problem()
@@ -3938,7 +4067,8 @@ class Repl:
         buf = []
         while True:
             try:
-                line = input("> " if not buf else ". ")
+                mark = "(sandbox) " if self.in_sandbox() else ""
+                line = input(mark + ("> " if not buf else ". "))
             except EOFError:
                 print()
                 if buf:
@@ -3979,6 +4109,8 @@ class Repl:
                 return "quit"
             elif cmd == "help":
                 print(HELP)
+            elif cmd == "sandbox":
+                self.do_sandbox()
             elif cmd == "run":
                 self.do_run(arg)
             elif cmd == "sh":
@@ -4000,6 +4132,16 @@ class Repl:
                 self.e.set_coding(arg == "on")
                 self.e.session.save()
                 print(f"coding mode is {'ON' if self.e.session.coding else 'off'}")
+            elif cmd == "edits":
+                if arg == "reset":
+                    self.e.reset_approved_files()
+                elif arg in EDITS_MODES:
+                    self.e.set_edits(arg)
+                elif arg:
+                    print("usage: :edits, :edits ask, :edits approved-files or :edits reset")
+                info = self.e.edits_info()
+                print(f"edits: {info['mode']}" + ("" if info["mode"] == "ask" else
+                      "; applied without asking: " + (", ".join(one_line(f)[0] for f in info["files"]) or "none yet")))
             elif cmd == "network":
                 if arg in ("on", "off"):
                     self.e.set_network(arg == "on")
@@ -4180,12 +4322,19 @@ def whoami():
 
 def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()):
     ui.engine = engine
+
+    # SIGINT stops a sandboxed run, as Ctrl-C does in the REPL, and is ignored otherwise: the default would end
+    # genai, and with it the conversation, wherever it happened to arrive.
+    def on_sigint(signum, frame):
+        if Sandbox.running:
+            raise KeyboardInterrupt
+    signal.signal(signal.SIGINT, on_sigint)
     user, uid = whoami()
     ui.emit({"type": "hello", "protocol": PROTOCOL, "version": VERSION,
              "host": socket.gethostname(), "user": user, "uid": uid, "remote": remote,
              "features": ["proposals", "decisions", "attach", "register_tools", "compact", "context", "coding",
                           "set_coding", "skills", "files", "read", "trace", "system", "plan", "network", "clear",
-                          "models", "plugins"],
+                          "models", "plugins", "interrupt", "edits"],
              "endpoint": engine.endpoint.info(),
              "profile": {"name": engine.profile.name, "description": engine.profile.description}
              if engine.profile else None,
@@ -4194,7 +4343,7 @@ def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()
              "coding_from": engine.coding_from if engine.session.coding else None,
              "coding_override": engine.coding_override if engine.session.coding else None, "cwd": os.getcwd(),
              "sandbox": engine.sandbox, "audit": engine.audit.path,
-             "runner": engine.box.info() if engine.box else None,
+             "runner": engine.box.info() if engine.box else None, "edits": engine.edits_info(),
              "skills": [s.name for s in engine.skills],
              "plugins": [p.name for p in engine.plugins],
              "tools": list(INTRINSICS)})
@@ -4285,6 +4434,16 @@ def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()
                 ui.error(str(err), "coding_refused")
             ui.emit({"type": "coding", "on": engine.session.coding, "coding_from": engine.coding_from,
                      "coding_override": engine.coding_override if engine.session.coding else None})
+        elif t == "edits":
+            mode, reset = msg.get("mode"), msg.get("reset")
+            if (mode is not None and mode not in EDITS_MODES) or (reset is not None and not isinstance(reset, bool)):
+                ui.error("edits takes 'mode': \"ask\" or \"approved-files\", and/or 'reset': true", "bad_message")
+                continue
+            if reset:
+                engine.reset_approved_files("wrapper")
+            if mode is not None:
+                engine.set_edits(mode, "wrapper")
+            ui.emit({"type": "edits", **engine.edits_info()})
         elif t == "network":
             on = msg.get("on")
             if on is not None and not isinstance(on, bool):
