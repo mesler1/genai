@@ -56,7 +56,7 @@ that the defence has to be deterministic controls around the model.
 - The system prompt states the rules, but every rule is also enforced in code: the path check,
   the approval step, the step limit. A persona is appended after the rules and cannot grant
   anything.
-- The ways untrusted text gets in are few and known: `read_file` and `list_dir`, `-f` and
+- The ways untrusted text gets in are few and known: `read_file`, `list_dir` and `search_files`, `-f` and
   `:attach`, output you share from `:run` or `:sh`, and tool results from a wrapper. There is no
   web or URL tool.
 

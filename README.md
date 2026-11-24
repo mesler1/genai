@@ -61,7 +61,7 @@ model, default skills, sampling settings and coding mode:
 | Skills | `genai -p NAME -k slurm` (skills must be blessed) |
 | Plugins (trusted commands) | `genai -p NAME --plugin slurm` (plugins must be blessed; [Plugins and trusted commands](#plugins-and-trusted-commands)) |
 | Sessions | `genai -p NAME -S nightly "summarize" > out.txt` |
-| Coding mode | `genai -e NAME --coding` (reads stop asking, except files that look like secrets; writes still ask) |
+| Coding mode | `genai -e NAME --coding` (reads stop asking, except files that look like secrets; writes still ask; the model can also search the files) |
 | Coding mode where it is refused | `genai -e NAME --coding-anywhere` (prints what that exposes) |
 | Builds and tests the model runs itself | a profile with `"coding": true` and a `"sandbox"` ([Sandboxed runs](#sandboxed-runs)) |
 | Start over, keeping the session | `:clear` in the REPL, `/clear` in genai-tui (the model forgets the conversation; the saved session keeps it) |
@@ -335,6 +335,15 @@ or set `GENAI_TUI_DISABLE=copy,model` for one run. Names are `model`, `copy`, `d
 refuses its requests. Without `ssh`, a genai-ssh session isn't followed. No file means
 everything is on; a file that can't be read is ignored, with a note in the conversation.
 
+## Searching files
+
+In coding mode the model also has `search_files`: a literal string (not a regular expression), optionally
+under a directory and only in files whose name matches a `glob` such as `*.py`, case-insensitive if it asks.
+It runs without asking, like a read, and gets back each matching line as `path:line: text`. It looks only where
+an automatic read would: hidden files and directories and symlinks are skipped, and so are binary files, files
+over the read limit and files that look like they hold secrets (it is told how many). It stops after 2000 files,
+200 matches or 5 seconds, and each line is cut to 200 characters around the match.
+
 ## Sandboxed runs
 
 In coding mode the model can only propose commands, so you run every build and test yourself. A
@@ -464,7 +473,7 @@ decision.
 | `type` | Meaning |
 |---|---|
 | `text` | A piece of the model's reply. |
-| `proposal` | `id`, `kind` (`read`, `list`, `write`, `edit`, `command`, `sandbox`, `trusted`, `external`, `invalid`), and the proposal's fields, such as `path`, `content`, `diff`, `command` and `reason`. `auto: true` means it needed no approval: coding mode, or a read the approved plan names. A `plan` proposal has `goal` and numbered `steps` (`n`, `kind`: `read`, `edit`, `write` or `command`, a `path` or the exact `command`, and `why`). While a plan is approved, a proposal it covers has `plan_step`; a command matching an approved step character for character also has `preapproved: true`, so the wrapper may run it without asking again; a command, edit or write the plan doesn't cover has `off_plan: true`. Edits and writes always ask. `secret: true` means the file looks like it holds secrets. A command is only shown: the wrapper runs it, if the user wants to, and can share the output with `attach`. A `sandbox` proposal (`command`, `reason`, `network`, `image`) is genai running the command in the sandbox: offline it has `auto: true` and runs at once; online it waits for a `decision`. A `trusted` proposal (`plugin`, `command`, `params`, `argv`, `read_only`) is a plugin's trusted command: `read_only` ones have `auto: true` and run at once; others wait for a `decision`. |
+| `proposal` | `id`, `kind` (`read`, `list`, `search`, `write`, `edit`, `command`, `sandbox`, `trusted`, `external`, `invalid`), and the proposal's fields, such as `path`, `content`, `diff`, `command` and `reason`. `auto: true` means it needed no approval: coding mode, or a read the approved plan names. A `plan` proposal has `goal` and numbered `steps` (`n`, `kind`: `read`, `edit`, `write` or `command`, a `path` or the exact `command`, and `why`). While a plan is approved, a proposal it covers has `plan_step`; a command matching an approved step character for character also has `preapproved: true`, so the wrapper may run it without asking again; a command, edit or write the plan doesn't cover has `off_plan: true`. Edits and writes always ask. `secret: true` means the file looks like it holds secrets. A command is only shown: the wrapper runs it, if the user wants to, and can share the output with `attach`. A `sandbox` proposal (`command`, `reason`, `network`, `image`) is genai running the command in the sandbox: offline it has `auto: true` and runs at once; online it waits for a `decision`. A `trusted` proposal (`plugin`, `command`, `params`, `argv`, `read_only`) is a plugin's trusted command: `read_only` ones have `auto: true` and run at once; others wait for a `decision`. A `search` proposal (`pattern`, `path`, optional `glob` and `ignore_case`) is the model's `search_files`, offered only in coding mode, and always `auto`. |
 | `result` | `id`, `status`, `detail`: what happened to a proposal that was performed. For a `sandbox` or `trusted` run, also `exit` (`null` if it was killed at the time limit or never ran) and `output`, exactly what the model is sent. |
 | `done` | The turn ended. `reason` is `reply`, `command`, `stopped` (Ctrl-C during a sandboxed run) or `step_limit`; `context` gives `used` and `limit`; `exchanges` gives the first and last exchange numbers of this turn, for `trace` (also on an `error` that ends a turn). |
 | `context` | The conversation is getting near the context limit. |
