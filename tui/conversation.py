@@ -425,6 +425,8 @@ class Card(Block):
         ev, k = self.ev, self.ev.get("kind")
         path = clean(ev.get("path", ""))
         return {"read": f"read {path}", "list": f"list {path or '.'}", "edit": f"edit {path}",
+                "search": f"search {clean(str(ev.get('pattern', '')))!r} in {path or '.'}"
+                          + (f" ({clean(str(ev['glob']))})" if ev.get("glob") else ""),
                 "write": f"{'overwrite' if ev.get('exists') else 'create'} {path}",
                 "command": "command", "external": f"tool {clean(ev.get('tool', ''))}",
                 "sandbox": f"sandbox · {'ONLINE' if ev.get('network') else 'offline'}",
