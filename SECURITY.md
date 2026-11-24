@@ -387,14 +387,24 @@ on the user's machine; the proxy requires the token (`X-Genai-Token`) and adds t
 
 The config is trusted because it arrived over the user's own ssh channel: genai-tui checked the user's blessed
 files before sending, and genai blesses nothing on the remote host for it. It logs a `remote_config` event with
-the hashes of what it received, never the token. Root on the remote host can use the session's token while the
+the hashes of what it received, never the token.
+
+Skills and plugins follow the same rule. The ones in use go in the config line with every file of their
+directories, and only if they are blessed on the user's machine. genai on the host hashes those bytes again and
+refuses the whole config if a hash differs from the one blessed there. It builds the skill or plugin from those
+bytes in memory and never reads or writes this host's copies. Nothing blessed only on the remote host can be
+turned on, so whoever controls that host's `~/.config/genai` can't add a skill to the prompt or a trusted command
+to the model's tools. A plugin's programs are looked for on the host, with the usual checks (its fixed search
+path, never `PATH`; owned by the user or root, not writable by others), so the Slurm plugin's commands run on the
+cluster. The program that runs is whatever is installed there, and a command whose program is missing there is
+left out. Root on the remote host can use the session's token while the
 tunnel is up, and can read that session's prompts, replies and files, which are on that host anyway. It cannot
 read the key, which was never sent. Everything else (coding-mode refusals, the sandbox, the audit log, sessions)
 works for the user genai runs as. As root, the REPL banner warns that proposed commands would run as root.
 
 How genai-tui sets it up (`genai-tui --remote`), and what each part is for:
 
-- The launcher runs `genai --remote-config` here: the endpoint and profile are checked and blessed on your machine,
+- The launcher runs `genai --remote-config` here: the endpoint, profile, skills and plugins are checked and blessed on your machine,
   and exported without `key_env`, `key_file`, `proxy`, `headers` or `ca_bundle`, so neither the key nor a secret in a
   header goes over the connection. Only the remote half of the config lacks them: `tui/keyproxy.py`, here, uses the
   endpoint's own proxy and headers.
