@@ -213,8 +213,10 @@ in between.
     isn't, so a mount that silently failed doesn't expose it. (A `tmpfs` over a path inside the
     overlay was found not to hide it, which is why the guard exists.)
   - genai `--json` ignores SIGINT, except during a sandboxed run, which it stops (the container is
-    killed and the turn ends `stopped`). genai-tui sends it one for Ctrl-C or `/stop`, only to its
-    own local child; a stray signal can't end the conversation.
+    killed and the turn ends `stopped`). The JSON `stop` message does the same, from whoever
+    holds genai's stdin (genai-tui, here or over ssh, for Ctrl-C or `/stop`): it can only stop a
+    run, never start or approve anything. An older genai without it gets a SIGINT, only from
+    genai-tui to its own local child; a stray signal can't end the conversation.
   - `--network=none` and no proxy variables, unless you switch the network on for the session;
     then every run asks first.
   - No home directory, `/tmp` or `/run` from the host, so no SSH agent, tmux or genai-tui
