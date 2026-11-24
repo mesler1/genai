@@ -403,6 +403,49 @@ class TestSkills(Tmp):
         self.assertEqual(G.load_skills(cfg, ["slurm"], notes.append), [])
         self.assertIn("changed", notes[-1])
 
+    def test_repl_raw_and_system(self):
+        with FakeAPI([reply("first \x1b[31mred"), reply("second")]) as api:
+            home, path = make_home(self.tmp, api.url)
+            bless_path(home, path)
+            cfg = G.Config(home)
+            eng = G.Engine(cfg, G.Endpoint.load(path), G.Session(cfg), G.PlainUI(io.StringIO()))
+            repl, out = G.Repl(eng), io.StringIO()
+            with mock.patch.object(sys, "stdout", out):
+                repl.command(":raw")
+                self.assertIn("nothing has been sent", out.getvalue())
+                repl.send("one")
+                repl.send("two")
+                out.seek(0)
+                out.truncate(0)
+                repl.command(":raw")
+                text = out.getvalue()
+                self.assertIn("Exchange 2 · turn 2", text)
+                self.assertNotIn("Exchange 1", text)
+                self.assertIn("User-Agent: genai/", text)
+                out.seek(0)
+                out.truncate(0)
+                repl.command(":raw 1")
+                self.assertIn("Exchange 1 · turn 1", out.getvalue())
+                out.seek(0)
+                out.truncate(0)
+                repl.command(":raw all")
+                self.assertEqual(out.getvalue().count("═" * 78), 4)
+                out.seek(0)
+                out.truncate(0)
+                repl.command(":raw 7")
+                self.assertIn("turn 7 has no exchanges", out.getvalue())
+                out.seek(0)
+                out.truncate(0)
+                repl.command(":system")
+                self.assertIn("── System prompt", out.getvalue())
+                self.assertIn('"name": "propose_command"', out.getvalue())
+
+    def test_page_escapes_control_characters(self):
+        out = io.StringIO()
+        with mock.patch.object(sys, "stdout", out):
+            G.page("ok\nred \x1b[31mtext\u202e")
+        self.assertEqual(out.getvalue().split("\n")[:2], ["ok", "red \\x1b[31mtext\\u202e"])
+
     def test_repl_skill_command(self):
         home = self.path("home", "genai")
         d = os.path.join(home, "skills", "slurm")
