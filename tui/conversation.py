@@ -764,6 +764,8 @@ class Model:
                       "followed and /run can send them there (plain ssh can't be)")
             self.note("Alt+1 … Alt+9 open the menu of a command proposal, Alt+1 the newest (as its card says); "
                       "↑↓ and Enter, or the letter shown, choose")
+            for f in self.features:
+                f.help(self)
         elif cmd == "/coding":
             if arg in ("on", "off"):
                 self.send({"type": "coding", "on": arg == "on"})
@@ -1448,6 +1450,8 @@ class App:
         self.prompt = os.environ.get("GENAI_TUI_PROMPT") if shell else None   # input happens in that pane
         # the other panes connect here; a feature that is off has no requests, so the Hub refuses them
         self.hub = Hub(self.state_dir, feature_requests(on)) if self.state_dir else None
+        if self.hub:
+            self.hub.plugins = any(f.name == "plugins" for f in on)
         fifo = fifo_path(self.state_dir) if self.state_dir else None
         self.rec = Recorder(fifo if fifo and os.path.exists(fifo) else None)   # each shell command and its output
         if shell:
@@ -2248,6 +2252,8 @@ class App:
                 self.from_prompt(msg)
             elif role in ("panel", "files"):
                 self.m.request(msg, role)
+            elif role.startswith("plugin:") and self.m.feature("plugins"):
+                self.m.feature("plugins").request(self.m, role, msg)
             elif role == "menu" and (msg.get("type") in ("share", "mark") or self.m.takes(role, msg.get("type"))):
                 self.m.request(msg, role)
             elif role == "menu" and msg.get("type") == "menu" and msg.get("action") == "open":

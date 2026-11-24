@@ -530,6 +530,88 @@ class TestSandboxRuns(unittest.TestCase):
         self.assertNotEqual(m.outbox[-1], {"type": "network", "on": False})   # waits until the reply ends
 
 
+class TestPluginsFeature(unittest.TestCase):
+    ROWS = [{"name": "slurm", "description": "cluster", "enabled": True, "blessed": True, "status": "blessed",
+             "pane": "slurm.py", "dir": "/opt/genai/plugins/slurm",
+             "commands": [{"name": "queue", "describe": "the queue", "read_only": True, "params": {}},
+                          {"name": "cancel", "describe": "cancel a job", "read_only": False, "params": {}}]},
+            {"name": "off", "description": "not on", "enabled": False, "blessed": True, "pane": None, "dir": "/x",
+             "commands": [{"name": "x", "read_only": True}]}]
+
+    def model(self, remote=False):
+        m = C.Model()
+        m.handle({"type": "hello", "version": "1", "endpoint": {"name": "e", "model": "m", "base_url": "u"},
+                  "sandbox": None, "features": ["plugins"], "remote": remote})
+        m.handle({"type": "plugins", "plugins": self.ROWS})
+        m.outbox.clear()
+        return m
+
+    def notes(self, m, n=6):
+        return "\n".join(text_of(b, 200) for b in m.blocks[-n:])
+
+    def test_list_switch_and_pane(self):
+        m = self.model()
+        m.submit("/plugins")
+        self.assertIn("[on ] slurm: cluster · pane: /plugins slurm pane", self.notes(m))
+        self.assertIn("[off] off: not on", self.notes(m))
+        m.submit("/plugins off on")
+        self.assertEqual(m.outbox[-1], {"type": "plugin", "name": "off", "on": True})
+        m.submit("/plugins slurm pane")
+        self.assertEqual(m.actions[-1], ("plugin_pane", "slurm", "/opt/genai/plugins/slurm/slurm.py"))
+        m.submit("/plugins off pane")
+        self.assertIn("switch it on first", self.notes(m, 1))
+        m.submit("/plugins nope on")
+        self.assertIn("no plugin named nope", self.notes(m, 1))
+        m = self.model(remote=True)
+        m.submit("/plugins slurm pane")
+        self.assertIn("don't run in remote mode yet", self.notes(m, 1))
+
+    def test_a_pane_runs_its_own_read_only_commands_and_hears_the_answer(self):
+        m = self.model()
+        f = m.feature("plugins")
+        f.request(m, "plugin:slurm", {"type": "run", "id": "s1", "command": "queue", "params": {}})
+        self.assertEqual(m.outbox[-1], {"type": "run", "id": "pl1", "plugin": "slurm", "command": "queue",
+                                        "params": {}})
+        m.handle({"type": "ran", "id": "pl1", "exit": 0, "output": "1|a\n"})
+        self.assertEqual(m.panes[-1], ("plugin:slurm", {"type": "ran", "id": "s1", "exit": 0, "output": "1|a\n"}))
+        m.handle({"type": "ran", "id": "pl1", "exit": 0, "output": "again"})       # answered once only
+        self.assertEqual(len(m.panes), 1)
+        m.panes.clear()
+        for role, msg, why in (("plugin:slurm", {"type": "run", "id": 2, "command": "cancel"}, "only read-only"),
+                               ("plugin:slurm", {"type": "run", "id": 3, "command": "x"}, "no such command"),
+                               ("plugin:slurm", {"type": "run", "id": 4, "command": "queue", "params": {"a": 1}},
+                                "no such command")):
+            f.request(m, role, msg)
+            self.assertIn(why, m.panes[-1][1]["error"])
+        f.request(m, "plugin:off", {"type": "run", "id": 5, "command": "x"})
+        self.assertEqual(m.panes[-1], ("plugin:off", {"type": "refused", "why": "this plugin is not on"}))
+        self.assertEqual(len([o for o in m.outbox if o["type"] == "run"]), 1)
+
+    def test_insert_and_attach(self):
+        m = self.model()
+        f = m.feature("plugins")
+        f.request(m, "plugin:slurm", {"type": "insert", "text": "12345\x1b[2J"})
+        self.assertEqual(m.panes[-1], ("prompt", {"type": "insert", "text": C.clean("12345\x1b[2J")}))
+        f.request(m, "plugin:slurm", {"type": "attach", "label": "job 7", "text": "JobId=7"})
+        self.assertEqual(m.actions[-1], ("plugin_attach", "slurm", "job 7", "JobId=7"))
+        f.request(m, "plugin:slurm", {"type": "attach", "text": "x" * 70000})
+        self.assertEqual(len(m.actions), 1)
+
+    def test_help_and_panel_list_the_tools(self):
+        m = self.model()
+        m.submit("/help")
+        text = "\n".join(text_of(b, 200) for b in m.blocks)
+        self.assertIn("slurm: queue (read-only) the queue", text)
+        self.assertIn("slurm: cancel (asks) cancel a job", text)
+        self.assertNotIn("off: x", text)
+        PANEL = load("panel", os.path.join(REPO, "tui", "panel.py"))
+        lines, _ = PANEL.view(m.snapshot(), 50, None)
+        shown = "\n".join("".join(t for t, _ in ln) for ln in lines)
+        self.assertIn("PLUGINS", shown)
+        self.assertIn("slurm · /plugins slurm pane", shown)
+        self.assertIn("  queue, cancel", shown)
+
+
 class TestPlan(unittest.TestCase):
     def plan_model(self):
         m = C.Model()
@@ -794,17 +876,17 @@ class TestFeatures(unittest.TestCase):
 
     def test_all_built_in_features_load(self):
         on = F.load(core=C.CORE)
-        self.assertEqual([f.name for f in on], ["model", "copy", "decline", "raw", "ssh", "files"])
+        self.assertEqual([f.name for f in on], ["model", "copy", "decline", "raw", "ssh", "files", "plugins"])
         m = C.Model()
         self.assertEqual([f.name for f in m.features], [f.name for f in on])
-        self.assertEqual(list(m.commands())[-6:], ["/model", "/copy", "/decline", "/raw", "/system", "/files"])
+        self.assertEqual(list(m.commands())[-7:], ["/model", "/copy", "/decline", "/raw", "/system", "/files", "/plugins"])
         self.assertEqual(C.feature_requests(on), {"panel": {"models"}, "menu": {"model", "copy", "raw", "system"},
                           "files": {"list", "view", "attach", "insert"}})
 
     def test_environment_disables_a_feature(self):
         m, warning = self.model(self.environ(GENAI_TUI_DISABLE="copy, model"))
         self.assertIsNone(warning)
-        self.assertEqual([f.name for f in m.features], ["decline", "raw", "ssh", "files"])
+        self.assertEqual([f.name for f in m.features], ["decline", "raw", "ssh", "files", "plugins"])
         m.submit("/copy")
         self.assertIn("unknown command /copy (/help lists them)", text_of(m.blocks[-1]))
         m.submit("/help")
@@ -820,7 +902,7 @@ class TestFeatures(unittest.TestCase):
         self.write_config('{"disable": ["decline", "raw"]}')
         m, warning = self.model(self.environ())
         self.assertIsNone(warning)
-        self.assertEqual([f.name for f in m.features], ["model", "copy", "ssh", "files"])
+        self.assertEqual([f.name for f in m.features], ["model", "copy", "ssh", "files", "plugins"])
         m.submit("/decline")
         self.assertIn("unknown command /decline", text_of(m.blocks[-1]))
 
@@ -832,7 +914,7 @@ class TestFeatures(unittest.TestCase):
         for text in ("{not json", '{"disable": "copy"}', '["copy"]', '{"disable": [1]}'):
             self.write_config(text)
             m, warning = self.model(self.environ())
-            self.assertEqual(len(m.features), 6, text)
+            self.assertEqual(len(m.features), 7, text)
             self.assertIn("was ignored, so every feature is on", warning)
 
     def test_the_hub_refuses_the_requests_of_a_disabled_feature(self):
@@ -1060,6 +1142,23 @@ class TestSocket(unittest.TestCase):
         self.assertEqual(self.received(2), [("hello", "panel"), ("panel", {"type": "coding", "on": True})])
         self.assertEqual(self.received(1, timeout=0.3), [])
 
+    def test_a_plugin_pane_may_only_run_insert_and_attach(self):
+        self.hub.plugins = True
+        pane = IPC.Client(self.dir, "plugin:slurm")
+        self.addCleanup(pane.close)
+        for kind in ("input", "key", "decision", "coding", "skill", "share", "run"):
+            pane.send({"type": kind})
+        self.assertEqual(self.received(2), [("hello", "plugin:slurm"), ("plugin:slurm", {"type": "run"})])
+        self.assertEqual(self.received(1, timeout=0.3), [])
+
+    def test_plugin_panes_need_the_plugins_feature(self):
+        for on, role in ((False, "plugin:slurm"), (True, "plugin:Bad"), (True, "plugin:")):
+            self.hub.plugins = on
+            c = IPC.Client(self.dir, role)
+            self.addCleanup(c.close)
+            c.send({"type": "run"})
+            self.assertEqual(self.received(1, timeout=0.3), [], role)
+
     def test_unknown_role_and_bad_lines_end_the_connection(self):
         import socket
         for first in (b'{"type": "hello", "role": "root"}\n', b"not json\n", b"x" * (IPC.MAX_LINE + 10)):
@@ -1206,8 +1305,8 @@ class TestInTmux(TmuxCase):
 class TestGenaiTui(TmuxCase):
     """tui/genai-tui itself: the conversation pane above a real bash pane, started through a pseudo-terminal."""
 
-    def start(self, api, editor="true", path=None, args="-e test"):
-        home = self.config(api)
+    def start(self, api, editor="true", path=None, args="-e test", keep_home=False):
+        home = self.home if keep_home else self.config(api)      # keep_home: the test made self.home with config()
         if not args:        # genai then finds the endpoint the way a bare `genai` does
             conf = dict(G.STARTER_CONFIG, default_endpoint="test")
             G.write_private(os.path.join(home, "config.json"), json.dumps(conf))
@@ -1554,6 +1653,41 @@ class TestGenaiTui(TmuxCase):
                 time.sleep(0.1)
             self.assertIn("You are genai", slurp(seen))
             self.assertEqual([n for n in os.listdir(self.runtime_state()) if n.startswith("raw-")], [])
+
+    def test_the_slurm_console_runs_its_commands_through_genai(self):
+        with FakeAPI([reply("ok")]) as api:
+            home = self.config(api)
+            fake = os.path.join(self.tmp, "slurm-bin")
+            os.mkdir(fake, 0o755)
+            nodes = "c001|batch*|idle|0/32/0/32|192000|none\nc002|batch*|drained|0/0/32/32|192000|bad DIMM\n"
+            for prog, body in (("sinfo", f'case "$*" in *-N*) printf "{nodes}";; *-s*) echo "batch*|up|1:00:00|2|0/1/1/2|0/32/32/64";; esac'),
+                               ("squeue", 'echo "7|batch|train|alice|RUNNING|1:00|1|c001"'),
+                               ("scontrol", 'echo "NodeName=$3 State=DRAIN Reason=bad_DIMM"')):
+                with open(os.path.join(fake, prog), "w") as f:
+                    f.write("#!/bin/sh\n" + body + "\n")
+                os.chmod(os.path.join(fake, prog), 0o755)
+            pdir = os.path.join(home, "plugins", "slurm")
+            shutil.copytree(os.path.join(REPO, "plugins", "slurm"), pdir)
+            with open(os.path.join(pdir, "plugin.json")) as f:
+                manifest = json.load(f)
+            manifest["search"] = [fake]
+            with open(os.path.join(pdir, "plugin.json"), "w") as f:
+                json.dump(manifest, f)
+            G.Config(home).set_blessed(pdir, {"kind": "plugin", "name": "slurm", "hash": G.hash_skill(pdir)[0]})
+            G.write_private(os.path.join(home, "config.json"), json.dumps(dict(G.STARTER_CONFIG, default_plugins=["slurm"])))
+            self.home = home
+            self.start(api, args="-e test --no-panel", keep_home=True)
+            self.type("/plugins slurm pane")
+            end = time.time() + 15
+            while time.time() < end and "slurm" not in self.panes():
+                time.sleep(0.2)
+            self.wait_for("bad DIMM", pane="slurm", timeout=15)
+            self.wait_for("running 1", pane="slurm")
+            self.tmux("send-keys", "-t", self.panes()["slurm"], "Down", "Enter")
+            self.wait_for("NodeName=c002", pane="slurm")
+            self.tmux("send-keys", "-t", self.panes()["slurm"], "Escape")
+            self.tmux("send-keys", "-t", self.panes()["slurm"], "i")
+            self.wait_for("c002", pane="you")
 
     def test_the_file_tree_browses_views_attaches_and_inserts(self):
         bindir = tempfile.mkdtemp(prefix="genai-tui-bin-")

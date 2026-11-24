@@ -141,6 +141,15 @@ data can be sensitive (other users' names, job names, node names, paths in job d
 before you bless them: a broad pattern still lets the model choose freely within it. Plugins are not available
 through `--config-stdin` yet.
 
+A plugin's pane (genai-tui) is third-party code too, blessed with the plugin's directory and run as you. It runs
+out of process, in a tmux pane of its own: never inside the conversation pane, which holds the answers to genai
+(and, in remote mode, the ssh control socket and the key proxy's token). Its socket role, `plugin:NAME`, may only
+run its own plugin's read-only commands through genai (with genai's checks, cache and rate limits), put text in
+the input box, where you see it before anything is sent, and offer text that opens in your editor before it can
+go with a message. It can't answer a question, approve anything, or run a command that would ask. As for every
+pane, the boundary is your user account: another program running as you could connect in that role, as it could
+drive tmux. genai-tui starts the pane from the directory genai reported; it isn't re-hashed at that moment.
+
 ### 4. Identity, privilege and credentials
 
 *ASI03, AML.T0083, AML.T0098.* Agents get compromised through the credentials within their
