@@ -415,6 +415,8 @@ class Card(Block):
                 "write": f"{'overwrite' if ev.get('exists') else 'create'} {path}",
                 "command": "command", "external": f"tool {clean(ev.get('tool', ''))}",
                 "sandbox": f"sandbox · {'ONLINE' if ev.get('network') else 'offline'}",
+                "trusted": f"{clean(str(ev.get('plugin', '?')))} · {clean(str(ev.get('command', '?')))}"
+                           + (" · read-only" if ev.get("read_only") else ""),
                 "plan": f"plan · {len(ev.get('steps') or [])} steps"}.get(k, str(k))
 
     def body(self, full=False):
@@ -437,7 +439,9 @@ class Card(Block):
         if k in ("command", "sandbox"):
             for i, ln in enumerate(command_text(ev.get("command", "")).split("\n")):
                 out.append((("$ " if i == 0 else "  ") + ln, ""))
-        if k == "sandbox" and self.output is not None:
+        elif k == "trusted":                             # a plugin's trusted command: what runs, as genai shows it
+            out.append(("$ " + command_text(str(ev.get("argv", ""))).replace("\n", " "), ""))
+        if k in ("sandbox", "trusted") and self.output is not None:
             lines = clean(self.output).rstrip("\n").split("\n") if self.output.strip() else ["(no output)"]
             if not full and len(lines) > OUTPUT_LINES:
                 out.append((f"… {len(lines) - OUTPUT_LINES} earlier lines of output (v views it all)", Q))
@@ -594,7 +598,7 @@ class Model:
         elif t == "proposal":
             card = self.add(Card(ev))
             self.cards[card.id] = card
-            if ev.get("auto") and ev.get("kind") == "sandbox":
+            if ev.get("auto") and ev.get("kind") in ("sandbox", "trusted"):
                 card.state = "running"
             elif ev.get("auto"):
                 card.state = "auto"
@@ -1541,6 +1545,8 @@ class App:
             c = self.m.pending[0]
             more = f"  ({len(self.m.pending)} waiting)" if len(self.m.pending) > 1 else ""
             lines = [[(f"Allow {c.id}: {c.title()}?", W), (more, Q)]]
+            if c.ev.get("kind") == "trusted":
+                lines.append([("  $ ", A), (fit(command_text(str(c.ev.get("argv", ""))).replace("\n", " "), w - 6), "")])
             if c.ev.get("kind") == "sandbox":
                 lines.append([("  $ ", A), (fit(command_text(c.ev.get("command", "")).replace("\n", "⏎"), w - 6), "")])
                 lines.append([("  The network is on: on a throwaway copy, but it could send what it reads anywhere.", R)])

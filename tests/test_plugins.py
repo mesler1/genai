@@ -260,9 +260,13 @@ class TestBinary(PluginBase):
         self.manifest["commands"]["x"] = {"argv": ["nothere"]}
         pl = self.load()
         with mock.patch.dict(os.environ, {"PATH": other}):
-            with self.assertRaises(G.GenaiError) as cm:
-                pl.resolve()
-        self.assertIn("not found", str(cm.exception))
+            self.assertEqual(pl.resolve(), ["x"])          # not installed here: only its command is left out
+        self.assertNotIn("x", pl.commands)
+        self.assertIn("queue", pl.commands)
+        self.manifest["commands"] = {"x": {"argv": ["nothere"]}}
+        with self.assertRaises(G.GenaiError) as cm:
+            self.load().resolve()
+        self.assertIn("none of its programs", str(cm.exception))
 
     def test_group_writable_directory_is_refused(self):
         os.chmod(self.bin, 0o775)

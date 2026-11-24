@@ -996,7 +996,7 @@ def trusted_binary(argv0, search):
     paths = [argv0] if os.path.isabs(argv0) else [os.path.join(d, argv0) for d in search]
     path = next((p for p in paths if os.path.exists(p)), None)
     if path is None:
-        raise GenaiError(f"{argv0}: not found in {', '.join(search)}")
+        raise GenaiError(f"{argv0}: not found in {', '.join(search)}", EXIT_USAGE, "not_found")
     real = os.path.realpath(path)
     st = os.stat(real)
     if not stat.S_ISREG(st.st_mode) or not os.access(real, os.X_OK):
@@ -1147,12 +1147,23 @@ class Plugin:
         return {c.tool: c for c in self.commands.values()}
 
     def resolve(self):
-        """Find every command's program now, refusing the plugin if one can't be trusted."""
-        for c in self.commands.values():
+        """Find every command's program now, refusing the plugin if one can't be trusted. A program that isn't
+        installed here (a cluster without accounting has no sacct) only leaves out its commands; the names of
+        those are returned."""
+        missing = []
+        for c in list(self.commands.values()):
             try:
                 c.resolve()
-            except (GenaiError, OSError) as e:
+            except GenaiError as e:
+                if e.kind != "not_found":
+                    raise GenaiError(f"plugin '{self.name}', command {c.name}: {e}", EXIT_USAGE, "bad_plugin") from None
+                missing.append(c.name)
+                del self.commands[c.name]
+            except OSError as e:
                 raise GenaiError(f"plugin '{self.name}', command {c.name}: {e}", EXIT_USAGE, "bad_plugin") from None
+        if not self.commands:
+            raise GenaiError(f"plugin '{self.name}': none of its programs is installed here", EXIT_USAGE, "bad_plugin")
+        return missing
 
     def summary(self):
         """The review screen for blessing: every command with what it may run, and the programs it would use."""
@@ -2716,7 +2727,9 @@ class Engine:
             if clash:
                 raise GenaiError(f"plugin '{name}': a registered tool already has the name {clash[0]}", EXIT_USAGE,
                                  "bad_plugin")
-            pl.resolve()
+            missing = pl.resolve()
+            if missing:
+                self.ui.notice(f"plugin '{name}': {', '.join(missing)} left out, as the program isn't installed here")
             self.plugins = [p for p in self.plugins if p.name != name] + [pl]
         else:
             self.plugins = [p for p in self.plugins if p.name != name]
