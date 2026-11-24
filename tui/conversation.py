@@ -582,6 +582,8 @@ class Model:
             self.reply = None
         if t == "hello":
             self.hello, self.coding, self.runner = ev, bool(ev.get("coding")), ev.get("runner")
+            if ev.get("remote") and isinstance(ev.get("host"), str):
+                self.shell_where = remote_where(clean(ev["host"]))   # the shell pane follows genai to that host
             self.add(Banner(ev, self.shell_where))
             if "skills" in (ev.get("features") or []):
                 self.send({"type": "skills"})          # for the info panel; not printed
