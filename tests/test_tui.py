@@ -650,6 +650,57 @@ class TestSandboxStatus(unittest.TestCase):
         self.assertIn("the model's sandbox: none", text)
 
 
+class TestEditsFeature(unittest.TestCase):
+    def model(self, edits=None, features=("edits",)):
+        m = C.Model()
+        m.handle({"type": "hello", "version": "1", "endpoint": {"name": "e", "model": "m", "base_url": "u"},
+                  "sandbox": None, "features": list(features), "edits": edits or {"mode": "ask", "files": []}})
+        m.outbox.clear()
+        return m
+
+    def panel(self, m):
+        PANEL = load("panel", os.path.join(REPO, "tui", "panel.py"))
+        lines, _ = PANEL.view(m.snapshot(), 42, None)
+        return "\n".join("".join(t for t, _ in ln) for ln in lines)
+
+    def test_commands_send_and_show(self):
+        m = self.model()
+        m.submit("/edits")
+        self.assertIn("every edit and write asks", text_of(m.blocks[-1], 200))
+        self.assertNotIn("EDITS", self.panel(m))
+        m.submit("/edits approved-files")
+        self.assertEqual(m.outbox[-1], {"type": "edits", "mode": "approved-files"})
+        m.handle({"type": "edits", "mode": "approved-files", "files": []})
+        self.assertIn("none yet", text_of(m.blocks[-1], 200))
+        m.handle({"type": "edits", "mode": "approved-files", "files": ["src/a.py", "b\x1b[2J"]})
+        text = self.panel(m)
+        self.assertIn("EDITS", text)
+        self.assertIn("  src/a.py", text)
+        self.assertNotIn("\x1b", text)
+        self.assertIn("/edits reset forgets them", text)
+        m.submit("/edits reset")
+        self.assertEqual(m.outbox[-1], {"type": "edits", "reset": True})
+        m.submit("/edits maybe")
+        self.assertIn("usage: /edits", text_of(m.blocks[-1], 200))
+        m = self.model(features=())
+        m.submit("/edits ask")
+        self.assertEqual(m.outbox, [])
+        self.assertIn("this genai can't", text_of(m.blocks[-1], 200))
+
+    def test_an_auto_applied_edit_is_shown_in_full(self):
+        m = self.model({"mode": "approved-files", "files": ["a.txt"]})
+        m.submit("go")
+        m.handle({"type": "proposal", "id": "p2", "kind": "edit", "path": "a.txt", "diff": "@@ -1 +1 @@\n-two\n+three\n",
+                  "reason": "r", "auto": True, "approved_file": True})
+        card = m.cards["p2"]
+        self.assertEqual((card.state, m.pending), ("accepted", []))
+        shown = text_of(card, 100)
+        self.assertIn("+three", shown)
+        self.assertIn("applied without asking", shown)
+        m.handle({"type": "result", "id": "p2", "status": "ok", "detail": "edited a.txt"})
+        self.assertEqual(card.state, "done")
+
+
 class TestPlan(unittest.TestCase):
     def plan_model(self):
         m = C.Model()
@@ -914,17 +965,17 @@ class TestFeatures(unittest.TestCase):
 
     def test_all_built_in_features_load(self):
         on = F.load(core=C.CORE)
-        self.assertEqual([f.name for f in on], ["model", "copy", "decline", "raw", "ssh", "files", "sandbox"])
+        self.assertEqual([f.name for f in on], ["model", "copy", "decline", "raw", "ssh", "files", "sandbox", "edits"])
         m = C.Model()
         self.assertEqual([f.name for f in m.features], [f.name for f in on])
-        self.assertEqual(list(m.commands())[-7:], ["/model", "/copy", "/decline", "/raw", "/system", "/files", "/sandbox"])
+        self.assertEqual(list(m.commands())[-8:], ["/model", "/copy", "/decline", "/raw", "/system", "/files", "/sandbox", "/edits"])
         self.assertEqual(C.feature_requests(on), {"panel": {"models"}, "menu": {"model", "copy", "raw", "system"},
                           "files": {"list", "view", "attach", "insert"}})
 
     def test_environment_disables_a_feature(self):
         m, warning = self.model(self.environ(GENAI_TUI_DISABLE="copy, model"))
         self.assertIsNone(warning)
-        self.assertEqual([f.name for f in m.features], ["decline", "raw", "ssh", "files", "sandbox"])
+        self.assertEqual([f.name for f in m.features], ["decline", "raw", "ssh", "files", "sandbox", "edits"])
         m.submit("/copy")
         self.assertIn("unknown command /copy (/help lists them)", text_of(m.blocks[-1]))
         m.submit("/help")
@@ -940,7 +991,7 @@ class TestFeatures(unittest.TestCase):
         self.write_config('{"disable": ["decline", "raw"]}')
         m, warning = self.model(self.environ())
         self.assertIsNone(warning)
-        self.assertEqual([f.name for f in m.features], ["model", "copy", "ssh", "files", "sandbox"])
+        self.assertEqual([f.name for f in m.features], ["model", "copy", "ssh", "files", "sandbox", "edits"])
         m.submit("/decline")
         self.assertIn("unknown command /decline", text_of(m.blocks[-1]))
 
@@ -952,7 +1003,7 @@ class TestFeatures(unittest.TestCase):
         for text in ("{not json", '{"disable": "copy"}', '["copy"]', '{"disable": [1]}'):
             self.write_config(text)
             m, warning = self.model(self.environ())
-            self.assertEqual(len(m.features), 7, text)
+            self.assertEqual(len(m.features), 8, text)
             self.assertIn("was ignored, so every feature is on", warning)
 
     def test_the_hub_refuses_the_requests_of_a_disabled_feature(self):

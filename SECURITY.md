@@ -269,8 +269,23 @@ safe and prompts are rare enough to be read.
   the whole new content instead, says the file is replaced entirely, and says when it will stay
   executable.
 - Coding mode exists to cut prompt fatigue, and it removes only read prompts. Writes always
-  ask. It never applies to hidden files, is tied to the directory it was granted in, and is
+  ask (unless you opt into edits `approved-files`, below). It never applies to hidden files, is tied to the directory it was granted in, and is
   shown in the banner with where it came from.
+- `"edits": "approved-files"` (opt-in, off by default) is the one exception to "writes always
+  ask". After you approve an edit or write to a file, further ones to that same path apply
+  without asking. The trade-off: text the model reads (a prompt injection in a file, a web page
+  you shared, a tool's output) could then rewrite a file you approved once, without a question.
+  What limits it:
+  - It covers only files you approved by hand in this process. The set is in memory only, never
+    saved with a session, so a resume or a new session starts empty; `:edits reset` or switching
+    to `ask` empties it, and declining any edit to a file takes that file out.
+  - New files, hidden files, a file or new text that looks like a secret (including the endpoint
+    key), and a whole replacement of a file that can't be diffed always ask.
+  - Each one is still shown with its diff, written to the audit log (`auto_edit`, and `file_op`
+    with `approved_file`), and bound to the file's state when it was proposed, like any write.
+    The model can't change a file's mode, so that can't happen behind it either.
+  - It is independent of plans: approving a plan adds no files to the set (a planned edit you
+    then approve counts like any other), and the set doesn't approve plan steps.
 - Coding mode is refused in your home directory, in any directory that contains it (so `/`),
   in genai's own config directory and in the usual credential directories (`~/.ssh`, `~/.gnupg`,
   `~/.aws`, `~/.kube`, `~/.docker`, `~/.password-store`, `~/.config/gcloud`). A project

@@ -619,6 +619,9 @@ class Model:
                 card.start(not self.remote())
             elif ev.get("auto") and ev.get("kind") == "trusted":
                 card.state = "running"
+            elif ev.get("auto") and ev.get("approved_file"):
+                card.state = "accepted"                 # shown in full: an edit that didn't ask
+                card.detail = "applied without asking: you approved an edit to this file earlier (/edits)"
             elif ev.get("auto"):
                 card.state = "auto"
             elif ev.get("kind") == "command":
