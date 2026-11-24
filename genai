@@ -67,7 +67,7 @@ ENDPOINT_KEYS = {"name", "base_url", "model", "key_env", "key_file", "context_li
 REMOTE_URL = re.compile(r"http://127\.0\.0\.1:([0-9]{1,5})((?:/[A-Za-z0-9._~-]+)*)")
 TOKEN_RE = re.compile(r"[0-9A-Fa-f]{32,128}")
 TOKEN_HEADER = "X-Genai-Token"
-PROFILE_KEYS = {"name", "description", "endpoint", "persona", "skills", "params", "coding", "sandbox"}
+PROFILE_KEYS = {"name", "description", "endpoint", "persona", "skills", "plugins", "params", "coding", "sandbox"}
 NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
 ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
@@ -638,14 +638,18 @@ STARTER_CONFIG = {
     "_help": "default_profile: profile (persona) used when -p is not given. "
              "default_endpoint: endpoint used when neither -e nor the profile names one. "
              "default_skills: skills used when the profile doesn't list its own (-k adds more). "
-             "endpoint_dirs, profile_dirs, skill_dirs: extra directories to search, after the ones here. "
-             "Endpoints, profiles and skills must be blessed: genai --bless PATH",
+             "default_plugins: plugins (trusted commands) used when the profile doesn't list its own "
+             "(--plugin adds more). "
+             "endpoint_dirs, profile_dirs, skill_dirs, plugin_dirs: extra directories to search, after the ones here. "
+             "Endpoints, profiles, skills and plugins must be blessed: genai --bless PATH",
     "default_profile": None,
     "default_endpoint": None,
     "default_skills": [],
+    "default_plugins": [],
     "endpoint_dirs": [],
     "profile_dirs": [],
     "skill_dirs": [],
+    "plugin_dirs": [],
 }
 
 
@@ -663,17 +667,19 @@ class Config:
             v = data.get(k)
             if v is not None and not (isinstance(v, str) and NAME_RE.fullmatch(v)):
                 raise GenaiError(f"config.json: {k} must be a name or null")
-        for k in ("default_skills", "endpoint_dirs", "profile_dirs", "skill_dirs"):
+        for k in ("default_skills", "default_plugins", "endpoint_dirs", "profile_dirs", "skill_dirs", "plugin_dirs"):
             v = data.get(k, [])
             if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
                 raise GenaiError(f"config.json: {k} must be a list of strings")
         self.default_profile = data.get("default_profile")
         self.default_endpoint = data.get("default_endpoint")
         self.default_skills = list(data.get("default_skills", []))
+        self.default_plugins = list(data.get("default_plugins", []))
 
         def dirs(name):
             return [os.path.join(self.home, name)] + [os.path.expanduser(p) for p in data.get(name[:-1] + "_dirs", [])]
         self.endpoint_dirs, self.profile_dirs, self.skill_dirs = dirs("endpoints"), dirs("profiles"), dirs("skills")
+        self.plugin_dirs = dirs("plugins")
         self.blessed_path = os.path.join(self.home, "blessed.json")
         self.sessions = os.path.join(self.home, "sessions")
         state_directory(self.sessions)
@@ -693,7 +699,8 @@ class Config:
             for d in reversed(missing):                       # ~/.config too, whatever the umask
                 os.mkdir(d, 0o700)
             state_directory(self.home)
-            for d in (self.endpoint_dirs[0], self.profile_dirs[0], self.skill_dirs[0], self.sessions):
+            for d in (self.endpoint_dirs[0], self.profile_dirs[0], self.skill_dirs[0], self.plugin_dirs[0],
+                      self.sessions):
                 if not os.path.isdir(d):
                     os.mkdir(d, 0o700)
             conf = os.path.join(self.home, "config.json")
@@ -703,7 +710,7 @@ class Config:
             eprint(f"genai: warning: cannot create {self.home}: {e}")
             return
         if fresh:
-            eprint(f"genai: created {self.home} (config.json, endpoints/, profiles/, skills/, sessions/)")
+            eprint(f"genai: created {self.home} (config.json, endpoints/, profiles/, skills/, plugins/, sessions/)")
 
     def blessed(self):
         b = read_state_json(self.blessed_path, {}) or {}
@@ -847,6 +854,396 @@ def load_skills(cfg, names, notice):
             continue
         out.append(s)
     return out
+
+
+# --------------------------------------------------------------------------
+# Plugins and trusted commands: programs you blessed once, with exactly the inputs they may take
+
+PLUGIN_KEYS = {"name", "description", "search", "env", "pane", "commands"}
+COMMAND_KEYS = {"describe", "argv", "params", "read_only", "timeout", "max_output", "min_interval", "cache"}
+PARAM_KEYS = {"pattern", "enum", "int", "describe"}
+PLUGIN_NAME = re.compile(r"[a-z][a-z0-9-]{0,30}")
+COMMAND_NAME = re.compile(r"[a-z][a-z0-9_]{0,30}")
+TEMPLATE = re.compile(r"\{\{|\}\}|\{([A-Za-z0-9_]+)\}|[{}]")
+DEFAULT_SEARCH = ("/usr/local/bin", "/usr/bin", "/bin")
+PARAM_CAP = 256                # characters of one parameter value
+TRUSTED_PER_MINUTE = 30        # real runs across all plugins; more are refused until the minute is up
+TRUSTED_CACHE = 256            # results kept for repeated calls
+
+
+def show_argv(argv):
+    """An argument list as one readable line, quoted where needed. For people: nothing is run through a shell."""
+    return " ".join(a if re.fullmatch(r"[A-Za-z0-9_@%+=:,./{}-]+", a) else shlex.quote(a) for a in argv)
+
+
+def _text(data, key, where, default=""):
+    v = data.get(key, default)
+    if not isinstance(v, str) or len(v) > 1000 or "\0" in v:
+        raise ValueError(f"{where}{key} must be text of at most 1000 characters")
+    return v
+
+
+def _number(data, key, where, default, lo, hi):
+    v = data.get(key, default)
+    if type(v) is not int or not lo <= v <= hi:
+        raise ValueError(f"{where}{key} must be a whole number from {lo} to {hi}")
+    return v
+
+
+def _object(data, allowed, where):
+    if not isinstance(data, dict):
+        raise ValueError(f"{where} must be an object")
+    unknown = sorted(set(data) - allowed)
+    if unknown:
+        raise ValueError(f"{where}: unknown field(s): {', '.join(unknown)}")
+    return data
+
+
+def _strings(value, where):
+    if not isinstance(value, list) or not value or not all(isinstance(x, str) and "\0" not in x for x in value):
+        raise ValueError(f"{where} must be a non-empty list of strings")
+    return value
+
+
+def split_template(text, where):
+    """An argument split into (is_placeholder, text) parts. '{{' and '}}' are literal braces; any other brace
+    that is not part of a {name} placeholder is an error."""
+    parts, pos = [], 0
+    for m in TEMPLATE.finditer(text):
+        parts.append((False, text[pos:m.start()]))
+        if m.group(1):
+            parts.append((True, m.group(1)))
+        elif m.group(0) in ("{{", "}}"):
+            parts.append((False, m.group(0)[0]))
+        else:
+            raise ValueError(f"{where}: a single '{m.group(0)}' is not allowed (write it doubled to mean a brace)")
+        pos = m.end()
+    parts.append((False, text[pos:]))
+    return parts
+
+
+class TrustedParam:
+    """What one placeholder accepts: a regular expression (the whole value must match), a list of values,
+    or a whole number in a range. A value that doesn't fit is refused, never cleaned."""
+
+    def __init__(self, data, where):
+        _object(data, PARAM_KEYS, where)
+        kinds = [k for k in ("pattern", "enum", "int") if k in data]
+        if len(kinds) != 1:
+            raise ValueError(f"{where}: needs exactly one of pattern, enum, int")
+        self.kind, self.rule = kinds[0], data[kinds[0]]
+        self.describe = _text(data, "describe", where + ".")
+        if self.kind == "pattern":
+            try:
+                self.rx = re.compile(self.rule)
+            except (re.error, TypeError):
+                raise ValueError(f"{where}.pattern is not a valid regular expression") from None
+            if self.rx.fullmatch(""):
+                raise ValueError(f"{where}.pattern matches the empty string")
+        elif self.kind == "enum":
+            _strings(self.rule, where + ".enum")
+        elif not (isinstance(self.rule, list) and len(self.rule) == 2 and all(type(n) is int for n in self.rule)
+                  and self.rule[0] <= self.rule[1]):
+            raise ValueError(f"{where}.int must be [min, max]")
+
+    def check(self, value):
+        """The value as a string, or ValueError saying why it is refused."""
+        if self.kind == "int" and type(value) is int:
+            value = str(value)
+        if not isinstance(value, str):
+            raise ValueError("must be a string")
+        if len(value) > PARAM_CAP or "\0" in value or "\n" in value or "\r" in value:
+            raise ValueError(f"must be at most {PARAM_CAP} characters, on one line")
+        if self.kind == "pattern" and not self.rx.fullmatch(value):
+            raise ValueError(f"does not match {self.rule}")
+        if self.kind == "enum" and value not in self.rule:
+            raise ValueError(f"must be one of: {', '.join(self.rule)}")
+        if self.kind == "int" and not (re.fullmatch(r"-?[0-9]{1,18}", value)
+                                       and self.rule[0] <= int(value) <= self.rule[1]):
+            raise ValueError(f"must be a whole number from {self.rule[0]} to {self.rule[1]}")
+        return value
+
+    def schema(self):
+        s = {"type": "string"}
+        if self.kind == "pattern":
+            s["pattern"] = self.rule
+        elif self.kind == "enum":
+            s["enum"] = self.rule
+        else:
+            s["pattern"] = "^-?[0-9]{1,18}$"
+        text = self.describe
+        if self.kind == "int":
+            text = f"{text} (a whole number from {self.rule[0]} to {self.rule[1]})".strip()
+        if text:
+            s["description"] = text
+        return s
+
+    def rules(self):
+        return {self.kind: self.rule, "describe": self.describe}
+
+
+def trusted_binary(argv0, search):
+    """Where a trusted command's program is: argv[0] if it is a path, else the first search directory that has it.
+    The user's PATH is never used. The file and its directory must belong to you or root and not be writable
+    by group or others, or whoever can write there could swap the program. Returns (path, identity)."""
+    paths = [argv0] if os.path.isabs(argv0) else [os.path.join(d, argv0) for d in search]
+    path = next((p for p in paths if os.path.exists(p)), None)
+    if path is None:
+        raise GenaiError(f"{argv0}: not found in {', '.join(search)}")
+    real = os.path.realpath(path)
+    st = os.stat(real)
+    if not stat.S_ISREG(st.st_mode) or not os.access(real, os.X_OK):
+        raise GenaiError(f"{real}: not an executable file")
+    for p in dict.fromkeys([real, os.path.dirname(real), os.path.dirname(path)]):
+        s = os.stat(p)
+        if s.st_mode & 0o022 or s.st_uid not in (0, os.geteuid()):
+            raise GenaiError(f"{p}: writable by group or others, or owned by another user, so the program there "
+                             "could be replaced; refused")
+    return real, (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+class TrustedCommand:
+    """One command of a plugin: a fixed argument list with named placeholders, and what each accepts."""
+
+    def __init__(self, plugin, name, data, search, env):
+        where = f"commands.{name}"
+        _object(data, COMMAND_KEYS, where)
+        self.plugin, self.name, self.search, self.env_names = plugin, name, search, env
+        w = where + "."
+        self.describe = _text(data, "describe", w)
+        self.argv = _strings(data.get("argv"), w + "argv")
+        self.read_only = data.get("read_only", False)
+        if not isinstance(self.read_only, bool):
+            raise ValueError(f"{w}read_only must be true or false")
+        self.timeout = _number(data, "timeout", w, 15, 1, 120)
+        self.max_output = _number(data, "max_output", w, 65536, 1, 1048576)
+        self.min_interval = _number(data, "min_interval", w, 2, 0, 3600)
+        self.cache = _number(data, "cache", w, 0, 0, 3600)
+        params = data.get("params", {})
+        if not isinstance(params, dict) or not all(COMMAND_NAME.fullmatch(k) for k in params):
+            raise ValueError(f"{w}params must be an object named by parameter names (a-z, 0-9, _)")
+        self.params = {k: TrustedParam(v, f"{w}params.{k}") for k, v in params.items()}
+        first = self.argv[0]
+        if not (re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", first) or (first.startswith("/") and "{" not in first)):
+            raise ValueError(f"{w}argv[0] must be a program name without '/' or placeholders, or an absolute path")
+        self.parts = [split_template(a, f"{w}argv[{i}]") for i, a in enumerate(self.argv)]
+        used = {text for parts in self.parts[1:] for is_param, text in parts if is_param}
+        if used - set(self.params):
+            raise ValueError(f"{w}argv uses undeclared placeholder(s): {', '.join(sorted(used - set(self.params)))}")
+        if set(self.params) - used:
+            raise ValueError(f"{w}params not used in argv: {', '.join(sorted(set(self.params) - used))}")
+        self.tool = f"{plugin.replace('-', '_')}__{name}"        # at most 31 + 2 + 31 characters
+        self.binary = self.identity = None
+
+    def resolve(self):
+        self.binary, self.identity = trusted_binary(self.argv[0], self.search)
+
+    def changed(self):
+        """Why the program may not run now, or None. It must be the very file found at load time."""
+        try:
+            st = os.stat(self.binary)
+        except OSError:
+            return "the program is gone since genai started; restart genai"
+        if (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns) != self.identity:
+            return "the program changed since genai started; restart genai"
+        return None
+
+    def check(self, args):
+        """The arguments as {name: string}, or ValueError. Every parameter is required; none is added or cleaned."""
+        if not isinstance(args, dict):
+            raise ValueError("params must be an object")
+        for k in sorted(set(args) - set(self.params)):
+            raise ValueError(f"unknown parameter '{one_line(str(k))[0]}'")
+        values = {}
+        for k, spec in self.params.items():
+            if k not in args:
+                raise ValueError(f"missing parameter '{k}'")
+            try:
+                values[k] = spec.check(args[k])
+            except ValueError as e:
+                raise ValueError(f"parameter '{k}' {e}") from None
+        return values
+
+    def build(self, values):
+        """The argument list to run: each placeholder becomes its value, and one argument stays one argument."""
+        return [self.binary] + ["".join(values[t] if is_param else t for is_param, t in parts)
+                                for parts in self.parts[1:]]
+
+    def shown(self, values=None):
+        """The command as shown to people: the program's name, then the values (or the {placeholders})."""
+        if values is None:
+            return show_argv(self.argv)
+        return show_argv([self.argv[0]] + self.build(values)[1:])
+
+    def env(self):
+        user = whoami()[0]
+        env = {"PATH": ":".join(self.search), "LANG": "C.UTF-8",
+               "HOME": os.environ.get("HOME") or os.path.expanduser("~"), "USER": user, "LOGNAME": user}
+        env.update({n: os.environ[n] for n in self.env_names if n in os.environ})
+        return env
+
+    def schema(self, host):
+        how = "read-only" if self.read_only else "the user is asked first"
+        props = {k: p.schema() for k, p in self.params.items()}
+        return _tool(self.tool, f"{self.describe} (runs `{self.shown()}` on {host}; {how})".strip(), props,
+                     list(props))
+
+    def info(self):
+        return {"name": self.name, "describe": self.describe, "params": {k: p.rules() for k, p in self.params.items()},
+                "read_only": self.read_only, "argv": self.argv}
+
+
+class Plugin:
+    """A plugin, read once like a skill: its hash and manifest come from one snapshot of the directory, so editing
+    the files afterwards changes nothing until the next load. error is set when the manifest is refused."""
+
+    def __init__(self, name, path):
+        self.name, self.path = name, path
+        self.error = self.hash = self.pane = None
+        self.description, self.commands = "", {}
+        try:
+            files = snapshot_skill(path)
+            self.hash = hash_snapshot(files)
+        except (GenaiError, OSError) as e:
+            self.error = str(e)
+            return
+        try:
+            self.parse(files)
+        except ValueError as e:
+            self.error, self.commands = f"plugin.json: {e}", {}
+
+    def parse(self, files):
+        data = _object(json.loads(files.get("plugin.json", b"").decode("utf-8")), PLUGIN_KEYS, "plugin")
+        if data.get("name") != os.path.basename(self.path) or not PLUGIN_NAME.fullmatch(data.get("name", "")):
+            raise ValueError("name must be lowercase letters, digits and '-', and the same as the directory's name")
+        self.description = _text(data, "description", "")
+        search = data.get("search", list(DEFAULT_SEARCH))
+        _strings(search, "search")
+        if not all(os.path.isabs(d) for d in search):
+            raise ValueError("search must list absolute directories")
+        env = data.get("env", [])
+        if env:
+            bad = [n for n in _strings(env, "env")
+                   if not ENV_NAME_RE.fullmatch(n) or n == "PATH" or n.startswith("LD_")]
+            if bad:
+                raise ValueError(f"env: not allowed: {', '.join(bad)} (PATH and LD_* are never passed on)")
+        pane = data.get("pane")
+        if pane is not None and not (isinstance(pane, str) and NAME_RE.fullmatch(pane) and pane in files):
+            raise ValueError("pane must be the name of a file in the plugin directory")
+        self.pane = pane
+        cmds = data.get("commands")
+        if not isinstance(cmds, dict) or not cmds or not all(COMMAND_NAME.fullmatch(k) for k in cmds):
+            raise ValueError("commands must be an object of commands named a-z, 0-9, _")
+        self.commands = {k: TrustedCommand(self.name, k, v, search, env) for k, v in cmds.items()}
+
+    def tools(self):
+        return {c.tool: c for c in self.commands.values()}
+
+    def resolve(self):
+        """Find every command's program now, refusing the plugin if one can't be trusted."""
+        for c in self.commands.values():
+            try:
+                c.resolve()
+            except (GenaiError, OSError) as e:
+                raise GenaiError(f"plugin '{self.name}', command {c.name}: {e}", EXIT_USAGE, "bad_plugin") from None
+
+    def summary(self):
+        """The review screen for blessing: every command with what it may run, and the programs it would use."""
+        c0 = next(iter(self.commands.values()))
+        lines = [f"  plugin:   {one_line(self.name)[0]}", f"  about:    {one_line(self.description)[0]}"]
+        if self.pane:
+            lines.append(f"  pane:     {one_line(self.pane)[0]} (for genai-tui; genai does not run it)")
+        lines.append(f"  search:   {', '.join(one_line(d)[0] for d in c0.search)} (your PATH is never used)")
+        lines.append(f"  env:      {', '.join(c0.env_names) or 'none'} passed on, besides PATH, LANG, HOME, USER "
+                     "and LOGNAME")
+        for c in self.commands.values():
+            flag = "read-only: runs without asking" if c.read_only else "[asks every time]"
+            lines.append(f"  command {one_line(c.name)[0]}: {one_line(c.describe)[0]}  ({flag})")
+            lines.append(f"    runs:    {one_line(c.shown())[0]}")
+            for k, p in c.params.items():
+                lines.append(f"    {k}: {p.kind} {one_line(json.dumps(p.rule))[0]}  {one_line(p.describe)[0]}".rstrip())
+            lines.append(f"    limits:  {c.timeout} s, {c.max_output} bytes of output, at most one run per "
+                         f"{c.min_interval} s, results kept {c.cache} s")
+            try:
+                lines.append(f"    program: {one_line(trusted_binary(c.argv[0], c.search)[0])[0]}")
+            except (GenaiError, OSError) as e:
+                lines.append(f"    program: [!] {one_line(str(e))[0]} (the plugin can't be used until this is fixed)")
+        lines.append("  [!] these commands run on this host as you, with no shell, and the read-only ones without "
+                     "asking: their output goes to the model and the endpoint like any file the model reads")
+        return "\n".join(lines)
+
+
+def find_plugins(cfg):
+    seen = {}
+    for d in cfg.plugin_dirs:
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            continue
+        for n in names:
+            p = os.path.join(d, n)
+            if n not in seen and os.path.isfile(os.path.join(p, "plugin.json")):
+                seen[n] = Plugin(n, os.path.abspath(p))
+    return seen
+
+
+def plugin_status(cfg, plugin):
+    return "invalid" if plugin.hash is None else bless_status(cfg, "plugin", plugin.path, plugin.hash)
+
+
+def plugin_rows(cfg, active=()):
+    """Every plugin found, for listings and the plugins message."""
+    rows = []
+    for n, pl in sorted(find_plugins(cfg).items()):
+        st = plugin_status(cfg, pl)
+        rows.append({"name": n, "path": pl.path, "dir": pl.path, "description": pl.description or pl.error or "",
+                     "status": st, "blessed": st == "blessed", "enabled": n in active, "active": n in active,
+                     "error": pl.error, "pane": pl.pane, "commands": [c.info() for c in pl.commands.values()]})
+    return rows
+
+
+def run_program(argv, env, cwd, timeout, cap):
+    """Run argv with no shell, no stdin and its own process group. Returns (exit code, stdout, stderr, note); the
+    exit code is None when the program was killed. Output past cap bytes (both streams together) is dropped and
+    ends the run."""
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd,
+                            env=env, start_new_session=True)
+    bufs, size, over = [bytearray(), bytearray()], [0], threading.Event()
+
+    def drain(stream, buf):
+        for chunk in iter(lambda: stream.read1(65536), b""):
+            room = max(cap - size[0], 0)
+            buf.extend(chunk[:room])
+            size[0] += min(len(chunk), room)
+            if len(chunk) > room:
+                over.set()
+                return
+
+    readers = [threading.Thread(target=drain, args=(s, b), daemon=True)
+               for s, b in zip((proc.stdout, proc.stderr), bufs)]
+    for r in readers:
+        r.start()
+    deadline, killed = time.monotonic() + timeout, False
+    try:
+        while proc.poll() is None:
+            if over.is_set() or time.monotonic() > deadline:
+                killed = True
+                break
+            over.wait(0.02)
+    finally:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)       # the program, and anything it left running
+        except OSError:
+            pass
+        proc.wait()
+        for r in readers:
+            r.join(5)
+        proc.stdout.close()
+        proc.stderr.close()
+    note = f"output cut at {cap} bytes" if over.is_set() else ""
+    if killed and not over.is_set():
+        note = f"killed after {timeout} s"
+    return (None if killed else proc.returncode), bytes(bufs[0]), bytes(bufs[1]), note
 
 
 def _is_loopback(host):
@@ -1012,6 +1409,7 @@ class Profile:
         self.endpoint = data.get("endpoint")
         self.persona = data.get("persona", "")
         self.skills = data.get("skills")          # None: the profile leaves skills to default_skills
+        self.plugins = data.get("plugins")        # likewise for default_plugins
         self.params = data.get("params", {})
         self.coding = data.get("coding", False)
         if self.endpoint is not None and not (isinstance(self.endpoint, str) and NAME_RE.fullmatch(self.endpoint)):
@@ -1020,6 +1418,9 @@ class Profile:
             raise GenaiError(f"{path}: 'description' and 'persona' must be text", EXIT_PROFILE)
         if self.skills is not None and not (isinstance(self.skills, list) and all(isinstance(x, str) for x in self.skills)):
             raise GenaiError(f"{path}: 'skills' must be a list of skill names", EXIT_PROFILE)
+        if self.plugins is not None and not (isinstance(self.plugins, list)
+                                             and all(isinstance(x, str) for x in self.plugins)):
+            raise GenaiError(f"{path}: 'plugins' must be a list of plugin names", EXIT_PROFILE)
         if not isinstance(self.params, dict):
             raise GenaiError(f"{path}: 'params' must be an object", EXIT_PROFILE)
         for k in ("model", "messages", "tools"):
@@ -1055,6 +1456,9 @@ class Profile:
             lines.append("  skills:   (not set; default_skills apply)")
         else:
             lines.append(f"  skills:   {', '.join(one(k) for k in self.skills) or 'none'}")
+        if self.plugins:
+            lines.append(f"  plugins:  {', '.join(one(k) for k in self.plugins)} (trusted commands; each plugin "
+                         "must be blessed on its own)")
         if self.params:
             lines.append(f"  params:   {json.dumps(self.params, sort_keys=True)}")
         if self.coding:
@@ -1117,7 +1521,7 @@ def bless_status(cfg, kind, path, h=None):
         return "unblessed"
     try:
         if h is None:
-            h = hash_skill(path)[0] if kind == "skill" else hash_file(path)
+            h = hash_skill(path)[0] if kind in ("skill", "plugin") else hash_file(path)
     except (GenaiError, OSError):
         return "invalid"
     return "blessed" if h == entry.get("hash") else "changed"
@@ -1243,10 +1647,13 @@ def bless(cfg, path, ask):
         return bless_hook(cfg, ask)
     if os.path.isdir(path):
         files = snapshot_skill(path)
-        if "SKILL.md" not in files:
-            raise GenaiError(f"{path}: a skill needs a SKILL.md")
+        plugin = Plugin(os.path.basename(path), path) if "plugin.json" in files else None
+        if plugin and plugin.error:
+            raise GenaiError(f"{path}: {plugin.error}")
+        if not plugin and "SKILL.md" not in files:
+            raise GenaiError(f"{path}: a skill needs a SKILL.md, and a plugin a plugin.json")
         h = hash_snapshot(files)
-        print(f"Skill {one_line(os.path.basename(path))[0]} at {one_line(path)[0]}")
+        print(f"{'Plugin' if plugin else 'Skill'} {one_line(os.path.basename(path))[0]} at {one_line(path)[0]}")
         for f in sorted(files):
             print(f"  {one_line(f)[0]} ({len(files[f])} bytes)")
         print(f"  hash: {h}")
@@ -1261,8 +1668,11 @@ def bless(cfg, path, ask):
                 print(f"  [!] {one_line(f)[0]} has hidden or control characters: {found}")
         if any(one_line(x)[1] for x in [path, *files]):
             print("  [!] the name or a file name above had characters that were escaped; read carefully")
-        entry = {"kind": "skill", "name": os.path.basename(path), "hash": h}
-        question = "Have you read every file above, and do you want to use this skill?"
+        if plugin:
+            print(plugin.summary())
+        entry = {"kind": "plugin" if plugin else "skill", "name": os.path.basename(path), "hash": h}
+        question = ("Have you read every command above, and may the model and you run them as shown?" if plugin
+                    else "Have you read every file above, and do you want to use this skill?")
     else:
         raw = read_regular(path)
         h = hash_bytes(raw)
@@ -1749,6 +2159,12 @@ Rules you work under:
 - You hold no privileges. If a step needs root or another host, say so; the user escalates themselves.
 - Be concise."""
 
+# Added to the system prompt while a plugin's trusted commands are offered.
+TRUSTED_RULES = """
+
+# Trusted commands
+- Some tools (named plugin__command, for example slurm__queue) run a fixed, read-only program on this host for the user and give you its output, for cluster status and the like. They run without asking and the user sees what ran. Use them rather than proposing an equivalent command with propose_command. A tool that says the user is asked first waits for their approval."""
+
 # Added to the system prompt while coding mode is on, so the model knows what that changes.
 CODING_RULES = """
 
@@ -2169,9 +2585,11 @@ def coding_refusal(cwd):
 class Engine:
     """The loop: send, turn tool calls into proposals, collect decisions, send again."""
 
-    def __init__(self, cfg, endpoint, session, ui, client=None, coding=None, profile=None, anywhere=False):
+    def __init__(self, cfg, endpoint, session, ui, client=None, coding=None, profile=None, anywhere=False,
+                 plugins=()):
         """coding: None, or where the request for coding mode came from ("--coding", "profile NAME").
-        anywhere: the user passed --coding-anywhere, which allows coding mode where it is normally refused."""
+        anywhere: the user passed --coding-anywhere, which allows coding mode where it is normally refused.
+        plugins: names of the plugins to enable; one that is missing, unblessed or refused is skipped with a notice."""
         self.cfg, self.endpoint, self.session, self.ui = cfg, endpoint, session, ui
         self.profile = profile
         self.client = client or Client(endpoint, profile.params if profile else None)
@@ -2186,6 +2604,16 @@ class Engine:
         self.commands = []       # command proposals shown in this process, newest last
         self.skills = []
         self.reload_skills()
+        self.plugins = []        # enabled plugins; never saved with the session
+        self.trusted = {}        # tool name -> TrustedCommand, for the enabled plugins
+        self.cached = {}         # (plugin, command, params) -> (when, exit, output, note): the last real result
+        self.last_run = {}       # (plugin, command) -> when it last really ran
+        self.runs = collections.deque()      # when each real run started, for the per-minute cap
+        for name in plugins:
+            try:
+                self.set_plugin(name, True)
+            except GenaiError as e:
+                ui.notice(f"plugin '{name}' skipped: {e}")
         self.anywhere = anywhere
         self.coding_override = None     # the refused place coding mode is on in, when --coding-anywhere allowed it
         self.plan = None                # the plan the user approved, if any; never saved with the session
@@ -2264,6 +2692,31 @@ class Engine:
         self.session.usage = None   # the system prompt changed, so the last measured size no longer holds
         self.audit.log("skill", name=name, on=on)
 
+    def set_plugin(self, name, on):
+        """Offer a plugin's trusted commands to the model and the user from the next request on, or stop. Only a
+        blessed plugin whose programs can be trusted is turned on."""
+        if on:
+            pl = find_plugins(self.cfg).get(name)
+            if not pl:
+                raise GenaiError(f"plugin '{name}' not found", EXIT_USAGE, "unknown_plugin")
+            st = plugin_status(self.cfg, pl)
+            if st != "blessed":
+                raise GenaiError(f"plugin '{name}' is {st}; read it, then: genai --bless {pl.path}", EXIT_USAGE,
+                                 "not_blessed")
+            if pl.error:
+                raise GenaiError(f"plugin '{name}': {pl.error}", EXIT_USAGE, "bad_plugin")
+            clash = sorted(set(pl.tools()) & set(self.external))
+            if clash:
+                raise GenaiError(f"plugin '{name}': a registered tool already has the name {clash[0]}", EXIT_USAGE,
+                                 "bad_plugin")
+            pl.resolve()
+            self.plugins = [p for p in self.plugins if p.name != name] + [pl]
+        else:
+            self.plugins = [p for p in self.plugins if p.name != name]
+        self.trusted = {t: c for p in self.plugins for t, c in p.tools().items()}
+        self.session.usage = None   # the tools changed, so the last measured size no longer holds
+        self.audit.log("plugin", name=name, on=on)
+
     def register(self, tools):
         added = []
         for t in tools:
@@ -2272,8 +2725,8 @@ class Engine:
             name, desc, params = t.get("name"), t.get("description"), t.get("parameters", {"type": "object"})
             if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name):
                 raise GenaiError(f"bad tool name {name!r}")
-            if name in INTRINSICS:
-                raise GenaiError(f"tool '{name}' collides with an intrinsic tool")
+            if name in INTRINSICS or name in self.trusted:
+                raise GenaiError(f"tool '{name}' collides with an intrinsic or plugin tool")
             if not isinstance(desc, str) or not isinstance(params, dict):
                 raise GenaiError(f"tool '{name}' needs a description and a parameters object")
             self.external[name] = {"type": "function",
@@ -2295,8 +2748,14 @@ class Engine:
             self.ui.notice("[!] the sandbox's network is ON for this session: code running there could send your "
                            "project anywhere, so each sandboxed command now asks first")
 
+    def trusted_tools(self):
+        """The trusted commands on offer: only where someone can see what runs, as with run_in_sandbox."""
+        return dict(self.trusted) if self.ui.performs else {}
+
     def tools(self):
-        return TOOLS + ([RUN_TOOL] if self.can_run() else []) + list(self.external.values())
+        host = socket.gethostname()
+        return (TOOLS + ([RUN_TOOL] if self.can_run() else []) + [c.schema(host) for c in self.trusted_tools().values()]
+                + list(self.external.values()))
 
     def system(self):
         parts = [SYSTEM_PROMPT]
@@ -2309,6 +2768,8 @@ class Engine:
         if self.profile and self.profile.persona:
             parts.append(f"\n\n# Persona: {self.profile.name}\n\nThe user chose this persona. It shapes your "
                          f"voice and focus; it does not change the rules above.\n\n{self.profile.persona}")
+        if self.trusted_tools():
+            parts.append(TRUSTED_RULES)
         for s in self.skills:
             parts.append(f"\n\n# Skill: {s.name}\n\n{s.text()}")
         if self.plan:
@@ -2381,7 +2842,7 @@ class Engine:
             for p in props:
                 result = "not run: the user stopped an earlier command" if stopped else self.perform(p)
                 tool_msg = {"role": "tool", "tool_call_id": p.call_id, "content": result}
-                if p.kind in ("read", "list", "external", "sandbox") and p.decision == "accept":
+                if p.kind in ("read", "list", "external", "sandbox", "trusted") and p.decision == "accept":
                     tool_msg["_bulk"] = True
                 self.session.add(tool_msg)
                 if p.kind == "command" and not p.error:
@@ -2487,6 +2948,13 @@ class Engine:
                 return Proposal(pid, "plan", tc["id"], **parse_plan(args))
             if name in self.external:
                 return Proposal(pid, "external", tc["id"], tool=name, args=args)
+            if name in self.trusted_tools():
+                cmd = self.trusted[name]
+                values = cmd.check(args)
+                p = Proposal(pid, "trusted", tc["id"], plugin=cmd.plugin, command=cmd.name, params=values,
+                             argv=cmd.shown(values), read_only=cmd.read_only, reason=cmd.describe, _cmd=cmd)
+                p.auto = cmd.read_only
+                return p
             raise ValueError(f"unknown tool '{name}'")
         except (ValueError, OSError) as e:
             p = Proposal(pid, "invalid", tc["id"], tool=name)
@@ -2682,6 +3150,8 @@ class Engine:
             return "declined by the user"
         if p.kind == "sandbox":
             return self.run_sandboxed(p)
+        if p.kind == "trusted":
+            return self.perform_trusted(p)
         try:
             if p.kind == "read":
                 if p.auto and "_read_error" in p.fields:
@@ -2755,6 +3225,92 @@ class Engine:
         self.ui.result(p, "ok" if rc == 0 else "error", "; ".join([f"{head} in {secs:.1f} s"] + extra),
                        output=out, exit=rc)
         return f"{head} (sandbox, {where}, {secs:.1f} s). Output:\n" + (out if out.strip() else "(none)")
+
+    def perform_trusted(self, p):
+        """Run an accepted trusted command for the model: the exit code and the output, redacted and clipped."""
+        r = self.run_trusted(p.fields["_cmd"], p.fields["params"], "model")
+        if r["error"]:
+            self.ui.result(p, "error", f"not run: {r['error']}", output="", exit=None)
+            return f"error: not run: {r['error']}"
+        rc, note = r["exit"], r["note"]
+        head = f"exit {rc}" if rc is not None else note
+        extra = [note] if note and rc is not None else []
+        if r["cached"] is not None:
+            extra.append(f"cached {r['cached']} s ago")
+        if r["redacted"]:
+            extra.append(f"redacted {redaction_note(r['redacted'])}")
+        self.ui.result(p, "ok" if rc == 0 else "error", "; ".join([f"{head} in {r['ms']} ms"] + extra),
+                       output=r["output"], exit=rc)
+        return head + (f" ({'; '.join(extra)})" if extra else "") + ". Output:\n" \
+            + (r["output"] if r["output"].strip() else "(none)")
+
+    def run_user(self, plugin, command, params):
+        """A trusted command the user asked for (a wrapper's run message): the same checks and limits as the
+        model's. Raises GenaiError when it can't be asked for; otherwise returns run_trusted's result."""
+        cmd = next((c for p in self.plugins if p.name == plugin for c in p.commands.values() if c.name == command),
+                   None)
+        if not cmd:
+            raise GenaiError(f"no command {one_line(str(plugin))[0]}.{one_line(str(command))[0]} in an enabled plugin",
+                             EXIT_USAGE, "unknown_command")
+        try:
+            values = cmd.check(params)
+        except ValueError as e:
+            raise GenaiError(str(e), EXIT_USAGE, "bad_params") from None
+        return self.run_trusted(cmd, values, "user")
+
+    def run_trusted(self, cmd, values, source):
+        """Run a trusted command whose parameters are already checked. Refused, not run, when the program changed,
+        when the same command ran less than its min_interval ago, or after 30 real runs in a minute; a result
+        younger than the command's cache time is returned again instead. Returns {error, exit, output, note,
+        cached (seconds, or None), ms, redacted}."""
+        res = {"error": None, "exit": None, "output": "", "note": "", "cached": None, "ms": 0, "redacted": {}}
+        limited = False
+
+        def finish():
+            self.audit.log("trusted_run", plugin=cmd.plugin, command=cmd.name, params=values, source=source,
+                           exit=res["exit"], ms=res["ms"], bytes=len(res["output"].encode()),
+                           cached=res["cached"] is not None, rate_limited=limited, binary=cmd.binary,
+                           error=res["error"], redacted=res["redacted"])
+            return res
+
+        key, now_ = (cmd.plugin, cmd.name), time.monotonic()
+        ckey = key + (tuple(sorted(values.items())),)
+        problem = cmd.changed()
+        if problem:
+            res["error"] = problem
+            return finish()
+        hit = self.cached.get(ckey)
+        if cmd.cache and hit and now_ - hit[0] < cmd.cache:
+            res.update(exit=hit[1], output=hit[2], note=hit[3], cached=int(now_ - hit[0]))
+            return finish()
+        while self.runs and now_ - self.runs[0] >= 60:
+            self.runs.popleft()
+        wait = max(cmd.min_interval - (now_ - self.last_run[key]), 0) if key in self.last_run else 0
+        if len(self.runs) >= TRUSTED_PER_MINUTE:
+            wait = max(wait, 60 - (now_ - self.runs[0]))
+        if wait > 0:
+            limited = True
+            res["error"] = f"rate limited: try again in {int(wait) + 1} s"
+            return finish()
+        self.last_run[key] = now_
+        self.runs.append(now_)
+        try:
+            rc, out, err, note = run_program(cmd.build(values), cmd.env(), os.getcwd(), cmd.timeout, cmd.max_output)
+        except OSError as e:
+            res["error"] = f"could not start the program: {e.strerror}"
+            return finish()
+        text = strip_ansi(out.decode("utf-8", "replace"))
+        if err.strip():
+            text += ("" if text.endswith("\n") or not text else "\n") + "[stderr]\n" \
+                + strip_ansi(err.decode("utf-8", "replace"))
+        text, counts = redact(text, self.secrets())
+        res.update(exit=rc, output=clip(text), note=note, redacted=counts, ms=int((time.monotonic() - now_) * 1000))
+        if cmd.cache:
+            self.cached.pop(ckey, None)
+            self.cached[ckey] = (now_, rc, res["output"], note)
+            while len(self.cached) > TRUSTED_CACHE:
+                del self.cached[next(iter(self.cached))]
+        return finish()
 
     # -- sharing output and compaction
 
@@ -2873,7 +3429,7 @@ class PlainUI:
     def decide(self, pending):
         for p in pending:
             p.decision = "decline" if p.kind != "external" else "declined"
-            what = p.fields.get("path") or p.fields.get("tool") or p.fields.get("goal")
+            what = p.fields.get("path") or p.fields.get("tool") or p.fields.get("goal") or p.fields.get("argv")
             self.notice(f"{p.kind} proposal {p.id} ({one_line(str(what))[0]}) declined: no terminal")
 
     def result(self, p, status, note, **extra):
@@ -2904,7 +3460,12 @@ class TtyUI(PlainUI):
         self.out.flush()
 
     def show_auto(self, p):
-        if p.kind == "sandbox":
+        if p.kind == "trusted":
+            f = p.fields
+            args = ", ".join(f"{k}={v}" for k, v in f["params"].items())
+            eprint(f"  \u21b3 [{p.id}] {one_line(f['plugin'])[0]}.{one_line(f['command'])[0]}({show_exact(args)}): "
+                   f"{show_exact(f['argv'])}")
+        elif p.kind == "sandbox":
             eprint(f"  [{p.id}] sandbox, offline: {one_line(p.fields['reason'])[0]}\n    $ {show_exact(p.fields['command'])}")
         else:
             eprint(f"  (coding mode) {p.kind} {one_line(p.fields['path'])[0]}")
@@ -2934,6 +3495,9 @@ class TtyUI(PlainUI):
             elif p.kind == "sandbox":
                 head = (f"Run in the sandbox, with the network ON:\n    $ {show_exact(f['command'])}\n"
                         "It works on a throwaway copy of the project, but it could send what it reads anywhere.")
+            elif p.kind == "trusted":
+                head = (f"Run {one_line(f['plugin'])[0]}.{one_line(f['command'])[0]} (a trusted command that asks "
+                        f"every time):\n    $ {show_exact(f['argv'])}")
             elif p.kind == "plan":
                 self.out.write(f"\n\033[1m[{p.id}] plan\033[0m — {one_line(f['goal'])[0]}\n{margin(plan_steps(f['steps']))}\n"
                                "Planned reads won't ask again; a planned command proposed exactly as shown is "
@@ -3503,7 +4067,7 @@ def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()
              "host": socket.gethostname(), "user": user, "uid": uid, "remote": remote,
              "features": ["proposals", "decisions", "attach", "register_tools", "compact", "context", "coding",
                           "set_coding", "skills", "files", "read", "trace", "system", "plan", "network", "clear",
-                          "models"],
+                          "models", "plugins"],
              "endpoint": engine.endpoint.info(),
              "profile": {"name": engine.profile.name, "description": engine.profile.description}
              if engine.profile else None,
@@ -3514,12 +4078,14 @@ def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()
              "sandbox": engine.sandbox, "audit": engine.audit.path,
              "runner": engine.box.info() if engine.box else None,
              "skills": [s.name for s in engine.skills],
+             "plugins": [p.name for p in engine.plugins],
              "tools": list(INTRINSICS)})
     engine.audit.log("start", mode="json", endpoint=engine.endpoint.info(),
                      profile=engine.profile.name if engine.profile else None, session=engine.session.id,
                      sandbox=engine.sandbox)
     for n in after_hello:
         ui.notice(n)
+    ui.emit({"type": "plugins", "plugins": plugin_rows(engine.cfg, [p.name for p in engine.plugins])})
 
     def turn(text, att):
         first = getattr(engine.client, "exchanges", 0) + 1
@@ -3629,6 +4195,35 @@ def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()
             except GenaiError as err:
                 ui.error(str(err), err.kind)
             ui.emit({"type": "skills", "skills": skill_rows(engine.cfg, [s.name for s in engine.skills])})
+        elif t == "plugins":
+            ui.emit({"type": "plugins", "plugins": plugin_rows(engine.cfg, [p.name for p in engine.plugins])})
+        elif t == "plugin":
+            name, on = msg.get("name"), msg.get("on")
+            if not isinstance(name, str) or not isinstance(on, bool):
+                ui.error("plugin needs 'name' and 'on': true or false", "bad_message")
+                continue
+            if remote:          # plugins blessed on this host aren't ones the user's own machine vouched for
+                ui.error("plugins aren't available in remote mode yet", "remote")
+                continue
+            try:
+                engine.set_plugin(name, on)
+            except GenaiError as err:
+                ui.error(str(err), err.kind)
+            ui.emit({"type": "plugins", "plugins": plugin_rows(engine.cfg, [p.name for p in engine.plugins])})
+        elif t == "run":
+            rid = msg.get("id")
+            if type(rid) not in (int, str):
+                ui.error("run needs 'id': a string or a number, which the answer repeats", "bad_message")
+                continue
+            try:
+                r = engine.run_user(msg.get("plugin"), msg.get("command"), msg.get("params", {}))
+            except GenaiError as err:
+                r = {"error": str(err)}
+            if r["error"]:
+                ui.emit({"type": "ran", "id": rid, "error": r["error"]})
+            else:
+                ui.emit({"type": "ran", "id": rid, "exit": r["exit"], "output": r["output"], "note": r["note"],
+                         "cached": r["cached"] is not None, "ms": r["ms"], "redacted": r["redacted"]})
         elif t == "files":
             path = msg.get("path", ".")
             if not isinstance(path, str):
@@ -3676,6 +4271,7 @@ def parse_args(argv):
     ap.add_argument("-S", "--session", help="keep the conversation in a named session (created or resumed)")
     ap.add_argument("--allow-session-endpoint-change", action="store_true",
                     help="allow this invocation to send saved context to a changed or unrecorded destination")
+    ap.add_argument("--plugin", action="append", default=[], help="use a blessed plugin (repeatable)")
     ap.add_argument("--coding", action="store_true", help="let the model read and list files here without asking")
     ap.add_argument("--coding-anywhere", action="store_true",
                     help="--coding, also where it is normally refused (your home directory, credential "
@@ -3687,8 +4283,10 @@ def parse_args(argv):
     ap.add_argument("--remote-config", action="store_true",
                     help="print the resolved endpoint and profile as one JSON line, without any key (for genai-tui's "
                          "remote mode; takes -e and -p)")
-    ap.add_argument("--bless", metavar="PATH", help="review and bless a skill directory, endpoint or profile file")
+    ap.add_argument("--bless", metavar="PATH",
+                    help="review and bless a skill or plugin directory, endpoint or profile file")
     ap.add_argument("--list-skills", action="store_true", help="list skills (with --json: as JSON)")
+    ap.add_argument("--list-plugins", action="store_true", help="list plugins (with --json: as JSON)")
     ap.add_argument("--list-endpoints", action="store_true", help="list endpoints (with --json: as JSON)")
     ap.add_argument("--list-profiles", action="store_true", help="list profiles (with --json: as JSON)")
     ap.add_argument("--list-sessions", action="store_true", help="list saved sessions (with --json: as JSON)")
@@ -3719,6 +4317,13 @@ def main(argv=None):
             rows = skill_rows(cfg)
             if args.json:
                 print(json.dumps({"type": "skills", "skills": rows}))
+            else:
+                print("\n".join(skill_lines(rows)))
+            return EXIT_OK
+        if args.list_plugins:
+            rows = plugin_rows(cfg)
+            if args.json:
+                print(json.dumps({"type": "plugins", "plugins": rows}))
             else:
                 print("\n".join(skill_lines(rows)))
             return EXIT_OK
@@ -3781,6 +4386,13 @@ def main(argv=None):
         for k in base + args.skill:
             if k not in session.skills:
                 session.skills.append(k)
+        if args.config_stdin:
+            plugins = []
+            if args.plugin:
+                notices.append("plugins aren't available in remote mode yet")
+        else:
+            plugins = list(dict.fromkeys((persona.plugins if persona and persona.plugins is not None
+                                          else cfg.default_plugins) + args.plugin))
 
         prompt = " ".join(args.prompt) if args.prompt else None
         if args.json:
@@ -3792,7 +4404,8 @@ def main(argv=None):
         attachments = [(f"file {f}", read_attachment(f)) for f in args.file]
         coding = ("--coding-anywhere" if args.coding_anywhere else "--coding" if args.coding else
                   f"profile {persona.name}" if persona and persona.coding else None)
-        engine = Engine(cfg, endpoint, session, ui, coding=coding, profile=persona, anywhere=args.coding_anywhere)
+        engine = Engine(cfg, endpoint, session, ui, coding=coding, profile=persona, anywhere=args.coding_anywhere,
+                        plugins=plugins)
         if isinstance(ui, TtyUI):       # hooks only run for a person at the terminal, the UI chosen above
             engine.notifier = Notifier.start(engine)
         for n in notices:

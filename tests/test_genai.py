@@ -452,8 +452,8 @@ class TestFirstRun(Tmp):
         data = json.load(open(conf))
         self.assertIsNone(data["default_profile"])                    # only the user sets it
         self.assertEqual({k for k in data if not k.startswith("_")},
-                         {"default_profile", "default_endpoint", "default_skills",
-                          "endpoint_dirs", "profile_dirs", "skill_dirs"})
+                         {"default_profile", "default_endpoint", "default_skills", "default_plugins",
+                          "endpoint_dirs", "profile_dirs", "skill_dirs", "plugin_dirs"})
         self.assertEqual(G.Config(home).default_profile, None)        # the starter file loads cleanly
 
     def test_config_typo_warns_and_bad_type_fails(self):
