@@ -5,6 +5,7 @@ import copy
 import io
 import json
 import os
+import re
 import sys
 import time
 import unittest
@@ -165,9 +166,19 @@ class TestManifest(PluginBase):
                           ({"pattern": "[a-z]*"}, "empty string"), ({"pattern": "("}, "regular expression"),
                           ({"pattern": 5}, "regular expression"), ({"enum": []}, "enum"), ({"enum": [1]}, "enum"),
                           ({"int": [5, 1]}, "[min, max]"), ({"int": [1]}, "[min, max]"),
-                          ({"int": ["a", "b"]}, "[min, max]"), ({"pattern": "a", "describe": 5}, "describe")]:
+                          ({"int": ["a", "b"]}, "[min, max]"), ({"pattern": "a", "describe": 5}, "describe"),
+                          ({"pattern": "^[a-z-]{1,9}$"}, "option"), ({"pattern": ".+"}, "option"),
+                          ({"enum": ["ok", "--all"]}, "option"), ({"int": [-1, 5]}, "from 0 up")]:
             p["user"] = spec
             self.refused(why)
+
+    def test_option_like_values_are_refused_whatever_the_pattern(self):
+        rule = G.TrustedParam({"pattern": "^[a-z]{1,9}$"}, "p")
+        rule.rx = re.compile(".+")                     # as if a pattern had slipped through the load-time check
+        for value in ("-M", "--format=%x", "-"):
+            with self.assertRaises(ValueError):
+                rule.check(value)
+        self.assertEqual(rule.check("alice"), "alice")
 
     def test_limits_search_env_and_pane(self):
         for key, bad in [("timeout", 0), ("timeout", 121), ("max_output", 2000000), ("min_interval", -1),
@@ -211,7 +222,7 @@ class TestManifest(PluginBase):
                     {"user": "$(id)", "fmt": "long"}, {"user": None, "fmt": "long"}, []]:
             with self.assertRaises(ValueError, msg=str(bad)):
                 c.check(bad)
-        self.manifest["commands"]["queue"]["params"]["user"] = {"pattern": ".+"}      # allows anything but...
+        self.manifest["commands"]["queue"]["params"]["user"] = {"pattern": "[^-].*"}  # allows almost anything but...
         c = self.load().commands["queue"]
         for bad in ("a\nb", "a\x00b", "a\rb", "x" * 257):
             with self.assertRaises(ValueError, msg=repr(bad)):
@@ -466,7 +477,7 @@ class TestRunning(PluginBase):
         self.assertEqual(self.calls(), [])
 
     def test_a_loose_value_stays_one_argument(self):
-        self.manifest["commands"]["queue"]["params"]["user"] = {"pattern": "[ -~]{1,40}"}
+        self.manifest["commands"]["queue"]["params"]["user"] = {"pattern": "[ -,.-~][ -~]{0,39}"}   # no leading '-'
         write_json(os.path.join(self.home, "plugins", "fake", "plugin.json"), self.manifest)
         bless_plugin(self.home, os.path.join(self.home, "plugins", "fake"))
         self.eng.set_plugin("fake", True)

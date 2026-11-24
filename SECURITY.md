@@ -132,11 +132,14 @@ range). Together they are the whole of what the model and the user's panes can r
 - **Audit.** Each run (or refusal) is logged as `trusted_run`: plugin, command, the validated values, who asked
   (`model` or `user`), exit code, time, bytes, whether it was cached or rate limited, and the program's path.
   Output is masked for the endpoint key and secret patterns, cut, and escaped wherever it is shown.
+- **No options.** No parameter value may start with `-`, whatever its pattern says, so the model can't pass the program an option
+  (another cluster, an output file, a format). A pattern, enum value or number range that would allow one is
+  refused when the plugin loads.
 
 What remains: a read-only command's output goes to the endpoint like any file the model reads, and cluster
 data can be sensitive (other users' names, job names, node names, paths in job details). Read the commands
-before you bless them; a pattern that allows `-` first, or anything broad, lets the model pass options to the
-program. Plugins are not available through `--config-stdin` yet.
+before you bless them: a broad pattern still lets the model choose freely within it. Plugins are not available
+through `--config-stdin` yet.
 
 ### 4. Identity, privilege and credentials
 
