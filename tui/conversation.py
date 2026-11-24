@@ -18,6 +18,7 @@ import os
 import queue
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -53,6 +54,7 @@ COMMANDS = {
     "/shell": "show the shell and move there (`` on its empty prompt hides it again)",
     "/panel": "show or hide the info panel on the right",
     "/plan": "[clear]: show the approved plan, or drop it so everything asks again",
+    "/stop": "stop the sandboxed run going on now (Ctrl-C on an empty input does the same)",
     "/compact": "shrink the conversation when the context is getting full",
     "/context": "show how full the context is",
     "/clear": "start over: the model forgets this conversation, and the screen clears (the saved session keeps it)",
@@ -389,19 +391,31 @@ def parse_plan_edit(text, steps):
 
 MARK = {R: "✗", W: "⚠", D: "✓"}      # notes: the symbol before one in that role (a plain note has none)
 STATE_MARK = {"waiting": "◆", "shown": "▸", "running": "…", "accepted": "✓", "done": "✓", "ran": "✓",
-              "declined": "⊘", "cancelled": "⊘", "error": "✗", "auto": "↳"}
+              "declined": "⊘", "cancelled": "⊘", "error": "✗", "auto": "↳", "stopped": "■"}
+# A proposal id, as it may go into a tmux format (the status line): genai's are p1, p2 ...
+PROPOSAL_ID = re.compile(r"[a-z]{1,4}[0-9]{1,6}")
 
 
 class Card(Block):
     """A proposal. Its state changes as it is decided and performed."""
     STATE_ROLE = {"waiting": W, "accepted": D, "done": D, "declined": Q, "error": R, "shown": A, "auto": Q,
-                  "running": A, "ran": D, "cancelled": Q}
+                  "running": A, "ran": D, "cancelled": Q, "stopped": W}
 
     def __init__(self, ev):
         super().__init__()
         self.ev, self.state, self.detail = ev, "waiting", ""
         self.output = None         # a sandboxed run's output, as the model got it
         self.key = None            # N when Alt+N opens this command's menu
+        self.started = None        # time.monotonic() when a sandboxed run started
+        self.stoppable = True      # /stop can stop it (in remote mode, only a genai that takes the stop message)
+        self.shown_secs = None     # the elapsed seconds last drawn
+
+    def start(self, stoppable=True):
+        self.state, self.started, self.stoppable = "running", time.monotonic(), stoppable
+        self.changed()
+
+    def elapsed(self):
+        return int(time.monotonic() - self.started) if self.started is not None else 0
 
     @property
     def id(self):
@@ -411,6 +425,8 @@ class Card(Block):
         ev, k = self.ev, self.ev.get("kind")
         path = clean(ev.get("path", ""))
         return {"read": f"read {path}", "list": f"list {path or '.'}", "edit": f"edit {path}",
+                "search": f"search {clean(str(ev.get('pattern', '')))!r} in {path or '.'}"
+                          + (f" ({clean(str(ev['glob']))})" if ev.get("glob") else ""),
                 "write": f"{'overwrite' if ev.get('exists') else 'create'} {path}",
                 "command": "command", "external": f"tool {clean(ev.get('tool', ''))}",
                 "sandbox": f"sandbox · {'ONLINE' if ev.get('network') else 'offline'}",
@@ -440,6 +456,10 @@ class Card(Block):
                 out.append((("$ " if i == 0 else "  ") + ln, ""))
         elif k == "trusted":                             # a plugin's trusted command: what runs, as genai shows it
             out.append(("$ " + command_text(str(ev.get("argv", ""))).replace("\n", " "), ""))
+        if k == "sandbox" and self.state == "running":
+            self.shown_secs = self.elapsed()
+            out.append((f"running {self.shown_secs}s · " + ("Ctrl-C (or /stop) stops it" if self.stoppable else
+                        "it can't be stopped from here in remote mode yet"), A))
         if k in ("sandbox", "trusted") and self.output is not None:
             lines = clean(self.output).rstrip("\n").split("\n") if self.output.strip() else ["(no output)"]
             if not full and len(lines) > OUTPUT_LINES:
@@ -597,8 +617,13 @@ class Model:
         elif t == "proposal":
             card = self.add(Card(ev))
             self.cards[card.id] = card
-            if ev.get("auto") and ev.get("kind") in ("sandbox", "trusted"):
+            if ev.get("auto") and ev.get("kind") == "sandbox":
+                card.start(self.can_stop())
+            elif ev.get("auto") and ev.get("kind") == "trusted":
                 card.state = "running"
+            elif ev.get("auto") and ev.get("approved_file"):
+                card.state = "accepted"                 # shown in full: an edit that didn't ask
+                card.detail = "applied without asking: you approved an edit to this file earlier (/edits)"
             elif ev.get("auto"):
                 card.state = "auto"
             elif ev.get("kind") == "command":
@@ -614,7 +639,7 @@ class Model:
         elif t == "result":
             card = self.cards.get(ev.get("id"))
             if card:
-                card.state = "done" if ev.get("status") == "ok" else "error"
+                card.state = {"ok": "done", "stopped": "stopped"}.get(ev.get("status"), "error")
                 card.detail = ev.get("detail") or ""
                 if isinstance(ev.get("output"), str):
                     card.output = ev["output"]
@@ -637,19 +662,19 @@ class Model:
             self.context = ((ev.get("context") or {}).get("used"), (ev.get("context") or {}).get("limit"))
             if ev.get("reason") == "step_limit":
                 self.note("genai stopped after its step limit; send a message to continue", W)
-            elif ev.get("reason") == "stopped":
-                self.note("the sandboxed run was stopped; send a message to continue", W)
             self.next_queued()
         elif t == "context":
             self.context = (ev.get("used"), ev.get("limit"))
         elif t == "error" and any(f.error(self, ev) for f in self.features):
             pass                           # a feature's own request failed, and it has said so
+        elif t == "error" and ev.get("code") == "not_running":
+            self.note("nothing is running in the sandbox now")     # it ended as the stop was sent
         elif t == "error":
             if ev.get("exchanges"):
                 self.exchanges[self.turn] = ev["exchanges"]
             self.note(f"error: {ev.get('message', '')}", R)
             if self.busy and not self.pending and ev.get("code") not in ("busy", "unknown_id", "bad_message",
-                                                                         "unknown_type"):
+                                                                         "unknown_type", "not_running"):
                 self.busy = False          # a failed turn ends without a done event
                 self.next_queued()
         elif t == "notice":
@@ -690,6 +715,49 @@ class Model:
             for f in self.features:
                 if t in f.events:
                     f.event(self, ev)
+
+    def remote(self):
+        return bool((self.hello or {}).get("remote"))
+
+    def running_card(self):
+        """The sandboxed run going on now, if any."""
+        return next((c for c in reversed(list(self.cards.values()))
+                     if c.ev.get("kind") == "sandbox" and c.state == "running"), None)
+
+    def can_stop(self):
+        features = (self.hello or {}).get("features") or []
+        return "stop" in features or ("interrupt" in features and not self.remote())
+
+    def stop(self):
+        """/stop and Ctrl-C: ask genai to stop the sandboxed run: the stop message, which works over ssh too, or
+        from an older genai here, a SIGINT to the genai child."""
+        card = self.running_card()
+        if not card:
+            self.note("nothing is running in the sandbox")
+        elif "stop" in ((self.hello or {}).get("features") or []):
+            self.note(f"stopping the sandboxed run {clean(card.id)}…", W)
+            self.send({"type": "stop"})
+        elif self.remote():
+            self.note("stopping a sandboxed run isn't available in remote mode yet; it ends at its time limit", W)
+        elif "interrupt" not in ((self.hello or {}).get("features") or []):
+            self.note("this genai can't stop a sandboxed run; it ends at its time limit", R)
+        else:
+            self.note(f"stopping the sandboxed run {clean(card.id)}…", W)
+            self.actions.append(("interrupt",))
+
+    def tmux_status(self):
+        """The sandbox part of tmux's status-right. It is a tmux format, so only fixed words, a checked proposal id
+        and a number go in."""
+        if self.hello is None:
+            return ""
+        card = self.running_card()
+        if card and PROPOSAL_ID.fullmatch(card.id):
+            return f" #[fg=yellow,bold]⏵ sandbox {card.id} {card.elapsed()}s#[default] │"
+        if card:
+            return f" #[fg=yellow,bold]⏵ sandbox {card.elapsed()}s#[default] │"
+        if self.hello.get("sandbox"):
+            return " #[fg=green]⊡ sandbox#[default] │"
+        return " #[fg=red,bold]NO SANDBOX#[default] │"
 
     def network_text(self):
         r = self.runner
@@ -764,6 +832,8 @@ class Model:
                       "followed and /run can send them there (plain ssh can't be)")
             self.note("Alt+1 … Alt+9 open the menu of a command proposal, Alt+1 the newest (as its card says); "
                       "↑↓ and Enter, or the letter shown, choose")
+            for f in self.features:
+                f.help(self)
         elif cmd == "/coding":
             if arg in ("on", "off"):
                 self.send({"type": "coding", "on": arg == "on"})
@@ -816,6 +886,8 @@ class Model:
             self.actions.append(("focus_shell",))
         elif cmd == "/panel":
             self.actions.append(("panel",))
+        elif cmd == "/stop":
+            self.stop()
         elif cmd == "/plan":
             if arg == "clear" and self.busy:
                 self.note("/plan clear has to wait until genai finishes this reply", W)
@@ -852,6 +924,7 @@ class Model:
         """What the info panel shows. Proposal titles and details are escaped here and again where drawn."""
         h = self.hello or {}
         ep, sb, prof = h.get("endpoint") or {}, h.get("sandbox"), h.get("profile") or {}
+        run = self.running_card()
         view = {
             "session": {"endpoint": ep.get("name"), "model": ep.get("model"), "profile": prof.get("name"),
                         "session": h.get("session"), "sandbox": sb.get("name") if sb else None,
@@ -859,6 +932,7 @@ class Model:
             "coding": self.coding, "busy": self.busy, "context": list(self.context or (None, None)),
             "runner": self.runner and {"network": bool(self.runner.get("network")), "problem": self.runner.get("problem"),
                                        "image": self.runner.get("image")},
+            "running": run and {"id": clean(run.id), "secs": run.elapsed(), "stoppable": run.stoppable},
             "skills": self.skills,
             "proposals": [{"id": c.id, "title": c.title(), "state": c.state, "detail": clean(c.detail)}
                           for c in self.cards.values() if c.state != "auto"],
@@ -929,7 +1003,10 @@ class Model:
         if not self.pending:
             return
         card = self.pending.pop(0)
-        card.state = "accepted" if accept else "declined"
+        if accept and card.ev.get("kind") == "sandbox":
+            card.start(self.can_stop())            # genai runs it as soon as it has the answer
+        else:
+            card.state = "accepted" if accept else "declined"
         card.changed()
         self.send({"type": "decision", "id": card.id, "decision": "accept" if accept else "decline"})
 
@@ -1412,6 +1489,17 @@ class Child:
         except (BrokenPipeError, ValueError):
             pass
 
+    def interrupt(self):
+        """Ctrl-C for genai: a SIGINT, which stops a sandboxed run (genai ignores it otherwise). Only when genai is
+        our own child here; over ssh there is no way to send it one yet."""
+        if self.writes or self.p.poll() is not None:
+            return False
+        try:
+            os.kill(self.p.pid, signal.SIGINT)
+        except OSError:
+            return False
+        return True
+
     def close(self):
         try:
             if self.writes:
@@ -1448,6 +1536,8 @@ class App:
         self.prompt = os.environ.get("GENAI_TUI_PROMPT") if shell else None   # input happens in that pane
         # the other panes connect here; a feature that is off has no requests, so the Hub refuses them
         self.hub = Hub(self.state_dir, feature_requests(on)) if self.state_dir else None
+        if self.hub:
+            self.hub.plugins = any(f.name == "plugins" for f in on)
         fifo = fifo_path(self.state_dir) if self.state_dir else None
         self.rec = Recorder(fifo if fifo and os.path.exists(fifo) else None)   # each shell command and its output
         if shell:
@@ -1466,6 +1556,7 @@ class App:
         self.cache = {}
         self.last_total = 0
         self.ctrl_c = 0.0
+        self.status = None         # the sandbox part of tmux's status line, as last set
         self.paste = None          # text of a bracketed paste in progress
         curses.curs_set(1)
         curses.use_default_colors()
@@ -1695,6 +1786,9 @@ class App:
             now = time.time()
             if ed.text:
                 ed.take()
+            elif m.running_card():
+                m.stop()
+                now = 0.0                              # stopping a run doesn't count towards quitting
             elif now - self.ctrl_c < 2:
                 m.quit = True
             else:
@@ -1743,7 +1837,8 @@ class App:
             lines = [[(t, "question" if i == 0 and r in (A, W) else ("key" if t.strip() in ("y", "n", "v", "e", "a") else r))
                       for t, r in segs] for i, segs in enumerate(lines)]
         return {"mode": mode, "lines": lines if mode != "input" else [], "hints": "" if mode == "input" else hints,
-                "busy": self.m.busy, "status": " · ".join(status), "exited": self.m.exited is not None,
+                "busy": self.m.busy, "running": self.m.running_card() is not None,
+                "status": " · ".join(status), "exited": self.m.exited is not None,
                 "q": self.question()}
 
     def question(self):
@@ -1792,6 +1887,8 @@ class App:
             self.page(curses.KEY_PPAGE if msg.get("up") else curses.KEY_NPAGE)
         elif t == "quit":
             self.m.quit = True
+        elif t == "stop":
+            self.m.stop()
         else:
             return False
         return True
@@ -2248,6 +2345,8 @@ class App:
                 self.from_prompt(msg)
             elif role in ("panel", "files"):
                 self.m.request(msg, role)
+            elif role.startswith("plugin:") and self.m.feature("plugins"):
+                self.m.feature("plugins").request(self.m, role, msg)
             elif role == "menu" and (msg.get("type") in ("share", "mark") or self.m.takes(role, msg.get("type"))):
                 self.m.request(msg, role)
             elif role == "menu" and msg.get("type") == "menu" and msg.get("action") == "open":
@@ -2277,6 +2376,9 @@ class App:
                 self.shell.focus()
             elif action[0] == "panel":
                 self.toggle_panel()
+            elif action[0] == "interrupt":
+                if not self.child.interrupt():
+                    self.m.note("genai couldn't be sent Ctrl-C", R)
             else:
                 for f in self.m.features:
                     if action[0] in f.actions:
@@ -2306,6 +2408,14 @@ class App:
             ask = self.m.ask
             if ask and ask.get("kind") == "run" and "peek" not in ask:
                 ask["peek"] = self.peek(ask)
+        card = self.m.running_card()
+        if card and card.shown_secs != card.elapsed():
+            card.changed()                             # its elapsed time, once a second
+        if self.shell:
+            status = self.m.tmux_status()
+            if status != self.status:
+                self.status = status
+                self.shell.tmux("set", "-g", "@genai_sandbox", status)
         self.publish()
 
 
@@ -2338,9 +2448,10 @@ def parse_args(argv):
         if given and not args.remote:
             ap.error(f"{name} needs --remote")
     if args.remote:
-        if args.session or args.skill:
-            ap.error("--remote can't use -S or -k yet: sessions and skills stay on the host genai runs on, and "
-                     "genai refuses them there")
+        if args.session:
+            ap.error("--remote can't use -S yet: a saved session would stay on the host genai runs on")
+        if any(not k or re.search(r"[\x00-\x1f\x7f]", k) for k in args.skill):
+            ap.error("-k needs a skill name without control characters")
         why = remote.check_destination(args.remote, args.as_user, args.dir)
         if why:
             ap.error(why)
@@ -2354,7 +2465,7 @@ def genai_args(a):
     for flag, value in (("-p", a.profile), ("-e", a.endpoint), ("-S", a.session)):
         if value and not a.remote:
             out += [flag, value]
-    for k in a.skill:
+    for k in a.skill if not a.remote else ():      # remote, the skills travel in the config line too
         out += ["-k", k]
     if a.allow_session_endpoint_change and not a.remote:
         out.append("--allow-session-endpoint-change")
@@ -2372,6 +2483,8 @@ def main(argv):
             for k, v in (("dest", args.remote), ("as", args.as_user), ("dir", args.dir), ("profile", args.profile),
                          ("endpoint", args.endpoint)):
                 print(f"{k}={v or ''}")
+            for k in args.skill:
+                print(f"skill={k}")
             for o in args.ssh_opts:
                 print(f"ssh={o}")
         return 0

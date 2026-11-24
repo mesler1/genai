@@ -41,6 +41,28 @@ class Tmp(unittest.TestCase):
 
 # ---------------------------------------------------------------- path check
 
+class TestWalk(Tmp):
+    def test_walk_skips_hidden_and_symlinks_and_closes_what_it_opened(self):
+        root = self.path("wd")
+        for d in ("a/b", ".git", "c"):
+            os.makedirs(os.path.join(root, d))
+        for f in ("top", "a/one", "a/b/two", ".git/x", "c/three", ".env"):
+            open(os.path.join(root, f), "w").close()
+        os.symlink(os.path.join(root, "a"), os.path.join(root, "link"))
+        wd = G.Workdir(root)
+        self.assertEqual(list(wd.walk(".")), ["top", "a/one", "a/b/two", "c/three"])
+        self.assertEqual(list(wd.walk("a")), ["a/one", "a/b/two"])
+        before = len(os.listdir("/proc/self/fd")) if os.path.isdir("/proc/self/fd") else None
+        for _ in range(20):
+            it = wd.walk(".")
+            next(it)
+            it.close()                          # stopped early: every directory it opened is closed
+        if before is not None:
+            self.assertEqual(len(os.listdir("/proc/self/fd")), before)
+        with self.assertRaises(G.DiskError):
+            list(wd.walk("link"))
+
+
 class TestWorkdir(Tmp):
     def setUp(self):
         super().setUp()
@@ -403,6 +425,49 @@ class TestSkills(Tmp):
         self.assertEqual(G.load_skills(cfg, ["slurm"], notes.append), [])
         self.assertIn("changed", notes[-1])
 
+    def test_repl_raw_and_system(self):
+        with FakeAPI([reply("first \x1b[31mred"), reply("second")]) as api:
+            home, path = make_home(self.tmp, api.url)
+            bless_path(home, path)
+            cfg = G.Config(home)
+            eng = G.Engine(cfg, G.Endpoint.load(path), G.Session(cfg), G.PlainUI(io.StringIO()))
+            repl, out = G.Repl(eng), io.StringIO()
+            with mock.patch.object(sys, "stdout", out):
+                repl.command(":raw")
+                self.assertIn("nothing has been sent", out.getvalue())
+                repl.send("one")
+                repl.send("two")
+                out.seek(0)
+                out.truncate(0)
+                repl.command(":raw")
+                text = out.getvalue()
+                self.assertIn("Exchange 2 · turn 2", text)
+                self.assertNotIn("Exchange 1", text)
+                self.assertIn("User-Agent: genai/", text)
+                out.seek(0)
+                out.truncate(0)
+                repl.command(":raw 1")
+                self.assertIn("Exchange 1 · turn 1", out.getvalue())
+                out.seek(0)
+                out.truncate(0)
+                repl.command(":raw all")
+                self.assertEqual(out.getvalue().count("═" * 78), 4)
+                out.seek(0)
+                out.truncate(0)
+                repl.command(":raw 7")
+                self.assertIn("turn 7 has no exchanges", out.getvalue())
+                out.seek(0)
+                out.truncate(0)
+                repl.command(":system")
+                self.assertIn("── System prompt", out.getvalue())
+                self.assertIn('"name": "propose_command"', out.getvalue())
+
+    def test_page_escapes_control_characters(self):
+        out = io.StringIO()
+        with mock.patch.object(sys, "stdout", out):
+            G.page("ok\nred \x1b[31mtext\u202e")
+        self.assertEqual(out.getvalue().split("\n")[:2], ["ok", "red \\x1b[31mtext\\u202e"])
+
     def test_repl_skill_command(self):
         home = self.path("home", "genai")
         d = os.path.join(home, "skills", "slurm")
@@ -688,6 +753,51 @@ class TestEndToEnd(Tmp):
             g.close()
             tools = [m["content"] for m in api.requests[-1]["body"]["messages"] if m["role"] == "tool"]
             self.assertEqual(tools, ["visible", "declined by the user", "declined by the user"])
+
+    def test_search_files_in_coding_mode(self):
+        turns = [calls(("search_files", {"pattern": "needle", "reason": "r"}),
+                       ("search_files", {"pattern": "NEEDLE", "path": "src", "glob": "*.py", "ignore_case": True,
+                                         "reason": "r"}),
+                       ("search_files", {"pattern": "x", "path": ".git", "reason": "r"}),
+                       ("search_files", {"pattern": "a\nb", "reason": "r"})),
+                 reply("done")]
+        with FakeAPI(turns) as api:
+            g = self.start(api, "--coding")
+            files = {"src/a.py": "one\nneedle here\n", "src/b.txt": "needle in text\n", "top.md": "x" * 300 + "needle\n",
+                     ".hidden/c.py": "needle\n", "src/keys.py": "needle\nAPI_KEY=sk-abcdefghijklmnopqrstuvwx1234\n",
+                     "bin.dat": "needle\0"}
+            for name, text in files.items():
+                os.makedirs(os.path.dirname(self.path("wd", name)) or self.wd, exist_ok=True)
+                with open(os.path.join(self.wd, name), "w") as f:
+                    f.write(text)
+            os.symlink(os.path.join(self.wd, "src"), os.path.join(self.wd, "link"))
+            g.send({"type": "user", "text": "x"})
+            first = g.until("proposal")
+            self.assertEqual((first["kind"], first["pattern"], first.get("auto")), ("search", "needle", True))
+            g.until("done")
+            g.close()
+            tools = [m["content"] for m in api.requests[-1]["body"]["messages"] if m["role"] == "tool"]
+            self.assertEqual(tools[0].split("\n")[:3], ["top.md:1: …" + "x" * 194 + "needle",
+                                                       "src/a.py:2: needle here", "src/b.txt:1: needle in text"])
+            self.assertIn("(skipped 1 file binary, large or unreadable)", tools[0])
+            self.assertIn("(skipped 1 file looking like secrets)", tools[0])
+            self.assertNotIn("hidden", tools[0])
+            self.assertNotIn("link/", tools[0])
+            self.assertEqual(tools[1], "src/a.py:2: needle here\n(skipped 1 file looking like secrets)")
+            self.assertIn("hidden directories are not searched", tools[2])
+            self.assertIn("one line of text", tools[3])
+            names = [t["function"]["name"] for t in api.requests[0]["body"]["tools"]]
+            self.assertIn("search_files", names)
+
+    def test_search_files_is_not_offered_outside_coding_mode(self):
+        with FakeAPI([call("search_files", pattern="x", reason="r"), reply("ok")]) as api:
+            g = self.start(api)
+            g.send({"type": "user", "text": "x"})
+            g.until("done")
+            g.close()
+            self.assertNotIn("search_files", [t["function"]["name"] for t in api.requests[0]["body"]["tools"]])
+            tool = [m for m in api.requests[-1]["body"]["messages"] if m["role"] == "tool"][0]
+            self.assertIn("only available in coding mode", tool["content"])
 
     def test_coding_refused_in_home(self):
         with FakeAPI([]) as api:
@@ -1642,14 +1752,13 @@ class TestRemoteConfig(Tmp):
                                input="")
             self.assertEqual(r.returncode, G.EXIT_USAGE, args)
 
-    def test_profile_persona_and_skills_notice(self):
+    def test_profile_persona_and_skills_by_name_are_not_loaded_here(self):
         with FakeAPI([reply("ok")]) as api:
             msg = self.config(api)
             msg["profile"] = {"name": "ops", "persona": "You are the zebra of ops.", "skills": ["anything"],
                               "endpoint": "ignored"}
             g = self.start(msg)
-            g.until("hello")
-            self.assertEqual(g.until("notice")["message"], "skills aren't available in remote mode yet")
+            self.assertEqual(g.until("hello")["skills"], [])   # only skills sent in the config line are used
             g.send({"type": "user", "text": "hi"})
             g.until("done")
             g.close()
@@ -1667,6 +1776,35 @@ class TestRemoteConfig(Tmp):
             with mock.patch.object(os, "geteuid", return_value=uid), mock.patch("sys.stdout", out):
                 G.Repl(e).banner()
             self.assertEqual("every command it proposes would run as root" in out.getvalue(), shown)
+
+    def test_repl_sandbox_markers(self):
+        home = self.path("home", "genai")
+        cfg = G.Config(home)
+        cfg.ensure()
+        ep = G.Endpoint({"name": "t", "base_url": "https://llm.invalid/v1", "model": "m"}, "t.json")
+        for name, inside in (("podman", True), ("", False)):
+            with self.subTest(sandbox=inside):
+                env = {"GENAI_SANDBOX": name, "GENAI_SANDBOX_WORK_HOST": "/host/w\x1b[31m"}
+                with mock.patch.dict(os.environ, env), mock.patch.object(G.os.path, "exists", return_value=False):
+                    eng = G.Engine(cfg, ep, G.Session(cfg), G.PlainUI())
+                    repl, out = G.Repl(eng), io.StringIO()
+                    prompts = []
+                    with mock.patch.object(sys, "stdout", out), \
+                            mock.patch("builtins.input", side_effect=lambda p: prompts.append(p) or ":quit"):
+                        repl.run()
+                        repl.command(":sandbox")
+                        repl.command(":help")
+                text = out.getvalue()
+                self.assertEqual(prompts, ["(sandbox) > " if inside else "> "])
+                self.assertIn(":sandbox ", text)
+                self.assertEqual("IN THE PODMAN SANDBOX: /work = /host/w" in text, inside)
+                self.assertNotIn("\x1b", text)                          # the host path is escaped
+                self.assertEqual("genai runs inside the podman sandbox" in text, inside)
+                self.assertEqual("genai runs OUTSIDE any sandbox, directly on this host" in text, not inside)
+                self.assertEqual("/opt/genai, read-only" in text, inside)
+                self.assertEqual("sandbox/run shell opens a shell in it" in text, inside)
+                self.assertEqual("network:" in text, inside)
+                self.assertEqual("sandbox/run genai runs genai in a podman sandbox" in text, not inside)
 
     def test_model_auto(self):
         with FakeAPI([reply("ok")], models=[{"id": "qwen3-coder"}]) as api:

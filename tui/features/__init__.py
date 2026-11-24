@@ -14,7 +14,7 @@ import importlib
 import json
 import os
 
-BUILTIN = ("model", "copy", "decline", "raw", "ssh", "files")
+BUILTIN = ("model", "copy", "decline", "raw", "ssh", "files", "sandbox", "edits", "plugins")
 
 
 class Feature:
@@ -54,6 +54,9 @@ class Feature:
 
     def card_action(self, app, what, card):
         """A choice from a command card's menu that is one of its card_actions. card is a command proposal."""
+
+    def help(self, m):
+        """More /help lines, after the commands."""
 
     def poll(self, app):
         """Once per App loop iteration, for things that have to be watched (such as genai-ssh's handshake)."""
