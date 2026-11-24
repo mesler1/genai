@@ -2726,6 +2726,7 @@ class Proposal:
         self.error = None          # set when the request is invalid and never shown for a decision
         self.reply = None          # what the model is told instead of "error: ..." (the user still sees error)
         self.stopped = False       # the user pressed Ctrl-C while it ran: the turn ends
+        self.digest = None         # set when a JSON front end is asked to decide it
 
     def event(self):
         ev = {"type": "proposal", "id": self.id, "kind": self.kind}
@@ -3956,6 +3957,17 @@ def plan_choice(p, msg):
     return True
 
 
+DIGEST_NONCE = secrets.token_bytes(16)     # this process's: a card left over from another genai never matches
+
+
+def digest(ev):
+    """A short digest of a proposal exactly as emitted, which a decision must echo. It catches mix-ups (an answer
+    meant for another card, a queue race, a reconnect to a new genai whose IDs start again at p1), not a front
+    end that means harm: one that can echo a digest can approve anything. Front ends echo it; they never compute it."""
+    body = json.dumps({k: v for k, v in ev.items() if k != "digest"}, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(DIGEST_NONCE + body.encode()).hexdigest()[:16]
+
+
 class JsonUI:
     """JSON Lines over stdio for wrappers and TUIs."""
     performs = True
@@ -4010,7 +4022,8 @@ class JsonUI:
 
     def decide(self, pending):
         """Emit every blocking proposal, then wait for decisions in any order.
-        No answer, EOF, or an unknown ID means decline."""
+        No answer, EOF, or an unknown ID means decline. A decision must echo the proposal's digest; one that
+        doesn't is refused and the proposal still waits (see digest)."""
         for p in pending:
             ev = p.event()
             for key in ("content", "diff", "path", "undiffable"):
@@ -4020,6 +4033,7 @@ class JsonUI:
                         ev.setdefault("flagged", []).append(key)
             if p.kind == "plan" and any(exact(st.get("command") or st.get("path") or "")[1] for st in ev["steps"]):
                 ev.setdefault("flagged", []).append("steps")
+            ev["digest"] = p.digest = digest(ev)
             self.emit(ev)
         waiting = {p.id: p for p in pending}
         while waiting:
@@ -4028,7 +4042,10 @@ class JsonUI:
                 break
             t = msg.get("type")
             pid = msg.get("id")
-            if t == "decision" and pid in waiting and waiting[pid].kind != "external":
+            if t in ("decision", "result") and pid in waiting and msg.get("digest") != waiting[pid].digest:
+                self.error(f"{pid}: that answer is for a proposal other than the one waiting (its digest is "
+                           f"{'missing' if 'digest' not in msg else 'different'}); it still waits", "digest_mismatch")
+            elif t == "decision" and pid in waiting and waiting[pid].kind != "external":
                 p = waiting.pop(pid)
                 p.decision = msg.get("decision") if msg.get("decision") in ("accept", "decline") else "decline"
                 if p.kind == "plan" and p.decision == "accept" and not plan_choice(p, msg):
@@ -4637,7 +4654,7 @@ def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()
              "host": socket.gethostname(), "user": user, "uid": uid, "remote": remote,
              "features": ["proposals", "decisions", "attach", "register_tools", "compact", "context", "coding",
                           "set_coding", "skills", "files", "read", "trace", "system", "plan", "network", "clear",
-                          "models", "plugins", "interrupt", "edits", "stop"],
+                          "models", "plugins", "interrupt", "edits", "stop", "digest"],
              "endpoint": engine.endpoint.info(),
              "profile": {"name": engine.profile.name, "description": engine.profile.description}
              if engine.profile else None,

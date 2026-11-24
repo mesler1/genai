@@ -996,7 +996,7 @@ class Model:
             (f"; you changed step {', '.join(map(str, sorted(edits)))}" if edits else "") + \
             ("; commands run on their own" if auto else "")
         card.changed()
-        msg = {"type": "decision", "id": card.id, "decision": "accept"}
+        msg = answer(card, "decision", decision="accept")
         if approve is not None:
             msg["approve"] = sorted(keep)
         if edits:
@@ -1012,7 +1012,16 @@ class Model:
         else:
             card.state = "accepted" if accept else "declined"
         card.changed()
-        self.send({"type": "decision", "id": card.id, "decision": "accept" if accept else "decline"})
+        self.send(answer(card, "decision", decision="accept" if accept else "decline"))
+
+
+def answer(card, kind, **fields):
+    """A decision or result for genai, echoing the digest of the proposal the card shows (genai refuses an answer
+    whose digest is missing or different)."""
+    msg = {"type": kind, "id": card.id, **fields}
+    if card.ev.get("digest"):
+        msg["digest"] = card.ev["digest"]
+    return msg
 
 
 def edit_key(ed, k):

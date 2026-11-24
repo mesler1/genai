@@ -275,6 +275,16 @@ safe and prompts are rare enough to be read.
   mean decline. Pending proposals never survive a crash or a resumed session.
 - An approval is bound to what you reviewed: the target file's sha256, or the fact that it did
   not exist. If the file changed before the write, nothing is written.
+- A wrapper's answer is bound to the proposal it shows. Each proposal that waits carries a
+  digest of the event exactly as genai emitted it, keyed with a random value chosen per genai
+  process. A decision must echo that digest, or it is refused and the proposal still waits. This
+  catches an answer meant for another card, a queue race, or a stale card after a reconnect to a
+  new genai process, whose IDs start again at `p1`. It does not stop a wrapper that means harm: a
+  wrapper that can read the digest can approve anything, and it runs as you anyway.
+- Every kind of proposal is one row of a table (`PROPOSAL_KINDS`), and `perform` runs a kind's
+  handler only after an accept, except for commands (shown, never run) and kinds the wrapper
+  answers itself. `tests/test_invariants.py` checks this, and the audit and end-of-input rules
+  above, over every row.
 - An edit that cannot be previewed is not applied.
 - An overwrite that cannot be shown as a diff (the existing file is binary or too large) shows
   the whole new content instead, says the file is replaced entirely, and says when it will stay

@@ -505,14 +505,20 @@ and get the error `remote` for any other name. A plugin's programs are looked fo
 checks, and `--plugin` is ignored. A bad line ends genai with exit status 3 and an `error` with code
 `bad_config`, and nothing is sent to any endpoint.
 
+**Digests.** Each proposal that waits for an answer carries a `digest`: 16 hex characters over the event exactly
+as genai emitted it and a random value that genai picks when it starts. A `decision` or `result` must echo it
+unchanged, without computing it. An answer whose digest is missing or different gets a `digest_mismatch` error and
+decides nothing: the proposal still waits. This catches mix-ups (an answer meant for another card, a queue race, a
+reconnect to a new genai whose IDs start again at `p1`), not a wrapper that means harm.
+
 **Messages a wrapper sends**
 
 | `type` | Fields | What happens |
 |---|---|---|
 | `user` | `text` | Sends a message to the model, with any queued attachments. |
 | `attach` | `text`, optional `label`, `ref` | Queues text for the next `user` message. Secrets in it are masked. Answered by `attached`. |
-| `decision` | `id`, `decision` (`accept` or `decline`); for a plan, optional `approve` and `edits` | Decides a read, list, write, edit or plan proposal. For a plan, `approve` lists the step numbers approved (default: all), and `edits` maps a command step's number to the command the user wants instead. A malformed choice declines the plan, with the error `bad_message`. |
-| `result` | `id`, `status` (`ok`, `declined`, `error`), `output` | Answers a proposal for a tool the wrapper registered. |
+| `decision` | `id`, `digest`, `decision` (`accept` or `decline`); for a plan, optional `approve` and `edits` | Decides a read, list, write, edit or plan proposal. For a plan, `approve` lists the step numbers approved (default: all), and `edits` maps a command step's number to the command the user wants instead. A malformed choice declines the plan, with the error `bad_message`. |
+| `result` | `id`, `digest`, `status` (`ok`, `declined`, `error`), `output` | Answers a proposal for a tool the wrapper registered. |
 | `register_tools` | `tools`: a list of `{name, description, parameters}` | Adds tools the model can call. The wrapper performs them. Answered by `registered`. |
 | `compact` | | Shrinks the conversation. Answered by `compacted`. |
 | `models` | | Answered by `models`: `current`, and `models`, each `{"id", "context"}` (the server's list, `GET /models`, without names genai won't use). |

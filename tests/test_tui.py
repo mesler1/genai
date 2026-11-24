@@ -329,6 +329,10 @@ class TestModel(unittest.TestCase):
         self.assertEqual(m.outbox[1:], [{"type": "decision", "id": "p1", "decision": "accept"},
                                         {"type": "decision", "id": "p2", "decision": "decline"}])
         m.handle({"type": "result", "id": "p1", "status": "ok", "detail": "wrote a"})
+        m.handle({"type": "proposal", "id": "p5", "kind": "read", "path": ".env", "digest": "0123456789abcdef"})
+        m.decide(True)                                   # genai's digest goes back with the answer, unchanged
+        self.assertEqual(m.outbox[-1], {"type": "decision", "id": "p5", "decision": "accept",
+                                        "digest": "0123456789abcdef"})
         self.assertEqual((m.cards["p1"].state, m.cards["p2"].state), ("done", "declined"))
         self.assertIn("secrets", text_of(m.cards["p2"]))
         self.assertIn("$ rm -rf ~", text_of(m.cards["p4"]))
