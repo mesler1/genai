@@ -361,6 +361,37 @@ class TestInterrupt(FakePodman):
         self.assertTrue(any("stopped by the user" in str(m.get("content")) for m in api.requests[1]["body"]["messages"]))
 
 
+    def test_stop_message_does_the_same_over_any_channel(self):
+        turns = [call("run_in_sandbox", command="echo started; sleep 30", reason="t"), reply("second")]
+        with FakeAPI(turns) as api:
+            home, ep = make_home(self.tmp, api.url)
+            bless_path(home, ep)
+            prof = {"name": "coder", "endpoint": "test", "coding": True, "sandbox": {"image": "img:1"}}
+            bless_path(home, write_json(os.path.join(home, "profiles", "coder.json"), prof))
+            self.project({"a.txt": "hi\n"})
+            g = Proc(home, self.path("wd"), ["-p", "coder"], env=self.env)
+            self.assertIn("stop", g.until("hello")["features"])
+            g.send({"type": "stop"})                     # idle: said so, and nothing else happens
+            self.assertEqual(g.until("error")["code"], "not_running")
+            g.send({"type": "user", "text": "go"})
+            g.until("proposal")
+            deadline = time.time() + 10
+            while not os.path.exists(self.log + ".pid") and time.time() < deadline:
+                time.sleep(0.05)
+            time.sleep(0.3)
+            started = time.monotonic()
+            g.send({"type": "stop"})                     # read while genai is busy with the run
+            r = g.until("result")
+            self.assertLess(time.monotonic() - started, 10)
+            self.assertEqual(r["status"], "stopped")
+            self.assertEqual(g.until("done")["reason"], "stopped")
+            self.assertTrue(any("kill" in c for c in self.podman_calls()))
+            g.send({"type": "user", "text": "again"})
+            self.assertEqual(g.until("done")["reason"], "reply")
+            g.close()
+        self.assertTrue(any("stopped by the user" in str(m.get("content")) for m in api.requests[1]["body"]["messages"]))
+
+
 class TestTerminal(unittest.TestCase):
     def test_shows_the_command_then_the_end_of_its_output(self):
         p = G.Proposal("p1", "sandbox", "c1", command="make test\x1b[2J", reason="check", network=False, image="i")

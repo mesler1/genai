@@ -407,7 +407,7 @@ class Card(Block):
         self.output = None         # a sandboxed run's output, as the model got it
         self.key = None            # N when Alt+N opens this command's menu
         self.started = None        # time.monotonic() when a sandboxed run started
-        self.stoppable = True      # /stop can stop it (not yet in remote mode)
+        self.stoppable = True      # /stop can stop it (in remote mode, only a genai that takes the stop message)
         self.shown_secs = None     # the elapsed seconds last drawn
 
     def start(self, stoppable=True):
@@ -618,7 +618,7 @@ class Model:
             card = self.add(Card(ev))
             self.cards[card.id] = card
             if ev.get("auto") and ev.get("kind") == "sandbox":
-                card.start(not self.remote())
+                card.start(self.can_stop())
             elif ev.get("auto") and ev.get("kind") == "trusted":
                 card.state = "running"
             elif ev.get("auto") and ev.get("approved_file"):
@@ -667,12 +667,14 @@ class Model:
             self.context = (ev.get("used"), ev.get("limit"))
         elif t == "error" and any(f.error(self, ev) for f in self.features):
             pass                           # a feature's own request failed, and it has said so
+        elif t == "error" and ev.get("code") == "not_running":
+            self.note("nothing is running in the sandbox now")     # it ended as the stop was sent
         elif t == "error":
             if ev.get("exchanges"):
                 self.exchanges[self.turn] = ev["exchanges"]
             self.note(f"error: {ev.get('message', '')}", R)
             if self.busy and not self.pending and ev.get("code") not in ("busy", "unknown_id", "bad_message",
-                                                                         "unknown_type"):
+                                                                         "unknown_type", "not_running"):
                 self.busy = False          # a failed turn ends without a done event
                 self.next_queued()
         elif t == "notice":
@@ -722,11 +724,19 @@ class Model:
         return next((c for c in reversed(list(self.cards.values()))
                      if c.ev.get("kind") == "sandbox" and c.state == "running"), None)
 
+    def can_stop(self):
+        features = (self.hello or {}).get("features") or []
+        return "stop" in features or ("interrupt" in features and not self.remote())
+
     def stop(self):
-        """/stop and Ctrl-C: ask genai to stop the sandboxed run. Locally that is a SIGINT to the genai child."""
+        """/stop and Ctrl-C: ask genai to stop the sandboxed run: the stop message, which works over ssh too, or
+        from an older genai here, a SIGINT to the genai child."""
         card = self.running_card()
         if not card:
             self.note("nothing is running in the sandbox")
+        elif "stop" in ((self.hello or {}).get("features") or []):
+            self.note(f"stopping the sandboxed run {clean(card.id)}…", W)
+            self.send({"type": "stop"})
         elif self.remote():
             self.note("stopping a sandboxed run isn't available in remote mode yet; it ends at its time limit", W)
         elif "interrupt" not in ((self.hello or {}).get("features") or []):
@@ -994,7 +1004,7 @@ class Model:
             return
         card = self.pending.pop(0)
         if accept and card.ev.get("kind") == "sandbox":
-            card.start(not self.remote())          # genai runs it as soon as it has the answer
+            card.start(self.can_stop())            # genai runs it as soon as it has the answer
         else:
             card.state = "accepted" if accept else "declined"
         card.changed()
