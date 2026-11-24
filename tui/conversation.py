@@ -2430,9 +2430,10 @@ def parse_args(argv):
         if given and not args.remote:
             ap.error(f"{name} needs --remote")
     if args.remote:
-        if args.session or args.skill:
-            ap.error("--remote can't use -S or -k yet: sessions and skills stay on the host genai runs on, and "
-                     "genai refuses them there")
+        if args.session:
+            ap.error("--remote can't use -S yet: a saved session would stay on the host genai runs on")
+        if any(not k or re.search(r"[\x00-\x1f\x7f]", k) for k in args.skill):
+            ap.error("-k needs a skill name without control characters")
         why = remote.check_destination(args.remote, args.as_user, args.dir)
         if why:
             ap.error(why)
@@ -2446,7 +2447,7 @@ def genai_args(a):
     for flag, value in (("-p", a.profile), ("-e", a.endpoint), ("-S", a.session)):
         if value and not a.remote:
             out += [flag, value]
-    for k in a.skill:
+    for k in a.skill if not a.remote else ():      # remote, the skills travel in the config line too
         out += ["-k", k]
     if a.allow_session_endpoint_change and not a.remote:
         out.append("--allow-session-endpoint-change")
@@ -2464,6 +2465,8 @@ def main(argv):
             for k, v in (("dest", args.remote), ("as", args.as_user), ("dir", args.dir), ("profile", args.profile),
                          ("endpoint", args.endpoint)):
                 print(f"{k}={v or ''}")
+            for k in args.skill:
+                print(f"skill={k}")
             for o in args.ssh_opts:
                 print(f"ssh={o}")
         return 0

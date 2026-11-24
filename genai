@@ -9,6 +9,7 @@ Standard library only; Python 3.10 or newer.
 """
 
 import argparse
+import base64
 import collections
 import datetime
 import difflib
@@ -789,10 +790,12 @@ class Skill:
     """A skill, read once. Its hash and every byte used later come from this one snapshot;
     nothing reopens the files, so editing them afterwards changes nothing until the next load."""
 
-    def __init__(self, name, path):
+    def __init__(self, name, path, files=None):
+        """files: the skill's bytes as sent by genai-tui from your own machine (remote mode); path is then only a
+        label, and nothing is read here."""
         self.name, self.path = name, path
         try:
-            self.files = snapshot_skill(path)
+            self.files = snapshot_skill(path) if files is None else files
             self.hash = hash_snapshot(self.files)
         except (GenaiError, OSError):
             self.files, self.hash = {}, None
@@ -825,11 +828,13 @@ def skill_status(cfg, skill):
     return bless_status(cfg, "skill", skill.path, skill.hash)
 
 
-def skill_rows(cfg, active=None):
-    """Every skill found, for listings. active: names in use, marked when given."""
+def skill_rows(cfg, active=None, found=None):
+    """Every skill found, for listings. active: names in use, marked when given. found: the skills your own machine
+    sent (remote mode), which are the only ones there, and blessed by being sent."""
     rows = []
-    for n, s in sorted(find_skills(cfg).items()):
-        row = {"name": n, "path": s.path, "description": s.description(), "status": skill_status(cfg, s)}
+    for n, s in sorted((find_skills(cfg) if found is None else found).items()):
+        row = {"name": n, "path": s.path, "description": s.description(),
+               "status": skill_status(cfg, s) if found is None else "blessed"}
         if active is not None:
             row["active"] = n in active
         rows.append(row)
@@ -1112,24 +1117,26 @@ class Plugin:
     """A plugin, read once like a skill: its hash and manifest come from one snapshot of the directory, so editing
     the files afterwards changes nothing until the next load. error is set when the manifest is refused."""
 
-    def __init__(self, name, path):
+    def __init__(self, name, path, files=None):
+        """files: the plugin's bytes as sent by genai-tui from your own machine (remote mode); path is then only a
+        label, and nothing is read here."""
         self.name, self.path = name, path
         self.error = self.hash = self.pane = None
-        self.description, self.commands = "", {}
+        self.description, self.commands, self.files = "", {}, {}
         try:
-            files = snapshot_skill(path)
-            self.hash = hash_snapshot(files)
+            self.files = snapshot_skill(path) if files is None else files
+            self.hash = hash_snapshot(self.files)
         except (GenaiError, OSError) as e:
             self.error = str(e)
             return
         try:
-            self.parse(files)
+            self.parse(self.files)
         except ValueError as e:
             self.error, self.commands = f"plugin.json: {e}", {}
 
     def parse(self, files):
         data = _object(json.loads(files.get("plugin.json", b"").decode("utf-8")), PLUGIN_KEYS, "plugin")
-        if data.get("name") != os.path.basename(self.path) or not PLUGIN_NAME.fullmatch(data.get("name", "")):
+        if data.get("name") != self.name or not PLUGIN_NAME.fullmatch(data.get("name", "")):
             raise ValueError("name must be lowercase letters, digits and '-', and the same as the directory's name")
         self.description = _text(data, "description", "")
         search = data.get("search", list(DEFAULT_SEARCH))
@@ -1217,11 +1224,12 @@ def plugin_status(cfg, plugin):
     return "invalid" if plugin.hash is None else bless_status(cfg, "plugin", plugin.path, plugin.hash)
 
 
-def plugin_rows(cfg, active=()):
-    """Every plugin found, for listings and the plugins message."""
+def plugin_rows(cfg, active=(), found=None):
+    """Every plugin found, for listings and the plugins message. found: the plugins your own machine sent (remote
+    mode), which are the only ones there, and blessed by being sent."""
     rows = []
-    for n, pl in sorted(find_plugins(cfg).items()):
-        st = plugin_status(cfg, pl)
+    for n, pl in sorted((find_plugins(cfg) if found is None else found).items()):
+        st = plugin_status(cfg, pl) if found is None else ("invalid" if pl.error else "blessed")
         rows.append({"name": n, "path": pl.path, "dir": pl.path, "description": pl.description or pl.error or "",
                      "status": st, "blessed": st == "blessed", "enabled": n in active, "active": n in active,
                      "error": pl.error, "pane": pl.pane, "commands": [c.info() for c in pl.commands.values()]})
@@ -1579,11 +1587,57 @@ def select_named(cfg, kind, name):
     return obj
 
 
+REMOTE_ITEM_CAP = 1 << 20      # bytes of one skill or plugin sent to a remote genai
+
+
+def remote_items(raw, kind, bad):
+    """The skills or plugins in a config line: {name: Skill or Plugin}, made from the bytes your machine sent. Each
+    one's hash is computed again here from those bytes and must be the one blessed there."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, list):
+        raise bad(f"'{kind}s' must be a list")
+    out = {}
+    for item in raw:
+        if not isinstance(item, dict) or set(item) != {"name", "hash", "files"}:
+            raise bad(f"each {kind} must have exactly 'name', 'hash' and 'files'")
+        name, files = item["name"], item["files"]
+        if not isinstance(name, str) or not NAME_RE.fullmatch(name) or name in out:
+            raise bad(f"{kind} names must be distinct names (letters, digits, . _ -)")
+        if not isinstance(files, dict) or not files:
+            raise bad(f"{kind} '{name}': 'files' must be an object of relative paths")
+        data, size = {}, 0
+        for rel, b64 in files.items():
+            parts = rel.split("/") if isinstance(rel, str) else [""]
+            if not isinstance(b64, str) or "\0" in rel or any(p in ("", ".", "..") for p in parts):
+                raise bad(f"{kind} '{name}': bad file {one_line(str(rel))[0]!r}")
+            try:
+                data[rel] = base64.b64decode(b64, validate=True)
+            except ValueError:
+                raise bad(f"{kind} '{name}': a file is not base64") from None
+            size += len(data[rel])
+        if size > REMOTE_ITEM_CAP:
+            raise bad(f"{kind} '{name}' is over {REMOTE_ITEM_CAP} bytes")
+        if hash_snapshot(data) != item["hash"]:
+            raise bad(f"{kind} '{name}': its files don't match the hash blessed on your machine")
+        label = f"{name} (from your machine)"
+        if kind == "skill":
+            if "SKILL.md" not in data:
+                raise bad(f"skill '{name}' has no SKILL.md")
+            out[name] = Skill(name, label, data)
+        else:
+            out[name] = Plugin(name, label, data)
+            if out[name].error:
+                raise bad(f"plugin '{name}': {out[name].error}")
+    return out
+
+
 def remote_config(line, audit):
-    """Parse the config line genai-tui sends first with --config-stdin: an endpoint, a profile (or null) and the
-    session token. genai-tui checked the user's blessed files on their machine, so nothing here is looked up or
-    blessed on this host; the audit log records what arrived. The key stays on the user's machine: the endpoint
-    is a loopback port that ssh forwards to a proxy there, which adds the key when the token matches."""
+    """Parse the config line genai-tui sends first with --config-stdin: an endpoint, a profile (or null), the
+    session token, and the skills and plugins to use. genai-tui checked the user's blessed files on their machine,
+    so nothing here is looked up or blessed on this host; the audit log records what arrived, with hashes. The key
+    stays on the user's machine: the endpoint is a loopback port that ssh forwards to a proxy there, which adds the
+    key when the token matches. Returns the endpoint, the profile and {"skills": {...}, "plugins": {...}}."""
     def bad(why):
         return GenaiError(f"bad config from the wrapper: {why}. Nothing was sent.", EXIT_PROFILE, "bad_config")
 
@@ -1608,11 +1662,15 @@ def remote_config(line, audit):
     m = REMOTE_URL.fullmatch(endpoint.base_url)
     if not m or not 0 < int(m.group(1)) < 65536:
         raise bad("base_url must be http://127.0.0.1:PORT, optionally with a path")
+    offered = {"skills": remote_items(msg.get("skills"), "skill", bad),
+               "plugins": remote_items(msg.get("plugins"), "plugin", bad)}
     endpoint.token = token
     digest = lambda o: hash_bytes(json.dumps(o, sort_keys=True).encode())
     audit.log("remote_config", endpoint=endpoint.name, model=endpoint.model, endpoint_sha256=digest(ep),
-              profile=persona.name if persona else None, profile_sha256=digest(prof) if persona else None)
-    return endpoint, persona
+              profile=persona.name if persona else None, profile_sha256=digest(prof) if persona else None,
+              skills={n: s.hash for n, s in offered["skills"].items()},
+              plugins={n: p.hash for n, p in offered["plugins"].items()})
+    return endpoint, persona, offered
 
 
 # Endpoint fields that never travel to a remote host: where the key is, the proxy (the key proxy uses the endpoint's
@@ -1621,9 +1679,29 @@ def remote_config(line, audit):
 REMOTE_STRIP = ("key_env", "key_file", "proxy", "headers", "ca_bundle")
 
 
-def export_remote(cfg, profile_name, endpoint_name):
+def export_items(cfg, kind, names):
+    """The blessed skills or plugins among names, with their bytes (base64) and hash, for a remote genai. One that
+    is missing, not blessed, refused or too big is left out, and genai says so on stderr."""
+    found, out = (find_skills(cfg) if kind == "skill" else find_plugins(cfg)), []
+    for n in dict.fromkeys(names):
+        item = found.get(n)
+        st = None if item is None else (skill_status(cfg, item) if kind == "skill" else plugin_status(cfg, item))
+        why = ("not found" if item is None else f"{st} (genai --bless {item.path})" if st != "blessed" else
+               getattr(item, "error", None) or
+               (f"over {REMOTE_ITEM_CAP} bytes" if sum(map(len, item.files.values())) > REMOTE_ITEM_CAP else None))
+        if why:
+            eprint(f"genai: {kind} '{n}' is not sent to the remote host: {why}")
+            continue
+        out.append({"name": n, "hash": item.hash,
+                    "files": {rel: base64.b64encode(b).decode() for rel, b in sorted(item.files.items())}})
+    return out
+
+
+def export_remote(cfg, profile_name, endpoint_name, skills=(), plugins=()):
     """What genai-tui's remote mode needs from this machine's configuration, resolved and checked exactly as a
-    normal start would (default profile and endpoint, blessing, changed files), and nothing secret."""
+    normal start would (default profile and endpoint, default skills and plugins, blessing, changed files), and
+    nothing secret: the skills and plugins in use go with their bytes, which the remote genai checks against the
+    hashes blessed here."""
     pname = profile_name or cfg.default_profile
     persona = select_named(cfg, "profile", pname) if pname else None
     endpoint = select_endpoint(cfg, endpoint_name or (persona.endpoint if persona else None) or cfg.default_endpoint)
@@ -1631,9 +1709,15 @@ def export_remote(cfg, profile_name, endpoint_name):
     if not re.fullmatch(r"(?:/[A-Za-z0-9._~-]+)*", path):
         raise GenaiError(f"endpoint '{endpoint.name}': the path of base_url ({path!r}) can't be used in remote mode "
                          "(letters, digits and . _ ~ - only)", EXIT_PROFILE)
-    cfg.audit.log("remote_config_export", endpoint=endpoint.name, profile=persona.name if persona else None)
+    skills = export_items(cfg, "skill", (persona.skills if persona and persona.skills is not None
+                                         else cfg.default_skills) + list(skills))
+    plugins = export_items(cfg, "plugin", (persona.plugins if persona and persona.plugins is not None
+                                           else cfg.default_plugins) + list(plugins))
+    cfg.audit.log("remote_config_export", endpoint=endpoint.name, profile=persona.name if persona else None,
+                  skills={s["name"]: s["hash"] for s in skills}, plugins={p["name"]: p["hash"] for p in plugins})
     return {"endpoint": {k: v for k, v in endpoint.data.items() if k not in REMOTE_STRIP},
-            "profile": persona.data if persona else None, "endpoint_name": endpoint.name, "base_path": path}
+            "profile": persona.data if persona else None, "endpoint_name": endpoint.name, "base_path": path,
+            "skills": skills, "plugins": plugins}
 
 
 def select_endpoint(cfg, name):
@@ -2618,10 +2702,12 @@ class Engine:
     """The loop: send, turn tool calls into proposals, collect decisions, send again."""
 
     def __init__(self, cfg, endpoint, session, ui, client=None, coding=None, profile=None, anywhere=False,
-                 plugins=()):
+                 plugins=(), offered=None):
         """coding: None, or where the request for coding mode came from ("--coding", "profile NAME").
         anywhere: the user passed --coding-anywhere, which allows coding mode where it is normally refused.
-        plugins: names of the plugins to enable; one that is missing, unblessed or refused is skipped with a notice."""
+        plugins: names of the plugins to enable; one that is missing, unblessed or refused is skipped with a notice.
+        offered: remote mode's {"skills": {...}, "plugins": {...}}, what your own machine sent (remote_config): the
+        only skills and plugins there are, in place of those found on this host."""
         self.cfg, self.endpoint, self.session, self.ui = cfg, endpoint, session, ui
         self.profile = profile
         self.client = client or Client(endpoint, profile.params if profile else None)
@@ -2634,6 +2720,7 @@ class Engine:
         self.box = Sandbox(profile.sandbox, os.getcwd(), ui.notice) if profile and profile.sandbox else None
         self.notifier = None     # the notify hook, set by main() when a person is at the terminal
         self.commands = []       # command proposals shown in this process, newest last
+        self.offered = offered
         self.skills = []
         self.reload_skills()
         self.plugins = []        # enabled plugins; never saved with the session
@@ -2689,7 +2776,18 @@ class Engine:
     # -- setup
 
     def reload_skills(self):
+        if self.offered is not None:
+            self.skills = [self.offered["skills"][n] for n in self.session.skills if n in self.offered["skills"]]
+            return
         self.skills = load_skills(self.cfg, self.session.skills, self.ui.notice)
+
+    def skill_rows(self):
+        found = self.offered["skills"] if self.offered is not None else None
+        return skill_rows(self.cfg, [s.name for s in self.skills], found)
+
+    def plugin_rows(self):
+        found = self.offered["plugins"] if self.offered is not None else None
+        return plugin_rows(self.cfg, [p.name for p in self.plugins], found)
 
     def set_coding(self, on, source=":coding"):
         refused = coding_refusal(os.getcwd()) if on else None
@@ -2711,10 +2809,10 @@ class Engine:
     def set_skill(self, name, on):
         """Use a skill from the next request on, or stop using it. Only a blessed skill can be turned on."""
         if on:
-            s = find_skills(self.cfg).get(name)
+            s = (find_skills(self.cfg) if self.offered is None else self.offered["skills"]).get(name)
             if not s:
                 raise GenaiError(f"skill '{name}' not found", EXIT_USAGE, "unknown_skill")
-            st = skill_status(self.cfg, s)
+            st = skill_status(self.cfg, s) if self.offered is None else "blessed"
             if st != "blessed":
                 raise GenaiError(f"skill '{name}' is {st}; read it, then: genai --bless {s.path}", EXIT_USAGE,
                                  "not_blessed")
@@ -2730,10 +2828,10 @@ class Engine:
         """Offer a plugin's trusted commands to the model and the user from the next request on, or stop. Only a
         blessed plugin whose programs can be trusted is turned on."""
         if on:
-            pl = find_plugins(self.cfg).get(name)
+            pl = (find_plugins(self.cfg) if self.offered is None else self.offered["plugins"]).get(name)
             if not pl:
                 raise GenaiError(f"plugin '{name}' not found", EXIT_USAGE, "unknown_plugin")
-            st = plugin_status(self.cfg, pl)
+            st = plugin_status(self.cfg, pl) if self.offered is None else "blessed"
             if st != "blessed":
                 raise GenaiError(f"plugin '{name}' is {st}; read it, then: genai --bless {pl.path}", EXIT_USAGE,
                                  "not_blessed")
@@ -4254,7 +4352,7 @@ def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()
                      sandbox=engine.sandbox)
     for n in after_hello:
         ui.notice(n)
-    ui.emit({"type": "plugins", "plugins": plugin_rows(engine.cfg, [p.name for p in engine.plugins])})
+    ui.emit({"type": "plugins", "plugins": engine.plugin_rows()})
 
     def turn(text, att):
         first = getattr(engine.client, "exchanges", 0) + 1
@@ -4359,36 +4457,40 @@ def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()
             ui.emit({"type": "network", "runner": engine.box.info() if engine.box else None,
                      "available": engine.can_run()})
         elif t == "skills":
-            ui.emit({"type": "skills", "skills": skill_rows(engine.cfg, [s.name for s in engine.skills])})
+            ui.emit({"type": "skills", "skills": engine.skill_rows()})
         elif t == "skill":
             name, on = msg.get("name"), msg.get("on")
             if not isinstance(name, str) or not isinstance(on, bool):
                 ui.error("skill needs 'name' and 'on': true or false", "bad_message")
                 continue
-            if remote:          # skills blessed on this host aren't ones the user's own machine vouched for
-                ui.error("skills aren't available in remote mode yet", "remote")
+            if remote and name not in engine.offered["skills"]:   # only what the user's own machine vouched for
+                ui.error(f"skill '{one_line(name)[0]}' wasn't sent from your machine: in remote mode, only the "
+                         "skills genai-tui sent (the profile's, default_skills and -k) can be used", "remote")
+                ui.emit({"type": "skills", "skills": engine.skill_rows()})
                 continue
             try:
                 engine.set_skill(name, on)
                 engine.session.save()
             except GenaiError as err:
                 ui.error(str(err), err.kind)
-            ui.emit({"type": "skills", "skills": skill_rows(engine.cfg, [s.name for s in engine.skills])})
+            ui.emit({"type": "skills", "skills": engine.skill_rows()})
         elif t == "plugins":
-            ui.emit({"type": "plugins", "plugins": plugin_rows(engine.cfg, [p.name for p in engine.plugins])})
+            ui.emit({"type": "plugins", "plugins": engine.plugin_rows()})
         elif t == "plugin":
             name, on = msg.get("name"), msg.get("on")
             if not isinstance(name, str) or not isinstance(on, bool):
                 ui.error("plugin needs 'name' and 'on': true or false", "bad_message")
                 continue
-            if remote:          # plugins blessed on this host aren't ones the user's own machine vouched for
-                ui.error("plugins aren't available in remote mode yet", "remote")
+            if remote and name not in engine.offered["plugins"]:  # only what the user's own machine vouched for
+                ui.error(f"plugin '{one_line(name)[0]}' wasn't sent from your machine: in remote mode, only the "
+                         "plugins genai-tui sent (the profile's and default_plugins) can be used", "remote")
+                ui.emit({"type": "plugins", "plugins": engine.plugin_rows()})
                 continue
             try:
                 engine.set_plugin(name, on)
             except GenaiError as err:
                 ui.error(str(err), err.kind)
-            ui.emit({"type": "plugins", "plugins": plugin_rows(engine.cfg, [p.name for p in engine.plugins])})
+            ui.emit({"type": "plugins", "plugins": engine.plugin_rows()})
         elif t == "run":
             rid = msg.get("id")
             if type(rid) not in (int, str):
@@ -4460,8 +4562,8 @@ def parse_args(argv):
                     help="with --json: read the endpoint, profile and session token from the first line of stdin "
                          "(for genai-tui's remote mode)")
     ap.add_argument("--remote-config", action="store_true",
-                    help="print the resolved endpoint and profile as one JSON line, without any key (for genai-tui's "
-                         "remote mode; takes -e and -p)")
+                    help="print the resolved endpoint, profile, skills and plugins as one JSON line, without any key "
+                         "(for genai-tui's remote mode; takes -e, -p, -k and --plugin)")
     ap.add_argument("--bless", metavar="PATH",
                     help="review and bless a skill or plugin directory, endpoint or profile file")
     ap.add_argument("--list-skills", action="store_true", help="list skills (with --json: as JSON)")
@@ -4488,9 +4590,9 @@ def main(argv=None):
                 raise GenaiError("blessing needs a terminal: it asks you to confirm you have read it", EXIT_USAGE)
             return EXIT_OK if bless(cfg, args.bless, ask_yes) else EXIT_ERROR
         if args.remote_config:
-            if args.session or args.skill:
-                raise GenaiError("--remote-config takes only -e and -p", EXIT_USAGE)
-            print(json.dumps(export_remote(cfg, args.profile, args.endpoint)))
+            if args.session:
+                raise GenaiError("--remote-config takes only -e, -p, -k and --plugin", EXIT_USAGE)
+            print(json.dumps(export_remote(cfg, args.profile, args.endpoint, args.skill, args.plugin)))
             return EXIT_OK
         if args.list_skills:
             rows = skill_rows(cfg)
@@ -4529,10 +4631,9 @@ def main(argv=None):
         session = Session.open(cfg, args.session)
         notices = []
         after_hello = []
+        offered = None
         if args.config_stdin:
-            endpoint, persona = remote_config(sys.stdin.readline(), cfg.audit)
-            if persona and persona.skills:
-                after_hello.append("skills aren't available in remote mode yet")
+            endpoint, persona, offered = remote_config(sys.stdin.readline(), cfg.audit)
         else:
             pname = args.profile or (session.profile if session.resumed else cfg.default_profile)
             persona = select_named(cfg, "profile", pname) if pname else None
@@ -4553,7 +4654,7 @@ def main(argv=None):
             notices.append(f"session '{session.id}' was used with profile '{session.profile or '-'}', "
                            f"now '{args.profile}'")
         if args.config_stdin:
-            base = []
+            base = list(offered["skills"])      # what your machine sent is what it had on
         elif not session.resumed:
             base = persona.skills if persona and persona.skills is not None else cfg.default_skills
         else:
@@ -4566,9 +4667,9 @@ def main(argv=None):
             if k not in session.skills:
                 session.skills.append(k)
         if args.config_stdin:
-            plugins = []
+            plugins = list(offered["plugins"])
             if args.plugin:
-                notices.append("plugins aren't available in remote mode yet")
+                notices.append("--plugin is ignored in remote mode: the plugins come from your machine")
         else:
             plugins = list(dict.fromkeys((persona.plugins if persona and persona.plugins is not None
                                           else cfg.default_plugins) + args.plugin))
@@ -4584,7 +4685,7 @@ def main(argv=None):
         coding = ("--coding-anywhere" if args.coding_anywhere else "--coding" if args.coding else
                   f"profile {persona.name}" if persona and persona.coding else None)
         engine = Engine(cfg, endpoint, session, ui, coding=coding, profile=persona, anywhere=args.coding_anywhere,
-                        plugins=plugins)
+                        plugins=plugins, offered=offered)
         if isinstance(ui, TtyUI):       # hooks only run for a person at the terminal, the UI chosen above
             engine.notifier = Notifier.start(engine)
         for n in notices:
