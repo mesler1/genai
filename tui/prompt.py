@@ -73,12 +73,22 @@ class Prompt:
             if msg is None:                    # the conversation pane has gone; genai-tui is closing
                 self.view = dict(self.view, mode="input", hints="the conversation has ended")
                 continue
+            if msg.get("type") == "insert":
+                self.insert(msg.get("text"))
+                continue
             view = msg.get("view") if msg.get("type") == "view" else None
             if not isinstance(view, dict):
                 continue
             if view.get("mode") in ("approval", "ask") and view.get("lines") != self.view.get("lines"):
                 self.asked_at = time.time()
             self.view = view
+
+    def insert(self, text):
+        """A path from the file tree, at the cursor: only into the input box, never as an answer, and only text
+        that is printable."""
+        if (self.view.get("mode") not in ("approval", "ask") and isinstance(text, str) and 0 < len(text) <= 4096
+                and text.isprintable()):
+            self.ed.insert(text)
 
     def send(self, msg):
         return self.link.send(msg)

@@ -97,7 +97,7 @@ much permission and too much autonomy.
 
 - **Functionality.** Six tools: propose a command, read a file, list a directory, write a
   file, edit a file, propose a plan. No delete, no fetch, no execute on your system. A seventh,
-  `run_in_sandbox`, exists only in coding mode with a profile's sandbox (section 5).
+  `run_in_sandbox`, exists only in coding mode with a profile's sandbox (section 5). Plugins you bless and enable add their trusted commands as tools (below).
 - **Permission.** File tools take relative paths only. `..`, absolute paths and `~` are
   rejected, and each path is walked one component at a time with `O_NOFOLLOW`, so a symlink
   anywhere in it is refused. Reads refuse FIFOs, devices and binary files. New files are
@@ -106,6 +106,40 @@ much permission and too much autonomy.
   which also caps how many sandboxed runs one turn makes.
   Reads are capped at 256 KiB, writes at 1 MiB, overwrite snapshots at 8 MiB, and directory scans at 500 entries plus a truncation check. Without a terminal and
   outside JSON mode, nothing is performed at all.
+
+#### Trusted commands (plugins)
+
+A plugin is blessed as a directory, like a skill: its hash covers every file, and a changed plugin is refused
+until you bless it again. What you bless is a list of commands, each a fixed argument list with named inputs
+and the rules for each input (a regular expression matched against the whole value, a list, or a number
+range). Together they are the whole of what the model and the user's panes can run.
+
+- **No shell.** The program is started directly with an argument list. A value fills one argument and is
+  never split, expanded or re-read, so `;`, `$(...)` and quotes in a value are only characters. Values that
+  break the rules (or are over 256 characters, or have a NUL or a newline) are refused, never cleaned.
+- **Fixed programs.** The program is found only in the plugin's `search` directories (or by an absolute path),
+  never through your `PATH`. It must be a regular executable file that neither group nor others can write, as
+  must its directory, owned by you or root. genai records the file it found and refuses to run it if it was
+  replaced afterwards.
+- **Minimal environment.** The program gets `PATH` (the search directories), `LANG`, `HOME`, `USER`, `LOGNAME`
+  and the variables the plugin lists; `PATH` and `LD_*` can't be listed. Standard input is empty.
+- **Limits.** A time limit (at most 120 s), an output cap (at most 1 MiB, then the program is killed), its own
+  process group (killed whole), at least `min_interval` seconds between real runs of one command, a cache so a
+  repeated question is answered from the last result, and 30 real runs a minute across all plugins.
+- **Auto-run versus asking.** Only commands the plugin marks `read_only` run without asking, and the blessing
+  screen lists them separately; they work only where someone can see what runs (not in plain, non-interactive
+  mode), like automatic reads. Every other command asks, in the normal approval flow, each time.
+- **Audit.** Each run (or refusal) is logged as `trusted_run`: plugin, command, the validated values, who asked
+  (`model` or `user`), exit code, time, bytes, whether it was cached or rate limited, and the program's path.
+  Output is masked for the endpoint key and secret patterns, cut, and escaped wherever it is shown.
+- **No options.** No parameter value may start with `-`, whatever its pattern says, so the model can't pass the program an option
+  (another cluster, an output file, a format). A pattern, enum value or number range that would allow one is
+  refused when the plugin loads.
+
+What remains: a read-only command's output goes to the endpoint like any file the model reads, and cluster
+data can be sensitive (other users' names, job names, node names, paths in job details). Read the commands
+before you bless them: a broad pattern still lets the model choose freely within it. Plugins are not available
+through `--config-stdin` yet.
 
 ### 4. Identity, privilege and credentials
 
@@ -267,6 +301,9 @@ shared filesystem; never an abstract socket, which has no permissions).
 - An answer names the question it answers. One meant for a question that has gone, or not yet
   appeared, is ignored, and keys typed within 0.3 s of a question appearing count as typing.
 - Messages are size-limited; a line that is too long or not JSON ends the connection.
+- The file tree pane can only ask the conversation pane to list, view, attach or insert the path of a file.
+  Listings and views go through genai's checks, and nothing goes to the model except an attachment you
+  reviewed in your editor first.
 - No text from the model goes into a tmux menu, pane title or popup command, where tmux would
   run a `#(...)`.
 - The shell pane's output reaches the conversation pane through a FIFO in that same directory
@@ -316,6 +353,51 @@ What remains: for commands, you are the last control. That is the design, and it
 other sections matter. With `--coding-anywhere` in your home directory, everything there that is
 not hidden is one injected instruction away from the endpoint: reads no longer ask, and a file
 the model reads can tell it what to read next.
+
+#### Remote genai
+
+genai-tui's remote mode runs genai on another host over ssh with `--json --config-stdin`. The API key never
+leaves the user's machine. Over ssh go the endpoint and profile (without any key) and a per-session token.
+genai there sends its requests to `http://127.0.0.1:PORT`, which ssh's reverse tunnel carries back to a proxy
+on the user's machine; the proxy requires the token (`X-Genai-Token`) and adds the key. genai refuses `key_env`,
+`key_file` and `proxy` in this mode, and any `base_url` that is not `http://127.0.0.1:PORT`.
+
+The config is trusted because it arrived over the user's own ssh channel: genai-tui checked the user's blessed
+files before sending, and genai blesses nothing on the remote host for it. It logs a `remote_config` event with
+the hashes of what it received, never the token. Root on the remote host can use the session's token while the
+tunnel is up, and can read that session's prompts, replies and files, which are on that host anyway. It cannot
+read the key, which was never sent. Everything else (coding-mode refusals, the sandbox, the audit log, sessions)
+works for the user genai runs as. As root, the REPL banner warns that proposed commands would run as root.
+
+How genai-tui sets it up (`genai-tui --remote`), and what each part is for:
+
+- The launcher runs `genai --remote-config` here: the endpoint and profile are checked and blessed on your machine,
+  and exported without `key_env`, `key_file`, `proxy`, `headers` or `ca_bundle`, so neither the key nor a secret in a
+  header goes over the connection. Only the remote half of the config lacks them: `tui/keyproxy.py`, here, uses the
+  endpoint's own proxy and headers.
+- ssh runs as a master connection started in your terminal, with `-a -x` (no agent, no X11 forwarding). Its control socket
+  is in genai-tui's state directory (mode 0700, in `$XDG_RUNTIME_DIR` or `/tmp`), where only you can reach it: whoever
+  can use that socket can open sessions as you on the host. Use ProxyJump (`-J`) for a bastion rather than `-A`, which
+  would let root on the host use your agent. The master, the key proxy and the state directory go when the launcher
+  exits (also on Ctrl-C and a closed terminal).
+- The key proxy listens on a Unix socket in the same directory and `ssh -O forward -R 127.0.0.1:0:SOCKET` makes a
+  loopback port on the host lead to it. Its token (32 random bytes) is in memory, in the launcher's 0600
+  `remote.json`, on the proxy's stdin and in genai's config line; never in a command line. The remote port can be
+  reached by every user of that host, so the token is the only protection: without it the proxy answers 401, and
+  only the two allowed requests are ever forwarded (see `tui/keyproxy.py`).
+- genai's source goes to the host on stdin, not as a file: the remote command is a fixed Python bootstrap that reads
+  exactly N bytes and executes them, so the host can't have a different or older genai than the one you have here.
+- The shell pane is `genai-ssh` over the same master, with the same handshake and key as always (see 7); with `--as`,
+  `sudo -n -H -u USER` starts its bash, and `--dir` is where it starts. `--as` takes only a user that `sudo -n`
+  accepts without a password, which the launcher checks first.
+
+Root on the remote host can, while the session is up, use the token to send chat and model-list requests to your
+endpoint (spending your quota, within the proxy's allowlist), read everything that session sends, receives and
+reads on that host. It cannot get the key, other URLs of the endpoint, or the
+proxy once genai-tui has exited. A remote root could also change what genai does there: it is your genai's code,
+but running on a host you don't control, so approvals still happen on your screen and commands still run only
+where you send them, but what the model is *shown* from that host (file contents, hello, the audit log's path) is
+only as honest as the host.
 
 ### 8. Supply chain and configuration trust
 
@@ -380,6 +462,9 @@ injected instruction into later sessions.
   exactly, and an empty buffer sends nothing.
 - Files are sent as they are, deliberately, because masking would corrupt code. genai warns
   when a file looks like it holds secrets.
+- A wrapper's file viewer (the `read` message) reads through the same checks as the model's reads.
+  The text goes only to the wrapper, never to the model or the session, with the endpoint key
+  masked, and each read is audit-logged with its path and size, not its content.
 - A failed edit on a file the model may not read reports only "declined", so edits cannot be
   used to probe file contents. The same holds for paths: where the model may not read without
   asking, an error that would reveal a symlink or a file in the middle of a path is shown to you
