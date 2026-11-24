@@ -316,6 +316,10 @@ Browsing sends nothing to the model. Listings and files come through genai, whic
 checks and masks secrets it recognises. `a` opens the file in your editor first, like shell context:
 what you save goes with your next message, and nothing does if you save an empty file.
 
+**Viewing.** A file, a whole proposal (`v`) and the raw view open in genai-tui's own pager, in a popup: Esc or `q`
+closes it, the arrows, PgUp/PgDn and the wheel scroll, `/` searches and `n`/`N` move between matches. To use
+another, set `GENAI_TUI_PAGER` (for example `GENAI_TUI_PAGER=less`).
+
 ### Features
 
 genai-tui's `/model`, `/copy`, `/decline`, `/raw`, `/system` and `/files`, and the `genai-ssh` handshake, are

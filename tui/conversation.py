@@ -18,7 +18,6 @@ import os
 import queue
 import re
 import shlex
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -1104,6 +1103,15 @@ EDITOR_HEADER = """# {title}
 """
 # For text that may hold '#' lines of its own (output, a file): only the comment lines on top are ours.
 EDITOR_HEADER_TOP = EDITOR_HEADER.replace("# Lines starting with '#' are removed.", "# The '#' lines up here are removed.")
+
+
+def pager_argv(path):
+    """How to show a text file genai-tui wrote: its own pager (tui/pager.py: Esc or q closes it), or the program in
+    GENAI_TUI_PAGER (for example less) if you set one."""
+    mine = os.environ.get("GENAI_TUI_PAGER", "").strip()
+    if mine:
+        return shlex.split(mine) + [path]
+    return [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "pager.py"), path]
 
 
 def editor_argv(path):
@@ -2193,11 +2201,7 @@ class App:
             f.write(text)
         curses.endwin()
         try:
-            # -c draws from the top (in a popup less otherwise fills from the bottom) and -~ drops the filler; the
-            # prompt replaces the temporary file's path. -R stays off: what is shown was cleaned, and stays plain text.
-            pager = (["less", "-c", "-~", "-+F", "-+S", "-Ps q quits \xb7 / searches ", path] if shutil.which("less")
-                     else ["more", path, os.devnull])
-            return self.run_here(pager) == 0
+            return self.run_here(pager_argv(path)) == 0
         except OSError as e:
             self.m.note(f"could not open the full preview: {e}", R)
             return False
