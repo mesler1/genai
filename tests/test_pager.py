@@ -67,19 +67,21 @@ class TestInTmux(unittest.TestCase):
     def tmux(self, *args):
         return subprocess.run(["tmux", "-L", self.sock, *args], capture_output=True, text=True).stdout
 
-    def start(self):
+    def start(self, env=""):
         self.tmux("-f", "/dev/null", "new-session", "-d", "-s", "p", "-x", "80", "-y", "20",
-                  f"env LANG=C.UTF-8 TERM=screen-256color {sys.executable} {REPO}/tui/pager.py {self.file}; "
+                  f"env {env}LANG=C.UTF-8 TERM=screen-256color {sys.executable} {REPO}/tui/pager.py {self.file}; "
                   "echo CLOSED; sleep 30")
         self.wait("line 1")
 
     def screen(self):
         return self.tmux("capture-pane", "-p", "-t", "p")
 
-    def wait(self, text, timeout=5):
+    def wait(self, text, timeout=5, line=False):
+        """Until text is on the screen; with line, as a whole line ("line 1" is not "line 190")."""
         end = time.time() + timeout
         while time.time() < end:
-            if text in self.screen():
+            screen = self.screen()
+            if (text in [ln.rstrip() for ln in screen.splitlines()]) if line else (text in screen):
                 return
             time.sleep(0.05)
         self.fail(f"{text!r} never appeared:\n{self.screen()}")
@@ -98,9 +100,14 @@ class TestInTmux(unittest.TestCase):
         self.wait("the needle is here")
         self.assertNotIn("line 1\n", self.screen())
         self.tmux("send-keys", "-t", "p", "g")
-        self.wait("line 1")
+        self.wait("line 1", line=True)                  # the top again, not just "line 190" at the match
         self.tmux("send-keys", "-t", "p", "q")
-        self.wait("CLOSED", timeout=2)
+        self.wait("CLOSED")
+
+    def test_stale_lines_and_columns_in_the_environment_are_ignored(self):
+        self.start("LINES=24 COLUMNS=80 ")           # readline exports these, and children inherit them
+        self.tmux("send-keys", "-t", "p", "/", "needle", "Enter")
+        self.wait("the needle is here")                  # in the 20-row pane, not on a 24th row it doesn't have
 
     def test_esc_in_the_search_prompt_cancels_it_and_keeps_the_pager(self):
         self.start()
