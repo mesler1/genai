@@ -184,7 +184,12 @@ in between.
   `no-new-privileges` is set, processes and memory are limited, the repo is read-only, one
   directory is writable, and genai uses its own config rather than yours.
 - The banner, the `:run` confirmation, the `hello` event and the audit log all say whether
-  commands run inside a sandbox or directly on the host.
+  commands run inside a sandbox or directly on the host. Inside `sandbox/run genai` the REPL also
+  marks itself: a `(sandbox) ` prompt, a bold banner line, and `:sandbox` for details. This is
+  display only, from `GENAI_SANDBOX` and `GENAI_SANDBOX_WORK_HOST`.
+- `sandbox/run shell` opens a bash in the same sandbox (same root, `/work`, config, flags and hooks).
+  It has `--network=none` unless you pass `--net`, and the endpoint's key variable is not passed in.
+  Its prompt carries a `[sandbox:podman /work]` marker, and its banner lists what is mounted.
 - Sandbox hooks ([HOOKS.md](HOOKS.md)) can only add read-only mounts and pass variables.
   They cannot make anything writable, change the container's flags, or pass `LD_PRELOAD`.
   They cannot mount your home directory, or anything under `/proc`, `/sys`, `/dev` or `/run`.
@@ -207,6 +212,9 @@ in between.
     checks each of them is empty before the command starts, and the run is refused if one
     isn't, so a mount that silently failed doesn't expose it. (A `tmpfs` over a path inside the
     overlay was found not to hide it, which is why the guard exists.)
+  - genai `--json` ignores SIGINT, except during a sandboxed run, which it stops (the container is
+    killed and the turn ends `stopped`). genai-tui sends it one for Ctrl-C or `/stop`, only to its
+    own local child; a stray signal can't end the conversation.
   - `--network=none` and no proxy variables, unless you switch the network on for the session;
     then every run asks first.
   - No home directory, `/tmp` or `/run` from the host, so no SSH agent, tmux or genai-tui
@@ -270,8 +278,23 @@ safe and prompts are rare enough to be read.
   the whole new content instead, says the file is replaced entirely, and says when it will stay
   executable.
 - Coding mode exists to cut prompt fatigue, and it removes only read prompts. Writes always
-  ask. It never applies to hidden files, is tied to the directory it was granted in, and is
+  ask (unless you opt into edits `approved-files`, below). It never applies to hidden files, is tied to the directory it was granted in, and is
   shown in the banner with where it came from.
+- `"edits": "approved-files"` (opt-in, off by default) is the one exception to "writes always
+  ask". After you approve an edit or write to a file, further ones to that same path apply
+  without asking. The trade-off: text the model reads (a prompt injection in a file, a web page
+  you shared, a tool's output) could then rewrite a file you approved once, without a question.
+  What limits it:
+  - It covers only files you approved by hand in this process. The set is in memory only, never
+    saved with a session, so a resume or a new session starts empty; `:edits reset` or switching
+    to `ask` empties it, and declining any edit to a file takes that file out.
+  - New files, hidden files, a file or new text that looks like a secret (including the endpoint
+    key), and a whole replacement of a file that can't be diffed always ask.
+  - Each one is still shown with its diff, written to the audit log (`auto_edit`, and `file_op`
+    with `approved_file`), and bound to the file's state when it was proposed, like any write.
+    The model can't change a file's mode, so that can't happen behind it either.
+  - It is independent of plans: approving a plan adds no files to the set (a planned edit you
+    then approve counts like any other), and the set doesn't approve plan steps.
 - Coding mode is refused in your home directory, in any directory that contains it (so `/`),
   in genai's own config directory and in the usual credential directories (`~/.ssh`, `~/.gnupg`,
   `~/.aws`, `~/.kube`, `~/.docker`, `~/.password-store`, `~/.config/gcloud`). A project
@@ -373,14 +396,24 @@ on the user's machine; the proxy requires the token (`X-Genai-Token`) and adds t
 
 The config is trusted because it arrived over the user's own ssh channel: genai-tui checked the user's blessed
 files before sending, and genai blesses nothing on the remote host for it. It logs a `remote_config` event with
-the hashes of what it received, never the token. Root on the remote host can use the session's token while the
+the hashes of what it received, never the token.
+
+Skills and plugins follow the same rule. The ones in use go in the config line with every file of their
+directories, and only if they are blessed on the user's machine. genai on the host hashes those bytes again and
+refuses the whole config if a hash differs from the one blessed there. It builds the skill or plugin from those
+bytes in memory and never reads or writes this host's copies. Nothing blessed only on the remote host can be
+turned on, so whoever controls that host's `~/.config/genai` can't add a skill to the prompt or a trusted command
+to the model's tools. A plugin's programs are looked for on the host, with the usual checks (its fixed search
+path, never `PATH`; owned by the user or root, not writable by others), so the Slurm plugin's commands run on the
+cluster. The program that runs is whatever is installed there, and a command whose program is missing there is
+left out. Root on the remote host can use the session's token while the
 tunnel is up, and can read that session's prompts, replies and files, which are on that host anyway. It cannot
 read the key, which was never sent. Everything else (coding-mode refusals, the sandbox, the audit log, sessions)
 works for the user genai runs as. As root, the REPL banner warns that proposed commands would run as root.
 
 How genai-tui sets it up (`genai-tui --remote`), and what each part is for:
 
-- The launcher runs `genai --remote-config` here: the endpoint and profile are checked and blessed on your machine,
+- The launcher runs `genai --remote-config` here: the endpoint, profile, skills and plugins are checked and blessed on your machine,
   and exported without `key_env`, `key_file`, `proxy`, `headers` or `ca_bundle`, so neither the key nor a secret in a
   header goes over the connection. Only the remote half of the config lacks them: `tui/keyproxy.py`, here, uses the
   endpoint's own proxy and headers.
