@@ -770,6 +770,10 @@ class Model:
 
     def exit(self, code, err=""):
         self.exited, self.busy, self.pending = code, False, []
+        for card in self.cards.values():   # nothing runs once genai has gone: no clock, and Ctrl-C quits again
+            if card.ev.get("kind") == "sandbox" and card.state == "running":
+                card.state, card.detail = "error", "genai exited before it finished"
+                card.changed()
         for ln in err.strip().splitlines()[-5:]:
             self.note(clean(ln), R)
         self.note(f"genai exited (code {code}). /quit or Ctrl-D to leave.", R)
