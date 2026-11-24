@@ -5,6 +5,8 @@
 #   sandbox/run live ENDPOINT.json  live test against a real endpoint (needs its key variable set)
 #   sandbox/run genai [ARGS...]  genai itself, interactive, in ./sandbox-work by default
 #   sandbox/run selfcheck        the live test's harness against a fake endpoint, no network
+#   sandbox/run shell [--net]    an interactive bash in the same sandbox as "genai": no network unless --net,
+#                                and no key variable (a shell doesn't need the endpoint)
 #
 # There is no image to build or pull. The sandbox's root is an empty directory tree made here, and
 # this machine's /usr and /etc are mounted into it read-only. So the sandbox has the host's Python,
@@ -16,12 +18,13 @@
 #   - one working directory is mounted read-write at /work, and is the only host path genai can write
 #     (besides its own config directory, below)
 #   - genai's config lives in a sandbox-only directory, never the user's real ~/.config/genai
-#   - GENAI_SANDBOX=<name> is set, so genai reports that commands run inside a sandbox
+#   - GENAI_SANDBOX=<name> is set, so genai reports that commands run inside a sandbox, and
+#     GENAI_SANDBOX_WORK_HOST=<host path of /work> so it (and the shell) can show where /work really is
 #   - only the key variable the endpoint names is passed in, by name (its value is never on a command line)
 #
 # Environment:
 #   GENAI_SANDBOX_STATE   host dir for the sandbox's genai config and root tree (default ~/.local/share/genai-sandbox)
-#   GENAI_SANDBOX_WORK    host dir mounted at /work for "genai" (default ./sandbox-work)
+#   GENAI_SANDBOX_WORK    host dir mounted at /work for "genai" and "shell" (default ./sandbox-work)
 #   GENAI_SANDBOX_PYTHON  the Python to run inside (default python3); it must live under a mounted directory
 #   GENAI_SANDBOX_RO      more host directories to mount read-only at the same path, colon-separated
 #                         (for a Python or editor outside /usr, for example /opt/python-3.12)
@@ -329,7 +332,12 @@ scratch_root() {  # a throwaway root and /work for the test modes
 mode=${1:-genai}
 shift || true
 
-case "$mode" in tests|live|selfcheck|genai) run_hooks "$mode"; apply_hook_ro ;; esac
+# A shell needs a terminal; say so before any hook runs.
+if [[ "$mode" == shell && ! ( -t 0 && -t 1 ) ]]; then
+  die "shell needs a terminal (stdin and stdout must be a terminal); run it from an interactive session" 2
+fi
+
+case "$mode" in tests|live|selfcheck|genai|shell) run_hooks "$mode"; apply_hook_ro ;; esac
 
 case "$mode" in
   tests)
@@ -373,17 +381,53 @@ case "$mode" in
   genai)
     work=${GENAI_SANDBOX_WORK:-$PWD/sandbox-work}
     mkdir -p "$work"
+    work_shown=$(cd "$work" && pwd)
     seed_config "$state/config"
     make_root "$state/root"
     apply_hook_vars
     echo "sandbox/run: genai in podman on this machine's OS; /work = $work; config = $state/config" >&2
     export_hook_vars
     exec "$podman" run "${common[@]}" "${mounts[@]}" "${tty_flags[@]}" "${keyflag[@]}" "${hook_flags[@]}" \
+      -e "GENAI_SANDBOX_WORK_HOST=$work_shown" \
       -v "$work:/work" -v "$state/config:/home/genai/.config/genai" -w /work \
       --rootfs "$state/root" "$pybin" /opt/genai/genai "$@"
     ;;
+  shell)
+    # The same sandbox as "genai" (root, /work, config, flags, hooks), with a bash instead of genai. No
+    # network unless --net, and no key variable: a shell has no use for the endpoint's key.
+    net=none
+    for a in "$@"; do
+      case "$a" in
+        --net) net=default ;;
+        *) echo "usage: sandbox/run shell [--net]" >&2; exit 2 ;;
+      esac
+    done
+    work=${GENAI_SANDBOX_WORK:-$PWD/sandbox-work}
+    mkdir -p "$work"
+    work_shown=$(cd "$work" && pwd)
+    seed_config "$state/config"
+    make_root "$state/root"
+    apply_hook_vars
+    # bash comes from the host's /usr (or /bin), which must be one of the mounted directories.
+    shbin=
+    for c in /usr/bin/bash /bin/bash; do
+      [[ -x "$c" ]] || continue
+      for d in "${ro_dirs[@]}"; do if inside "$c" "$d"; then shbin=$c; fi; done
+      [[ -z "$shbin" ]] || break
+    done
+    [[ -n "$shbin" ]] || die "no bash under a mounted directory (${ro_dirs[*]}); install bash in /usr or add its directory to GENAI_SANDBOX_RO"
+    netflags=(--network=none)
+    netword=off
+    if [[ "$net" == default ]]; then netflags=(); netword=on; fi
+    echo "sandbox/run: shell in podman on this machine's OS; /work = $work_shown; config = $state/config; network $netword" >&2
+    export_hook_vars
+    exec "$podman" run "${common[@]}" "${mounts[@]}" -it "${hook_flags[@]}" "${netflags[@]}" \
+      -e "GENAI_SANDBOX_WORK_HOST=$work_shown" -e "GENAI_SANDBOX_NET=$netword" -e TERM \
+      -v "$work:/work" -v "$state/config:/home/genai/.config/genai" -w /work \
+      --rootfs "$state/root" "$shbin" --noprofile --rcfile /opt/genai/sandbox/shellrc -i
+    ;;
   *)
-    sed -n '2,7p' "$0" >&2
+    sed -n '2,9p' "$0" >&2
     exit 2
     ;;
 esac
