@@ -661,12 +661,12 @@ class TestEndToEnd(Tmp):
             p = g.until("proposal")
             self.assertEqual((p["kind"], p["path"], p["exists"]), ("write", "rotate.sh", False))
             self.assertFalse(os.path.exists(os.path.join(self.wd, "rotate.sh")))
-            g.send({"type": "decision", "id": p["id"], "decision": "accept"})
+            g.send({"type": "decision", "id": p["id"], "digest": p["digest"], "decision": "accept"})
             self.assertEqual(g.until("result")["status"], "ok")
             p2 = g.until("proposal")
             self.assertEqual(p2["kind"], "edit")
             self.assertIn("-echo one", p2["diff"])
-            g.send({"type": "decision", "id": p2["id"], "decision": "decline"})
+            g.send({"type": "decision", "id": p2["id"], "digest": p2["digest"], "decision": "decline"})
             g.until("done")
             g.close()
             self.assertEqual(open(os.path.join(self.wd, "rotate.sh")).read(), "echo one\n")
@@ -685,6 +685,31 @@ class TestEndToEnd(Tmp):
             g.close()
             self.assertFalse(os.path.exists(os.path.join(self.wd, "x")))
 
+    def test_a_decision_must_echo_the_proposals_digest(self):
+        with FakeAPI([call("write_file", path="x", content="y", reason="r"), reply("fine")]) as api:
+            g = self.start(api)
+            g.send({"type": "user", "text": "go"})
+            p = g.until("proposal")
+            self.assertRegex(p["digest"], r"^[0-9a-f]{16}$")
+            other = G.digest(dict(p, content="z"))           # the same id, but another card's contents
+            for answer in ({}, {"digest": other}, {"digest": p["digest"][::-1]}):
+                g.send({"type": "decision", "id": p["id"], "decision": "accept", **answer})
+                err = g.until("error")
+                self.assertEqual(err["code"], "digest_mismatch")
+                self.assertIn("still waits", err["message"])
+            self.assertFalse(os.path.exists(os.path.join(self.wd, "x")))
+            g.send({"type": "decision", "id": p["id"], "digest": p["digest"], "decision": "accept"})
+            g.until("done")
+            g.close()
+            self.assertTrue(os.path.exists(os.path.join(self.wd, "x")))
+
+    def test_a_digest_from_another_genai_never_matches(self):
+        ev = {"type": "proposal", "id": "p1", "kind": "write", "path": "x", "content": "y"}
+        self.assertEqual(G.digest(ev), G.digest(dict(ev, digest="ignored")))
+        with mock.patch.object(G, "DIGEST_NONCE", b"another process"):
+            elsewhere = G.digest(ev)
+        self.assertNotEqual(G.digest(ev), elsewhere)
+
     def test_unknown_id_and_type_rejected(self):
         with FakeAPI([call("read_file", path="a", reason="r"), reply("fine")]) as api:
             g = self.start(api)
@@ -694,7 +719,7 @@ class TestEndToEnd(Tmp):
             p = g.until("proposal")
             g.send({"type": "decision", "id": "p999", "decision": "accept"})
             self.assertEqual(g.until("error")["code"], "unknown_id")
-            g.send({"type": "decision", "id": p["id"], "decision": "decline"})
+            g.send({"type": "decision", "id": p["id"], "digest": p["digest"], "decision": "decline"})
             g.until("done")
             g.close()
 
@@ -747,8 +772,8 @@ class TestEndToEnd(Tmp):
             self.assertFalse(p_env.get("auto"))
             self.assertEqual(p_write["kind"], "write")
             # batch: decide in reverse order
-            g.send({"type": "decision", "id": p_write["id"], "decision": "decline"})
-            g.send({"type": "decision", "id": p_env["id"], "decision": "decline"})
+            g.send({"type": "decision", "id": p_write["id"], "digest": p_write["digest"], "decision": "decline"})
+            g.send({"type": "decision", "id": p_env["id"], "digest": p_env["digest"], "decision": "decline"})
             g.until("done")
             g.close()
             tools = [m["content"] for m in api.requests[-1]["body"]["messages"] if m["role"] == "tool"]
@@ -833,7 +858,7 @@ class TestEndToEnd(Tmp):
             g.send({"type": "user", "text": "x"})
             p = g.until("proposal")
             self.assertFalse(p.get("auto"))
-            g.send({"type": "decision", "id": p["id"], "decision": "decline"})
+            g.send({"type": "decision", "id": p["id"], "digest": p["digest"], "decision": "decline"})
             g.until("done")
             g.close()
             system = [r["body"]["messages"][0]["content"] for r in api.requests]
@@ -865,7 +890,7 @@ class TestEndToEnd(Tmp):
             g.send({"type": "skill", "name": "slurm", "on": True})
             self.assertEqual(g.until("error")["code"], "busy")
             self.assertEqual(g.until("error")["code"], "busy")
-            g.send({"type": "decision", "id": p["id"], "decision": "decline"})
+            g.send({"type": "decision", "id": p["id"], "digest": p["digest"], "decision": "decline"})
             g.until("done")
             g.close()
             self.assertFalse(any(e["type"] == "coding" for e in g.events))
@@ -889,7 +914,7 @@ class TestEndToEnd(Tmp):
             g.send({"type": "trace"})                                 # allowed while a proposal waits
             ex = g.until("trace")["exchanges"]
             self.assertEqual([e["n"] for e in ex], [1])
-            g.send({"type": "decision", "id": p["id"], "decision": "decline"})
+            g.send({"type": "decision", "id": p["id"], "digest": p["digest"], "decision": "decline"})
             done = g.until("done")
             self.assertEqual(done["exchanges"], [1, 2])
             g.send({"type": "trace", "from": 1, "to": 2})
@@ -925,7 +950,7 @@ class TestEndToEnd(Tmp):
             g.send({"type": "user", "text": "fix a"})
             p = g.until("proposal")
             self.assertEqual((p["kind"], p["goal"], [s["n"] for s in p["steps"]]), ("plan", "fix a", [1, 2, 3, 4]))
-            g.send({"type": "decision", "id": p["id"], "decision": "accept", "approve": [1, 2, 3],
+            g.send({"type": "decision", "id": p["id"], "digest": p["digest"], "decision": "accept", "approve": [1, 2, 3],
                     "edits": {"3": "make test -j2"}})
             plan = g.until("plan")["plan"]
             self.assertEqual([(s["n"], s["status"]) for s in plan["steps"]],
@@ -935,7 +960,7 @@ class TestEndToEnd(Tmp):
             self.assertEqual((read["kind"], read.get("auto"), read["plan_step"]), ("read", True, 1))   # no question
             edit = g.until("proposal")
             self.assertEqual((edit["kind"], edit.get("auto"), edit["plan_step"]), ("edit", None, 2))   # still asks
-            g.send({"type": "decision", "id": edit["id"], "decision": "accept"})
+            g.send({"type": "decision", "id": edit["id"], "digest": edit["digest"], "decision": "accept"})
             cmd = g.until("proposal")
             self.assertEqual((cmd["command"], cmd.get("preapproved"), cmd["plan_step"]), ("make test -j2", True, 3))
             g.until("done")
@@ -946,7 +971,7 @@ class TestEndToEnd(Tmp):
             g.send({"type": "user", "text": "and?"})
             w = g.until("proposal")
             self.assertTrue(w.get("off_plan"))
-            g.send({"type": "decision", "id": w["id"], "decision": "decline"})
+            g.send({"type": "decision", "id": w["id"], "digest": w["digest"], "decision": "decline"})
             g.until("done")
             g.send({"type": "plan"})
             last = g.until("plan")["plan"]
@@ -971,7 +996,7 @@ class TestEndToEnd(Tmp):
             g = self.start(api)
             g.send({"type": "user", "text": "go"})
             p = g.until("proposal")
-            g.send({"type": "decision", "id": p["id"], "decision": "accept", "approve": [1, "x"]})
+            g.send({"type": "decision", "id": p["id"], "digest": p["digest"], "decision": "accept", "approve": [1, "x"]})
             self.assertEqual(g.until("error")["code"], "bad_message")
             g.until("done")
             g.close()
@@ -987,7 +1012,7 @@ class TestEndToEnd(Tmp):
             g = self.start(api)
             g.send({"type": "user", "text": "go"})
             p = g.until("proposal")
-            g.send({"type": "decision", "id": p["id"], "decision": "accept"})
+            g.send({"type": "decision", "id": p["id"], "digest": p["digest"], "decision": "accept"})
             first = g.until("proposal")
             g.until("done")
             g.send({"type": "user", "text": "again"})
@@ -1010,11 +1035,11 @@ class TestEndToEnd(Tmp):
                 f.write("A=1\n")
             g.send({"type": "user", "text": "go"})
             p = g.until("proposal")
-            g.send({"type": "decision", "id": p["id"], "decision": "accept"})
+            g.send({"type": "decision", "id": p["id"], "digest": p["digest"], "decision": "accept"})
             for _ in range(2):
                 r = g.until("proposal")
                 self.assertFalse(r.get("auto"))
-                g.send({"type": "decision", "id": r["id"], "decision": "decline"})
+                g.send({"type": "decision", "id": r["id"], "digest": r["digest"], "decision": "decline"})
             g.until("done")
             g.close()
 
@@ -1178,7 +1203,7 @@ class TestEndToEnd(Tmp):
             g.send({"type": "user", "text": "job?"})
             p = g.until("proposal")
             self.assertEqual((p["kind"], p["tool"], p["args"]), ("external", "job_details", {"job": "48211"}))
-            g.send({"type": "result", "id": p["id"], "status": "ok", "output": "State=PENDING token=supersecret1"})
+            g.send({"type": "result", "id": p["id"], "digest": p["digest"], "status": "ok", "output": "State=PENDING token=supersecret1"})
             g.until("done")
             g.close()
             self.assertIn("job_details", [t["function"]["name"] for t in api.requests[0]["body"]["tools"]])
@@ -1314,7 +1339,7 @@ class TestEndToEnd(Tmp):
             g = Proc(home, wd, ["-e", "test", "-S", "s1"])
             g.send({"type": "user", "text": "read it"})
             p = g.until("proposal")
-            g.send({"type": "decision", "id": p["id"], "decision": "accept"})
+            g.send({"type": "decision", "id": p["id"], "digest": p["digest"], "decision": "accept"})
             g.until("done")
             for text in ("t2", "t3"):
                 g.send({"type": "user", "text": text})
