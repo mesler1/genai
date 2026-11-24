@@ -119,6 +119,12 @@ def view(st, w, sel):
              (" " * max(w - 6 - width(cmd) - width(info), 0) + info, Q)], ("cmd", c.get("n")))
     if cmds:
         add([("click one to share it", Q)])
+    if st.get("agents"):
+        head("AGENTS")
+        for a in st["agents"]:
+            role = {"running": A, "done": D, "error": R, "stopped": W}.get(a.get("state"), "")
+            add([(f"{clean(a.get('id', '?')):4} ", Q), (fit(clean(a.get("state", "")), 8).ljust(9), role),
+                 (fit(clean(a.get("detail", "")), max(w - 14, 1)), Q)])
     head("PROPOSALS")
     props = st.get("proposals") or []
     if not props:

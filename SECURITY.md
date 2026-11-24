@@ -98,6 +98,7 @@ much permission and too much autonomy.
 - **Functionality.** Six tools: propose a command, read a file, list a directory, write a
   file, edit a file, propose a plan. No delete, no fetch, no execute on your system. A seventh,
   `run_in_sandbox`, exists only in coding mode with a profile's sandbox (section 5). Plugins you bless and enable add their trusted commands as tools (below).
+  Coding mode adds two more that only read: `search_files`, and `delegate`, which starts a subagent (below).
 - **Permission.** File tools take relative paths only. `..`, absolute paths and `~` are
   rejected, and each path is walked one component at a time with `O_NOFOLLOW`, so a symlink
   anywhere in it is refused. Reads refuse FIFOs, devices and binary files. New files are
@@ -106,6 +107,29 @@ much permission and too much autonomy.
   which also caps how many sandboxed runs one turn makes.
   Reads are capped at 256 KiB, writes at 1 MiB, overwrite snapshots at 8 MiB, and directory scans at 500 entries plus a truncation check. Without a terminal and
   outside JSON mode, nothing is performed at all.
+
+#### Subagents (`delegate`)
+
+In coding mode the model can hand a question to a subagent: a second model run, on the same endpoint and model,
+in the same process. It starts without asking unless the profile says `"agents": {"ask": true}`.
+
+- **Only reads.** Its tools are `read_file`, `list_dir`, `search_files` and, if the profile's sandbox is offline,
+  `run_in_sandbox`. Anything else is refused, so it can't write, edit, propose a command or plan, use a plugin or a
+  wrapper's tool, or start a subagent of its own. Nobody answers its questions: a read that would ask you (a hidden
+  or secret-looking file) is declined, and you get a notice.
+- **Limits.** 12 model calls and 600 seconds each, 4 subagents and 400,000 tokens (as the server counts them)
+  per turn of yours. Near a limit, or at 75% of the context, it is told to write its report with no tools.
+  Ctrl-C stops it and ends the turn.
+- **Its report** is masked like any tool output, cut to 12 KiB, and given to the model inside `<report>` tags, as
+  the subagent's own account and as data, not instructions. You see the same report. What the subagent read goes
+  to the endpoint like any other read; its whole conversation is kept in the saved session's history, not sent
+  to the main model.
+- **Audit.** `agent_start` (the task) and `agent_end` (status, steps, tokens, seconds), and every entry the
+  subagent causes carries `agent` with its id.
+
+What remains: a file can steer the subagent, and through its report the main model, as a file it reads directly
+could. The subagent only reads, so a steered one can only mislead; what it leads the main model to propose is
+still yours to approve.
 
 #### Trusted commands (plugins)
 

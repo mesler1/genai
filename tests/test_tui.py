@@ -530,6 +530,31 @@ class TestSandboxRuns(unittest.TestCase):
         self.assertNotEqual(m.outbox[-1], {"type": "network", "on": False})   # waits until the reply ends
 
 
+class TestAgentsFeature(unittest.TestCase):
+    def test_a_subagent_card_shows_progress_and_the_report(self):
+        m = C.Model()
+        m.handle({"type": "hello", "version": "1", "endpoint": {"name": "e", "model": "m", "base_url": "u"},
+                  "sandbox": None, "features": ["agents"]})
+        m.handle({"type": "proposal", "id": "p1", "kind": "agent", "task": "Find\x1b[2J the parser", "reason": "r",
+                  "auto": True})
+        card = m.cards["p1"]
+        self.assertEqual(card.state, "running")
+        self.assertEqual(card.title(), "subagent · Find\\x1b[2J the parser")
+        m.handle({"type": "agent", "id": "a1", "proposal": "p1", "state": "running", "step": 2, "steps": 12,
+                  "tokens": 3400, "doing": "search 'parse' in ."})
+        self.assertEqual(card.detail, "step 2/12 · 3400 tokens · search 'parse' in .")
+        m.handle({"type": "agent", "id": "a1", "proposal": "p1", "state": "done", "step": 3, "steps": 12,
+                  "tokens": 5000, "doing": "done after 3 steps"})
+        m.handle({"type": "result", "id": "p1", "status": "ok", "detail": "done after 3 steps", "output": "REPORT"})
+        self.assertEqual(card.state, "done")
+        self.assertIn("│ REPORT", text_of(card, 80))
+        PANEL = load("panel", os.path.join(REPO, "tui", "panel.py"))
+        lines, _ = PANEL.view(m.snapshot(), 60, None)
+        shown = "\n".join("".join(t for t, _ in ln) for ln in lines)
+        self.assertIn("AGENTS", shown)
+        self.assertIn("a1   done", shown)
+
+
 class TestPlan(unittest.TestCase):
     def plan_model(self):
         m = C.Model()
@@ -794,7 +819,7 @@ class TestFeatures(unittest.TestCase):
 
     def test_all_built_in_features_load(self):
         on = F.load(core=C.CORE)
-        self.assertEqual([f.name for f in on], ["model", "copy", "decline", "raw", "ssh", "files"])
+        self.assertEqual([f.name for f in on], ["model", "copy", "decline", "raw", "ssh", "files", "agents"])
         m = C.Model()
         self.assertEqual([f.name for f in m.features], [f.name for f in on])
         self.assertEqual(list(m.commands())[-6:], ["/model", "/copy", "/decline", "/raw", "/system", "/files"])
@@ -804,7 +829,7 @@ class TestFeatures(unittest.TestCase):
     def test_environment_disables_a_feature(self):
         m, warning = self.model(self.environ(GENAI_TUI_DISABLE="copy, model"))
         self.assertIsNone(warning)
-        self.assertEqual([f.name for f in m.features], ["decline", "raw", "ssh", "files"])
+        self.assertEqual([f.name for f in m.features], ["decline", "raw", "ssh", "files", "agents"])
         m.submit("/copy")
         self.assertIn("unknown command /copy (/help lists them)", text_of(m.blocks[-1]))
         m.submit("/help")
@@ -820,7 +845,7 @@ class TestFeatures(unittest.TestCase):
         self.write_config('{"disable": ["decline", "raw"]}')
         m, warning = self.model(self.environ())
         self.assertIsNone(warning)
-        self.assertEqual([f.name for f in m.features], ["model", "copy", "ssh", "files"])
+        self.assertEqual([f.name for f in m.features], ["model", "copy", "ssh", "files", "agents"])
         m.submit("/decline")
         self.assertIn("unknown command /decline", text_of(m.blocks[-1]))
 
@@ -832,7 +857,7 @@ class TestFeatures(unittest.TestCase):
         for text in ("{not json", '{"disable": "copy"}', '["copy"]', '{"disable": [1]}'):
             self.write_config(text)
             m, warning = self.model(self.environ())
-            self.assertEqual(len(m.features), 6, text)
+            self.assertEqual(len(m.features), 7, text)
             self.assertIn("was ignored, so every feature is on", warning)
 
     def test_the_hub_refuses_the_requests_of_a_disabled_feature(self):
