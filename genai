@@ -19,6 +19,7 @@ import hashlib
 import ipaddress
 import json
 import os
+import queue
 import re
 import secrets
 import shlex
@@ -457,6 +458,7 @@ class Sandbox:
     the home directory, a time limit, and memory and process limits where the host allows them."""
 
     running = False            # a container is running now: --json mode turns SIGINT into Ctrl-C only then
+    stop = threading.Event()   # set by a stop message (--json) to stop the run going on now, as Ctrl-C does
 
     def __init__(self, conf, root, notice):
         self.conf, self.root, self.notice = conf, os.path.realpath(root), notice
@@ -594,12 +596,21 @@ class Sandbox:
 
         reader = threading.Thread(target=drain, daemon=True)
         reader.start()
+        Sandbox.stop.clear()
         Sandbox.running = True
+        deadline = time.monotonic() + self.conf["timeout"]
         try:
-            rc = proc.wait(timeout=self.conf["timeout"])
-        except subprocess.TimeoutExpired:
-            self._kill(name, proc)
-            rc = "timeout"
+            while True:                     # in slices, so a stop message can end it as Ctrl-C does
+                try:
+                    rc = proc.wait(timeout=0.2)
+                    break
+                except subprocess.TimeoutExpired:
+                    if Sandbox.stop.is_set():
+                        raise KeyboardInterrupt
+                    if time.monotonic() >= deadline:
+                        self._kill(name, proc)
+                        rc = "timeout"
+                        break
         except KeyboardInterrupt:
             self._kill(name, proc)
             raise
@@ -3899,6 +3910,7 @@ class JsonUI:
         self.inp, self.out = inp, out
         self.queue = []          # attachments waiting for the next user message
         self.engine = None
+        self.lines = None        # stdin's lines, read by a thread of their own once reading starts
 
     def emit(self, ev):
         self.out.write(json.dumps(ev, ensure_ascii=False) + "\n")
@@ -3979,6 +3991,8 @@ class JsonUI:
                 self.queue_attach(msg)
             elif t in ("trace", "system"):
                 inspect(self.engine, self, msg)
+            elif t == "stop":
+                self.error("nothing is running in the sandbox", "not_running")
             else:
                 self.error(f"'{t}' is not allowed while proposals are pending", "busy")
         for p in waiting.values():
@@ -4001,10 +4015,28 @@ class JsonUI:
         ev.update(extra)
         self.emit(ev)
 
+    def listen(self):
+        """Read stdin on a thread of its own, so a stop message is seen while genai is busy: it stops the
+        sandboxed run going on now. Every other line waits in order for read()."""
+        for line in iter(self.inp.readline, ""):
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                msg = None
+            if isinstance(msg, dict) and msg.get("type") == "stop" and Sandbox.running:
+                Sandbox.stop.set()
+                continue
+            self.lines.put(line)
+        self.lines.put("")
+
     def read(self):
+        if self.lines is None:
+            self.lines = queue.Queue()
+            threading.Thread(target=self.listen, daemon=True).start()
         while True:
-            line = self.inp.readline()
+            line = self.lines.get()
             if not line:
+                self.lines.put("")      # stdin has ended: so does every later read
                 return None
             line = line.strip()
             if not line:
@@ -4551,7 +4583,7 @@ def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()
              "host": socket.gethostname(), "user": user, "uid": uid, "remote": remote,
              "features": ["proposals", "decisions", "attach", "register_tools", "compact", "context", "coding",
                           "set_coding", "skills", "files", "read", "trace", "system", "plan", "network", "clear",
-                          "models", "plugins", "interrupt", "edits"],
+                          "models", "plugins", "interrupt", "edits", "stop"],
              "endpoint": engine.endpoint.info(),
              "profile": {"name": engine.profile.name, "description": engine.profile.description}
              if engine.profile else None,
@@ -4635,6 +4667,8 @@ def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()
                          "context": {"used": engine.used(), "limit": engine.endpoint.context_limit}})
             except GenaiError as err:
                 ui.error(str(err), err.kind)
+        elif t == "stop":
+            ui.error("nothing is running in the sandbox", "not_running")
         elif t == "clear":
             n = engine.clear()
             ui.emit({"type": "cleared", "dropped": n, "context": {"used": engine.used(),

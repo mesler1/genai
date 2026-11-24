@@ -430,9 +430,9 @@ sandbox (`in the podman sandbox`, green, or `NOT sandboxed`, red, from `hello`'s
 the model's sandbox: `none`, `ready · offline` or `ONLINE` with its image, `can't run: …`, or
 `RUNNING p3 · 12s` while a run is going. tmux's status line says `⊡ sandbox` or a red
 `NO SANDBOX`, and `⏵ sandbox p3 12s` during a run. A running card counts its seconds. Ctrl-C on an
-empty input, or `/stop`, stops the run: genai-tui sends genai a SIGINT, which genai `--json` takes
-as Ctrl-C during a sandboxed run and ignores otherwise. In remote mode that isn't available yet,
-and the run ends at its time limit. `/sandbox` prints all of it, with the image, network and limits.
+empty input, or `/stop`, stops the run: genai-tui sends genai the `stop` message, which works in
+remote mode too (an older genai without it gets a SIGINT here, and in remote mode its run ends at
+its time limit). `/sandbox` prints all of it, with the image, network and limits.
 
 **The network switch.** `:network on` (or the JSON `network` message) gives the sandbox the
 network for this session; `:network off` takes it away, and a new session starts as the profile
@@ -462,7 +462,8 @@ genai's first line is `hello`. It has `protocol` (1), `version`, `features`, `en
 `memory`, `pids` and `problem`, or `null`), the active `skills` and `plugins`, and the model's `tools`. Check `features` before you use a message added
 later. With the feature `interrupt`, a SIGINT to genai `--json` stops a sandboxed run as Ctrl-C does in
 the REPL (its result's `status` is `stopped`, and the turn's `done` reason is `stopped`); at any
-other time it is ignored.
+other time it is ignored. The feature `stop` is the same as a message, for when genai is out of reach
+of a signal, as over ssh.
 
 `hello` also says where genai runs: `host` (its host name), `user` (the effective user's name, or the uid
 if it has none), `uid`, `remote` (true with `--config-stdin`) and `audit` (the path of its audit log). They are
@@ -513,6 +514,7 @@ checks, and `--plugin` is ignored. A bad line ends genai with exit status 3 and 
 | `compact` | | Shrinks the conversation. Answered by `compacted`. |
 | `models` | | Answered by `models`: `current`, and `models`, each `{"id", "context"}` (the server's list, `GET /models`, without names genai won't use). |
 | `model` | `model` (a name from `models`) | Uses that model from the next message, on the same server. Answered by `model` (`endpoint`, `context`), or an `unknown_model` error. |
+| `stop` | | Stops the sandboxed run going on now, as SIGINT does: genai reads it even while busy, the container is killed, the result's `status` is `stopped` and the turn ends `stopped`. When nothing is running (including while the model is still replying), answered by a `not_running` error, which doesn't end the turn. |
 | `clear` | | Starts the conversation over: the model gets none of it from now on, and an approved plan is dropped. The saved session's history keeps it. Answered by `cleared` (`dropped`: how many messages, `context`). |
 | `coding` | `on` (true or false) | Turns coding mode on or off. The same places are refused as for `--coding` (error `coding_refused`), and `--coding-anywhere` stays a command-line flag. Always answered by a `coding` event with the state now. |
 | `skills` | | Answered by `skills`: every skill, its blessing `status`, and whether it is `active`. |

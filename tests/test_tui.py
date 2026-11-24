@@ -623,6 +623,19 @@ class TestSandboxStatus(unittest.TestCase):
         self.assertIn("isn't available in remote mode yet", text_of(m.blocks[-1], 120))
         self.assertIn("can't be stopped from here in remote mode", text_of(card, 120))
 
+    def test_stop_message_works_here_and_over_ssh(self):
+        for remote in (False, True):
+            m = self.model(features=("interrupt", "stop"), remote=remote)
+            card = self.start(m)
+            self.assertTrue(card.stoppable)
+            self.assertIn("Ctrl-C (or /stop) stops it", text_of(card, 120))
+            m.submit("/stop")
+            self.assertEqual((m.outbox[-1], m.actions), ({"type": "stop"}, []))
+            self.assertIn("stopping the sandboxed run p3", text_of(m.blocks[-1]))
+            m.handle({"type": "error", "code": "not_running", "message": "nothing is running in the sandbox"})
+            self.assertTrue(m.busy)                           # the run had just ended; the turn goes on
+            self.assertIn("nothing is running in the sandbox now", text_of(m.blocks[-1]))
+
     def test_prompt_pane_ctrl_c_stops_a_run(self):
         p = C_PROMPT.Prompt.__new__(C_PROMPT.Prompt)
         sent = []
