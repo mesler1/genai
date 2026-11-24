@@ -2132,7 +2132,10 @@ class App:
             f.write(text)
         curses.endwin()
         try:
-            pager = ["less", "-+F", "-+S", path] if shutil.which("less") else ["more", path, os.devnull]
+            # -c draws from the top (in a popup less otherwise fills from the bottom) and -~ drops the filler; the
+            # prompt replaces the temporary file's path. -R stays off: what is shown was cleaned, and stays plain text.
+            pager = (["less", "-c", "-~", "-+F", "-+S", "-Ps q quits \xb7 / searches ", path] if shutil.which("less")
+                     else ["more", path, os.devnull])
             return self.run_here(pager) == 0
         except OSError as e:
             self.m.note(f"could not open the full preview: {e}", R)
