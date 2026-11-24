@@ -285,6 +285,14 @@ class TestModel(unittest.TestCase):
         self.assertEqual(len(picks), 19)
         self.assertTrue(all(re.search(r"model [0-9]+\\?\"$", a) for a in picks), picks[:2])
 
+    def test_remote_banner_says_where_commands_run(self):
+        m = C.Model()
+        m.shell_where = "OUTSIDE any sandbox, directly on this host"
+        self.hello(m, remote=True, host="login1", user="svc")
+        banner = text_of(m.blocks[0], 120)
+        self.assertIn("Approved commands run ON ANOTHER HOST, login1, over ssh", banner)
+        self.assertNotIn("directly on this host", banner)
+
     def test_messages_typed_while_busy_are_queued(self):
         m = C.Model()
         m.submit("one")
