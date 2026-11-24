@@ -1,0 +1,22 @@
+# rc for "sandbox/run shell": read by bash inside the sandbox, never by your own shell.
+# sandbox/run passes GENAI_SANDBOX_WORK_HOST (where /work is on the host) and GENAI_SANDBOX_NET (on/off).
+
+HISTFILE=/tmp/.bash_history   # the root is read-only; /tmp is a throwaway
+# Reverse video, so it shows on dark and light terminals; \[ \] keep bash's line-length count right.
+PS1='\[\e[7m\][sandbox:podman /work]\[\e[0m\] \w\$ '
+cd /work 2>/dev/null
+
+if [[ -z "${GENAI_SANDBOX_SHELL_SEEN:-}" ]]; then
+  GENAI_SANDBOX_SHELL_SEEN=1
+  net=${GENAI_SANDBOX_NET:-off}
+  if [[ "$net" == on ]]; then
+    netline="on (--net)"
+  else
+    netline="off (sandbox/run shell --net to allow)"
+  fi
+  printf '%s\n' \
+    "You are in the podman sandbox: /work is ${GENAI_SANDBOX_WORK_HOST:-(unknown)}, writable;" \
+    "the repo is at /opt/genai, read-only; this machine's /usr and /etc are read-only;" \
+    "nothing else from your home; network: $netline." \
+    "Changes outside /work and the config directory are discarded when you exit."
+fi
