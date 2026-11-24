@@ -13,6 +13,7 @@ import collections
 import datetime
 import difflib
 import errno
+import fnmatch
 import hashlib
 import ipaddress
 import json
@@ -45,6 +46,10 @@ ATTACH_CAP = 256 * 1024        # bytes per -f file
 OUTPUT_CAP = 32 * 1024         # chars of command output before head/tail cut
 REPLY_CAP = 8 * 1024 * 1024    # bytes of one endpoint reply (and of one streamed line)
 LIST_CAP = 500                 # entries per list_dir
+SEARCH_FILES = 2000            # files one search_files looks in
+SEARCH_MATCHES = 200           # matching lines it returns
+SEARCH_LINE = 200              # characters of each matching line
+SEARCH_SECONDS = 5             # and how long it may take
 WARN_FRACTION = 0.8
 KEEP_TURNS = 2                 # user turns kept word for word by :compact
 SUMMARY_WORDS = 300
@@ -60,7 +65,8 @@ MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+=-]{0,199}")
 EXIT_OK, EXIT_ERROR, EXIT_USAGE, EXIT_PROFILE, EXIT_API, EXIT_CONTEXT = 0, 1, 2, 3, 4, 5
 EXIT_INTERRUPT = 130
 
-INTRINSICS = ("propose_command", "read_file", "list_dir", "write_file", "edit_file", "propose_plan", "run_in_sandbox")
+INTRINSICS = ("propose_command", "read_file", "list_dir", "write_file", "edit_file", "propose_plan", "run_in_sandbox",
+              "search_files")
 PLAN_STEPS = 30                # steps one plan may have
 ENDPOINT_KEYS = {"name", "base_url", "model", "key_env", "key_file", "context_limit", "timeout",
                  "ca_bundle", "headers", "params", "allow_http", "proxy", "description"}
@@ -2032,6 +2038,38 @@ class Workdir:
             os.close(dfd)
         return sorted(out), False
 
+    def walk(self, path):
+        """The regular files under a directory, as relative paths, in order. Hidden names and symlinks are skipped
+        (never followed), and directories are opened one component at a time like everything else here."""
+        start = split_rel(path) if path not in ("", ".", "./") else []
+        stack = [(start, self._open_dir(start))]
+        try:
+            while stack:
+                parts, fd = stack.pop()
+                files = []
+                try:                                   # every fd is closed before anything is yielded
+                    try:
+                        with os.scandir(fd) as it:
+                            entries = sorted((e.name, e.stat(follow_symlinks=False).st_mode) for e in it
+                                             if not e.name.startswith("."))
+                    except OSError:
+                        entries = []
+                    subdirs = [name for name, mode in entries if stat.S_ISDIR(mode)]
+                    files = [name for name, mode in entries if stat.S_ISREG(mode)]
+                    for name in reversed(subdirs):
+                        try:
+                            sub = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                        except OSError:
+                            continue
+                        stack.append((parts + [name], sub))
+                finally:
+                    os.close(fd)
+                for name in files:
+                    yield "/".join(parts + [name])
+        finally:
+            for _, fd in stack:
+                os.close(fd)
+
     def write(self, path, content, expected=_UNCHECKED):
         data = content.encode("utf-8")
         if len(data) > WRITE_CAP:
@@ -2160,6 +2198,17 @@ TOOLS = [
           ["goal", "steps"]),
 ]
 
+# Offered only in coding mode, where reads run without asking.
+SEARCH_TOOL = _tool("search_files", "Search the text files under a directory for a literal string (not a regular "
+                    "expression) and get back each matching line as path:line: text. Hidden files and directories, "
+                    "symlinks, binary and large files, and files that look like they hold secrets are skipped. "
+                    f"At most {SEARCH_MATCHES} matches; narrow it with path or glob when there are more.",
+                    {"pattern": {"type": "string", "description": "The text to look for, on one line."},
+                     "path": {"type": "string", "description": "A directory relative to the working directory; "
+                                                               "'.' (the default) for all of it."},
+                     "glob": {"type": "string", "description": "Only files whose name matches, like '*.py'."},
+                     "ignore_case": {"type": "boolean"}, "reason": _REASON}, ["pattern", "reason"])
+
 # Offered only in coding mode, when the profile gives a sandbox that can run here.
 RUN_TOOL = _tool("run_in_sandbox", "Run ONE shell command (build, test, lint, try something) in a sandbox and get its "
                  "exit code and output back. It runs in /work, a throwaway copy of the working directory: changes it "
@@ -2187,7 +2236,7 @@ TRUSTED_RULES = """
 CODING_RULES = """
 
 # Coding mode is on
-- read_file and list_dir run without asking inside the working directory (hidden and secret-looking files still ask). Look before you change: list and read the files involved before proposing an edit. Never guess at a file's contents or at an API you haven't read.
+- read_file, list_dir and search_files run without asking inside the working directory (hidden and secret-looking files still ask, and search_files skips them). Look before you change: search, list and read the files involved before proposing an edit. Never guess at a file's contents or at an API you haven't read.
 - Change an existing file with edit_file, not write_file. old_text must match exactly once, so include a few unchanged lines around the change. Prefer several small edits to one large one.
 - Writes and edits are shown to the user as diffs and may be declined; if one is, ask rather than retrying the same change.
 {run}
@@ -2768,13 +2817,17 @@ class Engine:
             self.ui.notice("[!] the sandbox's network is ON for this session: code running there could send your "
                            "project anywhere, so each sandboxed command now asks first")
 
+    def can_search(self):
+        return self.read_allowed([])
+
     def trusted_tools(self):
         """The trusted commands on offer: only where someone can see what runs, as with run_in_sandbox."""
         return dict(self.trusted) if self.ui.performs else {}
 
     def tools(self):
         host = socket.gethostname()
-        return (TOOLS + ([RUN_TOOL] if self.can_run() else []) + [c.schema(host) for c in self.trusted_tools().values()]
+        return (TOOLS + ([SEARCH_TOOL] if self.can_search() else []) + ([RUN_TOOL] if self.can_run() else [])
+                + [c.schema(host) for c in self.trusted_tools().values()]
                 + list(self.external.values()))
 
     def system(self):
@@ -2862,7 +2915,7 @@ class Engine:
             for p in props:
                 result = "not run: the user stopped an earlier command" if stopped else self.perform(p)
                 tool_msg = {"role": "tool", "tool_call_id": p.call_id, "content": result}
-                if p.kind in ("read", "list", "external", "sandbox", "trusted") and p.decision == "accept":
+                if p.kind in ("read", "list", "search", "external", "sandbox", "trusted") and p.decision == "accept":
                     tool_msg["_bulk"] = True
                 self.session.add(tool_msg)
                 if p.kind == "command" and not p.error:
@@ -2910,6 +2963,8 @@ class Engine:
                              image=self.box.conf["image"])
                 p.auto = not self.box.network
                 return p
+            if name == "search_files":
+                return self.search_proposal(pid, tc["id"], args, reason)
             if name in ("read_file", "list_dir"):
                 path = args.get("path", ".")
                 parts = split_rel(path) if not (name == "list_dir" and path in (".", "./", "")) else []
@@ -2989,6 +3044,70 @@ class Engine:
                               f"it was declined: {e}"
                     p.reply = "declined by the user"
             return p
+
+    def search_proposal(self, pid, call_id, args, reason):
+        if not self.can_search():
+            raise ValueError("search_files is only available in coding mode")
+        pattern, path, glob = args.get("pattern"), args.get("path", "."), args.get("glob")
+        if not isinstance(pattern, str) or not pattern or "\n" in pattern or len(pattern) > 200:
+            raise ValueError("pattern must be one line of text, at most 200 characters")
+        if not isinstance(path, str) or (glob is not None and (not isinstance(glob, str) or len(glob) > 100)):
+            raise ValueError("path and glob must be strings")
+        parts = split_rel(path) if path not in ("", ".", "./") else []
+        if is_hidden(parts):
+            raise ValueError("hidden directories are not searched")
+        fields = {"path": path or ".", "pattern": pattern, "reason": reason}
+        if glob:
+            fields["glob"] = glob
+        if args.get("ignore_case") is True:
+            fields["ignore_case"] = True
+        p = Proposal(pid, "search", call_id, **fields)
+        p.auto = True
+        return p
+
+    def search(self, p):
+        """Run an automatic search_files: (what the model gets, a note for the user)."""
+        f = p.fields
+        fold = (lambda t: t.casefold()) if f.get("ignore_case") else (lambda t: t)
+        needle, keys = fold(f["pattern"]), self.secrets()
+        hits, files, skipped, stopped = [], 0, {}, None
+        deadline = time.monotonic() + SEARCH_SECONDS
+        for rel in self.wd.walk(f["path"]):
+            if f.get("glob") and not fnmatch.fnmatchcase(rel.rsplit("/", 1)[-1], f["glob"]):
+                continue
+            if files == SEARCH_FILES:
+                stopped = f"after {SEARCH_FILES} files"
+                break
+            if time.monotonic() > deadline:
+                stopped = f"after {SEARCH_SECONDS} seconds"
+                break
+            files += 1
+            try:
+                text = self.wd.read(rel)
+            except (ValueError, OSError):
+                skipped["binary, large or unreadable"] = skipped.get("binary, large or unreadable", 0) + 1
+                continue
+            if needle not in fold(text):
+                continue
+            if looks_secret(text) or any(k and k in text for k in keys):
+                skipped["looking like secrets"] = skipped.get("looking like secrets", 0) + 1
+                continue
+            for n, line in enumerate(text.split("\n"), 1):
+                at = fold(line).find(needle)
+                if at >= 0:
+                    start = max(0, min(at - SEARCH_LINE // 4, len(line) - SEARCH_LINE))     # the match stays in view
+                    hits.append(f"{rel}:{n}: {'…' if start else ''}{line[start:start + SEARCH_LINE]}"
+                                f"{'…' if start + SEARCH_LINE < len(line) else ''}")
+                    if len(hits) == SEARCH_MATCHES:
+                        stopped = f"at {SEARCH_MATCHES} matches"
+                        break
+            if stopped:
+                break
+        out, counts = redact("\n".join(hits), keys)
+        tail = [f"(stopped {stopped}; narrow it with path or glob)"] if stopped else []
+        tail += [f"(skipped {n} file{'' if n == 1 else 's'} {why})" for why, n in sorted(skipped.items())]
+        result = "\n".join(([out] if out else ["(no matches)"]) + tail)
+        return result, f"{len(hits)} matches in {files} files" + (f", stopped {stopped}" if stopped else "")
 
     def files(self, path):
         """One directory as a file tree shows it: each entry, whether it looks like it holds secrets, and
@@ -3181,6 +3300,8 @@ class Engine:
                 note = f"read {len(text)} characters"
                 if looks_secret(text):
                     self.ui.notice(f"warning: {p.fields['path']} looks like it contains secrets; it was sent as is")
+            elif p.kind == "search":
+                result, note = self.search(p)
             elif p.kind == "list":
                 rows, truncated = self.wd.list(p.fields["path"])
                 lines = [f"{n}/" if k == "dir" else f"{n}  ({s} bytes)" if k == "file" else f"{n}  [{k}]"
@@ -3487,6 +3608,8 @@ class TtyUI(PlainUI):
                    f"{show_exact(f['argv'])}")
         elif p.kind == "sandbox":
             eprint(f"  [{p.id}] sandbox, offline: {one_line(p.fields['reason'])[0]}\n    $ {show_exact(p.fields['command'])}")
+        elif p.kind == "search":
+            eprint(f"  (coding mode) search {show_exact(p.fields['pattern'])} in {one_line(p.fields['path'])[0]}")
         else:
             eprint(f"  (coding mode) {p.kind} {one_line(p.fields['path'])[0]}")
 
