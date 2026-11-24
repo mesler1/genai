@@ -342,7 +342,10 @@ ends the session.
 You can see where it runs: the banner and the info panel say `genai runs ON host AS user in dir` (red as root), the
 status line names the host, and the banner gives the audit log's path on the host (`hello`'s `audit`). The sessions,
 audit log and `~/.config/genai` that genai uses are those of the user it runs as on the host; its endpoint is not
-blessed there, because the blessing happened here. Test it against a SLES container with `tests/remote_sshd.sh test`.
+blessed there, because the blessing happened here. Test it against a SLES container with `tests/remote_sshd.sh test`, or against a real host of yours with
+`GENAI_TEST_REMOTE_HOST=me@devbox python3 -m unittest tests.test_remote.TestRealHost` (a turn, then a sandboxed run and a
+stopped one if the host has rootless podman and `GENAI_TEST_REMOTE_IMAGE`, default `docker.io/library/alpine:3`, pulled; it works in a
+`mktemp -d` directory there and removes it).
 
 Limits: the host's login shell must be POSIX-like, its sshd must allow TCP forwarding (`AllowTcpForwarding`), and
 `python3`, `python3.13` ... `python3.10` is searched in that order for 3.10 or newer (SLES: `zypper install python311`).
