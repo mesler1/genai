@@ -1179,6 +1179,27 @@ def remote_config(line, audit):
     return endpoint, persona
 
 
+# Endpoint fields that never travel to a remote host: where the key is, the proxy (the key proxy uses the endpoint's
+# own proxy, here, and a remote one would dial it from there), headers (they may hold secrets and are added here by
+# the key proxy) and the local CA bundle path (the remote leg is plain HTTP over the tunnel).
+REMOTE_STRIP = ("key_env", "key_file", "proxy", "headers", "ca_bundle")
+
+
+def export_remote(cfg, profile_name, endpoint_name):
+    """What genai-tui's remote mode needs from this machine's configuration, resolved and checked exactly as a
+    normal start would (default profile and endpoint, blessing, changed files), and nothing secret."""
+    pname = profile_name or cfg.default_profile
+    persona = select_named(cfg, "profile", pname) if pname else None
+    endpoint = select_endpoint(cfg, endpoint_name or (persona.endpoint if persona else None) or cfg.default_endpoint)
+    path = urllib.parse.urlsplit(endpoint.base_url).path
+    if not re.fullmatch(r"(?:/[A-Za-z0-9._~-]+)*", path):
+        raise GenaiError(f"endpoint '{endpoint.name}': the path of base_url ({path!r}) can't be used in remote mode "
+                         "(letters, digits and . _ ~ - only)", EXIT_PROFILE)
+    cfg.audit.log("remote_config_export", endpoint=endpoint.name, profile=persona.name if persona else None)
+    return {"endpoint": {k: v for k, v in endpoint.data.items() if k not in REMOTE_STRIP},
+            "profile": persona.data if persona else None, "endpoint_name": endpoint.name, "base_path": path}
+
+
 def select_endpoint(cfg, name):
     if not name:
         raise GenaiError("no endpoint is configured. Nothing was sent.\n"
@@ -3490,7 +3511,7 @@ def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()
              "resumed": engine.session.resumed, "coding": engine.session.coding,
              "coding_from": engine.coding_from if engine.session.coding else None,
              "coding_override": engine.coding_override if engine.session.coding else None, "cwd": os.getcwd(),
-             "sandbox": engine.sandbox,
+             "sandbox": engine.sandbox, "audit": engine.audit.path,
              "runner": engine.box.info() if engine.box else None,
              "skills": [s.name for s in engine.skills],
              "tools": list(INTRINSICS)})
@@ -3663,6 +3684,9 @@ def parse_args(argv):
     ap.add_argument("--config-stdin", action="store_true",
                     help="with --json: read the endpoint, profile and session token from the first line of stdin "
                          "(for genai-tui's remote mode)")
+    ap.add_argument("--remote-config", action="store_true",
+                    help="print the resolved endpoint and profile as one JSON line, without any key (for genai-tui's "
+                         "remote mode; takes -e and -p)")
     ap.add_argument("--bless", metavar="PATH", help="review and bless a skill directory, endpoint or profile file")
     ap.add_argument("--list-skills", action="store_true", help="list skills (with --json: as JSON)")
     ap.add_argument("--list-endpoints", action="store_true", help="list endpoints (with --json: as JSON)")
@@ -3686,6 +3710,11 @@ def main(argv=None):
             if not sys.stdin.isatty():
                 raise GenaiError("blessing needs a terminal: it asks you to confirm you have read it", EXIT_USAGE)
             return EXIT_OK if bless(cfg, args.bless, ask_yes) else EXIT_ERROR
+        if args.remote_config:
+            if args.session or args.skill:
+                raise GenaiError("--remote-config takes only -e and -p", EXIT_USAGE)
+            print(json.dumps(export_remote(cfg, args.profile, args.endpoint)))
+            return EXIT_OK
         if args.list_skills:
             rows = skill_rows(cfg)
             if args.json:
