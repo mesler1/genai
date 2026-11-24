@@ -924,7 +924,8 @@ def split_template(text, where):
 
 class TrustedParam:
     """What one placeholder accepts: a regular expression (the whole value must match), a list of values,
-    or a whole number in a range. A value that doesn't fit is refused, never cleaned."""
+    or a whole number from 0 up. A value that doesn't fit is refused, never cleaned. No value may start with '-':
+    one that did could be read by the program as an option (another cluster, an output file), not as data."""
 
     def __init__(self, data, where):
         _object(data, PARAM_KEYS, where)
@@ -940,11 +941,15 @@ class TrustedParam:
                 raise ValueError(f"{where}.pattern is not a valid regular expression") from None
             if self.rx.fullmatch(""):
                 raise ValueError(f"{where}.pattern matches the empty string")
+            if any(self.rx.fullmatch(v) for v in ("-", "-a", "-1", "--a", "--a=b")):
+                raise ValueError(f"{where}.pattern accepts a value starting with '-', which a program reads as an option")
         elif self.kind == "enum":
             _strings(self.rule, where + ".enum")
+            if any(v.startswith("-") for v in self.rule):
+                raise ValueError(f"{where}.enum has a value starting with '-', which a program reads as an option")
         elif not (isinstance(self.rule, list) and len(self.rule) == 2 and all(type(n) is int for n in self.rule)
-                  and self.rule[0] <= self.rule[1]):
-            raise ValueError(f"{where}.int must be [min, max]")
+                  and 0 <= self.rule[0] <= self.rule[1]):
+            raise ValueError(f"{where}.int must be [min, max], from 0 up")
 
     def check(self, value):
         """The value as a string, or ValueError saying why it is refused."""
@@ -954,11 +959,13 @@ class TrustedParam:
             raise ValueError("must be a string")
         if len(value) > PARAM_CAP or "\0" in value or "\n" in value or "\r" in value:
             raise ValueError(f"must be at most {PARAM_CAP} characters, on one line")
+        if value.startswith("-"):          # whatever the pattern says: it would be an option, not data
+            raise ValueError("must not start with '-'")
         if self.kind == "pattern" and not self.rx.fullmatch(value):
             raise ValueError(f"does not match {self.rule}")
         if self.kind == "enum" and value not in self.rule:
             raise ValueError(f"must be one of: {', '.join(self.rule)}")
-        if self.kind == "int" and not (re.fullmatch(r"-?[0-9]{1,18}", value)
+        if self.kind == "int" and not (re.fullmatch(r"[0-9]{1,18}", value)
                                        and self.rule[0] <= int(value) <= self.rule[1]):
             raise ValueError(f"must be a whole number from {self.rule[0]} to {self.rule[1]}")
         return value
@@ -970,7 +977,7 @@ class TrustedParam:
         elif self.kind == "enum":
             s["enum"] = self.rule
         else:
-            s["pattern"] = "^-?[0-9]{1,18}$"
+            s["pattern"] = "^[0-9]{1,18}$"
         text = self.describe
         if self.kind == "int":
             text = f"{text} (a whole number from {self.rule[0]} to {self.rule[1]})".strip()

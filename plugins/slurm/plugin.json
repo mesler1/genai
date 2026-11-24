@@ -33,7 +33,7 @@
     "queue_partition": {
       "describe": "jobs in one partition: job|name|user|state|time|nodes|reason or nodes",
       "argv": ["squeue", "-h", "-p", "{partition}", "-o", "%i|%j|%u|%T|%M|%D|%R"],
-      "params": {"partition": {"pattern": "^[A-Za-z0-9_.-]{1,64}$", "describe": "a partition name"}},
+      "params": {"partition": {"pattern": "^[A-Za-z0-9_.][A-Za-z0-9_.-]{0,63}$", "describe": "a partition name"}},
       "read_only": true, "min_interval": 5, "cache": 15
     },
     "job": {
@@ -45,7 +45,7 @@
     "node": {
       "describe": "details of one node (scontrol show node)",
       "argv": ["scontrol", "show", "node", "{name}"],
-      "params": {"name": {"pattern": "^[A-Za-z0-9_.-]{1,64}$", "describe": "a node name"}},
+      "params": {"name": {"pattern": "^[A-Za-z0-9_.][A-Za-z0-9_.-]{0,63}$", "describe": "a node name"}},
       "read_only": true
     },
     "jobs_history_user": {
