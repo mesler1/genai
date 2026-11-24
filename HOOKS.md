@@ -38,7 +38,7 @@ the container.
 - **Checks:** the directory and each hook file (after resolving symlinks) must be owned by you and
   not writable by group or others. Otherwise the sandbox does not start. A file that is not
   executable is ignored, with a note. A hook name is letters, digits, `.`, `_` and `-`.
-- **How a hook is run:** as its own process, with the mode (`tests`, `live`, `selfcheck`, `genai`)
+- **How a hook is run:** as its own process, with the mode (`tests`, `live`, `selfcheck`, `genai`, `shell`)
   as its one argument, your environment, and no input. If it exits non-zero, the sandbox does not
   start.
 - **How a hook answers:** on standard output, one request per line. Blank lines and lines starting
