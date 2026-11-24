@@ -636,6 +636,15 @@ class TestSandboxStatus(unittest.TestCase):
             self.assertTrue(m.busy)                           # the run had just ended; the turn goes on
             self.assertIn("nothing is running in the sandbox now", text_of(m.blocks[-1]))
 
+    def test_a_run_ends_when_genai_exits(self):
+        m = self.model()
+        card = self.start(m)
+        m.exit(1)
+        self.assertIsNone(m.running_card())
+        self.assertEqual((card.state, card.detail), ("error", "genai exited before it finished"))
+        self.assertNotIn("RUNNING", self.panel(m))
+        self.assertNotIn("⏵", m.tmux_status())
+
     def test_prompt_pane_ctrl_c_stops_a_run(self):
         p = C_PROMPT.Prompt.__new__(C_PROMPT.Prompt)
         sent = []
