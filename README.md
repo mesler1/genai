@@ -10,13 +10,28 @@ See [DECISIONS.md](DECISIONS.md) for the design choices and known limitations, a
 
 ## Quick start
 
+From a clone of this repository:
+
 ```bash
+mkdir -p ~/.local/bin                       # any directory on your PATH will do
+ln -s "$PWD/genai" "$PWD/tui/genai-tui" ~/.local/bin/
+genai --list-endpoints                      # the first run creates ~/.config/genai (none yet)
 cp endpoints/example.json ~/.config/genai/endpoints/work-llm.json   # edit name, base_url, model, key_env
 genai --bless ~/.config/genai/endpoints/work-llm.json   # shows URL, model, key source; asks you to confirm
 export GENAI_API_KEY=...                    # the endpoint names the variable, never the key
 genai -e work-llm "what does 'set -euo pipefail' do?"
+```
+
+To use the example persona, which grants coding mode and uses a bundled skill, add
+`"skill_dirs": ["/path/to/genai/skills"]` to `~/.config/genai/config.json` ([Configuration](#configuration)),
+then bless both and start it in a project directory (coding mode is refused in your home directory):
+
+```bash
 genai --bless profiles/coder.json           # a persona: shows its text, endpoint, skills, coding grant
+genai --bless skills/bash-scripts           # the skill it uses
+cd ~/src/some-project
 genai -e work-llm -p coder                  # REPL: a line with only '..' sends; :help for commands
+genai-tui -e work-llm -p coder              # the same in tmux panes, beside your shell (needs tmux)
 ```
 
 ## Endpoints and profiles
