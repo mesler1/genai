@@ -51,6 +51,13 @@ model, default skills, sampling settings and coding mode:
   `~/.ssh`, where genai prints a notice and leaves it off. Only you can override that, with
   `--coding-anywhere` on the command line. The REPL banner and the JSON `hello` event say where coding
   mode came from.
+- `"edits": "approved-files"` (default `"ask"`): once you approve an edit or write to a file, further
+  edits and writes to that same file apply without asking, for the rest of the session. They are
+  still shown with their diff, logged, and bound to the file as it was. New files, hidden files,
+  anything that looks like a secret, and a whole replacement of a file that can't be diffed always
+  ask; declining an edit to a file takes it out of the set. `:edits` (or `/edits` in genai-tui)
+  shows the files, `:edits reset` forgets them, and `:edits ask|approved-files` switches for this
+  session. The set is never saved, so a resumed session starts empty. Blessing flags the field.
 - Endpoints, profiles and skills are each blessed with `genai --bless PATH`. A profile can only use an
   endpoint and skills that are blessed on their own. If any file changes, genai refuses it until you
   bless it again.
@@ -322,7 +329,7 @@ another, set `GENAI_TUI_PAGER` (for example `GENAI_TUI_PAGER=less`).
 
 ### Features
 
-genai-tui's `/model`, `/copy`, `/decline`, `/raw`, `/system` and `/files`, and the `genai-ssh` handshake, are
+genai-tui's `/model`, `/copy`, `/decline`, `/raw`, `/system`, `/files` and `/edits`, and the `genai-ssh` handshake, are
 features, each in its own module under `tui/features/`. To switch some off, list them in
 `~/.config/genai/tui.json` (`$XDG_CONFIG_HOME/genai/tui.json`):
 
@@ -331,7 +338,7 @@ features, each in its own module under `tui/features/`. To switch some off, list
 ```
 
 or set `GENAI_TUI_DISABLE=copy,model` for one run. Names are `model`, `copy`, `decline`, `raw`,
-`ssh` and `files`. A disabled feature has no command, help line or menu item, and genai-tui's socket
+`ssh`, `files` and `edits`. A disabled feature has no command, help line or menu item, and genai-tui's socket
 refuses its requests. Without `ssh`, a genai-ssh session isn't followed. No file means
 everything is on; a file that can't be read is ignored, with a note in the conversation.
 
@@ -453,6 +460,7 @@ yet (a `notice` after `hello` says so). A bad line ends genai with exit status 3
 | `trace` | optional `from`, `to` (exchange numbers) | Answered by `trace`: the exchanges with the endpoint in that range (default: the latest), exactly as sent and received. Each has `n`, `time`, `method`, `url`, `headers` (the API key and the endpoint's own header values are not shown), `request` (the body, as sent), `http`, `stream`, `response` (the reply as it arrived: each streamed line, or the whole body), `status` (`ok` or `error`, with `error`), `message` (the reply as genai put it together), `usage` and `ms`. genai keeps the last 30, in memory only; `kept` gives the range it still has. |
 | `system` | | Answered by `system`: the system prompt and the tool definitions the next request will carry, with `model` and `params`. |
 | `plan` | optional `clear: true` | Answered by `plan`: the approved plan, or `null`. With `clear`, drops it first, so everything asks again. |
+| `edits` | optional `mode` (`ask` or `approved-files`), optional `reset: true` | Switches edits for this session, or forgets the approved files. Switching to `ask` forgets them too. Always answered by `edits`: `mode` and `files` (the approved set, as relative paths). genai also sends `edits` when the set changes, and `hello` has the same `edits` object. |
 | `network` | optional `on` (true or false) | Turns the sandbox's network on or off for this session (error `no_sandbox` without one). Answered by `network`: `runner` as in `hello`, and `available` (whether `run_in_sandbox` is offered now). |
 
 While proposals are waiting for decisions, only `decision`, `result`, `attach`, `trace` and `system` are accepted.
@@ -464,14 +472,14 @@ decision.
 | `type` | Meaning |
 |---|---|
 | `text` | A piece of the model's reply. |
-| `proposal` | `id`, `kind` (`read`, `list`, `write`, `edit`, `command`, `sandbox`, `trusted`, `external`, `invalid`), and the proposal's fields, such as `path`, `content`, `diff`, `command` and `reason`. `auto: true` means it needed no approval: coding mode, or a read the approved plan names. A `plan` proposal has `goal` and numbered `steps` (`n`, `kind`: `read`, `edit`, `write` or `command`, a `path` or the exact `command`, and `why`). While a plan is approved, a proposal it covers has `plan_step`; a command matching an approved step character for character also has `preapproved: true`, so the wrapper may run it without asking again; a command, edit or write the plan doesn't cover has `off_plan: true`. Edits and writes always ask. `secret: true` means the file looks like it holds secrets. A command is only shown: the wrapper runs it, if the user wants to, and can share the output with `attach`. A `sandbox` proposal (`command`, `reason`, `network`, `image`) is genai running the command in the sandbox: offline it has `auto: true` and runs at once; online it waits for a `decision`. A `trusted` proposal (`plugin`, `command`, `params`, `argv`, `read_only`) is a plugin's trusted command: `read_only` ones have `auto: true` and run at once; others wait for a `decision`. |
+| `proposal` | `id`, `kind` (`read`, `list`, `write`, `edit`, `command`, `sandbox`, `trusted`, `external`, `invalid`), and the proposal's fields, such as `path`, `content`, `diff`, `command` and `reason`. `auto: true` means it needed no approval: coding mode, or a read the approved plan names. A `plan` proposal has `goal` and numbered `steps` (`n`, `kind`: `read`, `edit`, `write` or `command`, a `path` or the exact `command`, and `why`). While a plan is approved, a proposal it covers has `plan_step`; a command matching an approved step character for character also has `preapproved: true`, so the wrapper may run it without asking again; a command, edit or write the plan doesn't cover has `off_plan: true`. Edits and writes ask, except with edits `approved-files`, where one to a file you already approved has `auto: true` and `approved_file: true` (it is applied at once; show its diff). `secret: true` means the file looks like it holds secrets. A command is only shown: the wrapper runs it, if the user wants to, and can share the output with `attach`. A `sandbox` proposal (`command`, `reason`, `network`, `image`) is genai running the command in the sandbox: offline it has `auto: true` and runs at once; online it waits for a `decision`. A `trusted` proposal (`plugin`, `command`, `params`, `argv`, `read_only`) is a plugin's trusted command: `read_only` ones have `auto: true` and run at once; others wait for a `decision`. |
 | `result` | `id`, `status`, `detail`: what happened to a proposal that was performed. For a `sandbox` or `trusted` run, also `exit` (`null` if it was killed at the time limit or never ran) and `output`, exactly what the model is sent. |
 | `done` | The turn ended. `reason` is `reply`, `command`, `stopped` (Ctrl-C during a sandboxed run) or `step_limit`; `context` gives `used` and `limit`; `exchanges` gives the first and last exchange numbers of this turn, for `trace` (also on an `error` that ends a turn). |
 | `context` | The conversation is getting near the context limit. |
 | `notice` | Something the user should know. |
 | `error` | `code` and `message`. |
 | `plan` | The approved plan changed: approved, a step done, or dropped. `plan` has `id`, `goal` and `steps`, each with `approved`, `status` (`todo`, `done`, `left out`) and `edited` when the user changed its command; `null` when there is none. A plan is never saved with the session. |
-| `attached`, `registered`, `compacted`, `cleared`, `models`, `model`, `coding`, `skills`, `files`, `file`, `trace`, `system`, `network`, `plugins`, `ran` | Answers to the messages above. |
+| `attached`, `registered`, `compacted`, `cleared`, `models`, `model`, `coding`, `skills`, `files`, `file`, `trace`, `system`, `network`, `plugins`, `ran`, `edits` | Answers to the messages above. |
 
 When stdin closes, every waiting proposal is declined and genai exits.
 

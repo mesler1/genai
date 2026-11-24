@@ -89,6 +89,17 @@ def view(st, w, sel):
         add([("commands run on their own" if plan.get("auto") else "each planned command asks once",
               W if plan.get("auto") else Q)])
         add([("/plan clear drops it", Q)])
+    edits = st.get("edits") or {}
+    if edits.get("mode") == "approved-files":
+        head("EDITS")
+        add([(fit("applied without asking:", w), W)])
+        for f in (edits.get("files") or [])[:10]:
+            add([(fit("  " + clean(f), w), "")])
+        if not edits.get("files"):
+            add([("  none yet", Q)])
+        elif len(edits["files"]) > 10:
+            add([(f"  … {len(edits['files']) - 10} more (/edits)", Q)])
+        add([(fit("/edits reset forgets them", w), Q)])
     head("SKILLS")
     skills = st.get("skills")
     if skills is None:
