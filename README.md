@@ -10,13 +10,28 @@ See [DECISIONS.md](DECISIONS.md) for the design choices and known limitations, a
 
 ## Quick start
 
+From a clone of this repository:
+
 ```bash
+mkdir -p ~/.local/bin                       # any directory on your PATH will do
+ln -s "$PWD/genai" "$PWD/tui/genai-tui" ~/.local/bin/
+genai --list-endpoints                      # the first run creates ~/.config/genai (none yet)
 cp endpoints/example.json ~/.config/genai/endpoints/work-llm.json   # edit name, base_url, model, key_env
 genai --bless ~/.config/genai/endpoints/work-llm.json   # shows URL, model, key source; asks you to confirm
 export GENAI_API_KEY=...                    # the endpoint names the variable, never the key
 genai -e work-llm "what does 'set -euo pipefail' do?"
+```
+
+To use the example persona, which grants coding mode and uses a bundled skill, add
+`"skill_dirs": ["/path/to/genai/skills"]` to `~/.config/genai/config.json` ([Configuration](#configuration)),
+then bless both and start it in a project directory (coding mode is refused in your home directory):
+
+```bash
 genai --bless profiles/coder.json           # a persona: shows its text, endpoint, skills, coding grant
+genai --bless skills/bash-scripts           # the skill it uses
+cd ~/src/some-project
 genai -e work-llm -p coder                  # REPL: a line with only '..' sends; :help for commands
+genai-tui -e work-llm -p coder              # the same in tmux panes, beside your shell (needs tmux)
 ```
 
 ## Endpoints and profiles
@@ -548,12 +563,12 @@ decision.
 | `type` | Meaning |
 |---|---|
 | `text` | A piece of the model's reply. |
-| `proposal` | `id`, `kind` (`read`, `list`, `search`, `write`, `edit`, `command`, `sandbox`, `trusted`, `external`, `invalid`), and the proposal's fields, such as `path`, `content`, `diff`, `command` and `reason`. `auto: true` means it needed no approval: coding mode, or a read the approved plan names. A `plan` proposal has `goal` and numbered `steps` (`n`, `kind`: `read`, `edit`, `write` or `command`, a `path` or the exact `command`, and `why`). While a plan is approved, a proposal it covers has `plan_step`; a command matching an approved step character for character also has `preapproved: true`, so the wrapper may run it without asking again; a command, edit or write the plan doesn't cover has `off_plan: true`. Edits and writes ask, except with edits `approved-files`, where one to a file you already approved has `auto: true` and `approved_file: true` (it is applied at once; show its diff). `secret: true` means the file looks like it holds secrets. A command is only shown: the wrapper runs it, if the user wants to, and can share the output with `attach`. A `sandbox` proposal (`command`, `reason`, `network`, `image`) is genai running the command in the sandbox: offline it has `auto: true` and runs at once; online it waits for a `decision`. A `trusted` proposal (`plugin`, `command`, `params`, `argv`, `read_only`) is a plugin's trusted command: `read_only` ones have `auto: true` and run at once; others wait for a `decision`. A `search` proposal (`pattern`, `path`, optional `glob` and `ignore_case`) is the model's `search_files`, offered only in coding mode, and always `auto`. |
+| `proposal` | `id`, `kind` (`read`, `list`, `search`, `write`, `edit`, `command`, `plan`, `sandbox`, `trusted`, `external`, `invalid`), `digest` when it waits for an answer, and the proposal's fields, such as `path`, `content`, `diff`, `command` and `reason`. `auto: true` means it needed no approval: coding mode, or a read the approved plan names. A `plan` proposal has `goal` and numbered `steps` (`n`, `kind`: `read`, `edit`, `write` or `command`, a `path` or the exact `command`, and `why`). While a plan is approved, a proposal it covers has `plan_step`; a command matching an approved step character for character also has `preapproved: true`, so the wrapper may run it without asking again; a command, edit or write the plan doesn't cover has `off_plan: true`. Edits and writes ask, except with edits `approved-files`, where one to a file you already approved has `auto: true` and `approved_file: true` (it is applied at once; show its diff). `secret: true` means the file looks like it holds secrets. A command is only shown: the wrapper runs it, if the user wants to, and can share the output with `attach`. A `sandbox` proposal (`command`, `reason`, `network`, `image`) is genai running the command in the sandbox: offline it has `auto: true` and runs at once; online it waits for a `decision`. A `trusted` proposal (`plugin`, `command`, `params`, `argv`, `read_only`) is a plugin's trusted command: `read_only` ones have `auto: true` and run at once; others wait for a `decision`. A `search` proposal (`pattern`, `path`, optional `glob` and `ignore_case`) is the model's `search_files`, offered only in coding mode, and always `auto`. |
 | `result` | `id`, `status`, `detail`: what happened to a proposal that was performed. For a `sandbox` or `trusted` run, also `exit` (`null` if it was killed at the time limit or never ran) and `output`, exactly what the model is sent. |
 | `done` | The turn ended. `reason` is `reply`, `command`, `stopped` (Ctrl-C during a sandboxed run) or `step_limit`; `context` gives `used` and `limit`; `exchanges` gives the first and last exchange numbers of this turn, for `trace` (also on an `error` that ends a turn). |
 | `context` | The conversation is getting near the context limit. |
 | `notice` | Something the user should know. |
-| `error` | `code` and `message`. |
+| `error` | `code` and `message`. Among the codes: `api` (the endpoint failed or couldn't be reached; nothing was performed), `busy` (not allowed while proposals wait), `unknown_id` (no waiting proposal with that ID and kind), `digest_mismatch` (see Digests), `not_running` (a `stop` with nothing running), `bad_message`, `unknown_type`, and, at the start, `session_endpoint_changed` (a resumed session was made with another endpoint; `--allow-session-endpoint-change` allows it). |
 | `plan` | The approved plan changed: approved, a step done, or dropped. `plan` has `id`, `goal` and `steps`, each with `approved`, `status` (`todo`, `done`, `left out`) and `edited` when the user changed its command; `null` when there is none. A plan is never saved with the session. |
 | `attached`, `registered`, `compacted`, `cleared`, `models`, `model`, `coding`, `skills`, `files`, `file`, `trace`, `system`, `network`, `plugins`, `ran`, `edits` | Answers to the messages above. |
 
