@@ -335,6 +335,36 @@ tunnel is up, and can read that session's prompts, replies and files, which are 
 read the key, which was never sent. Everything else (coding-mode refusals, the sandbox, the audit log, sessions)
 works for the user genai runs as. As root, the REPL banner warns that proposed commands would run as root.
 
+How genai-tui sets it up (`genai-tui --remote`), and what each part is for:
+
+- The launcher runs `genai --remote-config` here: the endpoint and profile are checked and blessed on your machine,
+  and exported without `key_env`, `key_file`, `proxy`, `headers` or `ca_bundle`, so neither the key nor a secret in a
+  header goes over the connection. Only the remote half of the config lacks them: `tui/keyproxy.py`, here, uses the
+  endpoint's own proxy and headers.
+- ssh runs as a master connection started in your terminal, with `-a -x` (no agent, no X11 forwarding). Its control socket
+  is in genai-tui's state directory (mode 0700, in `$XDG_RUNTIME_DIR` or `/tmp`), where only you can reach it: whoever
+  can use that socket can open sessions as you on the host. Use ProxyJump (`-J`) for a bastion rather than `-A`, which
+  would let root on the host use your agent. The master, the key proxy and the state directory go when the launcher
+  exits (also on Ctrl-C and a closed terminal).
+- The key proxy listens on a Unix socket in the same directory and `ssh -O forward -R 127.0.0.1:0:SOCKET` makes a
+  loopback port on the host lead to it. Its token (32 random bytes) is in memory, in the launcher's 0600
+  `remote.json`, on the proxy's stdin and in genai's config line; never in a command line. The remote port can be
+  reached by every user of that host, so the token is the only protection: without it the proxy answers 401, and
+  only the two allowed requests are ever forwarded (see `tui/keyproxy.py`).
+- genai's source goes to the host on stdin, not as a file: the remote command is a fixed Python bootstrap that reads
+  exactly N bytes and executes them, so the host can't have a different or older genai than the one you have here.
+- The shell pane is `genai-ssh` over the same master, with the same handshake and key as always (see 7); with `--as`,
+  `sudo -n -H -u USER` starts its bash, and `--dir` is where it starts. `--as` takes only a user that `sudo -n`
+  accepts without a password, which the launcher checks first.
+
+Root on the remote host can, while the session is up, use the token to send chat and model-list requests to your
+endpoint (spending your quota, within the proxy's allowlist), read everything that session sends, receives and
+reads on that host. It cannot get the key, other URLs of the endpoint, or the
+proxy once genai-tui has exited. A remote root could also change what genai does there: it is your genai's code,
+but running on a host you don't control, so approvals still happen on your screen and commands still run only
+where you send them, but what the model is *shown* from that host (file contents, hello, the audit log's path) is
+only as honest as the host.
+
 ### 8. Supply chain and configuration trust
 
 *LLM03, ASI04, AML.T0081, AML.T0104, AML.T0110; Invariant Labs on tool poisoning.* Recent

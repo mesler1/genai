@@ -55,6 +55,9 @@ def view(st, w, sel):
             add([(f"{label:9}", Q), (fit(clean(value or "?"), w - 11), role), (" ▾", A)], "model")
             continue
         add([(f"{label:9}", Q), (fit(clean(value or "?"), w - 9), role)])
+    gw = h.get("genai_where")
+    if gw:
+        add([("genai    ", Q), (fit(clean(gw[0].removeprefix("genai runs ")), w - 9), R if gw[1] == R else W)])
     where = h.get("shell_where")
     if where:
         add([("commands ", Q), (fit("run " + clean(where), w - 9), D if where.startswith("inside") else R)])
