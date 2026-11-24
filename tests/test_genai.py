@@ -41,6 +41,28 @@ class Tmp(unittest.TestCase):
 
 # ---------------------------------------------------------------- path check
 
+class TestWalk(Tmp):
+    def test_walk_skips_hidden_and_symlinks_and_closes_what_it_opened(self):
+        root = self.path("wd")
+        for d in ("a/b", ".git", "c"):
+            os.makedirs(os.path.join(root, d))
+        for f in ("top", "a/one", "a/b/two", ".git/x", "c/three", ".env"):
+            open(os.path.join(root, f), "w").close()
+        os.symlink(os.path.join(root, "a"), os.path.join(root, "link"))
+        wd = G.Workdir(root)
+        self.assertEqual(list(wd.walk(".")), ["top", "a/one", "a/b/two", "c/three"])
+        self.assertEqual(list(wd.walk("a")), ["a/one", "a/b/two"])
+        before = len(os.listdir("/proc/self/fd")) if os.path.isdir("/proc/self/fd") else None
+        for _ in range(20):
+            it = wd.walk(".")
+            next(it)
+            it.close()                          # stopped early: every directory it opened is closed
+        if before is not None:
+            self.assertEqual(len(os.listdir("/proc/self/fd")), before)
+        with self.assertRaises(G.DiskError):
+            list(wd.walk("link"))
+
+
 class TestWorkdir(Tmp):
     def setUp(self):
         super().setUp()
@@ -688,6 +710,51 @@ class TestEndToEnd(Tmp):
             g.close()
             tools = [m["content"] for m in api.requests[-1]["body"]["messages"] if m["role"] == "tool"]
             self.assertEqual(tools, ["visible", "declined by the user", "declined by the user"])
+
+    def test_search_files_in_coding_mode(self):
+        turns = [calls(("search_files", {"pattern": "needle", "reason": "r"}),
+                       ("search_files", {"pattern": "NEEDLE", "path": "src", "glob": "*.py", "ignore_case": True,
+                                         "reason": "r"}),
+                       ("search_files", {"pattern": "x", "path": ".git", "reason": "r"}),
+                       ("search_files", {"pattern": "a\nb", "reason": "r"})),
+                 reply("done")]
+        with FakeAPI(turns) as api:
+            g = self.start(api, "--coding")
+            files = {"src/a.py": "one\nneedle here\n", "src/b.txt": "needle in text\n", "top.md": "x" * 300 + "needle\n",
+                     ".hidden/c.py": "needle\n", "src/keys.py": "needle\nAPI_KEY=sk-abcdefghijklmnopqrstuvwx1234\n",
+                     "bin.dat": "needle\0"}
+            for name, text in files.items():
+                os.makedirs(os.path.dirname(self.path("wd", name)) or self.wd, exist_ok=True)
+                with open(os.path.join(self.wd, name), "w") as f:
+                    f.write(text)
+            os.symlink(os.path.join(self.wd, "src"), os.path.join(self.wd, "link"))
+            g.send({"type": "user", "text": "x"})
+            first = g.until("proposal")
+            self.assertEqual((first["kind"], first["pattern"], first.get("auto")), ("search", "needle", True))
+            g.until("done")
+            g.close()
+            tools = [m["content"] for m in api.requests[-1]["body"]["messages"] if m["role"] == "tool"]
+            self.assertEqual(tools[0].split("\n")[:3], ["top.md:1: …" + "x" * 194 + "needle",
+                                                       "src/a.py:2: needle here", "src/b.txt:1: needle in text"])
+            self.assertIn("(skipped 1 file binary, large or unreadable)", tools[0])
+            self.assertIn("(skipped 1 file looking like secrets)", tools[0])
+            self.assertNotIn("hidden", tools[0])
+            self.assertNotIn("link/", tools[0])
+            self.assertEqual(tools[1], "src/a.py:2: needle here\n(skipped 1 file looking like secrets)")
+            self.assertIn("hidden directories are not searched", tools[2])
+            self.assertIn("one line of text", tools[3])
+            names = [t["function"]["name"] for t in api.requests[0]["body"]["tools"]]
+            self.assertIn("search_files", names)
+
+    def test_search_files_is_not_offered_outside_coding_mode(self):
+        with FakeAPI([call("search_files", pattern="x", reason="r"), reply("ok")]) as api:
+            g = self.start(api)
+            g.send({"type": "user", "text": "x"})
+            g.until("done")
+            g.close()
+            self.assertNotIn("search_files", [t["function"]["name"] for t in api.requests[0]["body"]["tools"]])
+            tool = [m for m in api.requests[-1]["body"]["messages"] if m["role"] == "tool"][0]
+            self.assertIn("only available in coding mode", tool["content"])
 
     def test_coding_refused_in_home(self):
         with FakeAPI([]) as api:
