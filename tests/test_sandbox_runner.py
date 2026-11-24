@@ -392,6 +392,42 @@ class TestInterrupt(FakePodman):
         self.assertTrue(any("stopped by the user" in str(m.get("content")) for m in api.requests[1]["body"]["messages"]))
 
 
+class TestKill(unittest.TestCase):
+    """Ctrl-C at any point of a run kills the container, and a second one can't interrupt the kill."""
+
+    def box(self):
+        box = G.Sandbox(conf(), ".", print)
+        box.podman = "/usr/bin/podman"
+        return box
+
+    def test_a_second_ctrl_c_does_not_interrupt_the_kill(self):
+        def raises(signum, frame):
+            raise KeyboardInterrupt
+        before = signal.signal(signal.SIGINT, raises)
+        self.addCleanup(signal.signal, signal.SIGINT, before)
+        calls = []
+
+        def podman_kill(argv, **kw):
+            calls.append(argv)
+            os.kill(os.getpid(), signal.SIGINT)         # the second Ctrl-C, while the kill runs
+            time.sleep(0.05)
+        proc = mock.Mock()
+        with mock.patch.object(G.subprocess, "run", side_effect=podman_kill):
+            self.box()._kill("genai-1", proc)            # returns: the SIGINT was ignored
+        self.assertEqual(calls[0][-2:], ["kill", "genai-1"])
+        proc.wait.assert_called()
+        self.assertIs(signal.getsignal(signal.SIGINT), raises)   # and Ctrl-C works again afterwards
+
+    def test_ctrl_c_as_podman_starts_still_kills_it_by_name(self):
+        killed = []
+        with mock.patch.object(G.subprocess, "Popen", side_effect=KeyboardInterrupt), \
+                mock.patch.object(G.Sandbox, "_kill", lambda self, name, proc: killed.append((name, proc))):
+            with self.assertRaises(KeyboardInterrupt):
+                self.box()._podman(["podman", "run"], "genai-2", 100)
+        self.assertEqual(killed, [("genai-2", None)])
+        self.assertFalse(G.Sandbox.running)                # a later stray SIGINT is ignored again
+
+
 class TestTerminal(unittest.TestCase):
     def test_shows_the_command_then_the_end_of_its_output(self):
         p = G.Proposal("p1", "sandbox", "c1", command="make test\x1b[2J", reason="check", network=False, image="i")
