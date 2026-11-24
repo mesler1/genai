@@ -178,6 +178,7 @@ sandbox/run tests          # offline suite, --network=none
 sandbox/run selfcheck      # the live test's harness against a fake endpoint, --network=none
 sandbox/run live ~/.config/genai/endpoints/work-llm.json   # live test; needs the endpoint's key variable
 sandbox/run genai -e NAME  # interactive, with ./sandbox-work mounted at /work
+sandbox/run shell [--net]  # a bash in the same sandbox: no network unless --net, no key variable
 ```
 
 `sandbox/run` documents a small contract at its top: what is mounted where, which variables pass
@@ -185,6 +186,14 @@ in, and `GENAI_SANDBOX=<name>`. Your own sandbox can replace podman by following
 where commands run: the REPL banner, the `:run` confirmation and result line, the `hello` event, and
 the audit log all say **inside the <name> sandbox** or **OUTSIDE any sandbox**. That is an
 indicator, not a guarantee. It comes from `GENAI_SANDBOX` or podman's or docker's marker file.
+
+Inside `sandbox/run genai` the REPL marks itself so you can tell: the prompt is `(sandbox) > `, the
+banner's second line is in bold (`IN THE PODMAN SANDBOX: /work = <host path>, no host home`), and
+`:sandbox` says where genai and your commands run, the working directory, the config directory and
+whether the network looks available. Outside a sandbox the prompt is the plain `> ` and the banner says
+**OUTSIDE any sandbox**. `sandbox/run shell` opens a bash in the same sandbox, with the prompt
+`[sandbox:podman /work] DIR$` in reverse video and a banner saying what is mounted. It has no network
+unless you pass `--net`, and the key variable is never passed in.
 
 `sandbox/run genai` keeps its own config in `~/.local/share/genai-sandbox/config`; put and bless
 endpoints there, and set `GENAI_KEY_ENV` to the key variable to pass in.
@@ -197,7 +206,8 @@ endpoints there, and set `GENAI_KEY_ENV` to the key variable to pass in.
 | `GENAI_SANDBOX_HOOKS` | Directory of sandbox hooks (default `~/.local/share/genai-sandbox/hooks`). See Hooks below. |
 
 Anything your user can read under `/usr` and `/etc` can be read inside the sandbox, and
-`sandbox/run genai` has network access, since genai has to reach the endpoint.
+`sandbox/run genai` has network access, since genai has to reach the endpoint. `sandbox/run shell`
+does not, unless you pass `--net`.
 
 ## Hooks
 
