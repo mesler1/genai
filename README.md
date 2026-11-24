@@ -322,7 +322,7 @@ another, set `GENAI_TUI_PAGER` (for example `GENAI_TUI_PAGER=less`).
 
 ### Features
 
-genai-tui's `/model`, `/copy`, `/decline`, `/raw`, `/system` and `/files`, and the `genai-ssh` handshake, are
+genai-tui's `/model`, `/copy`, `/decline`, `/raw`, `/system`, `/files` and `/sandbox`, and the `genai-ssh` handshake, are
 features, each in its own module under `tui/features/`. To switch some off, list them in
 `~/.config/genai/tui.json` (`$XDG_CONFIG_HOME/genai/tui.json`):
 
@@ -331,7 +331,7 @@ features, each in its own module under `tui/features/`. To switch some off, list
 ```
 
 or set `GENAI_TUI_DISABLE=copy,model` for one run. Names are `model`, `copy`, `decline`, `raw`,
-`ssh` and `files`. A disabled feature has no command, help line or menu item, and genai-tui's socket
+`ssh`, `files` and `sandbox`. A disabled feature has no command, help line or menu item, and genai-tui's socket
 refuses its requests. Without `ssh`, a genai-ssh session isn't followed. No file means
 everything is on; a file that can't be read is ignored, with a note in the conversation.
 
@@ -372,6 +372,15 @@ The model then has a `run_in_sandbox` tool. Each command runs in a rootless podm
 An offline run needs no approval: you see the command, then its exit code and output, and so does
 the model. Ctrl-C stops it and ends the turn. Every run is in the audit log, by fingerprint.
 
+**Seeing it in genai-tui.** The info panel has a SANDBOX section: whether genai itself runs in a
+sandbox (`in the podman sandbox`, green, or `NOT sandboxed`, red, from `hello`'s `sandbox`), and
+the model's sandbox: `none`, `ready · offline` or `ONLINE` with its image, `can't run: …`, or
+`RUNNING p3 · 12s` while a run is going. tmux's status line says `⊡ sandbox` or a red
+`NO SANDBOX`, and `⏵ sandbox p3 12s` during a run. A running card counts its seconds. Ctrl-C on an
+empty input, or `/stop`, stops the run: genai-tui sends genai a SIGINT, which genai `--json` takes
+as Ctrl-C during a sandboxed run and ignores otherwise. In remote mode that isn't available yet,
+and the run ends at its time limit. `/sandbox` prints all of it, with the image, network and limits.
+
 **The network switch.** `:network on` (or the JSON `network` message) gives the sandbox the
 network for this session; `:network off` takes it away, and a new session starts as the profile
 says (`"network": true` starts it on, which blessing flags). While it is on, **every sandboxed
@@ -396,9 +405,11 @@ arrives as it is, so the wrapper must escape it before it displays it.
 
 genai's first line is `hello`. It has `protocol` (1), `version`, `features`, `endpoint`,
 `profile`, `session`, `resumed`, `coding`, `coding_from`, `coding_override`, `cwd`, `sandbox`,
-`runner` (the profile's sandbox for `run_in_sandbox`: `engine`, `image`, `network`, `timeout` and
-`problem`, or `null`), the active `skills` and `plugins`, and the model's `tools`. Check `features` before you use a message added
-later.
+`runner` (the profile's sandbox for `run_in_sandbox`: `engine`, `image`, `network`, `timeout`,
+`memory`, `pids` and `problem`, or `null`), the active `skills` and `plugins`, and the model's `tools`. Check `features` before you use a message added
+later. With the feature `interrupt`, a SIGINT to genai `--json` stops a sandboxed run as Ctrl-C does in
+the REPL (its result's `status` is `stopped`, and the turn's `done` reason is `stopped`); at any
+other time it is ignored.
 
 `hello` also says where genai runs: `host` (its host name), `user` (the effective user's name, or the uid
 if it has none), `uid`, `remote` (true with `--config-stdin`) and `audit` (the path of its audit log). They are
