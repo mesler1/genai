@@ -1210,6 +1210,8 @@ class TestGenaiTui(TmuxCase):
         env = dict(os.environ, XDG_CONFIG_HOME=os.path.dirname(home), HOME=self.tmp, LANG="C.UTF-8",
                    TERM="xterm-256color", GENAI_TUI_SOCKET=self.sock, EDITOR=editor, VISUAL=editor,
                    XDG_RUNTIME_DIR=self.runtime, PATH=f"{path}:{os.environ['PATH']}" if path else os.environ["PATH"])
+        if path and os.path.exists(os.path.join(path, "less")):
+            env["GENAI_TUI_PAGER"] = os.path.join(path, "less")      # the test's pager stands in for genai-tui's
         env.pop("TMUX", None)
         self.proc = subprocess.Popen(["script", "-qfc", f"stty cols 110 rows 40; {REPO}/tui/genai-tui {args}",
                                       "/dev/null"], cwd=self.wd, env=env, stdin=subprocess.PIPE,

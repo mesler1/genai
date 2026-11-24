@@ -3,7 +3,6 @@
 import curses
 import json
 import os
-import shutil
 import tempfile
 
 from . import Feature
@@ -80,8 +79,7 @@ class Raw(Feature):
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(text + "\n")
             curses.endwin()
-            pager = ["less", "-+F", "-i", path] if shutil.which("less") else ["more", path]
-            app.run_here(pager, full=True)
+            app.run_here(self.core.pager_argv(path), full=True)
         finally:
             os.unlink(path)
             if not app.state_dir:
