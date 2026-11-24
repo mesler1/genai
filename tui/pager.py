@@ -183,6 +183,8 @@ def main(argv):
         lines.pop()
     locale.setlocale(locale.LC_ALL, "")
     os.environ.setdefault("ESCDELAY", "25")      # so Esc on its own closes at once, not after a second
+    for stale in ("LINES", "COLUMNS"):           # curses prefers them to the pane's real size; readline exports
+        os.environ.pop(stale, None)              # them once, and they go stale as soon as the pane is resized
     curses.wrapper(lambda scr: Pager(scr, lines).run())
     return 0
 
