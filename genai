@@ -447,6 +447,8 @@ class Sandbox:
     discarded, files that look like secrets are hidden, there is no network unless switched on, nothing from
     the home directory, a time limit, and memory and process limits where the host allows them."""
 
+    running = False            # a container is running now: --json mode turns SIGINT into Ctrl-C only then
+
     def __init__(self, conf, root, notice):
         self.conf, self.root, self.notice = conf, os.path.realpath(root), notice
         self.podman = shutil.which("podman")
@@ -468,7 +470,8 @@ class Sandbox:
 
     def info(self):
         return {"engine": "podman", "image": self.conf["image"], "network": self.network,
-                "timeout": self.conf["timeout"], "problem": self.problem()}
+                "timeout": self.conf["timeout"], "memory": self.conf.get("memory"), "pids": self.conf.get("pids"),
+                "problem": self.problem()}
 
     def masks(self, values=()):
         """Files and directories to hide in the sandbox, relative to the project: secret-looking names, and
@@ -582,6 +585,7 @@ class Sandbox:
 
         reader = threading.Thread(target=drain, daemon=True)
         reader.start()
+        Sandbox.running = True
         try:
             rc = proc.wait(timeout=self.conf["timeout"])
         except subprocess.TimeoutExpired:
@@ -590,6 +594,8 @@ class Sandbox:
         except KeyboardInterrupt:
             self._kill(name, proc)
             raise
+        finally:
+            Sandbox.running = False
         reader.join(5)
         proc.stdout.close()
         out = strip_ansi(b"".join(chunks).decode("utf-8", "replace"))
@@ -3226,7 +3232,7 @@ class Engine:
         except KeyboardInterrupt:
             p.stopped = True
             self.audit.log("sandbox_exit", id=p.id, exit=None, stopped=True)
-            self.ui.result(p, "error", "stopped by you")
+            self.ui.result(p, "stopped", "the container was killed")
             return "stopped by the user before it finished"
         except GenaiError as e:
             ran, rc, out, note = False, None, "", str(e)
@@ -4082,12 +4088,19 @@ def whoami():
 
 def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()):
     ui.engine = engine
+
+    # SIGINT stops a sandboxed run, as Ctrl-C does in the REPL, and is ignored otherwise: the default would end
+    # genai, and with it the conversation, wherever it happened to arrive.
+    def on_sigint(signum, frame):
+        if Sandbox.running:
+            raise KeyboardInterrupt
+    signal.signal(signal.SIGINT, on_sigint)
     user, uid = whoami()
     ui.emit({"type": "hello", "protocol": PROTOCOL, "version": VERSION,
              "host": socket.gethostname(), "user": user, "uid": uid, "remote": remote,
              "features": ["proposals", "decisions", "attach", "register_tools", "compact", "context", "coding",
                           "set_coding", "skills", "files", "read", "trace", "system", "plan", "network", "clear",
-                          "models", "plugins"],
+                          "models", "plugins", "interrupt"],
              "endpoint": engine.endpoint.info(),
              "profile": {"name": engine.profile.name, "description": engine.profile.description}
              if engine.profile else None,

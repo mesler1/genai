@@ -196,13 +196,13 @@ t set -g status-style 'bg=default,fg=default'
 t set -g status-left ' genai │ '
 t set -g status-left-length 20
 if [ -n "$remote" ]; then       # the host that matters is the one genai runs on
-  t set -g status-right " genai on ${remote//#/##} │ \`\` shows the shell │ Ctrl-b o: other pane │ Ctrl-b d: detach "
+  t set -g status-right "#{@genai_sandbox} genai on ${remote//#/##} │ \`\` shows the shell │ Ctrl-b o: other pane │ Ctrl-b d: detach "
 else
-  t set -g status-right ' #H │ `` shows the shell │ Ctrl-b o: other pane │ Ctrl-b d: detach '
+  t set -g status-right '#{@genai_sandbox} #H │ `` shows the shell │ Ctrl-b o: other pane │ Ctrl-b d: detach '
 fi
 t set -g window-status-format ''          # hidden panes live in other windows; don't list them
 t set -g window-status-current-format ''
-t set -g status-right-length 100
+t set -g status-right-length 130
 t set -g @genai_prompt_pane "$prompt"
 t set -g @genai_shell_pane "$shell"
 t set -g @genai_conv_pane "$conv"
