@@ -65,6 +65,7 @@ model, default skills, sampling settings and coding mode:
 | Coding mode where it is refused | `genai -e NAME --coding-anywhere` (prints what that exposes) |
 | Builds and tests the model runs itself | a profile with `"coding": true` and a `"sandbox"` ([Sandboxed runs](#sandboxed-runs)) |
 | Start over, keeping the session | `:clear` in the REPL, `/clear` in genai-tui (the model forgets the conversation; the saved session keeps it) |
+| See exactly what was sent | `:raw [N\|all]` and `:system` in the REPL, `/raw` and `/system` in genai-tui (in `$PAGER`, default `less`; your API key is never shown) |
 | Wrappers | `genai -p NAME --json` (JSON Lines over stdio) |
 | Lists | `genai --list-endpoints`, `--list-profiles`, `--list-skills`, `--list-plugins`, `--list-sessions` (each with `--json`) |
 

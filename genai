@@ -3780,6 +3780,8 @@ Commands (on an empty buffer):
   :plan [clear]   show the approved plan and how far it has got, or drop it
   :compact [-e]   prune old file contents and output; summarize if still large
   :context        show how full the context is
+  :raw [N|all]    what was sent to the endpoint and what came back: the last turn, turn N, or all kept
+  :system         the system prompt and tool definitions sent with every request
   :models         list the models the server offers   :model NAME   use one of them from now on
   :clear          start over: the model forgets this conversation (the saved session keeps it)
   :skills         list skills, marking the ones in use
@@ -3791,11 +3793,68 @@ Commands (on an empty buffer):
 HOOK_BANNER = "hook: notify (runs {} when genai waits for you)"
 
 
+def pretty_json(text):
+    try:
+        return json.dumps(json.loads(text), indent=2, ensure_ascii=False)
+    except ValueError:
+        return text
+
+
+def trace_text(exchanges, named, kept):
+    """Exchanges with the endpoint as text for reading, as genai-tui's /raw shows them. named maps an exchange
+    number to its turn."""
+    out = ["genai: what was sent to the endpoint, and what came back",
+           "Exactly as sent and received, except your API key and the endpoint's own header values. Request bodies",
+           "are indented here for reading; they were sent as compact JSON.", ""]
+    if not exchanges:
+        out.append("genai no longer has these exchanges" + (f" (it keeps the last {TRACE_KEEP}: {kept[0]}–{kept[1]})"
+                                                            if kept else ""))
+    for ex in exchanges:
+        n = ex["n"]
+        status = ex.get("status", "?") + (f": {ex['error']}" if ex.get("error") else "")
+        took = f" · {ex['ms'] / 1000:.1f} s" if isinstance(ex.get("ms"), int) else ""
+        turn = f" · turn {named[n]}" if n in named else ""
+        out += ["═" * 78, f"Exchange {n}{turn} · {ex.get('time', '')}{took} · {status}", "═" * 78, "",
+                f"{ex.get('method', 'POST')} {ex.get('url', '')}"]
+        out += [f"{k}: {v}" for k, v in (ex.get("headers") or {}).items()]
+        body = ex.get("request") or ""
+        out += ["", f"── Request body ({len(body.encode())} bytes) " + "─" * 40, pretty_json(body), ""]
+        resp = ex.get("response") or []
+        how = f"streamed, {len(resp)} lines" if ex.get("stream") else "one body"
+        out += [f"── Response: HTTP {ex.get('http', '?')}, {how} " + "─" * 40]
+        out += resp if ex.get("stream") else [pretty_json("".join(resp))]
+        if ex.get("message") is not None:
+            out += ["", "── The reply as genai put it together " + "─" * 40,
+                    json.dumps(ex["message"], indent=2, ensure_ascii=False)]
+        if ex.get("usage"):
+            out += ["", f"usage: {json.dumps(ex['usage'])}"]
+        out.append("")
+    return "\n".join(out)
+
+
+def page(text):
+    """Show text in $PAGER (less by default) when stdout is a terminal, or print it. Control characters are
+    escaped line by line first. The text holds the conversation, so its file is private and removed after."""
+    text = "\n".join(exact(ln)[0] for ln in text.split("\n")) + "\n"
+    argv = shlex.split(os.environ.get("PAGER") or "less")
+    if not (sys.stdout.isatty() and argv and shutil.which(argv[0])):
+        sys.stdout.write(text)
+        return
+    fd, path = tempfile.mkstemp(prefix="genai-raw-", suffix=".txt")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        subprocess.run(argv + [path])
+    finally:
+        os.unlink(path)
+
+
 class Repl:
     def __init__(self, engine):
         self.e = engine
         self.capture = False
         self.attachments = []
+        self.turns = []          # for :raw: each turn's [first, last] exchange with the endpoint, or None
 
     def banner(self):
         p = self.e.endpoint
@@ -3866,12 +3925,43 @@ class Repl:
     def send(self, text, attachments=None):
         att = attachments if attachments is not None else self.attachments
         self.attachments = []
+        before = getattr(getattr(self.e, "client", None), "exchanges", 0)
         try:
             self.e.user_turn(text, att)
         except KeyboardInterrupt:
             print("\n(interrupted)")
         except GenaiError as err:
             print(f"genai: {exact(str(err))[0]}")
+        finally:
+            after = getattr(getattr(self.e, "client", None), "exchanges", 0)
+            self.turns.append([before + 1, after] if after > before else None)
+
+    def do_raw(self, arg):
+        trace = list(getattr(self.e.client, "trace", []))
+        kept = [trace[0]["n"], trace[-1]["n"]] if trace else None
+        named = {n: t for t, r in enumerate(self.turns, 1) if r for n in range(r[0], r[1] + 1)}
+        if arg == "all":
+            lo, hi = 1, 1 << 30
+        elif arg and not arg.isdigit():
+            print("usage: :raw, :raw N (a turn) or :raw all")
+            return
+        else:
+            had = [(t, r) for t, r in enumerate(self.turns, 1) if r]
+            hit = next((r for t, r in had if t == int(arg)), None) if arg else (had[-1][1] if had else None)
+            if hit is None:
+                print("nothing has been sent to the endpoint yet" if not arg else
+                      f"turn {arg} has no exchanges with the endpoint")
+                return
+            lo, hi = hit
+        page(trace_text([ex for ex in trace if lo <= ex["n"] <= hi], named, kept))
+
+    def do_system(self):
+        page("\n".join(["genai: the system prompt and tools sent with every request",
+                         "Your conversation follows the system prompt in each request.", "",
+                         f"model: {self.e.endpoint.model}",
+                         f"params: {json.dumps(getattr(self.e.client, 'params', {}))}", "",
+                         "── System prompt " + "─" * 60, self.e.system()["content"], "",
+                         "── Tools " + "─" * 68, json.dumps(self.e.tools(), indent=2, ensure_ascii=False)]))
 
     def command(self, line):
         cmd, _, arg = line[1:].partition(" ")
@@ -3924,6 +4014,10 @@ class Repl:
                     print(f"model: {self.e.endpoint.model} (:models lists the others, :model NAME switches)")
                 else:
                     print(f"model: {self.e.set_model(arg, ':model')} from your next message")
+            elif cmd == "raw":
+                self.do_raw(arg)
+            elif cmd == "system":
+                self.do_system()
             elif cmd == "context":
                 print(f"context: {self.e.used()}/{self.e.endpoint.context_limit} tokens (estimated)")
             elif cmd == "skills":
