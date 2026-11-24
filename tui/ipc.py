@@ -25,7 +25,7 @@ MAX_CLIENTS = 16
 HELLO_TIMEOUT = 2          # seconds to send a complete handshake
 SEND_TIMEOUT = 2            # seconds a send may wait on a pane that has stopped reading
 ROLES = {
-    "prompt": {"input", "key", "scroll", "quit"},
+    "prompt": {"input", "key", "scroll", "quit", "stop"},
     "panel": {"coding", "skill", "skills", "command"},
     "menu": {"share", "menu", "mark"},
     "files": set(),          # the files feature adds what this pane may ask for
