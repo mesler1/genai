@@ -6,6 +6,7 @@ The end-to-end tests run the remote command locally (remote.json's "ssh" is `sh 
 tests/remote_sshd.sh and is skipped without it.
 """
 
+import base64
 import importlib.machinery
 import importlib.util
 import json
@@ -26,8 +27,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(REPO, "tui"))
-from fakeapi import FakeAPI, reply  # noqa: E402
-from test_genai import Tmp, bless_path, make_home  # noqa: E402
+from fakeapi import FakeAPI, call, reply  # noqa: E402
+from test_genai import Tmp, bless_path, make_home, write_json  # noqa: E402
+import test_genai  # noqa: E402
 import test_tui  # noqa: E402
 
 import remote  # noqa: E402
@@ -126,8 +128,8 @@ class RemoteCase(Tmp):
         os.mkdir(self.state, 0o700)
         self.workdir = self.path("work")
         os.mkdir(self.workdir)
-        out = subprocess.run([sys.executable, GENAI, "--remote-config", "-e", "test"], env=self.env, check=True,
-                             capture_output=True, text=True).stdout
+        out = subprocess.run([sys.executable, GENAI, "--remote-config", "-e", "test", *self.prepare()], env=self.env,
+                             check=True, capture_output=True, text=True).stdout
         with open(os.path.join(self.state, "export.json"), "w") as f:
             f.write(out)
         self.token = "c0" * 32
@@ -139,6 +141,10 @@ class RemoteCase(Tmp):
         self.assertEqual(self.kp.stdout.readline().strip(), b"ready")
         self.fwd = Forwarder(os.path.join(self.state, "kp.sock"))
         self.addCleanup(self.fwd.close)
+
+    def prepare(self):
+        """Set up more of this machine's genai home before the export; returns more --remote-config options."""
+        return []
 
     def stop_proxy(self):
         self.kp.stdin.close()
@@ -242,6 +248,85 @@ class TestEndToEnd(RemoteCase):
         self.assertEqual(r.stdout.decode().strip(), "first line ['one', 'two']", r.stderr)
 
 
+class TestPluginsAndSkills(RemoteCase):
+    """A plugin and a skill blessed on this machine are sent in the config line; the plugin's commands run on the
+    remote host (here: the same machine, with a home of its own), and nothing blessed only there can be used."""
+
+    turns = [call("rp__who", user="alice"), reply("done")]
+
+    def prepare(self):
+        self.bin = self.path("rbin")
+        os.mkdir(self.bin, 0o755)
+        prog = os.path.join(self.bin, "whoq")
+        with open(prog, "w") as f:
+            f.write('#!/bin/sh\necho "ran on the remote host for $1 as HOME=$HOME"\n')
+        os.chmod(prog, 0o755)
+        pdir = os.path.join(self.home, "plugins", "rp")
+        os.makedirs(pdir)
+        with open(os.path.join(pdir, "plugin.json"), "w") as f:
+            json.dump({"name": "rp", "description": "remote plugin", "search": [self.bin],
+                       "commands": {"who": {"describe": "who", "argv": ["whoq", "{user}"], "read_only": True,
+                                            "params": {"user": {"pattern": "[a-z]+"}}, "min_interval": 0},
+                                    "gone": {"describe": "not installed", "argv": ["nosuchprogq"], "read_only": True}}},
+                      f)
+        sdir = os.path.join(self.home, "skills", "rs")
+        os.makedirs(sdir)
+        with open(os.path.join(sdir, "SKILL.md"), "w") as f:
+            f.write("# Remote skill\n\nSAY-PINEAPPLE\n")
+        cfg = test_genai.G.Config(self.home)
+        for kind, d in (("plugin", pdir), ("skill", sdir)):
+            cfg.set_blessed(d, {"kind": kind, "name": os.path.basename(d), "hash": test_genai.G.hash_skill(d)[0]})
+        return ["--plugin", "rp", "-k", "rs"]
+
+    def test_a_plugin_command_runs_remotely_and_the_skill_is_used(self):
+        c = self.child(self.write_info())
+        hello, seen = self.until(c, "hello")
+        self.assertEqual((hello["plugins"], hello["skills"]), (["rp"], ["rs"]), seen)
+        self.assertTrue(any("gone left out" in e.get("message", "") for e in seen if e["type"] == "notice"), seen)
+        c.send({"type": "user", "text": "who?"})
+        res, seen = self.until(c, "result")
+        self.assertEqual(res.get("exit"), 0, seen)
+        self.assertIn("ran on the remote host for alice", res["output"])
+        self.assertIn("HOME=", res["output"])
+        self.until(c, "done")
+        system = self.api.requests[0]["body"]["messages"][0]["content"]
+        self.assertIn("SAY-PINEAPPLE", system)
+        with open(os.path.join(self.remote_home, "genai", "audit.log")) as f:
+            rec = next(json.loads(x) for x in f if '"remote_config"' in x)
+        self.assertEqual(set(rec["plugins"]), {"rp"})
+        self.assertTrue(rec["skills"]["rs"].startswith("sha256:"))
+
+    def test_only_what_was_sent_can_be_switched_on(self):
+        c = self.child(self.write_info())
+        self.until(c, "hello")
+        c.send({"type": "plugin", "name": "rp", "on": False})
+        ev, seen = self.until(c, "plugins")
+        ev, seen = self.until(c, "plugins")         # the one after hello came first
+        self.assertFalse(ev["plugins"][0]["enabled"], seen)
+        c.send({"type": "plugin", "name": "rp", "on": True})
+        ev, _ = self.until(c, "plugins")
+        self.assertEqual([(r["name"], r["enabled"], r["status"]) for r in ev["plugins"]], [("rp", True, "blessed")])
+        for kind, name in (("plugin", "slurm"), ("skill", "hpc")):
+            c.send({"type": kind, "name": name, "on": True})
+            ev, seen = self.until(c, "error")
+            self.assertEqual(ev["code"], "remote", seen)
+            self.assertIn("wasn't sent from your machine", ev["message"])
+        c.send({"type": "skill", "name": "rs", "on": False})
+        ev, seen = self.until(c, "skills")
+        while ev["type"] == "skills" and ev["skills"][0]["active"]:
+            ev, seen = self.until(c, "skills")
+        self.assertEqual([(r["name"], r["active"]) for r in ev["skills"]], [("rs", False)])
+
+    def test_a_changed_file_in_the_config_line_is_refused(self):
+        info = self.write_info()
+        info["config"]["skills"][0]["files"]["SKILL.md"] = base64.b64encode(b"# tampered\n").decode()
+        c = self.child(info)
+        ev, seen = self.until(c, "hello", "error")
+        msgs = json.dumps(seen) + "\n".join(c.err)
+        self.assertNotEqual(ev["type"], "hello", seen)
+        self.assertIn("don't match the hash blessed on your machine", msgs)
+
+
 class TestOptions(unittest.TestCase):
     """conversation.py --check is what the launcher runs, in your terminal, before tmux starts."""
 
@@ -263,14 +348,21 @@ class TestOptions(unittest.TestCase):
     def test_mistakes_are_refused(self):
         for args, why in ((["--dir", "/x"], "--dir needs --remote"), (["--as", "u"], "--as needs --remote"),
                           (["--", "-J", "b"], "needs --remote"),
-                          (["--remote", "h", "-S", "x"], "can't use -S or -k"),
-                          (["--remote", "h", "-k", "x"], "can't use -S or -k"),
+                          (["--remote", "h", "-S", "x"], "can't use -S"),
+                          (["--remote", "h", "-k", "a\nb"], "without control characters"),
                           (["--remote=-oProxyCommand=x"], "--remote needs a host"),
                           (["--remote", "h", "--as", "a b"], "not a user name"),
                           (["--remote"], "expected one argument")):
             rc, _, err = self.check(*args)
             self.assertEqual(rc, 2, args)
             self.assertIn(why, err, args)
+
+    def test_skills_go_to_the_launcher_not_to_the_remote_genai(self):
+        rc, out, _ = self.check("--remote", "h", "-k", "hpc", "-k", "bash-scripts")
+        self.assertEqual(rc, 0)
+        self.assertEqual([x for x in out.splitlines() if x.startswith("skill=")], ["skill=hpc", "skill=bash-scripts"])
+        self.assertEqual(C.genai_args(C.parse_args(["--remote", "h", "-k", "hpc"])), [])
+        self.assertEqual(C.genai_args(C.parse_args(["-k", "hpc"])), ["-k", "hpc"])
 
     def test_remote_genai_gets_no_endpoint_or_profile_options(self):
         a = C.parse_args(["--remote", "h", "-e", "x", "-p", "y", "--coding"])
@@ -356,6 +448,103 @@ class TestRealSsh(RemoteCase):
 
     def test_as_another_user_through_sudo(self):
         self.run_turn("svc")
+
+
+REAL_HOST = os.environ.get("GENAI_TEST_REMOTE_HOST", "")
+REAL_IMAGE = os.environ.get("GENAI_TEST_REMOTE_IMAGE", "docker.io/library/alpine:3")
+
+
+@unittest.skipUnless(REAL_HOST and shutil.which("ssh"),
+                     "set GENAI_TEST_REMOTE_HOST to an ssh destination (your ~/.ssh/config applies)")
+class TestRealHost(RemoteCase):
+    """A turn, and a sandboxed run, on a real host of yours over a real ssh master and -R forward. The work is
+    done in a directory made with mktemp there and removed afterwards; genai there uses your ~/.config/genai as a real
+    remote run does, so its audit log records the run. For the sandboxed run the host needs rootless podman and
+    GENAI_TEST_REMOTE_IMAGE (default alpine:3) pulled there."""
+
+    turns = [reply("hello from a real host"),
+             call("run_in_sandbox", command="cat a.txt; cat .env; touch new.txt; id -un", reason="t"),
+             reply("ran it"),
+             call("run_in_sandbox", command="echo started; sleep 60", reason="t"),
+             reply("after the stop")]
+
+    def setUp(self):
+        super().setUp()
+        prof = {"name": "real", "endpoint": "test", "coding": True,
+                "sandbox": {"image": REAL_IMAGE, "timeout": 120}}
+        bless_path(self.home, write_json(os.path.join(self.home, "profiles", "real.json"), prof))
+        out = subprocess.run([sys.executable, GENAI, "--remote-config", "-e", "test", "-p", "real"], env=self.env,
+                             check=True, capture_output=True, text=True).stdout
+        with open(os.path.join(self.state, "export.json"), "w") as f:
+            f.write(out)
+        self.cm = os.path.join(self.state, "cm")
+        self.opts = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=15"]
+        subprocess.run(["ssh", "-M", "-S", self.cm, "-o", "ControlPersist=no", "-a", "-x", "-fN", *self.opts,
+                        REAL_HOST], check=True, timeout=60)
+        self.addCleanup(subprocess.run, ["ssh", "-S", self.cm, "-O", "exit", REAL_HOST], capture_output=True)
+        self.there = self.ssh("mktemp -d /tmp/genai-test-XXXXXXXX").strip()
+        self.assertRegex(self.there, r"^/tmp/genai-test-[A-Za-z0-9]{8}$")
+        self.addCleanup(self.ssh, f"rm -rf {shlex.quote(self.there)}")
+        self.ssh(f"cd {shlex.quote(self.there)} && echo hi > a.txt && echo API_TOKEN=abcdefghijklmnop12345 > .env")
+
+    def ssh(self, command, check=True):
+        r = subprocess.run(["ssh", "-S", self.cm, *self.opts, REAL_HOST, command], capture_output=True, text=True,
+                           timeout=120)
+        if check:
+            self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout
+
+    def start(self):
+        out = subprocess.run(["ssh", "-S", self.cm, "-O", "forward", "-R",
+                              f"127.0.0.1:0:{os.path.join(self.state, 'kp.sock')}", REAL_HOST],
+                             check=True, capture_output=True, text=True).stdout
+        port = int(out.strip().splitlines()[-1])
+        remote.write(self.state, REAL_HOST, None, self.there, port, "python3", self.token, self.opts)
+        c = self.child(remote.load(os.path.join(self.state, "remote.json")))
+        hello, seen = self.until(c, "hello", timeout=90)
+        self.assertEqual(hello["type"], "hello", seen)
+        self.assertEqual((hello["remote"], hello["cwd"]), (True, self.there))
+        return c, hello
+
+    def test_a_turn_then_a_sandboxed_run(self):
+        c, hello = self.start()
+        c.send({"type": "user", "text": "hi"})
+        done, seen = self.until(c, "done", timeout=90)
+        self.assertEqual(done["type"], "done", seen)
+        self.assertEqual("".join(e.get("text", "") for e in seen if e.get("type") == "text"), "hello from a real host")
+        h = {k.lower(): v for k, v in self.api.requests[0]["headers"].items()}
+        self.assertEqual(h["authorization"], f"Bearer {KEY}")
+        self.assertNotIn(KEY, json.dumps(seen))
+        if hello.get("runner", {}).get("problem") or not self.ssh("command -v podman", check=False).strip():
+            self.skipTest("no podman on the host")
+        if subprocess.run(["ssh", "-S", self.cm, *self.opts, REAL_HOST,
+                           f"podman image exists {shlex.quote(REAL_IMAGE)}"], timeout=60).returncode:
+            self.skipTest(f"pull {REAL_IMAGE} on the host first")
+        c.send({"type": "user", "text": "run it"})
+        result, seen = self.until(c, "result", timeout=180)
+        self.assertEqual(result["type"], "result", seen)
+        self.assertEqual((result["status"], result.get("exit")), ("ok", 0), result)
+        self.assertIn("hi", result["output"])
+        self.assertNotIn("abcdefghijklmnop12345", result["output"])       # .env is hidden in the container
+        done, seen = self.until(c, "done", timeout=90)
+        self.assertEqual(done["type"], "done", seen)
+        self.assertEqual(self.ssh(f"ls -A {shlex.quote(self.there)}").split(), [".env", "a.txt"])  # nothing kept
+        self.assertIn("stop", hello["features"])                # and a run can be stopped over ssh
+        c.send({"type": "user", "text": "a long one"})
+        prop, seen = self.until(c, "proposal", timeout=90)
+        self.assertEqual(prop["type"], "proposal", seen)
+        deadline = time.monotonic() + 60
+        while not self.ssh("podman ps -q --filter name=genai-", check=False).strip():
+            self.assertLess(time.monotonic(), deadline, "the container never started")
+            time.sleep(0.5)
+        started = time.monotonic()
+        c.send({"type": "stop"})
+        result, seen = self.until(c, "result", timeout=60)
+        self.assertEqual((result["type"], result.get("status")), ("result", "stopped"), seen)
+        self.assertLess(time.monotonic() - started, 30)
+        done, seen = self.until(c, "done", timeout=60)
+        self.assertEqual(done.get("reason"), "stopped", seen)
+        self.assertEqual(self.ssh("podman ps -aq --filter name=genai-", check=False).strip(), "")
 
 
 @unittest.skipUnless(sshd_container_up() and shutil.which("tmux") and shutil.which("script"),

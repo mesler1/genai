@@ -60,18 +60,32 @@ def view(st, w, sel):
         add([("genai    ", Q), (fit(clean(gw[0].removeprefix("genai runs ")), w - 9), R if gw[1] == R else W)])
     where = h.get("shell_where")
     if where:
-        add([("commands ", Q), (fit("run " + clean(where), w - 9), D if where.startswith("inside") else R)])
+        add([("commands ", Q), (fit("run " + clean(where), w - 9), D if where.startswith("inside") else W)])
     else:
         add([("commands ", Q), ("shown for manual execution", Q)])
     coding = st.get("coding")
     add([("coding   ", Q), ("[on] " if coding else "[off]", W if coding else ""),
          (fit("  c switches" if not coding else "  reads without asking", w - 14), Q)], "coding")
-    run = st.get("runner")
-    if run and run.get("problem"):
-        add([("sandbox  ", Q), (fit("can't run here", w - 9), R)])
+    head("SANDBOX")
+    if h.get("sandbox"):
+        add([("genai    ", Q), (fit(f"in the {clean(h['sandbox'])} sandbox", w - 9), D)])
+    else:
+        add([("genai    ", Q), (fit("not sandboxed", w - 9), "")])      # the usual way to run it: not a fault
+    run, going = st.get("runner"), st.get("running")
+    if going:
+        add([("model's  ", Q), (fit(f"RUNNING {clean(going.get('id', '?'))} · {going.get('secs', 0)}s", w - 9), W)])
+        add([(fit("  Ctrl-C or /stop stops it" if going.get("stoppable") else "  can't be stopped in remote mode yet",
+                  w), Q)])
+    elif run and run.get("problem"):
+        add([("model's  ", Q), (fit(f"can't run: {clean(run['problem'])}", w - 9), R)])
     elif run:
-        add([("sandbox  ", Q), ("ONLINE" if run.get("network") else "offline", W if run.get("network") else D),
-             (fit("  each run asks · /network" if run.get("network") else "  /network switches", w - 16), Q)])
+        add([("model's  ", Q), ("ready · ", D), ("ONLINE" if run.get("network") else "offline",
+                                                 W if run.get("network") else D),
+             (fit(f" · {clean(run.get('image') or '?')}", max(w - 24, 4)), Q)])
+        add([(fit("  each run asks · /network" if run.get("network") else "  /network switches", w), Q)])
+    else:
+        add([("model's  ", Q), ("none", Q)])
+    add([(fit("/sandbox shows the details", w), Q)])
     head("CONTEXT")
     ctx = st.get("context") or [None, None]
     add(bar(ctx[0] or 0, ctx[1], w) if ctx[0] is not None else [("not measured yet", Q)])
@@ -89,6 +103,17 @@ def view(st, w, sel):
         add([("commands run on their own" if plan.get("auto") else "each planned command asks once",
               W if plan.get("auto") else Q)])
         add([("/plan clear drops it", Q)])
+    edits = st.get("edits") or {}
+    if edits.get("mode") == "approved-files":
+        head("EDITS")
+        add([(fit("applied without asking:", w), W)])
+        for f in (edits.get("files") or [])[:10]:
+            add([(fit("  " + clean(f), w), "")])
+        if not edits.get("files"):
+            add([("  none yet", Q)])
+        elif len(edits["files"]) > 10:
+            add([(f"  … {len(edits['files']) - 10} more (/edits)", Q)])
+        add([(fit("/edits reset forgets them", w), Q)])
     head("SKILLS")
     skills = st.get("skills")
     if skills is None:
@@ -104,6 +129,13 @@ def view(st, w, sel):
              (" " + ("" if blessed else s.get("status", "")), R if s.get("status") == "changed" else Q)], i)
         if i == sel and not blessed:
             add([(fit(f"  bless: genai --bless {clean(s.get('path', ''))}", w), Q)], i)
+    plugins = st.get("plugins") or []
+    if plugins:
+        head("PLUGINS")
+        for pl in plugins[:8]:
+            add([(fit(clean(pl.get("name", "?")) + (" · /plugins %s pane" % clean(pl.get("name", "?"))
+                                                    if pl.get("pane") else ""), w), D)])
+            add([(fit("  " + ", ".join(clean(c) for c in pl.get("commands") or []), w), Q)])
     head("COMMANDS")
     cmds = st.get("commands") or []
     if not cmds:
@@ -146,7 +178,9 @@ class Panel:
                 curses.init_pair(i, fg, -1)
                 self.roles[role] = curses.color_pair(i)
         self.roles[A] |= curses.A_BOLD
-        curses.mousemask(getattr(curses, "BUTTON1_PRESSED", 0) | getattr(curses, "BUTTON1_CLICKED", 0))
+        # The release too, though a click acts on the press: without it, ncurses holds the press back until the next
+        # input arrives.
+        curses.mousemask(getattr(curses, "BUTTON1_PRESSED", 0) | getattr(curses, "BUTTON1_RELEASED", 0))
         curses.mouseinterval(0)
         scr.keypad(True)
         scr.timeout(100)
@@ -220,8 +254,10 @@ class Panel:
             self.msg = "" if self.request({"type": "skills"}) else "the conversation isn't listening"
         elif k == curses.KEY_MOUSE:
             try:
-                _, _, y, _, _ = curses.getmouse()
+                _, _, y, _, b = curses.getmouse()
             except curses.error:
+                return
+            if not b & curses.BUTTON1_PRESSED:                                   # the release: a click acts once
                 return
             if 0 <= y < len(self.acts) and self.acts[y] is not None:
                 if type(self.acts[y]) is int:

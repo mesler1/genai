@@ -260,9 +260,13 @@ class TestBinary(PluginBase):
         self.manifest["commands"]["x"] = {"argv": ["nothere"]}
         pl = self.load()
         with mock.patch.dict(os.environ, {"PATH": other}):
-            with self.assertRaises(G.GenaiError) as cm:
-                pl.resolve()
-        self.assertIn("not found", str(cm.exception))
+            self.assertEqual(pl.resolve(), ["x"])          # not installed here: only its command is left out
+        self.assertNotIn("x", pl.commands)
+        self.assertIn("queue", pl.commands)
+        self.manifest["commands"] = {"x": {"argv": ["nothere"]}}
+        with self.assertRaises(G.GenaiError) as cm:
+            self.load().resolve()
+        self.assertIn("none of its programs", str(cm.exception))
 
     def test_group_writable_directory_is_refused(self):
         os.chmod(self.bin, 0o775)
@@ -696,7 +700,7 @@ class TestJson(PluginBase):
             p = g.until("proposal")
             self.assertEqual((p["kind"], p.get("auto"), p["read_only"]), ("trusted", None, False))
             self.assertEqual(self.calls(), [])
-            g.send({"type": "decision", "id": p["id"], "decision": "accept"})
+            g.send({"type": "decision", "id": p["id"], "digest": p["digest"], "decision": "accept"})
             self.assertEqual(g.until("result")["exit"], 3)
             g.until("done")
             self.assertEqual(self.calls()[0]["args"], ["kill", "4"])
@@ -707,7 +711,7 @@ class TestJson(PluginBase):
             g = self.start(api)
             g.send({"type": "user", "text": "stop it"})
             p = g.until("proposal")
-            g.send({"type": "decision", "id": p["id"], "decision": "decline"})
+            g.send({"type": "decision", "id": p["id"], "digest": p["digest"], "decision": "decline"})
             g.until("done")
             g.close()
         self.assertEqual(self.calls(), [])
@@ -759,7 +763,7 @@ class TestJson(PluginBase):
             p = g.until("proposal")
             g.send({"type": "run", "id": 9, "plugin": "fake", "command": "job", "params": {"id": "1"}})
             self.assertEqual(g.until("error")["code"], "busy")
-            g.send({"type": "decision", "id": p["id"], "decision": "decline"})
+            g.send({"type": "decision", "id": p["id"], "digest": p["digest"], "decision": "decline"})
             g.until("done")
             g.close()
         self.assertEqual(self.calls(), [])

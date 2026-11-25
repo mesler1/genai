@@ -41,6 +41,28 @@ class Tmp(unittest.TestCase):
 
 # ---------------------------------------------------------------- path check
 
+class TestWalk(Tmp):
+    def test_walk_skips_hidden_and_symlinks_and_closes_what_it_opened(self):
+        root = self.path("wd")
+        for d in ("a/b", ".git", "c"):
+            os.makedirs(os.path.join(root, d))
+        for f in ("top", "a/one", "a/b/two", ".git/x", "c/three", ".env"):
+            open(os.path.join(root, f), "w").close()
+        os.symlink(os.path.join(root, "a"), os.path.join(root, "link"))
+        wd = G.Workdir(root)
+        self.assertEqual(list(wd.walk(".")), ["top", "a/one", "a/b/two", "c/three"])
+        self.assertEqual(list(wd.walk("a")), ["a/one", "a/b/two"])
+        before = len(os.listdir("/proc/self/fd")) if os.path.isdir("/proc/self/fd") else None
+        for _ in range(20):
+            it = wd.walk(".")
+            next(it)
+            it.close()                          # stopped early: every directory it opened is closed
+        if before is not None:
+            self.assertEqual(len(os.listdir("/proc/self/fd")), before)
+        with self.assertRaises(G.DiskError):
+            list(wd.walk("link"))
+
+
 class TestWorkdir(Tmp):
     def setUp(self):
         super().setUp()
@@ -403,6 +425,49 @@ class TestSkills(Tmp):
         self.assertEqual(G.load_skills(cfg, ["slurm"], notes.append), [])
         self.assertIn("changed", notes[-1])
 
+    def test_repl_raw_and_system(self):
+        with FakeAPI([reply("first \x1b[31mred"), reply("second")]) as api:
+            home, path = make_home(self.tmp, api.url)
+            bless_path(home, path)
+            cfg = G.Config(home)
+            eng = G.Engine(cfg, G.Endpoint.load(path), G.Session(cfg), G.PlainUI(io.StringIO()))
+            repl, out = G.Repl(eng), io.StringIO()
+            with mock.patch.object(sys, "stdout", out):
+                repl.command(":raw")
+                self.assertIn("nothing has been sent", out.getvalue())
+                repl.send("one")
+                repl.send("two")
+                out.seek(0)
+                out.truncate(0)
+                repl.command(":raw")
+                text = out.getvalue()
+                self.assertIn("Exchange 2 · turn 2", text)
+                self.assertNotIn("Exchange 1", text)
+                self.assertIn("User-Agent: genai/", text)
+                out.seek(0)
+                out.truncate(0)
+                repl.command(":raw 1")
+                self.assertIn("Exchange 1 · turn 1", out.getvalue())
+                out.seek(0)
+                out.truncate(0)
+                repl.command(":raw all")
+                self.assertEqual(out.getvalue().count("═" * 78), 4)
+                out.seek(0)
+                out.truncate(0)
+                repl.command(":raw 7")
+                self.assertIn("turn 7 has no exchanges", out.getvalue())
+                out.seek(0)
+                out.truncate(0)
+                repl.command(":system")
+                self.assertIn("── System prompt", out.getvalue())
+                self.assertIn('"name": "propose_command"', out.getvalue())
+
+    def test_page_escapes_control_characters(self):
+        out = io.StringIO()
+        with mock.patch.object(sys, "stdout", out):
+            G.page("ok\nred \x1b[31mtext\u202e")
+        self.assertEqual(out.getvalue().split("\n")[:2], ["ok", "red \\x1b[31mtext\\u202e"])
+
     def test_repl_skill_command(self):
         home = self.path("home", "genai")
         d = os.path.join(home, "skills", "slurm")
@@ -596,12 +661,12 @@ class TestEndToEnd(Tmp):
             p = g.until("proposal")
             self.assertEqual((p["kind"], p["path"], p["exists"]), ("write", "rotate.sh", False))
             self.assertFalse(os.path.exists(os.path.join(self.wd, "rotate.sh")))
-            g.send({"type": "decision", "id": p["id"], "decision": "accept"})
+            g.send({"type": "decision", "id": p["id"], "digest": p["digest"], "decision": "accept"})
             self.assertEqual(g.until("result")["status"], "ok")
             p2 = g.until("proposal")
             self.assertEqual(p2["kind"], "edit")
             self.assertIn("-echo one", p2["diff"])
-            g.send({"type": "decision", "id": p2["id"], "decision": "decline"})
+            g.send({"type": "decision", "id": p2["id"], "digest": p2["digest"], "decision": "decline"})
             g.until("done")
             g.close()
             self.assertEqual(open(os.path.join(self.wd, "rotate.sh")).read(), "echo one\n")
@@ -620,6 +685,31 @@ class TestEndToEnd(Tmp):
             g.close()
             self.assertFalse(os.path.exists(os.path.join(self.wd, "x")))
 
+    def test_a_decision_must_echo_the_proposals_digest(self):
+        with FakeAPI([call("write_file", path="x", content="y", reason="r"), reply("fine")]) as api:
+            g = self.start(api)
+            g.send({"type": "user", "text": "go"})
+            p = g.until("proposal")
+            self.assertRegex(p["digest"], r"^[0-9a-f]{16}$")
+            other = G.digest(dict(p, content="z"))           # the same id, but another card's contents
+            for answer in ({}, {"digest": other}, {"digest": p["digest"][::-1]}):
+                g.send({"type": "decision", "id": p["id"], "decision": "accept", **answer})
+                err = g.until("error")
+                self.assertEqual(err["code"], "digest_mismatch")
+                self.assertIn("still waits", err["message"])
+            self.assertFalse(os.path.exists(os.path.join(self.wd, "x")))
+            g.send({"type": "decision", "id": p["id"], "digest": p["digest"], "decision": "accept"})
+            g.until("done")
+            g.close()
+            self.assertTrue(os.path.exists(os.path.join(self.wd, "x")))
+
+    def test_a_digest_from_another_genai_never_matches(self):
+        ev = {"type": "proposal", "id": "p1", "kind": "write", "path": "x", "content": "y"}
+        self.assertEqual(G.digest(ev), G.digest(dict(ev, digest="ignored")))
+        with mock.patch.object(G, "DIGEST_NONCE", b"another process"):
+            elsewhere = G.digest(ev)
+        self.assertNotEqual(G.digest(ev), elsewhere)
+
     def test_unknown_id_and_type_rejected(self):
         with FakeAPI([call("read_file", path="a", reason="r"), reply("fine")]) as api:
             g = self.start(api)
@@ -629,7 +719,7 @@ class TestEndToEnd(Tmp):
             p = g.until("proposal")
             g.send({"type": "decision", "id": "p999", "decision": "accept"})
             self.assertEqual(g.until("error")["code"], "unknown_id")
-            g.send({"type": "decision", "id": p["id"], "decision": "decline"})
+            g.send({"type": "decision", "id": p["id"], "digest": p["digest"], "decision": "decline"})
             g.until("done")
             g.close()
 
@@ -682,12 +772,57 @@ class TestEndToEnd(Tmp):
             self.assertFalse(p_env.get("auto"))
             self.assertEqual(p_write["kind"], "write")
             # batch: decide in reverse order
-            g.send({"type": "decision", "id": p_write["id"], "decision": "decline"})
-            g.send({"type": "decision", "id": p_env["id"], "decision": "decline"})
+            g.send({"type": "decision", "id": p_write["id"], "digest": p_write["digest"], "decision": "decline"})
+            g.send({"type": "decision", "id": p_env["id"], "digest": p_env["digest"], "decision": "decline"})
             g.until("done")
             g.close()
             tools = [m["content"] for m in api.requests[-1]["body"]["messages"] if m["role"] == "tool"]
             self.assertEqual(tools, ["visible", "declined by the user", "declined by the user"])
+
+    def test_search_files_in_coding_mode(self):
+        turns = [calls(("search_files", {"pattern": "needle", "reason": "r"}),
+                       ("search_files", {"pattern": "NEEDLE", "path": "src", "glob": "*.py", "ignore_case": True,
+                                         "reason": "r"}),
+                       ("search_files", {"pattern": "x", "path": ".git", "reason": "r"}),
+                       ("search_files", {"pattern": "a\nb", "reason": "r"})),
+                 reply("done")]
+        with FakeAPI(turns) as api:
+            g = self.start(api, "--coding")
+            files = {"src/a.py": "one\nneedle here\n", "src/b.txt": "needle in text\n", "top.md": "x" * 300 + "needle\n",
+                     ".hidden/c.py": "needle\n", "src/keys.py": "needle\nAPI_KEY=sk-abcdefghijklmnopqrstuvwx1234\n",
+                     "bin.dat": "needle\0"}
+            for name, text in files.items():
+                os.makedirs(os.path.dirname(self.path("wd", name)) or self.wd, exist_ok=True)
+                with open(os.path.join(self.wd, name), "w") as f:
+                    f.write(text)
+            os.symlink(os.path.join(self.wd, "src"), os.path.join(self.wd, "link"))
+            g.send({"type": "user", "text": "x"})
+            first = g.until("proposal")
+            self.assertEqual((first["kind"], first["pattern"], first.get("auto")), ("search", "needle", True))
+            g.until("done")
+            g.close()
+            tools = [m["content"] for m in api.requests[-1]["body"]["messages"] if m["role"] == "tool"]
+            self.assertEqual(tools[0].split("\n")[:3], ["top.md:1: …" + "x" * 194 + "needle",
+                                                       "src/a.py:2: needle here", "src/b.txt:1: needle in text"])
+            self.assertIn("(skipped 1 file binary, large or unreadable)", tools[0])
+            self.assertIn("(skipped 1 file looking like secrets)", tools[0])
+            self.assertNotIn("hidden", tools[0])
+            self.assertNotIn("link/", tools[0])
+            self.assertEqual(tools[1], "src/a.py:2: needle here\n(skipped 1 file looking like secrets)")
+            self.assertIn("hidden directories are not searched", tools[2])
+            self.assertIn("one line of text", tools[3])
+            names = [t["function"]["name"] for t in api.requests[0]["body"]["tools"]]
+            self.assertIn("search_files", names)
+
+    def test_search_files_is_not_offered_outside_coding_mode(self):
+        with FakeAPI([call("search_files", pattern="x", reason="r"), reply("ok")]) as api:
+            g = self.start(api)
+            g.send({"type": "user", "text": "x"})
+            g.until("done")
+            g.close()
+            self.assertNotIn("search_files", [t["function"]["name"] for t in api.requests[0]["body"]["tools"]])
+            tool = [m for m in api.requests[-1]["body"]["messages"] if m["role"] == "tool"][0]
+            self.assertIn("only available in coding mode", tool["content"])
 
     def test_coding_refused_in_home(self):
         with FakeAPI([]) as api:
@@ -723,7 +858,7 @@ class TestEndToEnd(Tmp):
             g.send({"type": "user", "text": "x"})
             p = g.until("proposal")
             self.assertFalse(p.get("auto"))
-            g.send({"type": "decision", "id": p["id"], "decision": "decline"})
+            g.send({"type": "decision", "id": p["id"], "digest": p["digest"], "decision": "decline"})
             g.until("done")
             g.close()
             system = [r["body"]["messages"][0]["content"] for r in api.requests]
@@ -755,7 +890,7 @@ class TestEndToEnd(Tmp):
             g.send({"type": "skill", "name": "slurm", "on": True})
             self.assertEqual(g.until("error")["code"], "busy")
             self.assertEqual(g.until("error")["code"], "busy")
-            g.send({"type": "decision", "id": p["id"], "decision": "decline"})
+            g.send({"type": "decision", "id": p["id"], "digest": p["digest"], "decision": "decline"})
             g.until("done")
             g.close()
             self.assertFalse(any(e["type"] == "coding" for e in g.events))
@@ -779,7 +914,7 @@ class TestEndToEnd(Tmp):
             g.send({"type": "trace"})                                 # allowed while a proposal waits
             ex = g.until("trace")["exchanges"]
             self.assertEqual([e["n"] for e in ex], [1])
-            g.send({"type": "decision", "id": p["id"], "decision": "decline"})
+            g.send({"type": "decision", "id": p["id"], "digest": p["digest"], "decision": "decline"})
             done = g.until("done")
             self.assertEqual(done["exchanges"], [1, 2])
             g.send({"type": "trace", "from": 1, "to": 2})
@@ -815,7 +950,7 @@ class TestEndToEnd(Tmp):
             g.send({"type": "user", "text": "fix a"})
             p = g.until("proposal")
             self.assertEqual((p["kind"], p["goal"], [s["n"] for s in p["steps"]]), ("plan", "fix a", [1, 2, 3, 4]))
-            g.send({"type": "decision", "id": p["id"], "decision": "accept", "approve": [1, 2, 3],
+            g.send({"type": "decision", "id": p["id"], "digest": p["digest"], "decision": "accept", "approve": [1, 2, 3],
                     "edits": {"3": "make test -j2"}})
             plan = g.until("plan")["plan"]
             self.assertEqual([(s["n"], s["status"]) for s in plan["steps"]],
@@ -825,7 +960,7 @@ class TestEndToEnd(Tmp):
             self.assertEqual((read["kind"], read.get("auto"), read["plan_step"]), ("read", True, 1))   # no question
             edit = g.until("proposal")
             self.assertEqual((edit["kind"], edit.get("auto"), edit["plan_step"]), ("edit", None, 2))   # still asks
-            g.send({"type": "decision", "id": edit["id"], "decision": "accept"})
+            g.send({"type": "decision", "id": edit["id"], "digest": edit["digest"], "decision": "accept"})
             cmd = g.until("proposal")
             self.assertEqual((cmd["command"], cmd.get("preapproved"), cmd["plan_step"]), ("make test -j2", True, 3))
             g.until("done")
@@ -836,7 +971,7 @@ class TestEndToEnd(Tmp):
             g.send({"type": "user", "text": "and?"})
             w = g.until("proposal")
             self.assertTrue(w.get("off_plan"))
-            g.send({"type": "decision", "id": w["id"], "decision": "decline"})
+            g.send({"type": "decision", "id": w["id"], "digest": w["digest"], "decision": "decline"})
             g.until("done")
             g.send({"type": "plan"})
             last = g.until("plan")["plan"]
@@ -861,7 +996,7 @@ class TestEndToEnd(Tmp):
             g = self.start(api)
             g.send({"type": "user", "text": "go"})
             p = g.until("proposal")
-            g.send({"type": "decision", "id": p["id"], "decision": "accept", "approve": [1, "x"]})
+            g.send({"type": "decision", "id": p["id"], "digest": p["digest"], "decision": "accept", "approve": [1, "x"]})
             self.assertEqual(g.until("error")["code"], "bad_message")
             g.until("done")
             g.close()
@@ -877,7 +1012,7 @@ class TestEndToEnd(Tmp):
             g = self.start(api)
             g.send({"type": "user", "text": "go"})
             p = g.until("proposal")
-            g.send({"type": "decision", "id": p["id"], "decision": "accept"})
+            g.send({"type": "decision", "id": p["id"], "digest": p["digest"], "decision": "accept"})
             first = g.until("proposal")
             g.until("done")
             g.send({"type": "user", "text": "again"})
@@ -900,11 +1035,11 @@ class TestEndToEnd(Tmp):
                 f.write("A=1\n")
             g.send({"type": "user", "text": "go"})
             p = g.until("proposal")
-            g.send({"type": "decision", "id": p["id"], "decision": "accept"})
+            g.send({"type": "decision", "id": p["id"], "digest": p["digest"], "decision": "accept"})
             for _ in range(2):
                 r = g.until("proposal")
                 self.assertFalse(r.get("auto"))
-                g.send({"type": "decision", "id": r["id"], "decision": "decline"})
+                g.send({"type": "decision", "id": r["id"], "digest": r["digest"], "decision": "decline"})
             g.until("done")
             g.close()
 
@@ -1068,7 +1203,7 @@ class TestEndToEnd(Tmp):
             g.send({"type": "user", "text": "job?"})
             p = g.until("proposal")
             self.assertEqual((p["kind"], p["tool"], p["args"]), ("external", "job_details", {"job": "48211"}))
-            g.send({"type": "result", "id": p["id"], "status": "ok", "output": "State=PENDING token=supersecret1"})
+            g.send({"type": "result", "id": p["id"], "digest": p["digest"], "status": "ok", "output": "State=PENDING token=supersecret1"})
             g.until("done")
             g.close()
             self.assertIn("job_details", [t["function"]["name"] for t in api.requests[0]["body"]["tools"]])
@@ -1204,7 +1339,7 @@ class TestEndToEnd(Tmp):
             g = Proc(home, wd, ["-e", "test", "-S", "s1"])
             g.send({"type": "user", "text": "read it"})
             p = g.until("proposal")
-            g.send({"type": "decision", "id": p["id"], "decision": "accept"})
+            g.send({"type": "decision", "id": p["id"], "digest": p["digest"], "decision": "accept"})
             g.until("done")
             for text in ("t2", "t3"):
                 g.send({"type": "user", "text": text})
@@ -1642,14 +1777,13 @@ class TestRemoteConfig(Tmp):
                                input="")
             self.assertEqual(r.returncode, G.EXIT_USAGE, args)
 
-    def test_profile_persona_and_skills_notice(self):
+    def test_profile_persona_and_skills_by_name_are_not_loaded_here(self):
         with FakeAPI([reply("ok")]) as api:
             msg = self.config(api)
             msg["profile"] = {"name": "ops", "persona": "You are the zebra of ops.", "skills": ["anything"],
                               "endpoint": "ignored"}
             g = self.start(msg)
-            g.until("hello")
-            self.assertEqual(g.until("notice")["message"], "skills aren't available in remote mode yet")
+            self.assertEqual(g.until("hello")["skills"], [])   # only skills sent in the config line are used
             g.send({"type": "user", "text": "hi"})
             g.until("done")
             g.close()
@@ -1667,6 +1801,35 @@ class TestRemoteConfig(Tmp):
             with mock.patch.object(os, "geteuid", return_value=uid), mock.patch("sys.stdout", out):
                 G.Repl(e).banner()
             self.assertEqual("every command it proposes would run as root" in out.getvalue(), shown)
+
+    def test_repl_sandbox_markers(self):
+        home = self.path("home", "genai")
+        cfg = G.Config(home)
+        cfg.ensure()
+        ep = G.Endpoint({"name": "t", "base_url": "https://llm.invalid/v1", "model": "m"}, "t.json")
+        for name, inside in (("podman", True), ("", False)):
+            with self.subTest(sandbox=inside):
+                env = {"GENAI_SANDBOX": name, "GENAI_SANDBOX_WORK_HOST": "/host/w\x1b[31m"}
+                with mock.patch.dict(os.environ, env), mock.patch.object(G.os.path, "exists", return_value=False):
+                    eng = G.Engine(cfg, ep, G.Session(cfg), G.PlainUI())
+                    repl, out = G.Repl(eng), io.StringIO()
+                    prompts = []
+                    with mock.patch.object(sys, "stdout", out), \
+                            mock.patch("builtins.input", side_effect=lambda p: prompts.append(p) or ":quit"):
+                        repl.run()
+                        repl.command(":sandbox")
+                        repl.command(":help")
+                text = out.getvalue()
+                self.assertEqual(prompts, ["(sandbox) > " if inside else "> "])
+                self.assertIn(":sandbox ", text)
+                self.assertEqual("IN THE PODMAN SANDBOX: /work = /host/w" in text, inside)
+                self.assertNotIn("\x1b", text)                          # the host path is escaped
+                self.assertEqual("genai runs inside the podman sandbox" in text, inside)
+                self.assertEqual("genai runs OUTSIDE any sandbox, directly on this host" in text, not inside)
+                self.assertEqual("/opt/genai, read-only" in text, inside)
+                self.assertEqual("sandbox/run shell opens a shell in it" in text, inside)
+                self.assertEqual("network:" in text, inside)
+                self.assertEqual("sandbox/run genai runs genai in a podman sandbox" in text, not inside)
 
     def test_model_auto(self):
         with FakeAPI([reply("ok")], models=[{"id": "qwen3-coder"}]) as api:

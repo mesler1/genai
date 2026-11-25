@@ -6,9 +6,11 @@ import io
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -21,11 +23,17 @@ IMAGE = os.environ.get("GENAI_TEST_SANDBOX_IMAGE", "registry.suse.com/bci/bci-ba
 # Stands in for podman: logs its arguments, then runs the guard and the command on the host, in the project, with
 # /work meaning the project. It mounts nothing, so a path that should be hidden is still there and the guard trips.
 FAKE_PODMAN = r'''#!/usr/bin/env python3
-import json, os, subprocess, sys
+import json, os, signal, subprocess, sys
 args = sys.argv[1:]
 with open(os.environ["FAKE_PODMAN_LOG"], "a") as f:
     f.write(json.dumps(args) + "\n")
-if "kill" in args:
+pidfile = os.environ["FAKE_PODMAN_LOG"] + ".pid"
+if "kill" in args:                       # stops the fake container, as the real one would
+    try:
+        with open(pidfile) as f:
+            os.kill(int(f.read()), signal.SIGTERM)
+    except (OSError, ValueError):
+        pass
     sys.exit(0)
 if os.environ.get("FAKE_PODMAN_CGROUP") and any(a.startswith("--memory") for a in args):
     print("Error: runc create failed: unable to apply cgroup configuration: permission denied")
@@ -42,7 +50,14 @@ for a in args[:i]:
     if a.startswith("--volume=") and a.endswith(":/work:O"):
         root = a[len("--volume="):-len(":/work:O")]
 paths = [root + p[len("/work"):] for p in args[i + 4:]]
-sys.exit(subprocess.call(["/bin/sh", "-c", args[i + 2], "genai-guard"] + paths, cwd=root, env=env))
+child = subprocess.Popen(["/bin/sh", "-c", args[i + 2], "genai-guard"] + paths, cwd=root, env=env)
+with open(pidfile, "w") as f:
+    f.write(str(os.getpid()))
+def stop(*_):
+    child.kill()
+    sys.exit(137)
+signal.signal(signal.SIGTERM, stop)
+sys.exit(child.wait())
 '''
 
 
@@ -292,7 +307,7 @@ class TestSandboxLoop(FakePodman):
             g.send({"type": "user", "text": "x"})
             p = g.until("proposal")
             self.assertEqual((p["kind"], p.get("auto"), p["network"]), ("sandbox", None, True))
-            g.send({"type": "decision", "id": p["id"], "decision": "decline"})
+            g.send({"type": "decision", "id": p["id"], "digest": p["digest"], "decision": "decline"})
             g.until("done")
             g.close()
         self.assertEqual(self.podman_calls(), [])
@@ -304,11 +319,113 @@ class TestSandboxLoop(FakePodman):
             g = self.start(api, {"image": "img:1", "network": True})
             g.send({"type": "user", "text": "x"})
             p = g.until("proposal")
-            g.send({"type": "decision", "id": p["id"], "decision": "accept"})
+            g.send({"type": "decision", "id": p["id"], "digest": p["digest"], "decision": "accept"})
             self.assertEqual(g.until("result")["exit"], 0)
             g.until("done")
             g.close()
         self.assertNotIn("--network=none", self.podman_calls()[0])
+
+
+class TestInterrupt(FakePodman):
+    """In --json mode SIGINT stops a sandboxed run, like Ctrl-C in the REPL, and is ignored the rest of the time."""
+
+    def test_sigint_kills_the_container_and_ends_the_turn_stopped(self):
+        turns = [call("run_in_sandbox", command="echo started; sleep 30", reason="t"), reply("second")]
+        with FakeAPI(turns) as api:
+            home, ep = make_home(self.tmp, api.url)
+            bless_path(home, ep)
+            prof = {"name": "coder", "endpoint": "test", "coding": True, "sandbox": {"image": "img:1"}}
+            bless_path(home, write_json(os.path.join(home, "profiles", "coder.json"), prof))
+            self.project({"a.txt": "hi\n"})
+            g = Proc(home, self.path("wd"), ["-p", "coder"], env=self.env)
+            hello = g.until("hello")
+            self.assertIn("interrupt", hello["features"])
+            self.assertEqual(hello["runner"]["image"], "img:1")
+            g.p.send_signal(signal.SIGINT)               # idle: ignored
+            time.sleep(0.3)
+            self.assertIsNone(g.p.poll())
+            g.send({"type": "user", "text": "go"})
+            g.until("proposal")
+            deadline = time.time() + 10
+            while not os.path.exists(self.log + ".pid") and time.time() < deadline:
+                time.sleep(0.05)
+            time.sleep(0.3)
+            g.p.send_signal(signal.SIGINT)
+            r = g.until("result")
+            self.assertEqual(r["status"], "stopped")
+            self.assertEqual(g.until("done")["reason"], "stopped")
+            self.assertTrue(any("kill" in c for c in self.podman_calls()))
+            g.send({"type": "user", "text": "again"})    # genai is still there
+            self.assertEqual(g.until("done")["reason"], "reply")
+            g.close()
+        self.assertTrue(any("stopped by the user" in str(m.get("content")) for m in api.requests[1]["body"]["messages"]))
+
+
+    def test_stop_message_does_the_same_over_any_channel(self):
+        turns = [call("run_in_sandbox", command="echo started; sleep 30", reason="t"), reply("second")]
+        with FakeAPI(turns) as api:
+            home, ep = make_home(self.tmp, api.url)
+            bless_path(home, ep)
+            prof = {"name": "coder", "endpoint": "test", "coding": True, "sandbox": {"image": "img:1"}}
+            bless_path(home, write_json(os.path.join(home, "profiles", "coder.json"), prof))
+            self.project({"a.txt": "hi\n"})
+            g = Proc(home, self.path("wd"), ["-p", "coder"], env=self.env)
+            self.assertIn("stop", g.until("hello")["features"])
+            g.send({"type": "stop"})                     # idle: said so, and nothing else happens
+            self.assertEqual(g.until("error")["code"], "not_running")
+            g.send({"type": "user", "text": "go"})
+            g.until("proposal")
+            deadline = time.time() + 10
+            while not os.path.exists(self.log + ".pid") and time.time() < deadline:
+                time.sleep(0.05)
+            time.sleep(0.3)
+            started = time.monotonic()
+            g.send({"type": "stop"})                     # read while genai is busy with the run
+            r = g.until("result")
+            self.assertLess(time.monotonic() - started, 10)
+            self.assertEqual(r["status"], "stopped")
+            self.assertEqual(g.until("done")["reason"], "stopped")
+            self.assertTrue(any("kill" in c for c in self.podman_calls()))
+            g.send({"type": "user", "text": "again"})
+            self.assertEqual(g.until("done")["reason"], "reply")
+            g.close()
+        self.assertTrue(any("stopped by the user" in str(m.get("content")) for m in api.requests[1]["body"]["messages"]))
+
+
+class TestKill(unittest.TestCase):
+    """Ctrl-C at any point of a run kills the container, and a second one can't interrupt the kill."""
+
+    def box(self):
+        box = G.Sandbox(conf(), ".", print)
+        box.podman = "/usr/bin/podman"
+        return box
+
+    def test_a_second_ctrl_c_does_not_interrupt_the_kill(self):
+        def raises(signum, frame):
+            raise KeyboardInterrupt
+        before = signal.signal(signal.SIGINT, raises)
+        self.addCleanup(signal.signal, signal.SIGINT, before)
+        calls = []
+
+        def podman_kill(argv, **kw):
+            calls.append(argv)
+            os.kill(os.getpid(), signal.SIGINT)         # the second Ctrl-C, while the kill runs
+            time.sleep(0.05)
+        proc = mock.Mock()
+        with mock.patch.object(G.subprocess, "run", side_effect=podman_kill):
+            self.box()._kill("genai-1", proc)            # returns: the SIGINT was ignored
+        self.assertEqual(calls[0][-2:], ["kill", "genai-1"])
+        proc.wait.assert_called()
+        self.assertIs(signal.getsignal(signal.SIGINT), raises)   # and Ctrl-C works again afterwards
+
+    def test_ctrl_c_as_podman_starts_still_kills_it_by_name(self):
+        killed = []
+        with mock.patch.object(G.subprocess, "Popen", side_effect=KeyboardInterrupt), \
+                mock.patch.object(G.Sandbox, "_kill", lambda self, name, proc: killed.append((name, proc))):
+            with self.assertRaises(KeyboardInterrupt):
+                self.box()._podman(["podman", "run"], "genai-2", 100)
+        self.assertEqual(killed, [("genai-2", None)])
+        self.assertFalse(G.Sandbox.running)                # a later stray SIGINT is ignored again
 
 
 class TestTerminal(unittest.TestCase):

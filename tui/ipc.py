@@ -13,6 +13,7 @@ user account, and the sandbox is what keeps proposed commands outside it. Standa
 import json
 import os
 import queue
+import re
 import socket
 import struct
 import threading
@@ -24,11 +25,15 @@ MAX_CLIENTS = 16
 HELLO_TIMEOUT = 2          # seconds to send a complete handshake
 SEND_TIMEOUT = 2            # seconds a send may wait on a pane that has stopped reading
 ROLES = {
-    "prompt": {"input", "key", "scroll", "quit"},
+    "prompt": {"input", "key", "scroll", "quit", "stop"},
     "panel": {"coding", "skill", "skills", "command"},
     "menu": {"share", "menu", "mark"},
     "files": set(),          # the files feature adds what this pane may ask for
 }
+# A plugin's pane connects as "plugin:NAME". It may run its own plugin's read-only commands, put text in the input box
+# and offer text to attach after the user reviews it; the plugins feature checks each request (tui/features/plugins.py).
+PLUGIN_ROLE = re.compile(r"plugin:[a-z][a-z0-9-]{0,30}")
+PLUGIN_KINDS = {"run", "insert", "attach"}
 # What no feature may ever be given: answering a question or approving something is the prompt pane's alone.
 NEVER = {"hello", "input", "key", "scroll", "quit", "decision", "answer"}
 
@@ -109,6 +114,7 @@ class Hub:
         self.roles = {role: set(kinds) for role, kinds in ROLES.items()}     # extra: what the features that are on add
         for role, kinds in (extra or {}).items():
             allow(self.roles, role, kinds)
+        self.plugins = False       # whether plugin panes may connect (the plugins feature is on)
         self.inbox = queue.Queue()
         self.clients = []          # (connection, role)
         self.connections = set()   # includes sockets still sending a handshake
@@ -148,14 +154,18 @@ class Hub:
             msgs = messages(conn, first_timeout=HELLO_TIMEOUT)
             hello = next(msgs, None)
             role = hello.get("role") if hello and hello.get("type") == "hello" else None
-            if not isinstance(role, str) or role not in self.roles:
+            if isinstance(role, str) and PLUGIN_ROLE.fullmatch(role) and self.plugins:
+                kinds = PLUGIN_KINDS
+            elif isinstance(role, str) and role in self.roles:
+                kinds = self.roles[role]
+            else:
                 return
             with self.lock:
                 self.clients.append((conn, role))
             self.inbox.put(("hello", role))
             for msg in msgs:
                 kind = msg.get("type")
-                if isinstance(kind, str) and kind in self.roles[role]:
+                if isinstance(kind, str) and kind in kinds:
                     self.inbox.put((role, msg))
         except OSError:
             pass

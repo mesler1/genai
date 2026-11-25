@@ -293,6 +293,20 @@ class TestModel(unittest.TestCase):
         self.assertIn("Approved commands run ON ANOTHER HOST, login1, over ssh", banner)
         self.assertNotIn("directly on this host", banner)
 
+    def test_trusted_command_card_shows_what_ran_and_its_output(self):
+        m = C.Model()
+        self.hello(m)
+        m.submit("nodes?")
+        m.handle({"type": "proposal", "id": "p1", "kind": "trusted", "auto": True, "plugin": "slurm",
+                  "command": "down_nodes", "read_only": True, "argv": "sinfo -R -h", "reason": "down nodes"})
+        card = m.cards["p1"]
+        self.assertEqual(card.state, "running")
+        m.handle({"type": "result", "id": "p1", "status": "ok", "output": "cn042|down*\x1b[2J", "exit": 0})
+        text = text_of(card, 80)
+        self.assertIn("p1 · slurm · down_nodes · read-only", text)
+        self.assertIn("$ sinfo -R -h", text)
+        self.assertIn("│ cn042|down*\\x1b[2J", text)                     # output escaped, as everywhere
+
     def test_messages_typed_while_busy_are_queued(self):
         m = C.Model()
         m.submit("one")
@@ -315,6 +329,10 @@ class TestModel(unittest.TestCase):
         self.assertEqual(m.outbox[1:], [{"type": "decision", "id": "p1", "decision": "accept"},
                                         {"type": "decision", "id": "p2", "decision": "decline"}])
         m.handle({"type": "result", "id": "p1", "status": "ok", "detail": "wrote a"})
+        m.handle({"type": "proposal", "id": "p5", "kind": "read", "path": ".env", "digest": "0123456789abcdef"})
+        m.decide(True)                                   # genai's digest goes back with the answer, unchanged
+        self.assertEqual(m.outbox[-1], {"type": "decision", "id": "p5", "decision": "accept",
+                                        "digest": "0123456789abcdef"})
         self.assertEqual((m.cards["p1"].state, m.cards["p2"].state), ("done", "declined"))
         self.assertIn("secrets", text_of(m.cards["p2"]))
         self.assertIn("$ rm -rf ~", text_of(m.cards["p4"]))
@@ -510,10 +528,291 @@ class TestSandboxRuns(unittest.TestCase):
         self.assertEqual(snap["runner"]["network"], True)
         PANEL = load("panel", os.path.join(REPO, "tui", "panel.py"))
         lines, _ = PANEL.view(snap, 42, None)
-        self.assertIn("sandbox  ONLINE", "\n".join("".join(t for t, _ in ln) for ln in lines))
+        self.assertIn("model's  ready · ONLINE · dev:1", "\n".join("".join(t for t, _ in ln) for ln in lines))
         m.submit("go")
         m.submit("/network off")
         self.assertNotEqual(m.outbox[-1], {"type": "network", "on": False})   # waits until the reply ends
+
+
+class TestSandboxStatus(unittest.TestCase):
+    """The SANDBOX panel section, tmux's status line, a running card's clock, and stopping a run."""
+    RUNNER = TestSandboxRuns.RUNNER
+
+    def model(self, sandbox=None, runner=RUNNER, features=("interrupt",), remote=False):
+        m = C.Model()
+        m.handle({"type": "hello", "version": "1", "endpoint": {"name": "e", "model": "m", "base_url": "u"},
+                  "sandbox": sandbox, "coding": True, "runner": runner, "features": list(features), "remote": remote,
+                  "host": "h", "user": "u", "uid": 1000, "cwd": "/w"})
+        m.outbox.clear()
+        return m
+
+    def panel(self, m):
+        PANEL = load("panel", os.path.join(REPO, "tui", "panel.py"))
+        lines, _ = PANEL.view(m.snapshot(), 42, None)
+        return "\n".join("".join(t for t, _ in ln) for ln in lines)
+
+    def start(self, m, pid="p3"):
+        m.submit("test it")
+        m.handle({"type": "proposal", "id": pid, "kind": "sandbox", "command": "make", "reason": "r",
+                  "network": False, "image": "dev:1", "auto": True})
+        return m.cards[pid]
+
+    def test_panel_states(self):
+        self.assertIn("genai    in the podman sandbox", self.panel(self.model(sandbox={"name": "podman"})))
+        text = self.panel(self.model())
+        self.assertIn("genai    not sandboxed", text)
+        self.assertIn("model's  ready · offline · dev:1", text)
+        self.assertIn("model's  none", self.panel(self.model(runner=None)))
+        self.assertIn("model's  can't run: no podman", self.panel(self.model(runner=dict(self.RUNNER, problem="no podman"))))
+        m = self.model()
+        card = self.start(m)
+        card.started -= 12
+        text = self.panel(m)
+        self.assertIn("model's  RUNNING p3 · 12s", text)
+        self.assertIn("Ctrl-C or /stop stops it", text)
+        m.handle({"type": "result", "id": "p3", "status": "ok", "detail": "exit 0"})
+        self.assertIn("model's  ready", self.panel(m))
+
+    def test_tmux_status_holds_only_fixed_words_and_a_checked_id(self):
+        self.assertEqual(C.Model().tmux_status(), "")
+        self.assertIn("not sandboxed", self.model().tmux_status())
+        self.assertIn("⊡ sandbox", self.model(sandbox={"name": "podman"}).tmux_status())
+        m = self.model()
+        card = self.start(m)
+        card.started -= 5
+        self.assertIn("⏵ sandbox p3 5s", m.tmux_status())
+        m2 = self.model()
+        self.start(m2, pid="#[fg=red]x")                       # not an id genai would send: left out
+        status = m2.tmux_status()
+        self.assertNotIn("x", status.replace("fg=yellow", "").replace("#[default]", "").replace("box", ""))
+        self.assertIn("⏵ sandbox 0s", status)
+
+    def test_running_card_shows_its_clock_and_ends_stopped(self):
+        m = self.model()
+        card = self.start(m)
+        self.assertIn("running 0s · Ctrl-C (or /stop) stops it", text_of(card, 80))
+        card.started -= 7
+        self.assertIn("running 7s", text_of(card, 80))
+        m.handle({"type": "result", "id": "p3", "status": "stopped", "detail": "the container was killed"})
+        self.assertEqual(card.state, "stopped")
+        self.assertNotIn("running", text_of(card, 80))
+        self.assertIn("■ stopped", text_of(card, 80))
+
+    def test_an_approved_online_run_is_running(self):
+        m = self.model(runner=dict(self.RUNNER, network=True))
+        m.submit("go")
+        m.handle({"type": "proposal", "id": "p1", "kind": "sandbox", "command": "pip install x", "reason": "r",
+                  "network": True, "image": "dev:1"})
+        self.assertIsNone(m.running_card())
+        m.decide(True)
+        self.assertIs(m.running_card(), m.cards["p1"])
+
+    def test_stop_asks_for_an_interrupt_only_when_it_can(self):
+        m = self.model()
+        m.submit("/stop")
+        self.assertIn("nothing is running", text_of(m.blocks[-1]))
+        self.start(m)
+        m.submit("/stop")                                     # works while genai is busy
+        self.assertEqual(m.actions, [("interrupt",)])
+        self.assertIn("stopping the sandboxed run p3", text_of(m.blocks[-1]))
+        m = self.model(features=())
+        self.start(m)
+        m.submit("/stop")
+        self.assertEqual(m.actions, [])
+        self.assertIn("can't stop a sandboxed run", text_of(m.blocks[-1], 80))
+        m = self.model(remote=True)
+        card = self.start(m)
+        m.submit("/stop")
+        self.assertEqual(m.actions, [])
+        self.assertIn("isn't available in remote mode yet", text_of(m.blocks[-1], 120))
+        self.assertIn("can't be stopped from here in remote mode", text_of(card, 120))
+
+    def test_stop_message_works_here_and_over_ssh(self):
+        for remote in (False, True):
+            m = self.model(features=("interrupt", "stop"), remote=remote)
+            card = self.start(m)
+            self.assertTrue(card.stoppable)
+            self.assertIn("Ctrl-C (or /stop) stops it", text_of(card, 120))
+            m.submit("/stop")
+            self.assertEqual((m.outbox[-1], m.actions), ({"type": "stop"}, []))
+            self.assertIn("stopping the sandboxed run p3", text_of(m.blocks[-1]))
+            m.handle({"type": "error", "code": "not_running", "message": "nothing is running in the sandbox"})
+            self.assertTrue(m.busy)                           # the run had just ended; the turn goes on
+            self.assertIn("nothing is running in the sandbox now", text_of(m.blocks[-1]))
+
+    def test_stop_with_nothing_in_the_sandbox_points_at_the_shell_pane(self):
+        m = self.model(features=("interrupt", "stop"))
+        m.submit("/stop")
+        self.assertEqual(m.outbox, [])
+        self.assertIn("A command in the shell pane stops with Ctrl-C there", text_of(m.blocks[-1], 200))
+
+    def test_a_run_ends_when_genai_exits(self):
+        m = self.model()
+        card = self.start(m)
+        m.exit(1)
+        self.assertIsNone(m.running_card())
+        self.assertEqual((card.state, card.detail), ("error", "genai exited before it finished"))
+        self.assertNotIn("RUNNING", self.panel(m))
+        self.assertNotIn("⏵", m.tmux_status())
+
+    def test_prompt_pane_ctrl_c_stops_a_run(self):
+        p = C_PROMPT.Prompt.__new__(C_PROMPT.Prompt)
+        sent = []
+        p.send = lambda msg: sent.append(msg) or True
+        p.view, p.ctrl_c, p.paste = {"running": True}, 0.0, None
+        p.ed = C.Editor()
+        p.key("\x03")
+        p.key("\x03")
+        self.assertEqual(sent, [{"type": "stop"}, {"type": "stop"}])   # never a quit while a run is going
+        self.assertIn("stop", IPC.ROLES["prompt"])
+
+    def test_sandbox_command_prints_the_details(self):
+        m = self.model(runner=dict(self.RUNNER, memory="4g", pids=1024))
+        card = self.start(m)
+        m.submit("/sandbox")
+        text = "\n".join(text_of(b, 200) for b in m.blocks)
+        self.assertIn("genai: not sandboxed", text)
+        self.assertIn("sandbox/run genai runs it in a podman sandbox", text)
+        self.assertIn("image dev:1, offline, 300s time limit, 4g memory, 1024 processes", text)
+        self.assertIn(f"RUNNING {card.id}", text)
+        m = self.model(sandbox={"name": "podman"}, runner=None)
+        m.submit("/sandbox")
+        text = "\n".join(text_of(b, 200) for b in m.blocks)
+        self.assertIn("genai: in the podman sandbox", text)
+        self.assertIn("the model's sandbox: none", text)
+
+
+class TestEditsFeature(unittest.TestCase):
+    def model(self, edits=None, features=("edits",)):
+        m = C.Model()
+        m.handle({"type": "hello", "version": "1", "endpoint": {"name": "e", "model": "m", "base_url": "u"},
+                  "sandbox": None, "features": list(features), "edits": edits or {"mode": "ask", "files": []}})
+        m.outbox.clear()
+        return m
+
+    def panel(self, m):
+        PANEL = load("panel", os.path.join(REPO, "tui", "panel.py"))
+        lines, _ = PANEL.view(m.snapshot(), 42, None)
+        return "\n".join("".join(t for t, _ in ln) for ln in lines)
+
+    def test_commands_send_and_show(self):
+        m = self.model()
+        m.submit("/edits")
+        self.assertIn("every edit and write asks", text_of(m.blocks[-1], 200))
+        self.assertNotIn("EDITS", self.panel(m))
+        m.submit("/edits approved-files")
+        self.assertEqual(m.outbox[-1], {"type": "edits", "mode": "approved-files"})
+        m.handle({"type": "edits", "mode": "approved-files", "files": []})
+        self.assertIn("none yet", text_of(m.blocks[-1], 200))
+        m.handle({"type": "edits", "mode": "approved-files", "files": ["src/a.py", "b\x1b[2J"]})
+        text = self.panel(m)
+        self.assertIn("EDITS", text)
+        self.assertIn("  src/a.py", text)
+        self.assertNotIn("\x1b", text)
+        self.assertIn("/edits reset forgets them", text)
+        m.submit("/edits reset")
+        self.assertEqual(m.outbox[-1], {"type": "edits", "reset": True})
+        m.submit("/edits maybe")
+        self.assertIn("usage: /edits", text_of(m.blocks[-1], 200))
+        m = self.model(features=())
+        m.submit("/edits ask")
+        self.assertEqual(m.outbox, [])
+        self.assertIn("this genai can't", text_of(m.blocks[-1], 200))
+
+    def test_an_auto_applied_edit_is_shown_in_full(self):
+        m = self.model({"mode": "approved-files", "files": ["a.txt"]})
+        m.submit("go")
+        m.handle({"type": "proposal", "id": "p2", "kind": "edit", "path": "a.txt", "diff": "@@ -1 +1 @@\n-two\n+three\n",
+                  "reason": "r", "auto": True, "approved_file": True})
+        card = m.cards["p2"]
+        self.assertEqual((card.state, m.pending), ("accepted", []))
+        shown = text_of(card, 100)
+        self.assertIn("+three", shown)
+        self.assertIn("applied without asking", shown)
+        m.handle({"type": "result", "id": "p2", "status": "ok", "detail": "edited a.txt"})
+        self.assertEqual(card.state, "done")
+
+
+class TestPluginsFeature(unittest.TestCase):
+    ROWS = [{"name": "slurm", "description": "cluster", "enabled": True, "blessed": True, "status": "blessed",
+             "pane": "slurm.py", "dir": "/opt/genai/plugins/slurm",
+             "commands": [{"name": "queue", "describe": "the queue", "read_only": True, "params": {}},
+                          {"name": "cancel", "describe": "cancel a job", "read_only": False, "params": {}}]},
+            {"name": "off", "description": "not on", "enabled": False, "blessed": True, "pane": None, "dir": "/x",
+             "commands": [{"name": "x", "read_only": True}]}]
+
+    def model(self, remote=False):
+        m = C.Model()
+        m.handle({"type": "hello", "version": "1", "endpoint": {"name": "e", "model": "m", "base_url": "u"},
+                  "sandbox": None, "features": ["plugins"], "remote": remote})
+        m.handle({"type": "plugins", "plugins": self.ROWS})
+        m.outbox.clear()
+        return m
+
+    def notes(self, m, n=6):
+        return "\n".join(text_of(b, 200) for b in m.blocks[-n:])
+
+    def test_list_switch_and_pane(self):
+        m = self.model()
+        m.submit("/plugins")
+        self.assertIn("[on ] slurm: cluster · pane: /plugins slurm pane", self.notes(m))
+        self.assertIn("[off] off: not on", self.notes(m))
+        m.submit("/plugins off on")
+        self.assertEqual(m.outbox[-1], {"type": "plugin", "name": "off", "on": True})
+        m.submit("/plugins slurm pane")
+        self.assertEqual(m.actions[-1], ("plugin_pane", "slurm", "/opt/genai/plugins/slurm/slurm.py"))
+        m.submit("/plugins off pane")
+        self.assertIn("switch it on first", self.notes(m, 1))
+        m.submit("/plugins nope on")
+        self.assertIn("no plugin named nope", self.notes(m, 1))
+        m = self.model(remote=True)
+        m.submit("/plugins slurm pane")
+        self.assertIn("don't run in remote mode yet", self.notes(m, 1))
+
+    def test_a_pane_runs_its_own_read_only_commands_and_hears_the_answer(self):
+        m = self.model()
+        f = m.feature("plugins")
+        f.request(m, "plugin:slurm", {"type": "run", "id": "s1", "command": "queue", "params": {}})
+        self.assertEqual(m.outbox[-1], {"type": "run", "id": "pl1", "plugin": "slurm", "command": "queue",
+                                        "params": {}})
+        m.handle({"type": "ran", "id": "pl1", "exit": 0, "output": "1|a\n"})
+        self.assertEqual(m.panes[-1], ("plugin:slurm", {"type": "ran", "id": "s1", "exit": 0, "output": "1|a\n"}))
+        m.handle({"type": "ran", "id": "pl1", "exit": 0, "output": "again"})       # answered once only
+        self.assertEqual(len(m.panes), 1)
+        m.panes.clear()
+        for role, msg, why in (("plugin:slurm", {"type": "run", "id": 2, "command": "cancel"}, "only read-only"),
+                               ("plugin:slurm", {"type": "run", "id": 3, "command": "x"}, "no such command"),
+                               ("plugin:slurm", {"type": "run", "id": 4, "command": "queue", "params": {"a": 1}},
+                                "no such command")):
+            f.request(m, role, msg)
+            self.assertIn(why, m.panes[-1][1]["error"])
+        f.request(m, "plugin:off", {"type": "run", "id": 5, "command": "x"})
+        self.assertEqual(m.panes[-1], ("plugin:off", {"type": "refused", "why": "this plugin is not on"}))
+        self.assertEqual(len([o for o in m.outbox if o["type"] == "run"]), 1)
+
+    def test_insert_and_attach(self):
+        m = self.model()
+        f = m.feature("plugins")
+        f.request(m, "plugin:slurm", {"type": "insert", "text": "12345\x1b[2J"})
+        self.assertEqual(m.panes[-1], ("prompt", {"type": "insert", "text": C.clean("12345\x1b[2J")}))
+        f.request(m, "plugin:slurm", {"type": "attach", "label": "job 7", "text": "JobId=7"})
+        self.assertEqual(m.actions[-1], ("plugin_attach", "slurm", "job 7", "JobId=7"))
+        f.request(m, "plugin:slurm", {"type": "attach", "text": "x" * 70000})
+        self.assertEqual(len(m.actions), 1)
+
+    def test_help_and_panel_list_the_tools(self):
+        m = self.model()
+        m.submit("/help")
+        text = "\n".join(text_of(b, 200) for b in m.blocks)
+        self.assertIn("slurm: queue (read-only) the queue", text)
+        self.assertIn("slurm: cancel (asks) cancel a job", text)
+        self.assertNotIn("off: x", text)
+        PANEL = load("panel", os.path.join(REPO, "tui", "panel.py"))
+        lines, _ = PANEL.view(m.snapshot(), 50, None)
+        shown = "\n".join("".join(t for t, _ in ln) for ln in lines)
+        self.assertIn("PLUGINS", shown)
+        self.assertIn("slurm · /plugins slurm pane", shown)
+        self.assertIn("  queue, cancel", shown)
 
 
 class TestPlan(unittest.TestCase):
@@ -780,17 +1079,17 @@ class TestFeatures(unittest.TestCase):
 
     def test_all_built_in_features_load(self):
         on = F.load(core=C.CORE)
-        self.assertEqual([f.name for f in on], ["model", "copy", "decline", "raw", "ssh", "files"])
+        self.assertEqual([f.name for f in on], ["model", "copy", "decline", "raw", "ssh", "files", "sandbox", "edits", "plugins"])
         m = C.Model()
         self.assertEqual([f.name for f in m.features], [f.name for f in on])
-        self.assertEqual(list(m.commands())[-6:], ["/model", "/copy", "/decline", "/raw", "/system", "/files"])
+        self.assertEqual(list(m.commands())[-9:], ["/model", "/copy", "/decline", "/raw", "/system", "/files", "/sandbox", "/edits", "/plugins"])
         self.assertEqual(C.feature_requests(on), {"panel": {"models"}, "menu": {"model", "copy", "raw", "system"},
                           "files": {"list", "view", "attach", "insert"}})
 
     def test_environment_disables_a_feature(self):
         m, warning = self.model(self.environ(GENAI_TUI_DISABLE="copy, model"))
         self.assertIsNone(warning)
-        self.assertEqual([f.name for f in m.features], ["decline", "raw", "ssh", "files"])
+        self.assertEqual([f.name for f in m.features], ["decline", "raw", "ssh", "files", "sandbox", "edits", "plugins"])
         m.submit("/copy")
         self.assertIn("unknown command /copy (/help lists them)", text_of(m.blocks[-1]))
         m.submit("/help")
@@ -806,7 +1105,7 @@ class TestFeatures(unittest.TestCase):
         self.write_config('{"disable": ["decline", "raw"]}')
         m, warning = self.model(self.environ())
         self.assertIsNone(warning)
-        self.assertEqual([f.name for f in m.features], ["model", "copy", "ssh", "files"])
+        self.assertEqual([f.name for f in m.features], ["model", "copy", "ssh", "files", "sandbox", "edits", "plugins"])
         m.submit("/decline")
         self.assertIn("unknown command /decline", text_of(m.blocks[-1]))
 
@@ -818,7 +1117,7 @@ class TestFeatures(unittest.TestCase):
         for text in ("{not json", '{"disable": "copy"}', '["copy"]', '{"disable": [1]}'):
             self.write_config(text)
             m, warning = self.model(self.environ())
-            self.assertEqual(len(m.features), 6, text)
+            self.assertEqual(len(m.features), 9, text)
             self.assertIn("was ignored, so every feature is on", warning)
 
     def test_the_hub_refuses_the_requests_of_a_disabled_feature(self):
@@ -1046,6 +1345,23 @@ class TestSocket(unittest.TestCase):
         self.assertEqual(self.received(2), [("hello", "panel"), ("panel", {"type": "coding", "on": True})])
         self.assertEqual(self.received(1, timeout=0.3), [])
 
+    def test_a_plugin_pane_may_only_run_insert_and_attach(self):
+        self.hub.plugins = True
+        pane = IPC.Client(self.dir, "plugin:slurm")
+        self.addCleanup(pane.close)
+        for kind in ("input", "key", "decision", "coding", "skill", "share", "run"):
+            pane.send({"type": kind})
+        self.assertEqual(self.received(2), [("hello", "plugin:slurm"), ("plugin:slurm", {"type": "run"})])
+        self.assertEqual(self.received(1, timeout=0.3), [])
+
+    def test_plugin_panes_need_the_plugins_feature(self):
+        for on, role in ((False, "plugin:slurm"), (True, "plugin:Bad"), (True, "plugin:")):
+            self.hub.plugins = on
+            c = IPC.Client(self.dir, role)
+            self.addCleanup(c.close)
+            c.send({"type": "run"})
+            self.assertEqual(self.received(1, timeout=0.3), [], role)
+
     def test_unknown_role_and_bad_lines_end_the_connection(self):
         import socket
         for first in (b'{"type": "hello", "role": "root"}\n', b"not json\n", b"x" * (IPC.MAX_LINE + 10)):
@@ -1192,8 +1508,8 @@ class TestInTmux(TmuxCase):
 class TestGenaiTui(TmuxCase):
     """tui/genai-tui itself: the conversation pane above a real bash pane, started through a pseudo-terminal."""
 
-    def start(self, api, editor="true", path=None, args="-e test"):
-        home = self.config(api)
+    def start(self, api, editor="true", path=None, args="-e test", keep_home=False):
+        home = self.home if keep_home else self.config(api)      # keep_home: the test made self.home with config()
         if not args:        # genai then finds the endpoint the way a bare `genai` does
             conf = dict(G.STARTER_CONFIG, default_endpoint="test")
             G.write_private(os.path.join(home, "config.json"), json.dumps(conf))
@@ -1210,6 +1526,8 @@ class TestGenaiTui(TmuxCase):
         env = dict(os.environ, XDG_CONFIG_HOME=os.path.dirname(home), HOME=self.tmp, LANG="C.UTF-8",
                    TERM="xterm-256color", GENAI_TUI_SOCKET=self.sock, EDITOR=editor, VISUAL=editor,
                    XDG_RUNTIME_DIR=self.runtime, PATH=f"{path}:{os.environ['PATH']}" if path else os.environ["PATH"])
+        if path and os.path.exists(os.path.join(path, "less")):
+            env["GENAI_TUI_PAGER"] = os.path.join(path, "less")      # the test's pager stands in for genai-tui's
         env.pop("TMUX", None)
         self.proc = subprocess.Popen(["script", "-qfc", f"stty cols 110 rows 40; {REPO}/tui/genai-tui {args}",
                                       "/dev/null"], cwd=self.wd, env=env, stdin=subprocess.PIPE,
@@ -1263,6 +1581,48 @@ class TestGenaiTui(TmuxCase):
 
     def sent(self, api):
         return [m for m in api.requests[-1]["body"]["messages"] if m["role"] == "user"][-1]["content"]
+
+    def test_a_sandboxed_run_shows_it_is_running_and_ctrl_c_stops_it(self):
+        from test_sandbox_runner import FAKE_PODMAN
+        path = os.path.join(self.tmp, "test-bin")
+        os.mkdir(path)
+        for name, body in (("less", "#!/bin/sh\nexit 0\n"), ("podman", FAKE_PODMAN)):
+            with open(os.path.join(path, name), "w") as f:
+                f.write(body)
+            os.chmod(os.path.join(path, name), 0o700)
+        log = os.path.join(self.tmp, "podman.log")
+        plain = self.config
+
+        def config(api):                                   # and a blessed coding profile with a sandbox
+            home = plain(api)
+            prof = os.path.join(home, "profiles", "coder.json")
+            os.makedirs(os.path.dirname(prof), exist_ok=True)
+            with open(prof, "w") as f:
+                json.dump({"name": "coder", "endpoint": "test", "coding": True, "sandbox": {"image": "img:1"}}, f)
+            G.Config(home).set_blessed(prof, {"kind": "profile", "name": "coder", "hash": G.hash_file(prof)})
+            return home
+        self.config = config
+        turns = [call("run_in_sandbox", command="echo started; sleep 30", reason="t"), reply("it was stopped")]
+        with FakeAPI(turns) as api, mock.patch.dict(os.environ, {"FAKE_PODMAN_LOG": log}):
+            self.start(api, path=path, args="-p coder")
+            self.assertIn("not sandboxed", self.tmux("show", "-gv", "@genai_sandbox"))
+            self.type("go")
+            self.wait_for("Ctrl-C (or /stop) stops it", pane="genai")
+            self.wait_for("RUNNING p", pane="info")
+            end = time.time() + 10
+            while not os.path.exists(log + ".pid") and time.time() < end:
+                time.sleep(0.05)
+            self.assertRegex(self.tmux("show", "-gv", "@genai_sandbox"), r"⏵ sandbox p[0-9]+ [0-9]+s")
+            self.tmux("send-keys", "-t", self.panes()["you"], "C-c")
+            self.wait_for("■ stopped", pane="genai")
+            self.wait_for("stopped; send a message to continue", pane="genai")
+            self.type("carry on")                               # genai is still there
+            self.wait_for("it was stopped", pane="genai")
+            self.assertTrue(any("stopped by the user" in str(m.get("content"))
+                                for m in api.requests[-1]["body"]["messages"]))
+            self.assertTrue(any("kill" in ln for ln in open(log)))
+            self.assertIn("not sandboxed", self.tmux("show", "-gv", "@genai_sandbox"))
+            self.assertNotIn("genai exited", self.screen())
 
     def test_starts_with_no_arguments(self):
         with FakeAPI([reply("hello")]) as api:
@@ -1539,6 +1899,41 @@ class TestGenaiTui(TmuxCase):
             self.assertIn("You are genai", slurp(seen))
             self.assertEqual([n for n in os.listdir(self.runtime_state()) if n.startswith("raw-")], [])
 
+    def test_the_slurm_console_runs_its_commands_through_genai(self):
+        with FakeAPI([reply("ok")]) as api:
+            home = self.config(api)
+            fake = os.path.join(self.tmp, "slurm-bin")
+            os.mkdir(fake, 0o755)
+            nodes = "c001|batch*|idle|0/32/0/32|192000|none\nc002|batch*|drained|0/0/32/32|192000|bad DIMM\n"
+            for prog, body in (("sinfo", f'case "$*" in *-N*) printf "{nodes}";; *-s*) echo "batch*|up|1:00:00|2|0/1/1/2|0/32/32/64";; esac'),
+                               ("squeue", 'echo "7|batch|train|alice|RUNNING|1:00|1|c001"'),
+                               ("scontrol", 'echo "NodeName=$3 State=DRAIN Reason=bad_DIMM"')):
+                with open(os.path.join(fake, prog), "w") as f:
+                    f.write("#!/bin/sh\n" + body + "\n")
+                os.chmod(os.path.join(fake, prog), 0o755)
+            pdir = os.path.join(home, "plugins", "slurm")
+            shutil.copytree(os.path.join(REPO, "plugins", "slurm"), pdir)
+            with open(os.path.join(pdir, "plugin.json")) as f:
+                manifest = json.load(f)
+            manifest["search"] = [fake]
+            with open(os.path.join(pdir, "plugin.json"), "w") as f:
+                json.dump(manifest, f)
+            G.Config(home).set_blessed(pdir, {"kind": "plugin", "name": "slurm", "hash": G.hash_skill(pdir)[0]})
+            G.write_private(os.path.join(home, "config.json"), json.dumps(dict(G.STARTER_CONFIG, default_plugins=["slurm"])))
+            self.home = home
+            self.start(api, args="-e test --no-panel", keep_home=True)
+            self.type("/plugins slurm pane")
+            end = time.time() + 15
+            while time.time() < end and "slurm" not in self.panes():
+                time.sleep(0.2)
+            self.wait_for("bad DIMM", pane="slurm", timeout=15)
+            self.wait_for("running 1", pane="slurm")
+            self.tmux("send-keys", "-t", self.panes()["slurm"], "Down", "Enter")
+            self.wait_for("NodeName=c002", pane="slurm")
+            self.tmux("send-keys", "-t", self.panes()["slurm"], "Escape")
+            self.tmux("send-keys", "-t", self.panes()["slurm"], "i")
+            self.wait_for("c002", pane="you")
+
     def test_the_file_tree_browses_views_attaches_and_inserts(self):
         bindir = tempfile.mkdtemp(prefix="genai-tui-bin-")
         self.addCleanup(shutil.rmtree, bindir, True)
@@ -1578,6 +1973,27 @@ class TestGenaiTui(TmuxCase):
             self.assertIn("some words", slurp(seen))
             send("a")
             self.wait_for("attached file README.md")
+
+    def test_one_click_in_the_file_tree_acts_once(self):
+        """A mouse click is a press and a release; only one of them may count, or a folder opens and shuts again."""
+        with FakeAPI([reply("ok")]) as api:
+            self.start(api, args="-e test --no-panel")
+            os.makedirs(os.path.join(self.wd, "src"))
+            with open(os.path.join(self.wd, "src", "app.py"), "w") as f:
+                f.write("print('hi')\n")
+            self.type("/files")
+            end = time.time() + 10
+            while time.time() < end and "src/" not in self.screen("files"):
+                self.tmux("send-keys", "-t", self.panes()["files"], "r")
+                time.sleep(0.5)
+            self.wait_for("src/", pane="files")
+            self.click("src/", pane="files", hold=0.05)                      # selected first: a click opens it
+            self.wait_for("app.py", pane="files")
+            time.sleep(0.5)
+            self.assertIn("app.py", self.screen("files"))
+            self.click("src/", pane="files", hold=0.05)                      # and one more shuts it
+            time.sleep(0.5)
+            self.assertNotIn("app.py", self.screen("files"))
 
     def runtime_state(self):
         return next(os.path.join(self.runtime, d) for d in os.listdir(self.runtime) if d.startswith("genai-tui."))
@@ -1738,6 +2154,7 @@ class TestGenaiTui(TmuxCase):
             self.wait_for("Run p1")
             self.key("y")
             self.wait_for("the shell pane is busy (sleep is running)")
+            self.wait_for("/shell shows it")
             self.assertNotIn("should-not-run", self.screen("shell"))
 
     def test_edit_first_and_share_your_own_command(self):
