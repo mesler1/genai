@@ -491,8 +491,10 @@ and merge what you want, with git.
 ```
 
 1. **genai makes the copy.** It needs a git repository with no uncommitted changes to tracked
-   files (commit or stash first). It adds a git worktree from your last commit, on a new branch
-   `genai/work-N`, under `~/.local/state/genai/work/`. Untracked files aren't in the copy, and
+   files (commit or stash first). The copy is a new git repository under
+   `~/.local/state/genai/work/` holding your last commit and nothing else: no history, no other
+   branches. Each item the model finishes is committed there and fetched straight into a new
+   branch `genai/work-N` in your repository. Untracked files aren't in the copy, and
    starting from a directory with nothing committed is refused. Coding mode turns on for the
    session if it was off, and goes back off when it ends; files you approved with edits
    `approved-files` are set aside until then.
@@ -506,13 +508,14 @@ and merge what you want, with git.
    Offline sandbox runs work on a throwaway overlay of the copy, as usual: they see the model's
    edits, and their own changes are discarded.
 4. **It finishes each item with `finish_item`.** genai runs the profile's test command in the
-   sandbox, if there is one, and commits the changes on the branch. An item whose test fails, or
+   sandbox, if there is one, commits the changes in the copy, and fetches the commit into the
+   branch in your repository. An item whose test fails, or
    that changed nothing, isn't finished, and the model is told why. The commit's title is the
    model's short summary; its body names the plan item and holds the model's notes for later items.
 5. **At the end** genai commits anything left, removes the copy and shows the branch: its commits,
    the diff stat, and the commands to review it, merge it or delete it. genai never touches your
-   own branch. A session that changed nothing deletes its branch. If git fails at any point here,
-   nothing is deleted: genai says where the copy and the branch are.
+   own branch. A session that changed nothing leaves no branch. If git fails at any point here,
+   the copy isn't deleted: genai says where it is.
 
 **Contexts.** Each plan item runs in a fresh context: the model sees the task, the plan and the
 notes earlier items left, not their conversations, so a long session doesn't fill up. The context
@@ -561,12 +564,15 @@ endpoint or with its own model must be listed by that server (`model` left out o
 the first it lists); if the server can't be asked, the session doesn't start.
 
 **Git stays on your side.** genai runs every git command itself, on your machine, with hooks,
-fsmonitor, signing and every filter driver your repository's own config names off (those in your
-global and system config, such as Git LFS, stay on, so the copy has the real files), and it names the
-copy's git directory explicitly instead of trusting the copy's `.git` file. No file tool may write
-anything under `.git`, and the sandbox only ever gets an overlay of the copy. So nothing the model
-or a test writes can make git run a program on your machine. Commits use your git identity, or
-`genai` if you have none.
+fsmonitor and signing off. The copy has no config of its own beyond what `git init` writes, so your
+repository's own config (its filters, hooks and includes) never applies there; your global and
+system config does, so drivers such as Git LFS still give the copy the real files. genai touches
+your repository only to read your last commit into the copy and to fetch the copy's commits into
+`genai/work-N`. No file tool may write anything under `.git`, and the sandbox only ever gets an
+overlay of the copy. So nothing the model or a test writes can make git run a program on your
+machine. Commits use your git identity, or `genai` if you have none. If a session ends with a
+problem (git fails, or git ignores a file the model wrote), the copy stays where it is for you to
+look at; so does one left by a genai that was killed outright.
 
 ## JSON protocol
 
@@ -672,7 +678,7 @@ decision.
 | `context` | The conversation is getting near the context limit. |
 | `notice` | Something the user should know. |
 | `error` | `code` and `message`. Among the codes: `api` (the endpoint failed or couldn't be reached; nothing was performed), `busy` (not allowed while proposals wait), `unknown_id` (no waiting proposal with that ID and kind), `digest_mismatch` (see Digests), `not_running` (a `stop` with nothing running), `work_refused` and `work` (a work session can't start, or git failed; `work` also refuses the network on, or coding mode off, during a session), `bad_message`, `unknown_type`, and, at the start, `session_endpoint_changed` (a resumed session was made with another endpoint; `--allow-session-endpoint-change` allows it). |
-| `work` | A work session changed. `state` is `started` (`branch`, `base`, `path`, `steps_per_item`, `time_limit`, `test`, `planner`: `endpoint` and `model` for planning, or `null` when the profile's own model plans), `plan` (the plan was approved: `items`, each `n`, `title`, `status`, `commit`, and `current`), `item` (an item was committed), `context` (a fresh context: `role` `item`, or `review` for the planner taking back a stuck item; `item`; `why`), or `ended` (`why`: `done`, `ended` or `genai exited`; `branch`, `null` if nothing changed and it was deleted; `commits`, `stat`, `unfinished` (the commit of work left when it ended), `commands` to review and merge, `items`, `removed` (whether the copy was removed), `path` (where the copy still is, if it wasn't) and `problems` (what went wrong, such as a git failure or a file git ignores that the model wrote)). |
+| `work` | A work session changed. `state` is `started` (`branch`, `base`, `path`, `steps_per_item`, `time_limit`, `test`, `planner`: `endpoint` and `model` for planning, or `null` when the profile's own model plans), `plan` (the plan was approved: `items`, each `n`, `title`, `status`, `commit`, and `current`), `item` (an item was committed), `context` (a fresh context: `role` `item`, or `review` for the planner taking back a stuck item; `item`; `why`), or `ended` (`why`: `done`, `ended` or `genai exited`; `branch`, `null` if nothing changed, so there is none; `commits`, `stat`, `unfinished` (the commit of work left when it ended), `commands` to review and merge, `items`, `removed` (whether the copy was removed), `path` (where the copy still is, if it wasn't) and `problems` (what went wrong, such as a git failure or a file git ignores that the model wrote)). |
 | `plan` | The approved plan changed: approved, a step done, or dropped. `plan` has `id`, `goal` and `steps`, each with `approved`, `status` (`todo`, `done`, `left out`) and `edited` when the user changed its command; `null` when there is none. A plan is never saved with the session. |
 | `attached`, `registered`, `compacted`, `cleared`, `models`, `model`, `coding`, `skills`, `files`, `file`, `trace`, `system`, `network`, `plugins`, `ran`, `edits` | Answers to the messages above. |
 

@@ -231,19 +231,22 @@ in between.
 
 - **Work sessions** (`:work`, or the JSON `work` message) let the model edit, test and commit
   without asking, so the boundary moves from each edit to the branch you review at the end:
-  - The model works in a git worktree outside your project, on a branch of its own. Your own
-    files and branch are never written; you merge the branch yourself, with git.
-  - The copy's `.git` file and the repository's hooks could make git run a program. genai runs
-    every git command itself, on the host, with `GIT_DIR` set to the git directory it recorded
-    when it made the copy (before the model could write anything), with all `GIT_*` variables
-    from the environment dropped, and with `core.hooksPath=/dev/null`, `core.fsmonitor=false`,
-    signing, external diff and textconv, and bare-repository discovery off. Every `filter.*`
-    driver set in the repository's own config (its `.git/config`, a worktree's config, and what
-    they include, on a branch or not) is turned off too, by name: the copy is made empty, its
-    filters are read in its own context, and only then are its files checked out. Drivers from
-    your global and system config, such as Git LFS, stay on. No file tool may write under
-    `.git`, and the sandbox still runs on a throwaway overlay of the copy, so a test can't leave
-    anything behind.
+  - The model works in a copy outside your project: a new git repository (`git init`) holding
+    your last commit and nothing else, fetched with depth 1, so neither the model nor the sandbox
+    can read your history, other branches or tags, including a secret that was committed once and
+    removed. Your own files and branch are never written; you merge the branch yourself, with git.
+  - genai touches your repository in two places only: `git status` before the session, in your
+    own checkout with your own config, as you would run it; and `git fetch` of each commit made in
+    the copy into `refs/heads/genai/work-N`. That fetch only adds to the branch: a branch moved or
+    deleted meanwhile is an error, never overwritten, and a name taken meanwhile moves to the next
+    free one. SIGTERM and SIGHUP wait for it, so git is never killed halfway with a lock file left.
+  - The copy's config is only what `git init` writes, so your repository's own config (filters,
+    hooks, includes) never applies there; your global and system config does, so drivers such as
+    Git LFS stay on. genai runs every git command itself, on the host, with `GIT_DIR` set to the
+    copy's `.git` directory, all `GIT_*` variables from the environment dropped, and
+    `core.hooksPath=/dev/null`, `core.fsmonitor=false`, signing, external diff and textconv, and
+    bare-repository discovery off. No file tool may write under `.git`, and the sandbox still runs
+    on a throwaway overlay of the copy, so a test can't leave anything behind.
   - Edits and writes apply without asking only while an item of an approved plan is worked on;
     before approval, and while the planner reviews an item, they ask, whatever the edits mode:
     files you approved with `approved-files` count only outside the session. Hidden and
@@ -265,9 +268,10 @@ in between.
   - The user can stop the turn at any time (`stop`, Ctrl-C, `/stop`), including while the model
     writes tool calls or rollover notes, and end the session mid-turn (`work_end`), even while it
     is starting; quitting the front end, SIGTERM and SIGHUP end it too, committing what is there
-    and removing the copy. A signal that comes while the copy is being made or removed waits until
-    that is done. If git fails while ending, or git ignores a file the model wrote (the commit
-    would leave it out), nothing is deleted. Once a plan, finish or retry takes effect, the rest of
+    and removing the copy. If git fails while ending, or git ignores a file the model wrote (the
+    commit would leave it out), the copy is not deleted. A genai killed outright (SIGKILL, a
+    crash) leaves its copy in `~/.local/state/genai/work/`; your repository has whatever reached
+    the branch. Once a plan, finish or retry takes effect, the rest of
     that reply's calls are not run: they were decided for the state before it.
   - A profile can plan with another model (`work.planner`). On the same endpoint, nothing new
     is trusted. A second endpoint must be blessed like any other, the profile's summary says it
@@ -281,9 +285,7 @@ in between.
     configuration, and nothing in it has been reviewed until you review it. Running its tests or
     build on your machine before reading the diff runs the model's code as you. Filter drivers
     from your global and system config (such as Git LFS) still run when git checks out and
-    commits the copy, and the model's `.gitattributes` can choose which files they get. genai
-    checks for uncommitted changes with a plain `git status` in your own checkout, with your
-    filters, as you would.
+    commits the copy, and the model's `.gitattributes` can choose which files they get.
 
 What remains: the indicator is display only. A command you approve outside a sandbox can do
 anything you can. Inside `sandbox/run genai` the network is open, because genai has to reach

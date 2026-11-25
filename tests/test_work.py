@@ -1,4 +1,4 @@
-"""Tests for work sessions: the model plans, then edits, tests and commits on a git worktree of its own, and the user
+"""Tests for work sessions: the model plans, then edits, tests and commits in a copy of its own, and the user
 reviews the branch. A fake podman runs sandboxed commands on the host (see test_sandbox_runner); git is real.
 Run: python3 -m unittest discover -s tests"""
 
@@ -106,7 +106,6 @@ class WorkTest(FakePodman):
         self.assertEqual(git(root, "show", "genai/work-1:b.txt"), "new\n")
         self.assertEqual(git(root, "rev-parse", "--abbrev-ref", "HEAD").strip(), "main")
         self.assertEqual(os.listdir(self.path("state", "genai", "work")), [])     # the copy is gone
-        self.assertEqual(len(git(root, "worktree", "list").splitlines()), 1)
         mounts = [a for c in self.podman_calls() for a in c if a.endswith(":/work:O")]
         self.assertTrue(mounts and all(self.path("state") in m for m in mounts))  # the copy, as an overlay
         events = [e["event"] for e in self.audit()]
@@ -417,7 +416,7 @@ class WorkTest(FakePodman):
     def tool_replies(self, api):
         return [m["content"] for r in api.requests for m in r["body"]["messages"] if m["role"] == "tool"]
 
-    def test_a_git_failure_at_the_end_keeps_the_copy_and_the_branch(self):
+    def test_a_git_failure_at_the_end_keeps_the_copy(self):
         turns = [call("propose_work_plan", goal="g", items=["one"]),
                  call("write_file", path="b.txt", content="x\n", reason="r"), reply("pausing")]
         root = self.repo()
@@ -427,15 +426,14 @@ class WorkTest(FakePodman):
             started = g.until("work")
             self.approve(g)
             g.until("done")
-            gitdir = os.path.join(root, ".git", "worktrees", os.path.basename(started["path"]))
-            open(os.path.join(gitdir, "index.lock"), "w").close()       # so git add fails
+            open(os.path.join(started["path"], ".git", "index.lock"), "w").close()       # so git add fails
             g.send({"type": "work_end"})
             ended = self.ended(g)
             g.close()
         self.assertTrue(ended["problems"] and "could not be committed" in ended["problems"][0])
-        self.assertEqual((ended["branch"], ended["path"], ended["removed"]), ("genai/work-1", started["path"], False))
+        self.assertEqual((ended["branch"], ended["path"], ended["removed"]), (None, started["path"], False))
         self.assertTrue(os.path.exists(os.path.join(started["path"], "b.txt")))     # the work is still there
-        self.assertIn("genai/work-1", git(root, "branch"))
+        self.assertNotIn("genai/work", git(root, "branch"))                       # nothing was committed
 
     def test_the_repositorys_own_filter_drivers_never_run_in_the_copy_but_global_ones_do(self):
         turns = [call("propose_work_plan", goal="g", items=["one"]),
@@ -740,7 +738,6 @@ class WorkTest(FakePodman):
         self.assertEqual(rc, 128 + signal.SIGTERM)
         self.assertEqual(git(root, "show", "genai/work-1:b.txt"), "x\n")
         self.assertEqual(os.listdir(self.path("state", "genai", "work")), [])
-        self.assertEqual(len(git(root, "worktree", "list").splitlines()), 1)
 
 
     # -- what the second audit found
@@ -998,6 +995,72 @@ class WorkTest(FakePodman):
         self.assertIn("could not check", err["message"])
 
 
+    # -- the copy
+
+    def test_the_copy_holds_your_last_commit_and_nothing_else(self):
+        turns = [reply("looking")]
+        root = self.repo({"old.txt": "password = hunter2hunter2\n"})
+        old = git(root, "rev-parse", "HEAD").strip()
+        git(root, "rm", "-q", "old.txt")
+        with open(os.path.join(root, "a.txt"), "w") as f:
+            f.write("hi\n")
+        git(root, "add", "a.txt")
+        git(root, "commit", "-qm", "two")
+        git(root, "branch", "other", old)
+        with FakeAPI(turns) as api:
+            g = self.start(api)
+            g.send({"type": "work", "task": "t"})
+            started = g.until("work")
+            g.until("done")
+            copy = started["path"]
+            self.assertEqual(git(copy, "rev-list", "--all").split(), [git(root, "rev-parse", "HEAD").strip()])
+            self.assertNotEqual(subprocess.run(["git", "-C", copy, "cat-file", "-e", old]).returncode, 0)
+            self.assertFalse([k for k in git(copy, "config", "--local", "--list", "--name-only").split()
+                              if not k.startswith("core.")])        # no remote, no filters: nothing of yours
+            self.assertNotIn("genai/work", git(root, "branch"))     # nothing is on a branch until an item is done
+            g.close()
+
+    def test_a_branch_moved_outside_the_session_is_not_overwritten(self):
+        turns = [call("propose_work_plan", goal="g", items=["one", "two"]),
+                 call("write_file", path="b.txt", content="b\n", reason="r"),
+                 call("finish_item", n=1, summary="b"),
+                 call("write_file", path="c.txt", content="c\n", reason="r"), reply("pausing")]
+        root = self.repo()
+        base = git(root, "rev-parse", "HEAD").strip()
+        with FakeAPI(turns) as api:
+            g = self.start(api)
+            g.send({"type": "work", "task": "t"})
+            self.approve(g)
+            g.until("done")
+            self.assertEqual(git(root, "show", "genai/work-1:b.txt"), "b\n")     # on the branch already
+            git(root, "update-ref", "refs/heads/genai/work-1", base)
+            g.send({"type": "work_end"})
+            ended = self.ended(g)
+            g.close()
+        self.assertEqual(git(root, "rev-parse", "genai/work-1").strip(), base)
+        self.assertIn("was moved or deleted outside the session", ended["problems"][0])
+        self.assertFalse(ended["removed"])
+        self.assertTrue(os.path.exists(os.path.join(ended["path"], "c.txt")))
+
+    def test_a_branch_name_taken_meanwhile_moves_to_the_next(self):
+        turns = [call("propose_work_plan", goal="g", items=["one"]),
+                 call("write_file", path="b.txt", content="b\n", reason="r"), reply("pausing")]
+        root = self.repo()
+        with FakeAPI(turns) as api:
+            g = self.start(api)
+            g.send({"type": "work", "task": "t"})
+            self.assertEqual(g.until("work")["branch"], "genai/work-1")
+            self.approve(g)
+            g.until("done")
+            git(root, "branch", "genai/work-1")
+            g.send({"type": "work_end"})
+            ended = self.ended(g)
+            g.close()
+        self.assertEqual(ended["branch"], "genai/work-2")
+        self.assertEqual(git(root, "show", "genai/work-2:b.txt"), "b\n")
+        self.assertEqual(git(root, "rev-parse", "genai/work-1").strip(), git(root, "rev-parse", "main").strip())
+
+
 class TestWorkParts(unittest.TestCase):
     def test_a_pyvenv_cfg_directory_doesnt_count_as_a_virtual_environment(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1046,17 +1109,6 @@ class TestWorkParts(unittest.TestCase):
         self.assertEqual(p.decision, "decline")
         self.assertEqual(ui.read(), {"type": "user", "text": "later"})
 
-    def test_a_branch_that_cant_be_deleted_is_reported_as_kept(self):
-        tree = mock.Mock(branch="genai/work-1", base="b" * 40, path="/copy")
-        tree.commit.return_value, tree.ignored.return_value = None, []
-        tree.summary.return_value, tree.head.return_value = ([], ""), "b" * 40
-        tree.delete_branch.side_effect = G.GenaiError("cannot lock ref")
-        w = G.Work(tree, "t", 5, 60, None, mock.Mock(root="/proj"))
-        e = mock.Mock(work=w, approved_files=set())
-        info = G.Engine._end_work(e, w, "ended")
-        self.assertEqual((info["removed"], info["branch"], info["path"]), (True, "genai/work-1", None))
-        self.assertIn("could not be deleted", info["problems"][0])
-
     def test_a_sandboxed_run_is_cut_off_at_the_sessions_time(self):
         w = G.Work(None, "t", 5, 60, None, None)
         w.since -= 100
@@ -1097,7 +1149,7 @@ class TestWorkParts(unittest.TestCase):
             git(root, "commit", "-qm", "a")
             os.makedirs(os.path.join(root, "new"))
             with self.assertRaisesRegex(G.GenaiError, "nothing in this directory is committed"):
-                G.Worktree.create(os.path.join(root, "new"))
+                G.Copy.create(os.path.join(root, "new"))
 
     def test_a_pyvenv_cfg_doesnt_hide_a_secret_from_the_scan(self):
         with tempfile.TemporaryDirectory() as root:

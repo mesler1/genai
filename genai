@@ -677,12 +677,12 @@ class Sandbox:
 
 
 # --------------------------------------------------------------------------
-# Work sessions: a git worktree the model works in
+# Work sessions: a private git repository the model works in
 
-# Every git command genai runs for a work session: hooks, fsmonitor and signing off, so nothing in the copy or the
+# Every git command genai runs for a work session: hooks, fsmonitor and signing off, so nothing in the copy or a
 # repository's config can make git run a program; external diff and textconv drivers off for the same reason, and
-# no bare repository found by searching. Filter drivers from the repository's own config are turned off one by one
-# (filter_off), by name; those from your global and system config stay on.
+# no bare repository found by searching. Filter drivers from your global and system config (Git LFS, say) stay on:
+# you set them up, for every repository. The copy has no config of its own that could name another.
 GIT_SAFE = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false",
             "-c", "diff.external=", "-c", "core.pager=cat", "-c", "safe.bareRepository=explicit")
 
@@ -707,24 +707,6 @@ def run_git(args, cwd, env=None, ok=(0,)):
     return r.returncode, r.stdout
 
 
-def filter_off(cwd, env=None):
-    """Environment variables that turn off each filter driver set in the repository's own config (its config, a
-    worktree's, and the files they include, conditionally or not), so adding or checking out a file in the copy runs
-    no program that config names. Drivers from your global and system config, such as Git LFS, stay on: you set them
-    up, for every repository. GIT_CONFIG_* variables, not -c, so a driver name with "=" in it is turned off too."""
-    _, out = run_git(["config", "--show-scope", "--null", "--name-only", "--get-regexp", r"^filter\."], cwd, env,
-                     ok=(0, 1))
-    parts = out.split("\0")
-    names = {key[len("filter."):].rsplit(".", 1)[0] for scope, key in zip(parts[::2], parts[1::2])
-             if scope not in ("global", "system") and key.count(".") >= 2}
-    pairs = [(f"filter.{n}.{k}", v) for n in sorted(names)
-             for k, v in (("clean", ""), ("smudge", ""), ("process", ""), ("required", "false"))]
-    off = {"GIT_CONFIG_COUNT": str(len(pairs))}
-    for i, (k, v) in enumerate(pairs):
-        off[f"GIT_CONFIG_KEY_{i}"], off[f"GIT_CONFIG_VALUE_{i}"] = k, v
-    return off
-
-
 def git_line(out):
     """A path git printed: its line, without the newline but with any spaces it ends with."""
     return out.rstrip("\n")
@@ -735,14 +717,17 @@ def work_home():
     return os.path.join(base, "genai", "work")
 
 
-class Worktree:
-    """A work session's copy of the project: a git worktree on a branch of its own, outside the project. genai runs
-    every git command for it on the host, naming the worktree's git directory explicitly, so a .git file in the copy
-    is never trusted, and with hooks off. The model reaches the copy only through genai's file tools, and the sandbox
-    runs on a throwaway overlay of it, so neither can write the .git file or anything git reads from it."""
+class Copy:
+    """A work session's copy of the project: a new git repository outside it, holding your last commit and nothing
+    else (no history, no other branches), so neither the model nor the sandbox can read what that commit doesn't
+    have. genai touches your repository twice: it reads that commit into the copy at the start, and fetches each
+    commit made in the copy into the branch genai/work-N, which only genai writes. The model reaches the copy only
+    through genai's file tools, which never write .git, and the sandbox runs on a throwaway overlay of it."""
 
-    def __init__(self, top, path, gitdir, branch, base, sub):
-        self.top, self.path, self.gitdir, self.branch, self.base, self.sub = top, path, gitdir, branch, base, sub
+    def __init__(self, top, path, branch, base, sub):
+        self.top, self.path, self.branch, self.base, self.sub = top, path, branch, base, sub
+        self.gitdir = os.path.join(path, ".git")
+        self.published = base       # what the branch in your repository has (base: it doesn't exist yet)
 
     @property
     def wd(self):
@@ -751,8 +736,8 @@ class Worktree:
 
     @classmethod
     def create(cls, cwd):
-        """A new worktree for the repository cwd is in, from its last commit: (Worktree, untracked file count).
-        Refuses outside a repository, before the first commit, and with uncommitted changes to tracked files."""
+        """A new copy of the repository cwd is in, from its last commit: (Copy, untracked file count). Refuses
+        outside a repository, before the first commit, and with uncommitted changes to tracked files."""
         try:
             rc, out = run_git(["rev-parse", "--show-toplevel"], cwd, ok=(0, 128))
         except GenaiError as e:
@@ -768,7 +753,8 @@ class Worktree:
         rc, head = run_git(["rev-parse", "--verify", "-q", "HEAD^{commit}"], top, ok=(0, 1))
         if rc:
             raise GenaiError("the repository has no commits yet: commit something first", EXIT_USAGE, "work_refused")
-        # In your own checkout, with your own filters: git status there runs what yours does, nothing the model wrote.
+        head = head.strip()
+        # In your own checkout, with your own config: git status there runs what yours does, nothing the model wrote.
         _, status = run_git(["status", "--porcelain", "--untracked-files=all"], top)
         lines = status.splitlines()
         changed = [ln for ln in lines if not ln.startswith("??")]
@@ -776,34 +762,31 @@ class Worktree:
             raise GenaiError(f"the repository has uncommitted changes ({len(changed)} file"
                              f"{'s' if len(changed) != 1 else ''}): commit or stash them first, so the work starts "
                              "from what you have", EXIT_USAGE, "work_refused")
-        n = 1
+        name = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(top)) or "project"
+        n = cls.free(top)
+        path = os.path.join(ensure_dir(work_home()), f"{name}-{n}-{secrets.token_hex(3)}")
+        try:
+            run_git(["init", "-q", "--", path], work_home())
+            c = cls(top, os.path.realpath(path), f"genai/work-{n}", head, sub)
+            c.git(["fetch", "-q", "--depth", "1", "--no-tags", "--no-write-fetch-head", "--", top, head])
+            c.git(["checkout", "-q", "-b", c.branch, head])
+        except BaseException:           # a failure, a timeout or Ctrl-C: no half-made copy is left
+            shutil.rmtree(path, ignore_errors=True)
+            raise
+        return c, sum(1 for ln in lines if ln.startswith("??"))
+
+    @staticmethod
+    def free(top, n=1):
+        """The first n from n on with no branch genai/work-n in your repository."""
         while run_git(["show-ref", "--verify", "-q", f"refs/heads/genai/work-{n}"], top, ok=(0, 1))[0] == 0:
             n += 1
-        branch = f"genai/work-{n}"
-        name = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(top)) or "project"
-        path = os.path.join(ensure_dir(work_home()), f"{name}-{n}-{secrets.token_hex(3)}")
-        # Made empty, then filled: the filters to turn off are read in the copy's own context (a worktree's config,
-        # or one included only on its branch), before a single file is checked out.
-        try:
-            run_git(["worktree", "add", "-q", "--no-checkout", "-b", branch, path, head.strip()], top)
-            _, gitdir = run_git(["rev-parse", "--absolute-git-dir"], path)  # now, before anything could change it
-            tree = cls(top, os.path.realpath(path), git_line(gitdir), branch, head.strip(), sub)
-            tree.git(["reset", "-q", "--hard"])
-        except BaseException:           # a failure, a timeout or Ctrl-C: no half-made copy or branch is left
-            for args in (["worktree", "remove", "--force", path], ["branch", "-q", "-D", branch]):
-                try:
-                    run_git(args, top, ok=(0, 1, 128))
-                except GenaiError:
-                    pass
-            raise
-        return tree, sum(1 for ln in lines if ln.startswith("??"))
+        return n
 
     def git(self, args, ok=(0,), env=None):
-        env = dict({"GIT_DIR": self.gitdir, "GIT_WORK_TREE": self.path}, **(env or {}))
-        return run_git(args, self.path, {**env, **filter_off(self.path, env)}, ok)
+        return run_git(args, self.path, dict({"GIT_DIR": self.gitdir, "GIT_WORK_TREE": self.path}, **(env or {})), ok)
 
     def commit(self, message):
-        """Commit everything in the copy: the short hash, or None if nothing changed."""
+        """Commit everything in the copy: the short hash, or None if nothing changed. publish puts it on the branch."""
         message = plain_text(message)
         self.git(["add", "-A"])
         if self.git(["diff", "--cached", "--quiet", "--no-ext-diff"], ok=(0, 1))[0] == 0:
@@ -814,6 +797,29 @@ class Worktree:
                    "GIT_COMMITTER_NAME": "genai", "GIT_COMMITTER_EMAIL": "genai@localhost"}
         self.git(["commit", "-q", "--no-verify", "-m", message], env=who)
         return self.git(["rev-parse", "--short", "HEAD"])[1].strip()
+
+    def publish(self):
+        """Fetch the copy's commits into the branch in your repository. The branch is made by the first one; if a
+        branch of that name has turned up since the session started, the next free name is used. Each fetch must
+        add to what the branch had, so a branch that was moved or deleted meanwhile is an error, not overwritten.
+        Signals wait for it: git killed halfway could leave a lock file in your repository."""
+        head = self.head()
+        if head == self.published:
+            return
+        ref = f"refs/heads/{self.branch}"
+        with signals_held():
+            if self.published == self.base and \
+                    run_git(["show-ref", "--verify", "-q", ref], self.top, ok=(0, 1))[0] == 0:
+                self.branch = f"genai/work-{self.free(self.top, int(self.branch.rsplit('-', 1)[1]) + 1)}"
+                ref = f"refs/heads/{self.branch}"
+                self.git(["branch", "-q", "-m", self.branch])
+            elif self.published != self.base and \
+                    run_git(["rev-parse", "--verify", "-q", ref], self.top, ok=(0, 1))[1].strip() != self.published:
+                raise GenaiError(f"the branch {self.branch} was moved or deleted outside the session: its commits are "
+                                 f"still in the copy at {self.path}", EXIT_USAGE, "work")
+            run_git(["fetch", "-q", "--no-tags", "--no-write-fetch-head", "--", self.path, f"{head}:{ref}"],
+                    self.top)
+        self.published = head
 
     def summary(self):
         """(commits as "hash subject" lines, diff stat) since the session started."""
@@ -833,11 +839,10 @@ class Worktree:
         return [p for p in out.split("\0") if p]
 
     def remove(self):
-        run_git(["worktree", "remove", "--force", self.path], self.top)
-
-    def delete_branch(self):
-        """Delete the branch, only if it still points where the session started (it has no commits)."""
-        run_git(["update-ref", "-d", f"refs/heads/{self.branch}", self.base], self.top)
+        try:
+            shutil.rmtree(self.path)
+        except OSError as e:
+            raise GenaiError(f"{self.path}: {e.strerror or e}", EXIT_USAGE, "work") from None
 
 
 class Work:
@@ -3534,7 +3539,7 @@ class Engine:
     # -- work sessions
 
     def start_work(self, task, steps=None, seconds=None, source=":work"):
-        """Start a work session on a git worktree of the project, and send the task. Returns how the turn ended."""
+        """Start a work session on a copy of the project, and send the task. Returns how the turn ended."""
         if self.work:
             raise GenaiError(f"a work session is already on ({self.work.tree.branch}); end it first", EXIT_USAGE,
                              "work_refused")
@@ -3566,10 +3571,9 @@ class Engine:
                 except GenaiError as e:
                     raise GenaiError(str(e), EXIT_USAGE, "work_refused") from None
                 self.ui.coding(True, source, self.coding_override)
-            with signals_held():        # from here on, the copy is always either cleaned up or in self.work
-                tree, untracked = Worktree.create(os.getcwd())
-                self.work = Work(tree, task.strip(), steps or work["steps_per_item"],
-                                 seconds or work["time_limit"], work["test"], self.wd)
+            tree, untracked = Copy.create(os.getcwd())
+            self.work = Work(tree, task.strip(), steps or work["steps_per_item"],
+                             seconds or work["time_limit"], work["test"], self.wd)
         except BaseException:
             self.session.held = None
             self.put_back_coding(before)
@@ -3607,18 +3611,17 @@ class Engine:
         self.ui.coding(on, frm, override)
 
     def end_work(self, why="ended"):
-        """End the work session: commit what is left, remove the copy, keep the branch if it has any commits, and go
-        back to the project. If git fails at any point, or a file the model wrote would be lost (git ignores it),
-        the copy and the branch both stay, and the user is told where they are. Signals wait until it is done.
-        Returns what happened, for the user."""
+        """End the work session: commit what is left (each commit is on the branch in the project as soon as it is
+        made), remove the copy, and go back to the project. If git fails at any point, or a file the model wrote
+        would be lost (git ignores it), the copy stays, and the user is told where it is. Returns what happened, for
+        the user."""
         w = self.work
         if not w:
             raise GenaiError("no work session is on", EXIT_USAGE, "not_running")
-        with signals_held():
-            return self._end_work(w, why)
+        return self._end_work(w, why)
 
     def _end_work(self, w, why):
-        left, problems, commits, stat, keep = None, [], [], "", True
+        left, problems, commits, stat = None, [], [], ""
         try:
             left = w.tree.commit("Unfinished work, left when the session ended")
         except GenaiError as e:
@@ -3638,9 +3641,10 @@ class Engine:
             stat = f"(could not read the branch: {e})"
         if not problems:
             try:
-                keep = w.tree.head() != w.tree.base
+                w.tree.publish()            # commits made in the copy and not on the branch yet, if any
             except GenaiError as e:
-                problems.append(f"the branch could not be read: {e}")
+                problems.append(f"the branch could not be updated: {e}")
+        keep = w.tree.published != w.tree.base     # the branch exists: it has the session's commits
         removed = False
         if not problems:            # before anything is said: if the front end has gone, saying it fails
             try:
@@ -3648,12 +3652,6 @@ class Engine:
                 removed = True
             except GenaiError as e:
                 problems.append(f"the copy could not be removed: {e}")
-            if removed and not keep:
-                try:
-                    w.tree.delete_branch()
-                except GenaiError as e:
-                    problems.append(f"the branch could not be deleted: {e}")
-                    keep = True
         self.audit.log("work_end", why=why, branch=w.tree.branch, kept=keep, commits=len(commits), unfinished=left,
                        removed=removed, problems=problems)
         self.work, self.wd = None, w.home
@@ -3669,8 +3667,8 @@ class Engine:
             self.put_back_coding(w.before)
         self.session.save()
         if not removed:
-            self.ui.notice(f"[!] {'; '.join(problems)}. Nothing more was deleted: the copy is still at "
-                           f"{w.tree.path}" + (f" and the branch {w.tree.branch} is kept" if keep else ""))
+            self.ui.notice(f"[!] {'; '.join(problems)}. The copy is still at {w.tree.path}"
+                           + (f", and what reached the branch {w.tree.branch} is there" if keep else ""))
         elif problems:
             self.ui.notice(f"[!] {'; '.join(problems)}")
         base = w.tree.base[:12]
@@ -4497,6 +4495,10 @@ class Engine:
         if nxt:
             w.swap = ("item", None, f"item {n} was finished")
         self.ui.result(p, "ok", f"item {n} committed as {sha}")
+        try:
+            w.tree.publish()
+        except GenaiError as e:     # it's committed in the copy; the end of the session tries again
+            self.ui.notice(f"[!] item {n} is committed in the copy, but the branch couldn't be updated: {e}")
         self.ui.work({"state": "item", **w.info()})
         if nxt is None:
             return f"Item {n} committed as {sha}. Every item is done: reply with a short summary of the work."
@@ -5771,14 +5773,14 @@ def whoami():
 
 
 class Signals:
-    held = 0            # > 0 while a work session's copy is being made or put away (signals_held)
+    held = 0            # > 0 while a work session's commits are fetched into your repository (signals_held)
     pending = None      # a signal that came meanwhile
 
 
 @contextlib.contextmanager
 def signals_held():
-    """SIGTERM and SIGHUP wait until this is done: one in the middle of making or removing a work session's copy
-    would leave half of it behind. genai exits as soon as it is done."""
+    """SIGTERM and SIGHUP wait until this is done: git killed in the middle of a fetch into your repository could
+    leave a lock file behind. genai exits as soon as it is done."""
     Signals.held += 1
     try:
         yield
@@ -5792,7 +5794,7 @@ def signals_held():
 def exit_on_signals():
     """SIGTERM and SIGHUP (a front end closing, a terminal going away) end genai the way the end of input does: the
     finally blocks run, so a work session commits what it has and removes its copy. A second one is ignored while
-    that happens, and one that comes while a copy is being made or removed waits for it (signals_held)."""
+    that happens, and one that comes while commits are fetched into your repository waits for it (signals_held)."""
     def on_signal(signum, frame):
         for sig in (signal.SIGTERM, signal.SIGHUP):
             signal.signal(sig, signal.SIG_IGN)
