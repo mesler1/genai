@@ -101,7 +101,11 @@ much permission and too much autonomy.
 - **Permission.** File tools take relative paths only. `..`, absolute paths and `~` are
   rejected, and each path is walked one component at a time with `O_NOFOLLOW`, so a symlink
   anywhere in it is refused. Reads refuse FIFOs, devices and binary files. New files are
-  created without execute permission.
+  created without execute permission. A hard link can't be told apart: it is the same file
+  under a second name, so a hard link in your project to a file elsewhere is read like any
+  other file there. The model can't make one, and Linux normally lets you hard-link only
+  your own files, so only a hard link you made yourself does this. Files that look like
+  secrets still ask, wherever they are linked from.
 - **Autonomy.** A turn ends when a command is proposed. A turn is capped at 10 model steps,
   which also caps how many sandboxed runs one turn makes.
   Reads are capped at 256 KiB, writes at 1 MiB, overwrite snapshots at 8 MiB, and directory scans at 500 entries plus a truncation check. Without a terminal and
