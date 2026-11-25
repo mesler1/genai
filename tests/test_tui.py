@@ -640,6 +640,12 @@ class TestSandboxStatus(unittest.TestCase):
             self.assertTrue(m.busy)                           # the run had just ended; the turn goes on
             self.assertIn("nothing is running in the sandbox now", text_of(m.blocks[-1]))
 
+    def test_stop_with_nothing_in_the_sandbox_points_at_the_shell_pane(self):
+        m = self.model(features=("interrupt", "stop"))
+        m.submit("/stop")
+        self.assertEqual(m.outbox, [])
+        self.assertIn("A command in the shell pane stops with Ctrl-C there", text_of(m.blocks[-1], 200))
+
     def test_a_run_ends_when_genai_exits(self):
         m = self.model()
         card = self.start(m)
@@ -1968,6 +1974,27 @@ class TestGenaiTui(TmuxCase):
             send("a")
             self.wait_for("attached file README.md")
 
+    def test_one_click_in_the_file_tree_acts_once(self):
+        """A mouse click is a press and a release; only one of them may count, or a folder opens and shuts again."""
+        with FakeAPI([reply("ok")]) as api:
+            self.start(api, args="-e test --no-panel")
+            os.makedirs(os.path.join(self.wd, "src"))
+            with open(os.path.join(self.wd, "src", "app.py"), "w") as f:
+                f.write("print('hi')\n")
+            self.type("/files")
+            end = time.time() + 10
+            while time.time() < end and "src/" not in self.screen("files"):
+                self.tmux("send-keys", "-t", self.panes()["files"], "r")
+                time.sleep(0.5)
+            self.wait_for("src/", pane="files")
+            self.click("src/", pane="files", hold=0.05)                      # selected first: a click opens it
+            self.wait_for("app.py", pane="files")
+            time.sleep(0.5)
+            self.assertIn("app.py", self.screen("files"))
+            self.click("src/", pane="files", hold=0.05)                      # and one more shuts it
+            time.sleep(0.5)
+            self.assertNotIn("app.py", self.screen("files"))
+
     def runtime_state(self):
         return next(os.path.join(self.runtime, d) for d in os.listdir(self.runtime) if d.startswith("genai-tui."))
 
@@ -2127,6 +2154,7 @@ class TestGenaiTui(TmuxCase):
             self.wait_for("Run p1")
             self.key("y")
             self.wait_for("the shell pane is busy (sleep is running)")
+            self.wait_for("/shell shows it")
             self.assertNotIn("should-not-run", self.screen("shell"))
 
     def test_edit_first_and_share_your_own_command(self):

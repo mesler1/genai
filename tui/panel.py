@@ -178,7 +178,9 @@ class Panel:
                 curses.init_pair(i, fg, -1)
                 self.roles[role] = curses.color_pair(i)
         self.roles[A] |= curses.A_BOLD
-        curses.mousemask(getattr(curses, "BUTTON1_PRESSED", 0) | getattr(curses, "BUTTON1_CLICKED", 0))
+        # The release too, though a click acts on the press: without it, ncurses holds the press back until the next
+        # input arrives.
+        curses.mousemask(getattr(curses, "BUTTON1_PRESSED", 0) | getattr(curses, "BUTTON1_RELEASED", 0))
         curses.mouseinterval(0)
         scr.keypad(True)
         scr.timeout(100)
@@ -252,8 +254,10 @@ class Panel:
             self.msg = "" if self.request({"type": "skills"}) else "the conversation isn't listening"
         elif k == curses.KEY_MOUSE:
             try:
-                _, _, y, _, _ = curses.getmouse()
+                _, _, y, _, b = curses.getmouse()
             except curses.error:
+                return
+            if not b & curses.BUTTON1_PRESSED:                                   # the release: a click acts once
                 return
             if 0 <= y < len(self.acts) and self.acts[y] is not None:
                 if type(self.acts[y]) is int:

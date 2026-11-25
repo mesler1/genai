@@ -312,7 +312,9 @@ class Pane:
         self.roles[A] |= curses.A_BOLD
         self.wheel_up = getattr(curses, "BUTTON4_PRESSED", 0)
         self.wheel_down = getattr(curses, "BUTTON5_PRESSED", 0)
-        curses.mousemask(getattr(curses, "BUTTON1_PRESSED", 0) | getattr(curses, "BUTTON1_CLICKED", 0)
+        # The release too, though a click acts on the press: without it in the mask, ncurses holds the press back
+        # until the next input arrives, and the pane stops redrawing until then.
+        curses.mousemask(getattr(curses, "BUTTON1_PRESSED", 0) | getattr(curses, "BUTTON1_RELEASED", 0)
                          | self.wheel_up | self.wheel_down)
         curses.mouseinterval(0)
         scr.keypad(True)
@@ -378,7 +380,7 @@ class Pane:
                 self.top = max(self.top - 3, 0)
             elif self.wheel_down and bstate & self.wheel_down:
                 self.top += 3
-            else:
+            elif bstate & curses.BUTTON1_PRESSED:                                # not the release: a click is one
                 self.send(self.tree.click(y - 1 + self.top, self.scr.getmaxyx()[1] - 1))
             return
         self.send(self.tree.key(k))
