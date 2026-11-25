@@ -178,6 +178,9 @@ class Prompt:
         if k in (curses.KEY_PPAGE, curses.KEY_NPAGE):
             self.send({"type": "scroll", "up": k == curses.KEY_PPAGE})
             return
+        if asking and k == "\x03" and self.view.get("halt"):
+            self.send({"type": "stop"})             # the turn stops; what waits for an answer is declined
+            return
         if asking:
             if isinstance(k, str) and k.isprintable() and time.time() - self.asked_at >= SETTLE:
                 self.answer(k.lower())
@@ -205,6 +208,8 @@ class Prompt:
             elif self.view.get("running"):
                 self.send({"type": "stop"})       # stops the sandboxed run; it doesn't count towards quitting
                 now = 0.0
+            elif self.view.get("halt") and now - self.ctrl_c >= 2:
+                self.send({"type": "stop"})       # stops genai's turn; a second Ctrl-C soon after still quits
             elif now - self.ctrl_c < 2:
                 self.send({"type": "quit"})
             self.ctrl_c = now

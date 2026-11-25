@@ -237,36 +237,53 @@ in between.
     every git command itself, on the host, with `GIT_DIR` set to the git directory it recorded
     when it made the copy (before the model could write anything), with all `GIT_*` variables
     from the environment dropped, and with `core.hooksPath=/dev/null`, `core.fsmonitor=false`,
-    signing, external diff and textconv, bare-repository discovery, and every `filter.*` driver
-    the repository's config names (clean, smudge and process) off. No file tool may write under
+    signing, external diff and textconv, and bare-repository discovery off. Every `filter.*`
+    driver set in the repository's own config (its `.git/config`, a worktree's config, and what
+    they include, on a branch or not) is turned off too, by name: the copy is made empty, its
+    filters are read in its own context, and only then are its files checked out. Drivers from
+    your global and system config, such as Git LFS, stay on. No file tool may write under
     `.git`, and the sandbox still runs on a throwaway overlay of the copy, so a test can't leave
     anything behind.
   - Edits and writes apply without asking only while an item of an approved plan is worked on;
-    before approval, and while the planner reviews an item, they ask. Hidden and secret-looking
-    files always ask, and so does a `pyvenv.cfg`, as the sandbox's secret scan treats a virtual
-    environment differently (it skips only its package directories, never the whole directory).
+    before approval, and while the planner reviews an item, they ask, whatever the edits mode:
+    files you approved with `approved-files` count only outside the session. Hidden and
+    secret-looking files always ask, and so does a `pyvenv.cfg` or anything under a directory of
+    that name, as the sandbox's secret scan treats a virtual environment differently (it skips
+    only its package directories, never the whole directory, and only for a real
+    `pyvenv.cfg` file).
   - The sandbox still hides secrets and runs offline: a session can't start with the network on,
     the network can't be turned on during one, and a finish test checks again before it runs.
   - Only the tools offered at that point can be called: a call to any other is refused.
   - The session's state is its own: coding mode, if the session turned it on, and approved files
-    go back to what they were when it ends, or when starting fails. A planner on another endpoint
-    starts from the task alone, without the earlier conversation, and a secret-read question names
-    the endpoint the file would go to. `/clear` drops the planner's waiting context as well.
-  - The user can stop the turn at any time (`stop`, Ctrl-C, `/stop`) and end the session mid-turn
-    (`work_end`); quitting the front end, SIGTERM and SIGHUP end it too, committing what is there
-    and removing the copy. If git fails while ending, nothing is deleted.
+    go back to what they were when it ends, or when starting fails (`:edits reset` during it
+    forgets the set-aside ones too). While it is on, the saved session keeps the conversation and
+    coding mode from before it, so one resumed after a crash doesn't carry the session's. A planner
+    on another endpoint starts from the task alone, without the earlier conversation or queued
+    attachments; every read question while it plans names the endpoint the file would go to; and
+    when an item's context replaces the plan, the planner keeps its own context and is only told
+    the new plan. `/clear` drops the planner's waiting context as well.
+  - The user can stop the turn at any time (`stop`, Ctrl-C, `/stop`), including while the model
+    writes tool calls or rollover notes, and end the session mid-turn (`work_end`), even while it
+    is starting; quitting the front end, SIGTERM and SIGHUP end it too, committing what is there
+    and removing the copy. A signal that comes while the copy is being made or removed waits until
+    that is done. If git fails while ending, or git ignores a file the model wrote (the commit
+    would leave it out), nothing is deleted. Once a plan, finish or retry takes effect, the rest of
+    that reply's calls are not run: they were decided for the state before it.
   - A profile can plan with another model (`work.planner`). On the same endpoint, nothing new
     is trusted. A second endpoint must be blessed like any other, the profile's summary says it
     sees the project, and its key is masked in output too. It reads files, so whatever the
     profile's endpoint may see, it may see.
-  - Each plan item has a step budget and the session a time limit without you. A stuck item goes
-    back to the planning context once; after that, or at the time limit, it pauses. Every step,
+  - Each plan item has a step budget and the session a time limit without you, which also cuts
+    off a sandboxed run or test that would outlast it. A stuck item goes back to the planning
+    context once; after that, or at the time limit, it pauses. Every step,
     edit, test, commit and context swap is in the audit log.
   - What remains: the branch contains whatever the model wrote, including test files and build
     configuration, and nothing in it has been reviewed until you review it. Running its tests or
-    build on your machine before reading the diff runs the model's code as you. Git still
-    applies `.gitattributes` filters you have configured globally (such as Git LFS) when it
-    checks out and commits the copy.
+    build on your machine before reading the diff runs the model's code as you. Filter drivers
+    from your global and system config (such as Git LFS) still run when git checks out and
+    commits the copy, and the model's `.gitattributes` can choose which files they get. genai
+    checks for uncommitted changes with a plain `git status` in your own checkout, with your
+    filters, as you would.
 
 What remains: the indicator is display only. A command you approve outside a sandbox can do
 anything you can. Inside `sandbox/run genai` the network is open, because genai has to reach

@@ -428,20 +428,24 @@ class Card(Block):
         return self.ev.get("id", "?")
 
     def title(self):
+        """One row: every field in it is shown with line breaks as ⏎."""
         ev, k = self.ev, self.ev.get("kind")
-        path = clean(ev.get("path", ""))
+        row = lambda v: one_row(str(v))     # noqa: E731
+        count = lambda v: len(v) if isinstance(v, list) else "?"     # noqa: E731
+        path = row(ev.get("path", ""))
         return {"read": f"read {path}", "list": f"list {path or '.'}", "edit": f"edit {path}",
-                "search": f"search {clean(str(ev.get('pattern', '')))!r} in {path or '.'}"
-                          + (f" ({clean(str(ev['glob']))})" if ev.get("glob") else ""),
+                "search": f"search {row(ev.get('pattern', ''))!r} in {path or '.'}"
+                          + (f" ({row(ev['glob'])})" if ev.get("glob") else ""),
                 "write": f"{'overwrite' if ev.get('exists') else 'create'} {path}",
-                "command": "command", "external": f"tool {clean(ev.get('tool', ''))}",
+                "command": "command", "external": f"tool {row(ev.get('tool', ''))}",
                 "sandbox": f"sandbox · {'ONLINE' if ev.get('network') else 'offline'}",
-                "trusted": f"{clean(str(ev.get('plugin', '?')))} · {clean(str(ev.get('command', '?')))}"
+                "trusted": f"{row(ev.get('plugin', '?'))} · {row(ev.get('command', '?'))}"
                            + (" · read-only" if ev.get("read_only") else ""),
-                "plan": f"plan · {len(ev.get('steps') or [])} steps",
-                "work_plan": f"work plan · {len(ev.get('items') or [])} items",
-                "finish": f"finish item {ev.get('n', '?')}: {clean(str(ev.get('summary', '')))}",
-                "retry": f"the planner retries item {ev.get('n', '?')}"}.get(k, str(k))
+                "plan": f"plan · {count(ev.get('steps'))} steps",
+                "work_plan": f"work plan · {count(ev.get('items'))} items",
+                "finish": f"finish item {row(ev.get('n', '?'))}: {row(ev.get('summary', ''))}",
+                "retry": f"the planner retries item {row(ev.get('n', '?'))}"}.get(k if isinstance(k, str) else None,
+                                                                                 row(k))
 
     def body(self, full=False):
         """(text, role) lines inside the card. A sandboxed run's output is cut to its last lines unless full."""
@@ -659,7 +663,7 @@ class Model:
         elif t == "result":
             card = self.cards.get(ev.get("id"))
             if card:
-                card.state = {"ok": "done", "stopped": "stopped"}.get(ev.get("status"), "error")
+                card.state = {"ok": "done", "stopped": "stopped", "skipped": "stopped"}.get(ev.get("status"), "error")
                 card.detail = ev.get("detail") or ""
                 if isinstance(ev.get("output"), str):
                     card.output = ev["output"]
@@ -679,6 +683,7 @@ class Model:
             if ev.get("exchanges"):
                 self.exchanges[self.turn] = ev["exchanges"]
             self.busy = False
+            self.retire("the turn ended before you answered")
             self.context = ((ev.get("context") or {}).get("used"), (ev.get("context") or {}).get("limit"))
             if ev.get("reason") == "step_limit":
                 self.note("genai stopped after its step limit; send a message to continue", W)
@@ -798,12 +803,25 @@ class Model:
         return (f"sandbox network is {'ON: each sandboxed run asks first' if r.get('network') else 'off'}"
                 + ("" if self.coding else " (the sandbox is used in coding mode)") + " · /network on|off")
 
+    def retire(self, why):
+        """The turn is over (it was stopped, or genai has gone): nothing still waits for an answer, and nothing
+        still runs, so no card asks or keeps its clock going, and Ctrl-C quits again."""
+        for card in self.pending:
+            card.state, card.detail = "stopped", why
+            card.changed()
+        self.pending = []
+        for card in self.cards.values():
+            if card.ev.get("kind") in RUNS and card.state == "running":
+                card.state, card.detail = "stopped", card.detail or "stopped"
+                card.changed()
+
     def exit(self, code, err=""):
-        self.exited, self.busy, self.pending = code, False, []
-        for card in self.cards.values():   # nothing runs once genai has gone: no clock, and Ctrl-C quits again
+        self.exited, self.busy = code, False
+        for card in self.cards.values():
             if card.ev.get("kind") in RUNS and card.state == "running":
                 card.state, card.detail = "error", "genai exited before it finished"
                 card.changed()
+        self.retire("genai exited")
         for ln in err.strip().splitlines()[-5:]:
             self.note(clean(ln), R)
         self.note(f"genai exited (code {code}). /quit or Ctrl-D to leave.", R)
@@ -1703,6 +1721,8 @@ class App:
                 ep = (self.m.hello or {}).get("endpoint") or {}
                 to = c.ev.get("to") if isinstance(c.ev.get("to"), str) else ep.get("base_url", "the endpoint")
                 lines.append([(f"It looks like it holds secrets; allowing sends it to {clean(str(to))}", R)])
+            elif isinstance(c.ev.get("to"), str):
+                lines.append([(f"  Allowing sends it to the planner, at {one_row(c.ev['to'])}", W)])
             lines.append([("  y", A), (" yes   ", ""), ("n", A), (" no   ", ""), ("v", A), (" view it all", "")])
             return lines, None, "y allow · n or Esc decline · v view in full"
         rows, cur = self.ed.view(w)
@@ -1796,6 +1816,9 @@ class App:
         if m.ask and not m.pending:
             if isinstance(k, str):
                 self.answer(k.lower())
+            return
+        if m.pending and k == "\x03" and m.busy and m.can_halt():
+            m.stop()                                   # the turn stops; what waits for you is declined
             return
         if m.pending and m.pending[0].ev.get("kind") == "plan":
             if k in ("y", "Y"):
@@ -1891,6 +1914,7 @@ class App:
                       for t, r in segs] for i, segs in enumerate(lines)]
         return {"mode": mode, "lines": lines if mode != "input" else [], "hints": "" if mode == "input" else hints,
                 "busy": self.m.busy, "running": self.m.running_card() is not None,
+                "halt": self.m.busy and self.m.can_halt() and self.m.exited is None,
                 "status": " · ".join(status), "exited": self.m.exited is not None,
                 "q": self.question()}
 

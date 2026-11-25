@@ -864,6 +864,53 @@ class TestWorkFeature(unittest.TestCase):
         self.assertIn(" 1. a⏎b", text_of(m.cards["p1"], 100))
 
 
+    def test_a_path_with_a_line_break_stays_on_one_row(self):
+        m = self.model()
+        m.handle({"type": "proposal", "id": "p1", "kind": "write", "path": "a\nb.py", "content": "x", "auto": True,
+                  "work": True})
+        self.assertEqual(m.cards["p1"].title(), "create a⏎b.py")
+        m.handle({"type": "proposal", "id": "p2", "kind": ["odd"], "items": 3, "digest": "d"})
+        self.assertEqual(m.cards["p2"].title(), "['odd']")
+
+    def test_a_stopped_turn_leaves_nothing_waiting_or_running(self):
+        m = self.model(features=("work", "halt", "stop"))
+        m.busy = True
+        m.handle({"type": "proposal", "id": "p1", "kind": "work_plan", "goal": "g", "reason": "g",
+                  "items": ["a"], "digest": "d"})
+        m.handle({"type": "proposal", "id": "p2", "kind": "finish", "n": 1, "summary": "s", "auto": True,
+                  "test": "make test"})
+        self.assertTrue(m.pending and m.running_card())
+        m.handle({"type": "done", "reason": "stopped"})
+        self.assertEqual(m.pending, [])
+        self.assertIsNone(m.running_card())
+        self.assertEqual((m.cards["p1"].state, m.cards["p2"].state), ("stopped", "stopped"))
+        m.handle({"type": "proposal", "id": "p3", "kind": "write", "path": "x", "content": "x", "auto": True})
+        m.handle({"type": "result", "id": "p3", "status": "skipped", "detail": "not run"})
+        self.assertEqual(m.cards["p3"].state, "stopped")
+
+    def test_odd_work_fields_dont_break_the_panel(self):
+        m = self.model()
+        m.handle({"type": "work", "state": "started", "branch": "b", "items": [], "role": "plan"})
+        m.handle({"type": "work", "state": "context", "role": ["item"], "item": 1, "why": "w"})
+        m.handle({"type": "work", "state": "item", "items": [{"n": 1, "title": "t", "status": ["done"]}],
+                  "current": 1})
+        self.assertIn("WORK", self.panel(m))
+        m.submit("/work")
+        self.assertIn("1. t", self.shown(m))
+
+    def test_ctrl_c_in_the_prompt_pane_stops_a_turn_even_during_a_question(self):
+        p = C_PROMPT.Prompt.__new__(C_PROMPT.Prompt)
+        sent = []
+        p.send = lambda msg: sent.append(msg) or True
+        p.view, p.ctrl_c, p.paste, p.asked_at = {"mode": "approval", "halt": True}, 0.0, None, 0.0
+        p.ed = C.Editor()
+        p.key("\x03")
+        p.view = {"mode": "input", "busy": True, "halt": True}
+        p.key("\x03")
+        p.key("\x03")
+        self.assertEqual(sent, [{"type": "stop"}, {"type": "stop"}, {"type": "quit"}])
+
+
 class TestPluginsFeature(unittest.TestCase):
     ROWS = [{"name": "slurm", "description": "cluster", "enabled": True, "blessed": True, "status": "blessed",
              "pane": "slurm.py", "dir": "/opt/genai/plugins/slurm",

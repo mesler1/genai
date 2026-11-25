@@ -11,6 +11,7 @@ Standard library only; Python 3.10 or newer.
 import argparse
 import base64
 import collections
+import contextlib
 import copy
 import datetime
 import difflib
@@ -473,6 +474,14 @@ def secret_name(name):
     return name in SECRET_NAMES or name.startswith(SECRET_PREFIXES) or name.endswith(SECRET_SUFFIXES)
 
 
+def is_plain_file(path):
+    """A regular file, not a directory, a link or anything else of that name."""
+    try:
+        return stat.S_ISREG(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
 class Sandbox:
     """Runs one command in a podman container: the project is a copy-on-write overlay whose changes are
     discarded, files that look like secrets are hidden, there is no network unless switched on, nothing from
@@ -535,7 +544,7 @@ class Sandbox:
                                 files.append(r + "/config")
                         elif e.name not in SCAN_SKIP and not (e.name in VENV_PARTS and rel in venvs):
                             stack.append(r)
-                            if os.path.exists(os.path.join(e.path, "pyvenv.cfg")):
+                            if is_plain_file(os.path.join(e.path, "pyvenv.cfg")):
                                 venvs.add(r)
                     elif e.is_file() and (secret_name(e.name) or self.secret_file(e.path, values)):
                         files.append(r)
@@ -570,10 +579,11 @@ class Sandbox:
                 + net + limits + mounts + [self.conf["image"], "/bin/sh", "-c", _GUARD, "genai-guard"]
                 + [f"/work/{p}" for p in files + dirs])
 
-    def run(self, command, values=(), cap=OUTPUT_CAP * 8):
+    def run(self, command, values=(), cap=OUTPUT_CAP * 8, timeout=None):
         """Run command; returns (ran, exit code or None, output, note). ran is False when the command never
-        started; the exit code is None when it was killed at the time limit. Ctrl-C stops the container and is
-        raised again."""
+        started; the exit code is None when it was killed at the time limit (the sandbox's, or timeout seconds if
+        that is sooner). Ctrl-C stops the container and is raised again."""
+        limit = max(1, min(self.conf["timeout"], int(timeout))) if timeout is not None else self.conf["timeout"]
         problem = self.problem()
         if problem:
             return False, None, "", problem
@@ -589,7 +599,7 @@ class Sandbox:
         with tempfile.TemporaryDirectory(prefix="genai-empty-") as empty:
             os.chmod(empty, 0o500)
             for attempt in (1, 2):
-                rc, out = self._podman(self.argv(name, command, files, dirs, empty, guard), name, cap)
+                rc, out = self._podman(self.argv(name, command, files, dirs, empty, guard), name, cap, limit)
                 if attempt == 1 and self.limits and rc in (125, 126) and "cgroup" in out:
                     self.limits = False
                     self.notice("this host doesn't let podman limit memory or processes (cgroups aren't delegated "
@@ -601,13 +611,13 @@ class Sandbox:
             return False, None, "", (f"refused: {out[len(guard):].strip()} should have been hidden in the sandbox but "
                               "wasn't, so the command did not run")
         if rc == "timeout":
-            return True, None, out, f"killed after {self.conf['timeout']} s"
+            return True, None, out, f"killed after {limit} s"
         if rc in (125, 126, 127) and out.startswith("Error:"):
             hint = f" (podman pull {self.conf['image']} first)" if "image not known" in out else ""
             return False, None, "", f"the sandbox could not start: {one_line(out.strip())[0]}{hint}"
         return True, rc, out, f"{hidden} secret-looking path{'s' if hidden != 1 else ''} hidden" if hidden else ""
 
-    def _podman(self, argv, name, cap):
+    def _podman(self, argv, name, cap, limit=None):
         chunks, size, proc = [], [0], None
 
         def drain():
@@ -616,7 +626,7 @@ class Sandbox:
                     chunks.append(chunk)
                 size[0] += len(chunk)
 
-        deadline = time.monotonic() + self.conf["timeout"]
+        deadline = time.monotonic() + (limit or self.conf["timeout"])
         try:                                # everything from here on, so a Ctrl-C at any point kills the container
             Sandbox.running = True
             proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -671,19 +681,20 @@ class Sandbox:
 
 # Every git command genai runs for a work session: hooks, fsmonitor and signing off, so nothing in the copy or the
 # repository's config can make git run a program; external diff and textconv drivers off for the same reason, and
-# no bare repository found by searching. Filter drivers are turned off one by one (filter_off), by name.
+# no bare repository found by searching. Filter drivers from the repository's own config are turned off one by one
+# (filter_off), by name; those from your global and system config stay on.
 GIT_SAFE = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false",
             "-c", "diff.external=", "-c", "core.pager=cat", "-c", "safe.bareRepository=explicit")
 
 
-def run_git(args, cwd, env=None, ok=(0,), safe=()):
+def run_git(args, cwd, env=None, ok=(0,)):
     """git on the host: (exit code, output). GIT_* variables from the environment are dropped, so only what genai
-    sets here decides which repository is used. safe: more -c settings, after GIT_SAFE. Raises GenaiError for an
-    exit code not in ok, and for an argument git can't be given (a NUL)."""
+    sets here decides which repository is used. Raises GenaiError for an exit code not in ok, and for an argument git
+    can't be given (a NUL)."""
     full = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     full.update({"GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C"}, **(env or {}))
     try:
-        r = subprocess.run(["git", *GIT_SAFE, *safe, *args], cwd=cwd, env=full, stdin=subprocess.DEVNULL,
+        r = subprocess.run(["git", *GIT_SAFE, *args], cwd=cwd, env=full, stdin=subprocess.DEVNULL,
                            capture_output=True, text=True, errors="replace", timeout=120)
     except FileNotFoundError:
         raise GenaiError("git is not installed", EXIT_USAGE, "work_refused") from None
@@ -697,12 +708,21 @@ def run_git(args, cwd, env=None, ok=(0,), safe=()):
 
 
 def filter_off(cwd, env=None):
-    """-c settings that turn off every filter driver the repository's config names (clean, smudge and process
-    commands), so adding or checking out a file in the copy runs no program from the config."""
-    _, out = run_git(["config", "--null", "--name-only", "--get-regexp", r"^filter\."], cwd, env, ok=(0, 1))
-    names = {k[len("filter."):].rsplit(".", 1)[0] for k in out.split("\0") if k.count(".") >= 2}
-    return tuple(a for n in sorted(names) for a in ("-c", f"filter.{n}.clean=", "-c", f"filter.{n}.smudge=",
-                                                     "-c", f"filter.{n}.process=", "-c", f"filter.{n}.required=false"))
+    """Environment variables that turn off each filter driver set in the repository's own config (its config, a
+    worktree's, and the files they include, conditionally or not), so adding or checking out a file in the copy runs
+    no program that config names. Drivers from your global and system config, such as Git LFS, stay on: you set them
+    up, for every repository. GIT_CONFIG_* variables, not -c, so a driver name with "=" in it is turned off too."""
+    _, out = run_git(["config", "--show-scope", "--null", "--name-only", "--get-regexp", r"^filter\."], cwd, env,
+                     ok=(0, 1))
+    parts = out.split("\0")
+    names = {key[len("filter."):].rsplit(".", 1)[0] for scope, key in zip(parts[::2], parts[1::2])
+             if scope not in ("global", "system") and key.count(".") >= 2}
+    pairs = [(f"filter.{n}.{k}", v) for n in sorted(names)
+             for k, v in (("clean", ""), ("smudge", ""), ("process", ""), ("required", "false"))]
+    off = {"GIT_CONFIG_COUNT": str(len(pairs))}
+    for i, (k, v) in enumerate(pairs):
+        off[f"GIT_CONFIG_KEY_{i}"], off[f"GIT_CONFIG_VALUE_{i}"] = k, v
+    return off
 
 
 def git_line(out):
@@ -748,8 +768,8 @@ class Worktree:
         rc, head = run_git(["rev-parse", "--verify", "-q", "HEAD^{commit}"], top, ok=(0, 1))
         if rc:
             raise GenaiError("the repository has no commits yet: commit something first", EXIT_USAGE, "work_refused")
-        off = filter_off(top)       # status may run a clean filter, as add does
-        _, status = run_git(["status", "--porcelain", "--untracked-files=all"], top, safe=off)
+        # In your own checkout, with your own filters: git status there runs what yours does, nothing the model wrote.
+        _, status = run_git(["status", "--porcelain", "--untracked-files=all"], top)
         lines = status.splitlines()
         changed = [ln for ln in lines if not ln.startswith("??")]
         if changed:
@@ -762,14 +782,25 @@ class Worktree:
         branch = f"genai/work-{n}"
         name = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(top)) or "project"
         path = os.path.join(ensure_dir(work_home()), f"{name}-{n}-{secrets.token_hex(3)}")
-        run_git(["worktree", "add", "-q", "-b", branch, path, head.strip()], top, safe=off)
-        _, gitdir = run_git(["rev-parse", "--absolute-git-dir"], path)   # now, before anything could change it
-        return cls(top, os.path.realpath(path), git_line(gitdir), branch, head.strip(), sub), \
-            sum(1 for ln in lines if ln.startswith("??"))
+        # Made empty, then filled: the filters to turn off are read in the copy's own context (a worktree's config,
+        # or one included only on its branch), before a single file is checked out.
+        try:
+            run_git(["worktree", "add", "-q", "--no-checkout", "-b", branch, path, head.strip()], top)
+            _, gitdir = run_git(["rev-parse", "--absolute-git-dir"], path)  # now, before anything could change it
+            tree = cls(top, os.path.realpath(path), git_line(gitdir), branch, head.strip(), sub)
+            tree.git(["reset", "-q", "--hard"])
+        except BaseException:           # a failure, a timeout or Ctrl-C: no half-made copy or branch is left
+            for args in (["worktree", "remove", "--force", path], ["branch", "-q", "-D", branch]):
+                try:
+                    run_git(args, top, ok=(0, 1, 128))
+                except GenaiError:
+                    pass
+            raise
+        return tree, sum(1 for ln in lines if ln.startswith("??"))
 
     def git(self, args, ok=(0,), env=None):
         env = dict({"GIT_DIR": self.gitdir, "GIT_WORK_TREE": self.path}, **(env or {}))
-        return run_git(args, self.path, env, ok, safe=filter_off(self.path, env))
+        return run_git(args, self.path, {**env, **filter_off(self.path, env)}, ok)
 
     def commit(self, message):
         """Commit everything in the copy: the short hash, or None if nothing changed."""
@@ -793,11 +824,20 @@ class Worktree:
     def head(self):
         return self.git(["rev-parse", "HEAD"])[1].strip()
 
-    def remove(self, keep):
-        """Remove the copy. The branch stays if keep (it has the session's commits); otherwise it goes too."""
+    def ignored(self, paths):
+        """Which of these paths (from the copy's top) are files git ignores, so a commit leaves them out."""
+        if not paths:
+            return []
+        _, out = self.git(["ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--",
+                           *(f":(literal){p}" for p in sorted(paths))])
+        return [p for p in out.split("\0") if p]
+
+    def remove(self):
         run_git(["worktree", "remove", "--force", self.path], self.top)
-        if not keep:
-            run_git(["branch", "-q", "-D", self.branch], self.top)
+
+    def delete_branch(self):
+        """Delete the branch, only if it still points where the session started (it has no commits)."""
+        run_git(["update-ref", "-d", f"refs/heads/{self.branch}", self.base], self.top)
 
 
 class Work:
@@ -820,7 +860,9 @@ class Work:
         self.cleared_at = 0         # tokens in use when old output was last dropped
         self.planner_ep = None      # (Endpoint, Client) the planner's contexts go to, if not the session's own
         self.before = None          # what the session put aside, to be put back when it ends: approved files,
-                                    # coding mode, and the conversation if the planner is elsewhere
+                                    # coding mode, the conversation if the planner is elsewhere, queued attachments
+        self.written = set()        # paths written or edited in the copy, from its top: checked at the end, so a
+                                    # file git ignores isn't lost with the copy
 
     def fresh(self, renew=False):
         """A new item or a fresh attempt: a new budget of steps. renew: the user has just spoken (a message, or the
@@ -846,6 +888,10 @@ class Work:
 
     def done(self):
         return bool(self.items) and all(it["status"] == "done" for it in self.items)
+
+    def left(self):
+        """Seconds the session may still run without the user: a sandboxed run is cut off when they are up."""
+        return self.seconds - (time.monotonic() - self.since)
 
     def info(self):
         return {"branch": self.tree.branch, "base": self.tree.base[:12], "path": self.tree.path,
@@ -2905,6 +2951,8 @@ class Client:
                 if delta.get("content"):
                     content.append(delta["content"])
                     on_text(delta["content"])
+                if delta.get("tool_calls"):
+                    on_text("")             # no text, but a stop is seen here too
                 for tc in delta.get("tool_calls") or []:
                     slot = calls.setdefault(tc.get("index", 0), {"id": None, "name": "", "args": []})
                     if tc.get("id"):
@@ -2953,6 +3001,8 @@ class Session:
         self.usage = None    # (total_tokens, len(messages) when measured)
         self.created = now()
         self.resumed = False
+        self.held = None     # during a work session: {"coding", "messages"} as they were, saved in place of the
+                             # live ones, so a session resumed after a crash is the one from before it
 
     @classmethod
     def open(cls, cfg, sid):
@@ -3009,9 +3059,10 @@ class Session:
     def save(self):
         if not self.path:
             return
-        data = {"id": self.id, "endpoint": self.endpoint, "profile": self.profile, "coding": self.coding, "cwd": self.cwd,
-                "destination_id": self.destination_id, "skills": self.skills, "created": self.created, "updated": now(),
-                "messages": self.messages, "history": self.history}
+        held = self.held or {"coding": self.coding, "messages": self.messages}
+        data = {"id": self.id, "endpoint": self.endpoint, "profile": self.profile, "coding": held["coding"],
+                "cwd": self.cwd, "destination_id": self.destination_id, "skills": self.skills, "created": self.created,
+                "updated": now(), "messages": held["messages"], "history": self.history}
         write_private(self.path, json.dumps(data, ensure_ascii=False) + "\n")
 
 
@@ -3264,25 +3315,26 @@ class Engine:
             raise GenaiError(f"the planner endpoint: {e}", EXIT_USAGE, "work_refused") from None
         if ep is self.endpoint and (not model or model == ep.model):
             return None
+        same = ep is self.endpoint
         ep = copy.copy(ep)
-        try:
-            client = Client(ep)
+        try:            # on the same endpoint, the profile's sampling settings still apply
+            client = Client(ep, self.profile.params if same and self.profile else None)
         except GenaiError as e:
             raise GenaiError(f"the planner endpoint: {e}", EXIT_USAGE, "work_refused") from None
-        if model and model != ep.model:
+        if (model and model != ep.model) or ep.model == "auto":     # checked as :model checks, or resolved
             try:
                 listed = client.model_list()
             except GenaiError as e:
-                listed = None
-                self.ui.notice(f"could not check that {ep.base_url} has the planner model '{model}': {e}")
-            if listed:
-                hit = next((m for m in listed if m[0] == model), None)
-                if hit is None:
-                    raise GenaiError(f"the planner model '{one_line(model)[0]}' is not one {ep.base_url} lists "
-                                     "(:models lists them)", EXIT_USAGE, "work_refused")
-                if hit[1]:
-                    ep.context_limit = hit[1]
-            ep.model = model
+                raise GenaiError(f"could not check that {ep.base_url} has the planner model: {e}", EXIT_USAGE,
+                                 "work_refused") from None
+            hit = (listed[0] if listed else None) if not model or model == "auto" else \
+                next((m for m in listed if m[0] == model), None)
+            if hit is None:
+                raise GenaiError(f"the planner model '{one_line(model or 'auto')[0]}' is not one {ep.base_url} lists "
+                                 "(:models lists them)", EXIT_USAGE, "work_refused")
+            ep.model = hit[0]
+            if hit[1]:
+                ep.context_limit = hit[1]
         return ep, client
 
     def set_model(self, name, source):
@@ -3421,8 +3473,11 @@ class Engine:
                            "without asking, for the rest of this session; :edits reset forgets those files")
 
     def reset_approved_files(self, source=":edits reset"):
-        self.audit.log("edits_reset", files=sorted(self.approved_files), source=source)
+        """Forget the approved files: those set aside during a work session too, so they don't come back after."""
+        put_aside = self.work.before["files"] if self.work and self.work.before else set()
+        self.audit.log("edits_reset", files=sorted(self.approved_files | put_aside), source=source)
         self.approved_files.clear()
+        put_aside.clear()
 
     def edits_info(self):
         return {"mode": self.edits, "files": sorted(self.approved_files)}
@@ -3456,14 +3511,15 @@ class Engine:
     def work_edit(self, p):
         """Does this edit or write apply without asking, in a work session? Yes, in the copy, while an item of the
         approved plan is being worked on, unless the file is hidden, or it or the new content looks secret. Before the
-        plan is approved, and while the planner reviews an item, every edit asks. So does a pyvenv.cfg, which would
-        change what the sandbox's secret scan looks at."""
+        plan is approved, and while the planner reviews an item, every edit asks. So does a pyvenv.cfg, or anything
+        under a directory of that name, which would change what the sandbox's secret scan looks at. In a work
+        session these rules are the only ones: edits "approved-files" doesn't apply in the copy."""
         w = self.work
         if not w or not self.ui.performs or not w.items or not w.current or w.role != "item":
             return False
         key = self.file_key(p.fields.get("path"))
         if (key is None or is_hidden(key.split("/")) or p.fields.get("undiffable")
-                or key.split("/")[-1] == "pyvenv.cfg"):
+                or "pyvenv.cfg" in key.split("/")):
             return False
         new = p.fields.get("_content") if p.kind == "edit" else p.fields.get("content")
         texts = [new or ""]
@@ -3501,27 +3557,33 @@ class Engine:
         if problem:
             raise GenaiError(f"the sandbox can't run here: {problem}", EXIT_USAGE, "work_refused")
         before = {"coding": (self.session.coding, self.coding_from, self.coding_override),
-                  "files": set(self.approved_files), "messages": None}
-        if not self.session.coding:
-            try:
-                self.set_coding(True, source)
-            except GenaiError as e:
-                raise GenaiError(str(e), EXIT_USAGE, "work_refused") from None
-            self.ui.coding(True, source, self.coding_override)
+                  "files": set(self.approved_files), "messages": None, "queue": None}
+        self.session.held = {"coding": self.session.coding, "messages": list(self.session.messages)}
         try:
-            tree, untracked = Worktree.create(os.getcwd())
+            if not self.session.coding:
+                try:
+                    self.set_coding(True, source)
+                except GenaiError as e:
+                    raise GenaiError(str(e), EXIT_USAGE, "work_refused") from None
+                self.ui.coding(True, source, self.coding_override)
+            with signals_held():        # from here on, the copy is always either cleaned up or in self.work
+                tree, untracked = Worktree.create(os.getcwd())
+                self.work = Work(tree, task.strip(), steps or work["steps_per_item"],
+                                 seconds or work["time_limit"], work["test"], self.wd)
         except BaseException:
+            self.session.held = None
             self.put_back_coding(before)
             raise
-        self.clear_plan()
-        self.approved_files.clear()     # approvals are for files in the project, not the copy; they come back after
-        self.work = Work(tree, task.strip(), steps or work["steps_per_item"], seconds or work["time_limit"],
-                         work["test"], self.wd)
         self.work.planner_ep = planner
         self.work.before = before
-        if planner:     # the planner is elsewhere: it starts from the task alone, not the conversation so far
-            before["messages"] = self.session.messages
+        self.approved_files.clear()     # approvals are for files in the project, not the copy; they come back after
+        self.ui.edits(self.edits_info())
+        if planner:     # the planner is elsewhere: it starts from the task alone, not the conversation so far,
+            before["messages"] = self.session.messages      # and attachments queued for that wait for it
             self.session.messages, self.session.usage = [], None
+            if getattr(self.ui, "queue", None):
+                before["queue"], self.ui.queue = self.ui.queue, []
+        self.clear_plan()
         self.wd = Workdir(tree.wd)
         self.box.root = os.path.realpath(tree.wd)
         self.audit.log("work_start", branch=tree.branch, base=tree.base, path=tree.path, steps=self.work.steps,
@@ -3546,16 +3608,29 @@ class Engine:
 
     def end_work(self, why="ended"):
         """End the work session: commit what is left, remove the copy, keep the branch if it has any commits, and go
-        back to the project. If git fails at any point, the copy and the branch both stay, and the user is told where
-        they are. Returns what happened, for the user."""
+        back to the project. If git fails at any point, or a file the model wrote would be lost (git ignores it),
+        the copy and the branch both stay, and the user is told where they are. Signals wait until it is done.
+        Returns what happened, for the user."""
         w = self.work
         if not w:
             raise GenaiError("no work session is on", EXIT_USAGE, "not_running")
+        with signals_held():
+            return self._end_work(w, why)
+
+    def _end_work(self, w, why):
         left, problems, commits, stat, keep = None, [], [], "", True
         try:
             left = w.tree.commit("Unfinished work, left when the session ended")
         except GenaiError as e:
             problems.append(f"what was left could not be committed: {e}")
+        try:
+            lost = w.tree.ignored(w.written)
+            if lost:
+                problems.append(f"git ignores {len(lost)} file{'s' if len(lost) != 1 else ''} the model wrote, so "
+                                f"{'they are' if len(lost) != 1 else 'it is'} not on the branch: "
+                                + ", ".join(lost[:5]) + (" …" if len(lost) > 5 else ""))
+        except GenaiError as e:
+            problems.append(f"could not check for files git ignores: {e}")
         try:
             commits, stat = w.tree.summary()
         except GenaiError as e:
@@ -3566,33 +3641,46 @@ class Engine:
                 keep = w.tree.head() != w.tree.base
             except GenaiError as e:
                 problems.append(f"the branch could not be read: {e}")
+        removed = False
+        if not problems:            # before anything is said: if the front end has gone, saying it fails
+            try:
+                w.tree.remove()
+                removed = True
+            except GenaiError as e:
+                problems.append(f"the copy could not be removed: {e}")
+            if removed and not keep:
+                try:
+                    w.tree.delete_branch()
+                except GenaiError as e:
+                    problems.append(f"the branch could not be deleted: {e}")
+                    keep = True
+        self.audit.log("work_end", why=why, branch=w.tree.branch, kept=keep, commits=len(commits), unfinished=left,
+                       removed=removed, problems=problems)
         self.work, self.wd = None, w.home
         self.box.root = os.path.realpath(w.home.root)
+        self.session.held = None
         if w.before:
             self.approved_files.clear()
             self.approved_files.update(w.before["files"])
             if w.before["messages"] is not None:
                 self.session.messages, self.session.usage = w.before["messages"], None
+            if w.before["queue"]:
+                self.ui.queue = w.before["queue"] + self.ui.queue
             self.put_back_coding(w.before)
-        removed = False
-        if problems:
-            self.ui.notice(f"[!] {'; '.join(problems)}. Nothing was deleted: the copy is still at {w.tree.path} "
-                           f"and the branch {w.tree.branch} is kept")
-        else:
-            try:
-                w.tree.remove(keep)
-                removed = True
-            except GenaiError as e:
-                self.ui.notice(f"the copy at {w.tree.path} could not be removed: {e}")
+        self.session.save()
+        if not removed:
+            self.ui.notice(f"[!] {'; '.join(problems)}. Nothing more was deleted: the copy is still at "
+                           f"{w.tree.path}" + (f" and the branch {w.tree.branch} is kept" if keep else ""))
+        elif problems:
+            self.ui.notice(f"[!] {'; '.join(problems)}")
         base = w.tree.base[:12]
         commands = [f"git log --stat {base}..{w.tree.branch}", f"git diff {base} {w.tree.branch}",
                     f"git merge {w.tree.branch}", f"git branch -D {w.tree.branch}"] if keep else []
         info = {"state": "ended", "why": why, "branch": w.tree.branch if keep else None, "base": base,
                 "commits": commits, "stat": stat, "unfinished": left, "removed": removed, "commands": commands,
                 "items": w.items, "path": None if removed else w.tree.path, "problems": problems}
-        self.audit.log("work_end", why=why, branch=w.tree.branch, kept=keep, commits=len(commits), unfinished=left,
-                       removed=removed, problems=problems)
         self.ui.work(info)
+        self.ui.edits(self.edits_info())
         return info
 
     def leave_work(self):
@@ -3764,7 +3852,8 @@ class Engine:
         def text(chunk):
             if self.halt:
                 raise Halted
-            self.ui.text(chunk)
+            if chunk:
+                self.ui.text(chunk)
         msg, usage = self.active()[1].chat(msgs, self.tools() if tools else None, text, max_tokens)
         self.ui.text_end()
         if usage and usage.get("total_tokens"):
@@ -3821,7 +3910,11 @@ class Engine:
                 self.ui.notice(f"step limit ({STEP_LIMIT}) reached; send a message to continue")
                 return "step_limit"
             if self.work:
-                self.work_context()
+                try:
+                    self.work_context()
+                except Halted:          # stopped while the model wrote notes for a fresh context
+                    self.ui.text_end()
+                    return self.halted()
             if step or not checked:
                 self.check_budget()
             step += 1
@@ -3832,6 +3925,8 @@ class Engine:
             except Halted:
                 self.ui.text_end()
                 return self.halted()
+            if self.halt:               # it came as the reply ended: nothing in it is shown or done
+                return self.halted()
             self.session.add(msg)
             self.session.save()
             calls = msg.get("tool_calls")
@@ -3840,9 +3935,21 @@ class Engine:
             props = [self.make_proposal(tc) for tc in calls]
             self.decide(props)
             ended = stopped = False
+            moved = None        # a plan, finish or retry that took effect: what follows it was decided for before
             for p in props:
                 stopped = stopped or bool(self.halt)
-                result = "not run: the user stopped an earlier command" if stopped else self.perform(p)
+                if stopped or moved:
+                    result = ("not run: the user stopped an earlier command" if stopped else
+                              f"not run: it came after {moved} in the same reply, and the work session has moved on "
+                              "since; call it again if it is still needed")
+                    if not p.error:
+                        self.ui.result(p, "stopped" if stopped else "skipped", result)
+                else:
+                    mark = (self.work.current, self.work.swap, len(self.work.reports)) if self.work else None
+                    result = self.perform(p)
+                    if (mark and self.work and p.kind in ("work_plan", "finish", "retry") and not p.error
+                            and mark != (self.work.current, self.work.swap, len(self.work.reports))):
+                        moved = PROPOSAL_KINDS[p.kind].tool
                 tool_msg = {"role": "tool", "tool_call_id": p.call_id, "content": result}
                 kind = PROPOSAL_KINDS.get(p.kind)
                 if kind and kind.bulk and p.decision == "accept":
@@ -4001,7 +4108,7 @@ class Engine:
                 or not all(isinstance(x, str) and x.strip() for x in items)):
             raise ValueError(f"items must be a list of 1 to {PLAN_STEPS} lines of text")
         items = [plain_text(x).strip() for x in items]
-        if any("\n" in x or "\t" in x for x in items) or not all(items):
+        if any(len(x.splitlines()) != 1 or "\t" in x for x in items):     # any line break, U+2028 too
             raise ValueError("each item must be one line of text")
         goal = plain_text(goal).strip()
         return Proposal(pid, "work_plan", call_id, goal=goal, items=items, reason=goal)
@@ -4190,7 +4297,7 @@ class Engine:
             if p.kind in ("edit", "write") and not p.auto and self.work_edit(p):
                 p.auto, p.fields["work"] = True, True
                 self.audit.log("auto_edit", id=p.id, kind=p.kind, path=p.fields["path"], work=True)
-            elif p.kind in ("edit", "write") and not p.auto and self.auto_edit(p):
+            elif p.kind in ("edit", "write") and not p.auto and not self.work and self.auto_edit(p):
                 p.auto, p.fields["approved_file"] = True, True
                 self.audit.log("auto_edit", id=p.id, kind=p.kind, path=p.fields["path"])
         for p in live:
@@ -4202,6 +4309,11 @@ class Engine:
         if any(PROPOSAL_KINDS[p.kind].shown for p in live):
             self.notify("command")      # once, however many commands were shown
         pending = [p for p in live if not PROPOSAL_KINDS[p.kind].shown and not p.auto]
+        ep = self.active()[0] if self.work else None
+        for p in pending:       # a read for a planner elsewhere: the question says where it goes
+            if ep and ep is not self.endpoint and p.kind in ("read", "list", "search") and "to" not in p.fields:
+                p.fields["to"] = ep.base_url
+                self.ui.notice(f"allowing {p.id} sends what it reads to the planner, at {ep.base_url}")
         if pending:
             self.notify("approval", count=len(pending), kinds=sorted({p.kind for p in pending}))
             self.ui.decide(pending)
@@ -4323,7 +4435,14 @@ class Engine:
         w.current = 1
         w.reports = []          # a new plan numbers its items afresh; what was done is committed on the branch
         w.fresh(renew=True)
-        w.role, w.swap = "plan", ("item", None, "the plan was approved")   # whoever proposed it plans from now on
+        if w.role == "item":
+            # An item's context replanned: the planner's context stays its own (an item's conversation doesn't go to
+            # a planner elsewhere), and is told of the new plan.
+            w.planner = (w.planner or []) + [{"role": "user", "content": "An item's context replaced the plan, and the user "
+                                      "approved the new one:\n" + work_text(w)}]
+        else:
+            w.role = "plan"     # the planner's context, or the first plan's: it plans from now on
+        w.swap = ("item", None, "the plan was approved")
         self.audit.log("work_plan", id=p.id, items=len(w.items))
         self.ui.work({"state": "plan", **w.info()})
         return ("The user approved this plan. Work through it item by item, without asking; call finish_item when "
@@ -4335,9 +4454,13 @@ class Engine:
         if w.test and self.box.network:     # set_network refuses this; checked again, as the test doesn't ask
             self.ui.result(p, "error", f"item {n} not finished: the sandbox's network is on")
             return "not finished: the sandbox's network is on, and the test only runs offline. Ask the user."
+        if w.test and w.left() < 1:
+            why = f"the work session has run {w.seconds // 60} min without you"
+            self.ui.result(p, "skipped", f"item {n} not finished: {why}")
+            return f"not finished: {why}, so the test did not run"
         if w.test:
             try:
-                ran, rc, out, note = self.box.run(w.test, self.secrets())
+                ran, rc, out, note = self.box.run(w.test, self.secrets(), timeout=w.left())
             except KeyboardInterrupt:
                 p.stopped = True
                 self.ui.result(p, "stopped", "the test command was stopped")
@@ -4431,6 +4554,10 @@ class Engine:
             return f"error: {e}"
         self.audit.log("file_op", id=p.id, kind=p.kind, path=p.fields.get("path"), status="ok", auto=p.auto,
                        **({"approved_file": True} if p.fields.get("approved_file") else {}))
+        key = self.file_key(p.fields["path"]) if self.work and p.kind in ("write", "edit") else None
+        if key:
+            sub = self.work.tree.sub
+            self.work.written.add(key if sub == "." else f"{sub}/{key}")
         self.ui.result(p, "ok", note)
         step = p.fields.get("plan_step")
         if step and self.plan:
@@ -4444,9 +4571,14 @@ class Engine:
         """Run an accepted run_in_sandbox call. The model gets the exit code and the output, redacted and clipped;
         the user sees the same."""
         where = "online" if p.fields["network"] else "offline"
+        left = self.work.left() if self.work else None
+        if left is not None and left < 1:
+            why = f"the work session has run {self.work.seconds // 60} min without you"
+            self.ui.result(p, "skipped", f"not run: {why}")
+            return f"not run: {why}"
         started = time.monotonic()
         try:
-            ran, rc, out, note = self.box.run(p.fields["command"], self.secrets())
+            ran, rc, out, note = self.box.run(p.fields["command"], self.secrets(), timeout=left)
         except KeyboardInterrupt:
             p.stopped = True
             self.audit.log("sandbox_exit", id=p.id, exit=None, stopped=True)
@@ -4895,7 +5027,9 @@ class JsonUI:
         self.engine = None
         self.lines = None        # stdin's lines, read by a thread of their own once reading starts
         self.busy = False        # a turn is going on (run_json sets it, under lock)
+        self.starting_work = False   # that turn is starting a work session (it may not be on yet)
         self.lock = threading.Lock()
+        self.again = []          # messages read while a stop came in, handled next
 
     def emit(self, ev):
         self.out.write(json.dumps(ev, ensure_ascii=False) + "\n")
@@ -4967,6 +5101,8 @@ class JsonUI:
         while waiting:
             msg = self.read()
             if msg is None or (self.engine and self.engine.halt):
+                if msg is not None and msg.get("type") != "halt":
+                    self.again.append(msg)      # not lost: it is handled after the turn
                 break
             t = msg.get("type")
             if t == "halt":
@@ -5024,7 +5160,7 @@ class JsonUI:
             if not self.busy:
                 return False
             e = self.engine
-            if why == "end" and not (e and e.work):
+            if why == "end" and not (e and (e.work or self.starting_work)):
                 return False
             if e and e.halt != "end":
                 e.halt = why
@@ -5052,10 +5188,15 @@ class JsonUI:
         self.halt("end")
         self.lines.put("")
 
-    def read(self):
+    def start_listening(self):
         if self.lines is None:
             self.lines = queue.Queue()
             threading.Thread(target=self.listen, daemon=True).start()
+
+    def read(self):
+        if self.again:
+            return self.again.pop(0)
+        self.start_listening()
         while True:
             line = self.lines.get()
             if line is HALT:
@@ -5629,13 +5770,35 @@ def whoami():
         return str(uid), uid
 
 
+class Signals:
+    held = 0            # > 0 while a work session's copy is being made or put away (signals_held)
+    pending = None      # a signal that came meanwhile
+
+
+@contextlib.contextmanager
+def signals_held():
+    """SIGTERM and SIGHUP wait until this is done: one in the middle of making or removing a work session's copy
+    would leave half of it behind. genai exits as soon as it is done."""
+    Signals.held += 1
+    try:
+        yield
+    finally:
+        Signals.held -= 1
+        if not Signals.held and Signals.pending:
+            signum, Signals.pending = Signals.pending, None
+            raise SystemExit(128 + signum)
+
+
 def exit_on_signals():
     """SIGTERM and SIGHUP (a front end closing, a terminal going away) end genai the way the end of input does: the
     finally blocks run, so a work session commits what it has and removes its copy. A second one is ignored while
-    that happens."""
+    that happens, and one that comes while a copy is being made or removed waits for it (signals_held)."""
     def on_signal(signum, frame):
         for sig in (signal.SIGTERM, signal.SIGHUP):
             signal.signal(sig, signal.SIG_IGN)
+        if Signals.held:
+            Signals.pending = signum
+            return
         raise SystemExit(128 + signum)
     for sig in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, on_signal)
@@ -5678,18 +5841,18 @@ def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()
     def turn(text, att, start=None):
         first = getattr(engine.client, "exchanges", 0) + 1
         with ui.lock:
-            engine.halt, ui.busy = None, True
+            engine.halt, ui.busy, ui.starting_work = None, True, start is not None
             Sandbox.stop.clear()        # a stop from now on ends this turn's runs, even one about to start
         try:
             reason = start() if start else engine.user_turn(text, att)
             ui.emit({"type": "done", "reason": reason, "context": {"used": engine.used(),
-                                                                    "limit": engine.endpoint.context_limit},
+                                                                    "limit": engine.active()[0].context_limit},
                      "exchanges": exchanges(first)})
         except GenaiError as err:
             ui.error(str(err), err.kind, exchanges=exchanges(first))
         finally:
             with ui.lock:
-                ui.busy, why, engine.halt = False, engine.halt, None
+                ui.busy, ui.starting_work, why, engine.halt = False, False, engine.halt, None
         if why == "end" and engine.work:        # work_end came during the turn
             try:
                 engine.end_work("ended")
@@ -5701,6 +5864,7 @@ def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()
         last = getattr(engine.client, "exchanges", 0)
         return [first, last] if last >= first else None
 
+    ui.start_listening()        # now, so a stop or the end of input is seen during a first turn too
     if first_prompt is not None:
         turn(first_prompt, attachments)
     while True:

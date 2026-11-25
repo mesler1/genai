@@ -14,6 +14,12 @@ def items_of(ev):
 def number(v):
     return v if isinstance(v, int) and not isinstance(v, bool) else None
 
+
+def word(v):
+    """A field genai sends as a short string (a role, a status): anything else counts as none."""
+    return v if isinstance(v, str) else None
+
+
 class Work(Feature):
     name = "work"
     commands = {"/work": "TASK: the model plans, then codes, tests and commits each item on a branch of its own "
@@ -60,7 +66,7 @@ class Work(Feature):
     def status(self, w):
         items = items_of(w)
         done = sum(1 for it in items if it.get("status") == "done")
-        cur, role = number(w.get("current")), w.get("role")
+        cur, role = number(w.get("current")), word(w.get("role"))
         if not items:
             return "planning"
         doing = {"review": f"planner reviews item {cur}", "plan": "planning"}.get(role, f"on item {cur}")
@@ -68,7 +74,7 @@ class Work(Feature):
 
     def item_line(self, it, current):
         row = self.core.one_row
-        mark = {"done": "✓", "left out": "✗"}.get(it.get("status"), "▸" if it.get("n") == current else "·")
+        mark = {"done": "✓", "left out": "✗"}.get(word(it.get("status")), "▸" if it.get("n") == current else "·")
         commit = f"  {row(it['commit'])[:7]}" if it.get("commit") else ""
         n = number(it.get("n"))
         return f"{mark} {n if n is not None else '?':>2}. {row(it.get('title', ''))}{commit}"
