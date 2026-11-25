@@ -393,10 +393,14 @@ class TestEndpoints(Tmp):
             readme = f.read()
         block = readme[readme.index("## Quick start"):readme.index("## Endpoints and profiles")]
         text = block[block.index("```json\n") + 8:]
-        text = text[:text.index("```")].replace("YOUR-SERVER-ADDRESS", "https://llm.internal")
+        text = text[:text.index("```")]
         p = self.path("work-llm.json")
         with open(p, "w") as f:
             f.write(text)
+        with self.assertRaisesRegex(G.GenaiError, "base_url must be an http"):     # left as it is, it goes nowhere
+            G.Endpoint.load(p)
+        with open(p, "w") as f:
+            f.write(text.replace("YOUR-SERVER-ADDRESS", "https://llm.internal"))
         e = G.Endpoint.load(p)
         self.assertEqual((e.name, e.base_url, e.key_env), ("work-llm", "https://llm.internal/v1", "GENAI_API_KEY"))
 
