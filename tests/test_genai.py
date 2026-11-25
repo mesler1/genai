@@ -388,10 +388,21 @@ class TestEndpoints(Tmp):
         bless_path(home, shared)
         self.assertEqual(G.select_endpoint(G.Config(home), "team").base_url, "https://team.example/v1")
 
-    def test_example_endpoint_is_valid(self):
-        p = G.Endpoint.load(os.path.join(os.path.dirname(HERE), "endpoints", "example.json"))
-        self.assertTrue(p.base_url.startswith("https://"))
-        self.assertEqual(p.key_env, "GENAI_API_KEY")
+    def test_the_quick_start_endpoint_is_valid_once_filled_in(self):
+        with open(os.path.join(os.path.dirname(HERE), "README.md")) as f:
+            readme = f.read()
+        block = readme[readme.index("## Quick start"):readme.index("## Endpoints and profiles")]
+        text = block[block.index("```json\n") + 8:]
+        text = text[:text.index("```")]
+        p = self.path("work-llm.json")
+        with open(p, "w") as f:
+            f.write(text)
+        with self.assertRaisesRegex(G.GenaiError, "base_url must be an http"):     # left as it is, it goes nowhere
+            G.Endpoint.load(p)
+        with open(p, "w") as f:
+            f.write(text.replace("YOUR-SERVER-ADDRESS", "https://llm.internal"))
+        e = G.Endpoint.load(p)
+        self.assertEqual((e.name, e.base_url, e.key_env), ("work-llm", "https://llm.internal/v1", "GENAI_API_KEY"))
 
 
 class TestSkills(Tmp):
@@ -1253,8 +1264,8 @@ class TestEndToEnd(Tmp):
             self.assertFalse(api.requests[0]["body"]["stream"])
             self.assertGreaterEqual(done["context"]["used"], 12)
 
-    MODELS = [{"id": "qwen3-coder", "max_model_len": 65536}, {"id": "llama-3.1-8b"}, {"id": "bad name"},
-              {"id": "x#{run}"}, {"id": "-flag"}, {"id": "qwen3-coder"}, {"no": "id"}, "junk"]
+    MODELS = [{"id": "coder-model", "max_model_len": 65536}, {"id": "llama-3.1-8b"}, {"id": "bad name"},
+              {"id": "x#{run}"}, {"id": "-flag"}, {"id": "coder-model"}, {"no": "id"}, "junk"]
 
     def test_models_listed_and_switched_on_the_same_server(self):
         with FakeAPI([reply("one"), reply("two")], models=self.MODELS) as api:
@@ -1265,22 +1276,22 @@ class TestEndToEnd(Tmp):
             g.send({"type": "models"})
             m = g.until("models")
             self.assertEqual(m["current"], "fake-model")
-            self.assertEqual(m["models"], [{"id": "qwen3-coder", "context": 65536}, {"id": "llama-3.1-8b", "context": None}])
+            self.assertEqual(m["models"], [{"id": "coder-model", "context": 65536}, {"id": "llama-3.1-8b", "context": None}])
             g.send({"type": "user", "text": "hi"})
             g.until("done")
             g.send({"type": "model", "model": "bad name"})              # only a name the server listed, as listed
             self.assertEqual(g.until("error")["code"], "unknown_model")
-            g.send({"type": "model", "model": "qwen3-coder"})
+            g.send({"type": "model", "model": "coder-model"})
             ev = g.until("model")
-            self.assertEqual((ev["endpoint"]["model"], ev["context"]["limit"]), ("qwen3-coder", 65536))
+            self.assertEqual((ev["endpoint"]["model"], ev["context"]["limit"]), ("coder-model", 65536))
             g.send({"type": "user", "text": "again"})
             g.until("done")
             g.close()
             bodies = [r["body"] for r in api.requests if r.get("body")]
-            self.assertEqual([b["model"] for b in bodies], ["fake-model", "qwen3-coder"])
+            self.assertEqual([b["model"] for b in bodies], ["fake-model", "coder-model"])
             self.assertEqual(len(bodies[1]["messages"]), 4)              # the conversation went along
             audit = [json.loads(ln) for ln in open(os.path.join(home, "audit.log"))]
-            self.assertIn(("model", "qwen3-coder", "fake-model"),
+            self.assertIn(("model", "coder-model", "fake-model"),
                           [(a["event"], a.get("model"), a.get("before")) for a in audit])
 
     def test_model_auto_takes_the_first_the_server_lists(self):
@@ -1289,11 +1300,11 @@ class TestEndToEnd(Tmp):
             bless_path(home, path)
             g = Proc(home, self.tmp, ["-e", "test"])
             hello = g.until("hello")
-            self.assertEqual(hello["endpoint"]["model"], "qwen3-coder")
+            self.assertEqual(hello["endpoint"]["model"], "coder-model")
             g.send({"type": "user", "text": "hi"})
             g.until("done")
             g.close()
-            self.assertEqual(api.requests[-1]["body"]["model"], "qwen3-coder")
+            self.assertEqual(api.requests[-1]["body"]["model"], "coder-model")
         with FakeAPI([], models=[{"id": "has space"}]) as api:
             home2 = os.path.join(self.tmp, "h2")
             os.makedirs(home2)
@@ -1832,13 +1843,13 @@ class TestRemoteConfig(Tmp):
                 self.assertEqual("sandbox/run genai runs genai in a podman sandbox" in text, not inside)
 
     def test_model_auto(self):
-        with FakeAPI([reply("ok")], models=[{"id": "qwen3-coder"}]) as api:
+        with FakeAPI([reply("ok")], models=[{"id": "coder-model"}]) as api:
             g = self.start(self.config(api, model="auto"))
-            self.assertEqual(g.until("hello")["endpoint"]["model"], "qwen3-coder")
+            self.assertEqual(g.until("hello")["endpoint"]["model"], "coder-model")
             g.send({"type": "user", "text": "hi"})
             g.until("done")
             g.close()
-            self.assertEqual(api.requests[-1]["body"]["model"], "qwen3-coder")
+            self.assertEqual(api.requests[-1]["body"]["model"], "coder-model")
 
 
 if __name__ == "__main__":

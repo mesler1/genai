@@ -10,7 +10,7 @@ One JSON file. genai has no default endpoint and ignores `OPENAI_BASE_URL` and p
 {
   "name": "hpc-llm",
   "description": "Optional one-line description",
-  "base_url": "https://llm.example.internal/v1",
+  "base_url": "YOUR-SERVER-ADDRESS/v1",
   "model": "enterprise-large",
   "key_env": "HPC_LLM_KEY",
   "context_limit": 120000,
@@ -50,7 +50,7 @@ Unknown fields are an error, so don't invent any.
 
 1. Ask for what you don't know, one question at a time: the base URL, the model id, how the user keeps their key (an environment variable or a file), and the context window if they know it.
 2. If they don't know the model id, propose a command that lists models, with the key referenced by variable, never typed out:
-   `curl -sS -H "Authorization: Bearer $HPC_LLM_KEY" https://llm.example.internal/v1/models`
+   `curl -sS -H "Authorization: Bearer $HPC_LLM_KEY" "$BASE_URL/models"`, with `BASE_URL` set to the address they gave you
 3. Write the endpoint with `write_file` to `NAME.json` in the working directory. Your file tools can't reach `~/.config/genai/`, and that is by design.
 4. Tell the user the next steps, which only they can do:
    - Review the file, then bless it: `genai --bless ./NAME.json`. genai shows the URL, model and key source and asks them to confirm. A blessed endpoint can be used by name from where it is.

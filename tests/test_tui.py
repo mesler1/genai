@@ -257,9 +257,9 @@ class TestModel(unittest.TestCase):
         m.shell = object()
         m.submit("/model")
         self.assertEqual(m.outbox[-1], {"type": "models"})
-        m.handle({"type": "models", "current": "m", "models": [{"id": "qwen3-coder"}, {"id": "x#{evil}"},
+        m.handle({"type": "models", "current": "m", "models": [{"id": "coder-model"}, {"id": "x#{evil}"},
                                                                  {"id": "llama"}, "junk"]})
-        self.assertEqual((m.feature("model").models, m.actions[-1]), (["qwen3-coder", "llama"], ("model_menu",)))
+        self.assertEqual((m.feature("model").models, m.actions[-1]), (["coder-model", "llama"], ("model_menu",)))
         m.request({"type": "model", "n": 1})                       # the menu sends a position, never a name
         self.assertEqual(m.outbox[-1], {"type": "model", "model": "llama"})
         m.request({"type": "model", "n": 7})
@@ -276,9 +276,9 @@ class TestModel(unittest.TestCase):
     def test_model_menu_items_carry_only_positions(self):
         sh = C.Shell("%1")
         with mock.patch.object(C.subprocess, "Popen") as popen:
-            C.Model().feature("model").menu(sh, ["qwen3-coder", "bad#{x}"] + [f"m{i}" for i in range(25)], "qwen3-coder")
+            C.Model().feature("model").menu(sh, ["coder-model", "bad#{x}"] + [f"m{i}" for i in range(25)], "coder-model")
         argv = popen.call_args[0][0]
-        self.assertIn("• qwen3-coder", argv)
+        self.assertIn("• coder-model", argv)
         self.assertNotIn("bad#{x}", " ".join(argv))
         self.assertIn("-  7 more: /model NAME", argv)
         picks = [a for a in argv if "request.py" in a]
@@ -1758,8 +1758,8 @@ class TestGenaiTui(TmuxCase):
             self.assertIn("```\necho first-out\n```\nOutput:\n```\nfirst-out\n```", self.sent(api))
 
     def test_switch_model_from_the_drop_down(self):
-        with FakeAPI([reply("from fake"), reply("from qwen")],
-                     models=[{"id": "fake-model"}, {"id": "qwen3-coder", "max_model_len": 65536}]) as api:
+        with FakeAPI([reply("from fake"), reply("from coder")],
+                     models=[{"id": "fake-model"}, {"id": "coder-model", "max_model_len": 65536}]) as api:
             self.start(api)
             self.type("hi")
             self.wait_for("from fake")
@@ -1767,11 +1767,11 @@ class TestGenaiTui(TmuxCase):
             time.sleep(0.5)
             env = dict(os.environ, GENAI_TUI_STATE=self.runtime_state())
             subprocess.run([sys.executable, os.path.join(REPO, "tui", "request.py"), "model", "1"], env=env, check=True)
-            self.wait_for("model: qwen3-coder from your next message")
-            self.wait_for("qwen3-coder ▾", pane="info")
+            self.wait_for("model: coder-model from your next message")
+            self.wait_for("coder-model ▾", pane="info")
             self.type("and now?")
-            self.wait_for("from qwen")
-            self.assertEqual([r["body"]["model"] for r in api.requests if r.get("body")], ["fake-model", "qwen3-coder"])
+            self.wait_for("from coder")
+            self.assertEqual([r["body"]["model"] for r in api.requests if r.get("body")], ["fake-model", "coder-model"])
 
     def fake_ssh(self):
         """A PATH with an ssh that runs the remote command here through sh, as sshd runs it through your login
