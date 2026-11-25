@@ -34,11 +34,15 @@ class WorkTest(FakePodman):
         git(root, "commit", "-q", "-m", "start")
         return root
 
-    def start(self, api, work=None, sandbox=None, context_limit=100000):
+    def start(self, api, work=None, sandbox=None, context_limit=100000, planner_api=None):
         if os.path.exists(self.path("home")):
             subprocess.run(["rm", "-rf", self.path("home")], check=True)
         home, ep = make_home(self.tmp, api.url, context_limit=context_limit)
         bless_path(home, ep)
+        if planner_api:
+            bless_path(home, write_json(os.path.join(home, "endpoints", "big.json"),
+                                        {"name": "big", "base_url": planner_api.url, "model": "big-model",
+                                         "context_limit": 100000}))
         prof = {"name": "coder", "endpoint": "test", "coding": True, "sandbox": sandbox or {"image": "img:1"}}
         if work is not None:
             prof["work"] = work
@@ -335,6 +339,41 @@ class WorkTest(FakePodman):
         self.assertIn("NOTES: big.txt is all x", fresh[1]["content"])
 
 
+    def test_a_planner_endpoint_plans_and_reviews(self):
+        plans = [call("propose_work_plan", goal="g", items=["one"]),
+                 call("finish_item", n=1, summary="b is there"), reply("done")]
+        works = [call("write_file", path="b.txt", content="x\n", reason="r"),
+                 call("read_file", path="b.txt", reason="polish")]
+        self.repo()
+        with FakeAPI(works) as api, FakeAPI(plans) as big:
+            g = self.start(api, {"steps_per_item": 2, "planner": "big"}, planner_api=big)
+            g.send({"type": "work", "task": "t"})
+            self.assertEqual(g.until("work")["planner"], "big")
+            self.approve(g)
+            ended = g.until("work")
+            while ended["state"] != "ended":
+                ended = g.until("work")
+            g.close()
+        self.assertEqual(len(big.requests), 3)          # the plan; then the review, which finishes; then the summary
+        self.assertEqual(len(api.requests), 2)          # item 1's two steps
+        self.assertTrue(all(r["body"]["model"] == "big-model" for r in big.requests))
+        self.assertIn("used its budget", big.requests[1]["body"]["messages"][-1]["content"])
+        self.assertEqual(ended["why"], "done")
+        start = next(e for e in self.audit() if e["event"] == "work_start")
+        self.assertEqual(start["planner"]["model"], "big-model")
+
+    def test_an_unknown_planner_endpoint_refuses_the_session(self):
+        self.repo()
+        with FakeAPI([]) as api:
+            g = self.start(api, {"planner": "nope"})
+            g.send({"type": "work", "task": "t"})
+            err = g.until("error")
+            g.close()
+        self.assertEqual(err["code"], "work_refused")
+        self.assertIn("planner endpoint", err["message"])
+        self.assertEqual(git(self.path("wd"), "branch").split(), ["*", "main"])     # nothing was made
+
+
 class TestWorkProfile(unittest.TestCase):
     def test_work_needs_a_sandbox_and_checks_its_fields(self):
         with self.assertRaisesRegex(G.GenaiError, "needs a 'sandbox'"):
@@ -344,8 +383,12 @@ class TestWorkProfile(unittest.TestCase):
         with self.assertRaisesRegex(G.GenaiError, "unknown work fields"):
             G.Profile({"name": "p", "sandbox": {"image": "i:1"}, "work": {"steps": 3}}, "p.json")
         p = G.Profile({"name": "p", "sandbox": {"image": "i:1"}, "work": {"test": "make test"}}, "p.json")
-        self.assertEqual(p.work, {"test": "make test", "steps_per_item": 20, "time_limit": 7200})
+        self.assertEqual(p.work, {"test": "make test", "steps_per_item": 20, "time_limit": 7200, "planner": None})
         self.assertIn("20 steps per plan item", p.summary()[0])
+        with self.assertRaisesRegex(G.GenaiError, "endpoint's name"):
+            G.Profile({"name": "p", "sandbox": {"image": "i:1"}, "work": {"planner": "../x"}}, "p.json")
+        p = G.Profile({"name": "p", "sandbox": {"image": "i:1"}, "work": {"planner": "big"}}, "p.json")
+        self.assertIn("plans with endpoint big, which also sees the project", p.summary()[0])
 
 
 if __name__ == "__main__":

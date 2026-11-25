@@ -403,7 +403,7 @@ def where_runs(sb):
 # Sandbox runner: commands the model runs itself, in a container, on a throwaway copy of the project
 
 SANDBOX_KEYS = {"engine", "image", "network", "timeout", "memory", "pids"}
-WORK_KEYS = {"test", "steps_per_item", "time_limit"}
+WORK_KEYS = {"test", "steps_per_item", "time_limit", "planner"}
 WORK_STEPS = 20                # model steps one plan item may take in a work session, by default
 WORK_STEPS_MAX = 500
 WORK_TIME = 7200               # seconds a work session may run unattended, by default
@@ -780,6 +780,7 @@ class Work:
         self.reviewed = set()       # items the planner has already reviewed in this stretch
         self.swap = None            # (role, hint): a context swap due after the current step's tool results
         self.cleared_at = 0         # tokens in use when old output was last dropped
+        self.planner_ep = None      # (Endpoint, Client) the planner's contexts go to, if not the session's own
 
     def fresh(self):
         """A new item, or a message from the user: a new budget of steps and time."""
@@ -806,7 +807,8 @@ class Work:
     def info(self):
         return {"branch": self.tree.branch, "base": self.tree.base[:12], "path": self.tree.path,
                 "steps_per_item": self.steps, "time_limit": self.seconds, "test": self.test,
-                "current": self.current, "items": self.items, "role": self.role}
+                "current": self.current, "items": self.items, "role": self.role,
+                "planner": self.planner_ep[0].name if self.planner_ep else None}
 
 
 def short_title(text, n=COMMIT_TITLE):
@@ -1778,6 +1780,8 @@ class Profile:
             test = f"test command {one(w['test'])}" if w["test"] else "no test command"
             lines.append(f"  work:     {w['steps_per_item']} steps per plan item, {w['time_limit'] // 60} min unattended, "
                          f"{test}")
+            if w["planner"]:
+                lines.append(f"            plans with endpoint {one(w['planner'])}, which also sees the project")
         if self.persona:
             lines.append("  persona (sent to the model with every request):")
             lines += ["    | " + ln for ln in show_exact(self.persona).splitlines()]
@@ -2595,7 +2599,11 @@ def parse_work(data, path):
         steps, seconds = work_limits(data.get("steps_per_item"), data.get("time_limit"), path)
     except GenaiError as e:
         raise GenaiError(str(e), EXIT_PROFILE) from None
-    return {"test": test, "steps_per_item": steps or WORK_STEPS, "time_limit": seconds or WORK_TIME}
+    planner = data.get("planner")
+    if planner is not None and (not isinstance(planner, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", planner)):
+        raise GenaiError(f"{path}: work 'planner' must be an endpoint's name", EXIT_PROFILE)
+    return {"test": test, "steps_per_item": steps or WORK_STEPS, "time_limit": seconds or WORK_TIME,
+            "planner": planner}
 
 
 RUN_TOOL = _tool("run_in_sandbox", "Run ONE shell command (build, test, lint, try something) in a sandbox and get its "
@@ -3378,8 +3386,19 @@ class Engine:
         if not isinstance(task, str) or not task.strip():
             raise GenaiError("a work session needs a task", EXIT_USAGE, "bad_message")
         work = self.profile.work if self.profile and self.profile.work else \
-            {"test": None, "steps_per_item": WORK_STEPS, "time_limit": WORK_TIME}
+            {"test": None, "steps_per_item": WORK_STEPS, "time_limit": WORK_TIME, "planner": None}
         steps, seconds = work_limits(steps, seconds, "work")
+        planner = None
+        if work["planner"] and work["planner"] != self.endpoint.name:
+            if self.offered is not None:
+                self.ui.notice(f"the profile plans with endpoint '{work['planner']}', but in remote mode only "
+                               f"'{self.endpoint.name}' can be reached: it plans too")
+            else:
+                try:
+                    ep = select_endpoint(self.cfg, work["planner"])
+                    planner = (ep, Client(ep))
+                except GenaiError as e:
+                    raise GenaiError(f"the planner endpoint: {e}", EXIT_USAGE, "work_refused") from None
         if not self.session.coding:
             self.set_coding(True, source)
             self.coding_from = source
@@ -3390,9 +3409,12 @@ class Engine:
         self.clear_plan()
         self.work = Work(tree, task.strip(), steps or work["steps_per_item"], seconds or work["time_limit"],
                          work["test"], self.wd)
+        self.work.planner_ep = planner
         self.wd = Workdir(tree.wd)
         self.box.root = os.path.realpath(tree.wd)
         self.audit.log("work_start", branch=tree.branch, base=tree.base, path=tree.path, steps=self.work.steps,
+                       planner=({"name": planner[0].name, "base_url": planner[0].base_url, "model": planner[0].model}
+                                if planner else None),
                        seconds=self.work.seconds, source=source,
                        **(command_fingerprint(self.work.test) if self.work.test else {}))
         self.ui.work({"state": "started", **self.work.info()})
@@ -3486,7 +3508,7 @@ class Engine:
         """Keep a work session's context small, before each step: drop old file contents and output once it is
         WORK_CLEAR_FRACTION full; if one item still fills it, start the item again in a fresh context, with notes."""
         w = self.work
-        limit = self.endpoint.context_limit
+        limit = self.active()[0].context_limit
         used = self.used()
         if used < WORK_CLEAR_FRACTION * limit or used < w.cleared_at + WORK_CLEAR_AGAIN * limit:
             return
@@ -3566,6 +3588,13 @@ class Engine:
 
     # -- context budget
 
+    def active(self):
+        """(endpoint, client) the next request goes to: a work session's planner contexts may use their own."""
+        w = self.work
+        if w and w.planner_ep and w.role in ("plan", "review"):
+            return w.planner_ep
+        return self.endpoint, self.client
+
     def used(self):
         msgs = self.session.messages
         u = self.session.usage
@@ -3574,7 +3603,7 @@ class Engine:
         return estimate_tokens([self.system()] + msgs) + estimate_tokens(self.tools())
 
     def check_budget(self):
-        used, limit = self.used(), self.endpoint.context_limit
+        used, limit = self.used(), self.active()[0].context_limit
         self.ui.context(used, limit)
         if used >= limit:
             raise GenaiError(f"the conversation is at the context limit ({used}/{limit} tokens). "
@@ -3587,7 +3616,7 @@ class Engine:
 
     def send(self, max_tokens=None, tools=True):
         msgs = [self.system()] + wire(self.session.messages)
-        msg, usage = self.client.chat(msgs, self.tools() if tools else None, self.ui.text, max_tokens)
+        msg, usage = self.active()[1].chat(msgs, self.tools() if tools else None, self.ui.text, max_tokens)
         self.ui.text_end()
         if usage and usage.get("total_tokens"):
             self.session.usage = (int(usage["total_tokens"]), len(self.session.messages) + 1)
@@ -4352,8 +4381,9 @@ class Engine:
         self.audit.log("shared", source=source, ref=ref, chars=len(text))
 
     def secrets(self):
-        """Exact values to mask in text bound for the model: the endpoint key."""
-        return [getattr(self.client, "_key", None)]
+        """Exact values to mask in text bound for the model: the endpoint keys."""
+        w = getattr(self, "work", None)
+        return [getattr(self.client, "_key", None)] + ([w.planner_ep[1]._key] if w and w.planner_ep else [])
 
     def clear(self):
         """Start the conversation over: from now on the model gets none of it, and an approved plan is dropped.
@@ -4579,7 +4609,8 @@ class TtyUI(PlainUI):
             test = f"test command: {show_exact(ev['test'])}" if ev["test"] else "no test command"
             eprint(f"genai: work session on branch {ev['branch']}, a copy of your last commit ({ev['base'][:7]}). "
                    f"Your own files are not touched.\n  limits: {ev['steps_per_item']} model steps per plan item, "
-                   f"{ev['time_limit'] // 60} min without you; {test}. :work end stops it.")
+                   f"{ev['time_limit'] // 60} min without you; {test}. :work end stops it."
+                   + (f"\n  plans with endpoint {one_line(ev['planner'])[0]}" if ev.get("planner") else ""))
         elif state == "item" and ev["current"]:
             it = ev["items"][ev["current"] - 1]
             eprint(f"genai: next, item {it['n']} of {len(ev['items'])}: {one_line(it['title'])[0]}")

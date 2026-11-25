@@ -534,6 +534,11 @@ The profile sets the defaults, and `:work --steps N --minutes M TASK` overrides 
 }
 ```
 
+**A model for planning.** `"planner": "NAME"` in `work` sends the planning contexts (making the
+plan, and reviewing a stuck item) to another blessed endpoint, such as a stronger model, while the
+items run on the profile's own. The planner reads files and so sees the project too. In remote mode
+only the profile's endpoint can be reached, so it plans as well, with a notice.
+
 **Git stays on your side.** genai runs every git command itself, on your machine, with hooks,
 fsmonitor and signing off, and it names the copy's git directory explicitly instead of trusting
 the copy's `.git` file. No file tool may write anything under `.git`, and the sandbox only ever
@@ -645,7 +650,7 @@ decision.
 | `context` | The conversation is getting near the context limit. |
 | `notice` | Something the user should know. |
 | `error` | `code` and `message`. Among the codes: `api` (the endpoint failed or couldn't be reached; nothing was performed), `busy` (not allowed while proposals wait), `unknown_id` (no waiting proposal with that ID and kind), `digest_mismatch` (see Digests), `not_running` (a `stop` with nothing running), `work_refused` and `work` (a work session can't start, or git failed), `bad_message`, `unknown_type`, and, at the start, `session_endpoint_changed` (a resumed session was made with another endpoint; `--allow-session-endpoint-change` allows it). |
-| `work` | A work session changed. `state` is `started` (`branch`, `base`, `path`, `steps_per_item`, `time_limit`, `test`), `plan` (the plan was approved: `items`, each `n`, `title`, `status`, `commit`, and `current`), `item` (an item was committed), `context` (a fresh context: `role` `item`, or `review` for the planner taking back a stuck item; `item`; `why`), or `ended` (`why`: `done`, `ended` or `genai exited`; `branch`, `null` if nothing changed; `commits`, `stat`, `unfinished` (the commit of work left when it ended), `commands` to review and merge). |
+| `work` | A work session changed. `state` is `started` (`branch`, `base`, `path`, `steps_per_item`, `time_limit`, `test`, `planner`: the planning endpoint's name, or `null`), `plan` (the plan was approved: `items`, each `n`, `title`, `status`, `commit`, and `current`), `item` (an item was committed), `context` (a fresh context: `role` `item`, or `review` for the planner taking back a stuck item; `item`; `why`), or `ended` (`why`: `done`, `ended` or `genai exited`; `branch`, `null` if nothing changed; `commits`, `stat`, `unfinished` (the commit of work left when it ended), `commands` to review and merge). |
 | `plan` | The approved plan changed: approved, a step done, or dropped. `plan` has `id`, `goal` and `steps`, each with `approved`, `status` (`todo`, `done`, `left out`) and `edited` when the user changed its command; `null` when there is none. A plan is never saved with the session. |
 | `attached`, `registered`, `compacted`, `cleared`, `models`, `model`, `coding`, `skills`, `files`, `file`, `trace`, `system`, `network`, `plugins`, `ran`, `edits` | Answers to the messages above. |
 

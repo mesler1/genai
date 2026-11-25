@@ -241,6 +241,9 @@ in between.
     sandbox still runs on a throwaway overlay of the copy, so a test can't leave anything behind.
   - Hidden and secret-looking files still ask, and the sandbox still hides secrets and runs
     offline: a session can't start with the network on.
+  - A profile can send the planning to a second endpoint (`work.planner`). It must be blessed like
+    any endpoint, the profile's summary says it sees the project, and its key is masked in output
+    too. It reads files, so whatever the profile's endpoint may see, it may see.
   - Each plan item has a step budget and the session a time limit without you. A stuck item goes
     back to the planning context once; after that, or at the time limit, it pauses. Every step,
     edit, test, commit and context swap is in the audit log.
