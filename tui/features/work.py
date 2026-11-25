@@ -31,16 +31,19 @@ class Work(Feature):
     def __init__(self):
         self.info = None           # the session's last state from genai, while one is on
         self.last = None           # how the last one ended, for /work after it
+        self.starting = False      # /work TASK was sent and genai hasn't said started, or refused, yet
+        self.ending = False        # /work end was sent and genai hasn't answered yet
 
     def command(self, m, cmd, arg):
         core = self.core
         if not arg:
             self.show(m)
-        elif arg == "end" and self.info is None:
+        elif arg == "end" and self.info is None and not self.starting:
             m.note("no work session is on", core.Q)
         elif arg == "end" and m.exited is None and (not m.busy or m.can_halt()):
             if m.busy:
                 m.note("ending the work session: genai stops its turn first, then commits what is there", core.W)
+            self.ending = True
             m.send({"type": "work_end"})
         elif m.busy or m.exited is not None:
             m.note("/work has to wait until genai finishes this reply (Ctrl-C stops a long one)", core.W)
@@ -50,6 +53,7 @@ class Work(Feature):
             m.turn += 1
             m.add(core.UserMsg(f"/work {arg}"))
             m.busy = True
+            self.starting = True
             m.send({"type": "work", "task": arg})
 
     def show(self, m):
@@ -82,6 +86,7 @@ class Work(Feature):
     def event(self, m, ev):
         core = self.core
         clean, state = core.clean, ev.get("state")
+        self.starting = False
         if state == "ended":
             self.ended(m, ev)
             return
@@ -120,17 +125,23 @@ class Work(Feature):
 
     def ended(self, m, ev):
         core, clean = self.core, self.core.clean
-        why = ev.get("why")
-        head = {"done": "work session done", "ended": "work session ended"}.get(why, f"work session ended ({clean(str(why))})")
-        self.info = None
+        why = word(ev.get("why"))
+        head = {"done": "work session done", "ended": "work session ended"}.get(
+            why, f"work session ended ({core.one_row(str(ev.get('why')))})")
+        self.info, self.ending = None, False
         for p in ev.get("problems") if isinstance(ev.get("problems"), list) else []:
             m.note(f"  {clean(str(p))}", core.R)
-        if ev.get("path"):
-            m.note(f"  nothing was deleted: the copy is still at {core.one_row(ev['path'])}", core.W)
+        path = core.one_row(str(ev["path"])) if ev.get("path") else None
         if not ev.get("branch"):
-            self.last = f"{head}; nothing was changed"
-            m.note(f"{head}: nothing was changed, so the branch was deleted", core.Q)
+            if path:        # the copy was kept and no branch has all of its work: it is the place to look
+                self.last = f"{head}; the work is in the copy at {path}"
+                m.note(f"{head}: the work is not on a branch; it is in the copy at {path}", core.W)
+            else:
+                self.last = f"{head}; nothing was changed"
+                m.note(f"{head}: nothing was changed, so no branch was made", core.Q)
             return
+        if path:
+            m.note(f"  nothing was deleted: the copy is still at {path}", core.W)
         branch = clean(str(ev["branch"]))
         self.last = f"{head}, on branch {branch}"
         m.note(f"{head}: the work is on branch {branch}", core.D if why == "done" else core.W)
@@ -147,13 +158,28 @@ class Work(Feature):
                 m.note(f"    {core.one_row(c)}")
 
     def error(self, m, ev):
+        if ev.get("code") == "not_running" and self.ending:     # the answer to /work end: no session is on
+            self.info, self.ending = None, False
+            m.note("no work session is on", self.core.Q)
+            return True
         if ev.get("code") == "work_refused":
+            self.starting = False
             m.note(f"no work session: {self.core.clean(ev.get('message', ''))}", self.core.R)
             if m.busy and not m.pending:
                 m.busy = False
                 m.next_queued()
             return True
         return False
+
+    def exited(self, m):
+        """genai is gone without ending the session: say where its work is."""
+        w, self.info, self.starting, self.ending = self.info, None, False, False
+        if w is None:
+            return
+        row = self.core.one_row
+        self.last = f"genai exited during it; the work is in the copy at {row(str(w.get('path', '?')))}"
+        m.note(f"genai exited during the work session: what reached the branch {row(str(w.get('branch', '?')))} "
+               f"is there, and the copy is at {row(str(w.get('path', '?')))}", self.core.W)
 
     def snapshot(self, m, view):
         w = self.info

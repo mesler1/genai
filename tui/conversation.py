@@ -473,7 +473,7 @@ class Card(Block):
             self.shown_secs = self.elapsed()
             out.append((f"running {self.shown_secs}s · " + ("Ctrl-C (or /stop) stops it" if self.stoppable else
                         "it can't be stopped from here in remote mode yet"), A))
-        if k in ("sandbox", "trusted") and self.output is not None:
+        if k in ("sandbox", "trusted", "finish") and self.output is not None:
             lines = clean(self.output).rstrip("\n").split("\n") if self.output.strip() else ["(no output)"]
             if not full and len(lines) > OUTPUT_LINES:
                 out.append((f"… {len(lines) - OUTPUT_LINES} earlier lines of output (v views it all)", Q))
@@ -822,6 +822,8 @@ class Model:
                 card.state, card.detail = "error", "genai exited before it finished"
                 card.changed()
         self.retire("genai exited")
+        for f in self.features:
+            f.exited(self)
         for ln in err.strip().splitlines()[-5:]:
             self.note(clean(ln), R)
         self.note(f"genai exited (code {code}). /quit or Ctrl-D to leave.", R)

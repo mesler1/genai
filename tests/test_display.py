@@ -95,7 +95,7 @@ cp "$1" "{self.saved}"
         os.chmod(ed, 0o700)
         self.sent = []
         self.engine = types.SimpleNamespace(
-            commands=[proposal("echo out")], sandbox=None, audit=G.Audit(self.audit_path),
+            commands=[proposal("echo out")], sandbox=None, audit=G.Audit(self.audit_path), ui=G.PlainUI(),
             share=lambda *a: G.Engine.share(self.engine, *a),
             user_turn=lambda text, att: self.sent.append(text))
         self.repl = G.Repl(self.engine)

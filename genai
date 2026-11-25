@@ -584,6 +584,7 @@ class Sandbox:
         started; the exit code is None when it was killed at the time limit (the sandbox's, or timeout seconds if
         that is sooner). Ctrl-C stops the container and is raised again."""
         limit = max(1, min(self.conf["timeout"], int(timeout))) if timeout is not None else self.conf["timeout"]
+        deadline = time.monotonic() + limit     # one deadline: the scan for secrets and a retry come out of it
         problem = self.problem()
         if problem:
             return False, None, "", problem
@@ -599,7 +600,7 @@ class Sandbox:
         with tempfile.TemporaryDirectory(prefix="genai-empty-") as empty:
             os.chmod(empty, 0o500)
             for attempt in (1, 2):
-                rc, out = self._podman(self.argv(name, command, files, dirs, empty, guard), name, cap, limit)
+                rc, out = self._podman(self.argv(name, command, files, dirs, empty, guard), name, cap, deadline)
                 if attempt == 1 and self.limits and rc in (125, 126) and "cgroup" in out:
                     self.limits = False
                     self.notice("this host doesn't let podman limit memory or processes (cgroups aren't delegated "
@@ -617,7 +618,7 @@ class Sandbox:
             return False, None, "", f"the sandbox could not start: {one_line(out.strip())[0]}{hint}"
         return True, rc, out, f"{hidden} secret-looking path{'s' if hidden != 1 else ''} hidden" if hidden else ""
 
-    def _podman(self, argv, name, cap, limit=None):
+    def _podman(self, argv, name, cap, deadline=None):
         chunks, size, proc = [], [0], None
 
         def drain():
@@ -626,9 +627,13 @@ class Sandbox:
                     chunks.append(chunk)
                 size[0] += len(chunk)
 
-        deadline = time.monotonic() + (limit or self.conf["timeout"])
+        deadline = deadline or time.monotonic() + self.conf["timeout"]
+        if time.monotonic() >= deadline:
+            return "timeout", ""
         try:                                # everything from here on, so a Ctrl-C at any point kills the container
             Sandbox.running = True
+            if Sandbox.stop.is_set():       # a stop that came while the run was being set up
+                raise KeyboardInterrupt
             proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             reader = threading.Thread(target=drain, daemon=True)
             reader.start()
@@ -681,8 +686,9 @@ class Sandbox:
 
 # Every git command genai runs for a work session: hooks, fsmonitor and signing off, so nothing in the copy or a
 # repository's config can make git run a program; external diff and textconv drivers off for the same reason, and
-# no bare repository found by searching. Filter drivers from your global and system config (Git LFS, say) stay on:
-# you set them up, for every repository. The copy has no config of its own that could name another.
+# no bare repository found by searching. Filter drivers from your global and system config stay on: you set them
+# up, for every repository. The copy has no config of its own that could name another. (A repository with Git LFS
+# files is refused: the copy can't reach the LFS store.)
 GIT_SAFE = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false",
             "-c", "diff.external=", "-c", "core.pager=cat", "-c", "safe.bareRepository=explicit")
 
@@ -722,11 +728,14 @@ class Copy:
     else (no history, no other branches), so neither the model nor the sandbox can read what that commit doesn't
     have. genai touches your repository twice: it reads that commit into the copy at the start, and fetches each
     commit made in the copy into the branch genai/work-N, which only genai writes. The model reaches the copy only
-    through genai's file tools, which never write .git, and the sandbox runs on a throwaway overlay of it."""
+    through genai's file tools, which never write .git, and the sandbox runs on a throwaway overlay of it.
+    The copy's files are in DIR/tree and its git directory in DIR/git, beside them: the sandbox mounts only the
+    files, so it can't read the commit's objects, which hold every file the sandbox hides as a secret."""
 
-    def __init__(self, top, path, branch, base, sub):
-        self.top, self.path, self.branch, self.base, self.sub = top, path, branch, base, sub
-        self.gitdir = os.path.join(path, ".git")
+    def __init__(self, top, home, branch, base, sub):
+        self.top, self.home, self.branch, self.base, self.sub = top, home, branch, base, sub
+        self.path = os.path.join(home, "tree")      # the copy's files: where the work is, and what you're shown
+        self.gitdir = os.path.join(home, "git")
         self.published = base       # what the branch in your repository has (base: it doesn't exist yet)
 
     @property
@@ -762,25 +771,48 @@ class Copy:
             raise GenaiError(f"the repository has uncommitted changes ({len(changed)} file"
                              f"{'s' if len(changed) != 1 else ''}): commit or stash them first, so the work starts "
                              "from what you have", EXIT_USAGE, "work_refused")
+        lfs = [p for p in run_git(["ls-files", "-z", "--", ":(attr:filter=lfs)"], top)[1].split("\0") if p]
+        if lfs:             # the copy can't reach your LFS store: checking these out there fails
+            raise GenaiError(f"work sessions don't support Git LFS yet, and {len(lfs)} file"
+                             f"{'s' if len(lfs) != 1 else ''} here {'are' if len(lfs) != 1 else 'is'} stored with it "
+                             f"({show_exact(lfs[0])}{', …' if len(lfs) > 1 else ''})", EXIT_USAGE, "work_refused")
+        if run_git(["show-ref", "--verify", "-q", "refs/heads/genai"], top, ok=(0, 1))[0] == 0:
+            raise GenaiError("the repository has a branch named genai, so no branch genai/work-N can be made beside "
+                             "it: rename that branch first", EXIT_USAGE, "work_refused")
+        fmt = git_line(run_git(["rev-parse", "--show-object-format"], top)[1]) or "sha1"
         name = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(top)) or "project"
         n = cls.free(top)
-        path = os.path.join(ensure_dir(work_home()), f"{name}-{n}-{secrets.token_hex(3)}")
+        home = os.path.realpath(tempfile.mkdtemp(prefix=f"{name}-{n}-", dir=ensure_dir(work_home())))  # ours alone
         try:
-            run_git(["init", "-q", "--", path], work_home())
-            c = cls(top, os.path.realpath(path), f"genai/work-{n}", head, sub)
-            c.git(["fetch", "-q", "--depth", "1", "--no-tags", "--no-write-fetch-head", "--", top, head])
+            run_git(["init", "-q", f"--object-format={fmt}", f"--separate-git-dir={home}/git", "--", f"{home}/tree"],
+                    home)
+            c = cls(top, home, f"genai/work-{n}", head, sub)
+            c.git(["fetch", "-q", "--depth", "1", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules",
+                   "--", top, head])
             c.git(["checkout", "-q", "-b", c.branch, head])
-        except BaseException:           # a failure, a timeout or Ctrl-C: no half-made copy is left
-            shutil.rmtree(path, ignore_errors=True)
+        except BaseException as e:          # a failure, a timeout or Ctrl-C: no half-made copy is left
+            shutil.rmtree(home, ignore_errors=True)
+            if isinstance(e, GenaiError) and os.path.exists(home):
+                raise GenaiError(f"{e} (and the half-made copy at {home} could not be removed)", e.code,
+                                 e.kind) from None
             raise
         return c, sum(1 for ln in lines if ln.startswith("??"))
 
     @staticmethod
     def free(top, n=1):
-        """The first n from n on with no branch genai/work-n in your repository."""
-        while run_git(["show-ref", "--verify", "-q", f"refs/heads/genai/work-{n}"], top, ok=(0, 1))[0] == 0:
+        """The first n from n on for which a branch genai/work-n can be made in your repository: none of that name,
+        and none below it (genai/work-n/x)."""
+        _, out = run_git(["for-each-ref", "--format=%(refname)", "refs/heads/genai/"], top)
+        taken = {r.split("/")[3] for r in out.split("\n") if r.count("/") >= 3}
+        while f"work-{n}" in taken:
             n += 1
         return n
+
+    def on_branch(self):
+        """What the branch in your repository points at now, or None if there is no such branch."""
+        rc, out = run_git(["rev-parse", "--verify", "-q", f"refs/heads/{self.branch}^{{commit}}"], self.top,
+                          ok=(0, 1))
+        return out.strip() if rc == 0 else None
 
     def git(self, args, ok=(0,), env=None):
         return run_git(args, self.path, dict({"GIT_DIR": self.gitdir, "GIT_WORK_TREE": self.path}, **(env or {})), ok)
@@ -801,25 +833,28 @@ class Copy:
     def publish(self):
         """Fetch the copy's commits into the branch in your repository. The branch is made by the first one; if a
         branch of that name has turned up since the session started, the next free name is used. Each fetch must
-        add to what the branch had, so a branch that was moved or deleted meanwhile is an error, not overwritten.
-        Signals wait for it: git killed halfway could leave a lock file in your repository."""
+        add to what the branch had, so a branch that was moved or deleted meanwhile is an error, not overwritten;
+        so is one found changed when there is nothing new to add, since the copy is then all that has the work.
+        Signals wait for it: git killed halfway could leave a lock file in your repository. A branch already at
+        the copy's commit counts as published: a fetch that finished just before a signal ended genai, say."""
         head = self.head()
-        if head == self.published:
-            return
-        ref = f"refs/heads/{self.branch}"
         with signals_held():
-            if self.published == self.base and \
-                    run_git(["show-ref", "--verify", "-q", ref], self.top, ok=(0, 1))[0] == 0:
-                self.branch = f"genai/work-{self.free(self.top, int(self.branch.rsplit('-', 1)[1]) + 1)}"
-                ref = f"refs/heads/{self.branch}"
-                self.git(["branch", "-q", "-m", self.branch])
-            elif self.published != self.base and \
-                    run_git(["rev-parse", "--verify", "-q", ref], self.top, ok=(0, 1))[1].strip() != self.published:
+            now = self.on_branch()
+            if now == head:
+                self.published = head
+                return
+            if self.published == self.base:
+                if head == self.base:       # nothing made yet: no branch, whatever has that name
+                    return
+                if now is not None:
+                    self.branch = f"genai/work-{self.free(self.top, int(self.branch.rsplit('-', 1)[1]) + 1)}"
+                    self.git(["branch", "-q", "-m", self.branch])
+            elif now != self.published:
                 raise GenaiError(f"the branch {self.branch} was moved or deleted outside the session: its commits are "
                                  f"still in the copy at {self.path}", EXIT_USAGE, "work")
-            run_git(["fetch", "-q", "--no-tags", "--no-write-fetch-head", "--", self.path, f"{head}:{ref}"],
-                    self.top)
-        self.published = head
+            run_git(["fetch", "-q", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules",
+                     "--no-auto-maintenance", "--", self.path, f"{head}:refs/heads/{self.branch}"], self.top)
+            self.published = head
 
     def summary(self):
         """(commits as "hash subject" lines, diff stat) since the session started."""
@@ -830,19 +865,22 @@ class Copy:
     def head(self):
         return self.git(["rev-parse", "HEAD"])[1].strip()
 
-    def ignored(self, paths):
-        """Which of these paths (from the copy's top) are files git ignores, so a commit leaves them out."""
-        if not paths:
+    def missing(self, paths):
+        """Which of these paths (from the copy's top), files the model wrote that are still there, the last commit
+        doesn't have: files git ignores, and files inside a submodule's directory, which the copy only holds as
+        a commit id."""
+        here = sorted(p for p in paths if os.path.isfile(os.path.join(self.path, p)))
+        if not here:
             return []
-        _, out = self.git(["ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--",
-                           *(f":(literal){p}" for p in sorted(paths))])
-        return [p for p in out.split("\0") if p]
+        _, out = self.git(["ls-tree", "-r", "-z", "--name-only", "HEAD", "--", *(f":(literal){p}" for p in here)])
+        have = set(out.split("\0"))
+        return [p for p in here if p not in have]
 
     def remove(self):
         try:
-            shutil.rmtree(self.path)
+            shutil.rmtree(self.home)
         except OSError as e:
-            raise GenaiError(f"{self.path}: {e.strerror or e}", EXIT_USAGE, "work") from None
+            raise GenaiError(f"{self.home}: {e.strerror or e}", EXIT_USAGE, "work") from None
 
 
 class Work:
@@ -2352,7 +2390,9 @@ def split_rel(path):
 
 
 def is_hidden(parts):
-    return any(p.startswith(".") for p in parts)
+    """A path whose reads and writes always ask: a part starting with '.', or a name the sandbox hides as a secret
+    (id_rsa, *.key and the like), so the file tools never take automatically what the sandbox keeps from a run."""
+    return any(p.startswith(".") or secret_name(p) for p in parts)
 
 
 class DiskError(ValueError):
@@ -2956,8 +2996,8 @@ class Client:
                 if delta.get("content"):
                     content.append(delta["content"])
                     on_text(delta["content"])
-                if delta.get("tool_calls"):
-                    on_text("")             # no text, but a stop is seen here too
+                else:
+                    on_text("")             # reasoning or a tool call: no text, but a stop is seen here too
                 for tc in delta.get("tool_calls") or []:
                     slot = calls.setdefault(tc.get("index", 0), {"id": None, "name": "", "args": []})
                     if tc.get("id"):
@@ -3033,8 +3073,9 @@ class Session:
             s.close_dangling()
         return s
 
-    def close_dangling(self):
-        """Pending proposals never survive a resume: answer any unanswered tool call as declined."""
+    def close_dangling(self, why="declined: the session ended before the user decided"):
+        """Answer any unanswered tool call (why: the answer), so the conversation can go on: pending proposals
+        never survive a resume, or a Ctrl-C at the question that asked about them."""
         for msgs in (self.messages, self.history):
             if not msgs:
                 continue
@@ -3050,8 +3091,7 @@ class Session:
             answered = {m.get("tool_call_id") for m in msgs[last_calls + 1:] if m.get("role") == "tool"}
             for tc in msgs[last_calls]["tool_calls"]:
                 if tc["id"] not in answered:
-                    msgs.append({"role": "tool", "tool_call_id": tc["id"],
-                                 "content": "declined: the session ended before the user decided"})
+                    msgs.append({"role": "tool", "tool_call_id": tc["id"], "content": why})
 
     def add(self, msg):
         self.messages.append(msg)
@@ -3471,7 +3511,8 @@ class Engine:
             raise GenaiError(f"edits must be one of: {', '.join(EDITS_MODES)}", EXIT_USAGE, "bad_message")
         self.edits = mode
         self.audit.log("edits", mode=mode, source=source)
-        if mode == "ask" and self.approved_files:          # off forgets them: on again starts from none
+        if mode == "ask" and (self.approved_files or self.work and self.work.before and self.work.before["files"]):
+            # off forgets them, those a work session set aside too: on again starts from none
             self.reset_approved_files(source)
         if mode == "approved-files":
             self.ui.notice("[!] edits: approved-files: a further edit or write to a file you approved one for applies "
@@ -3563,7 +3604,8 @@ class Engine:
             raise GenaiError(f"the sandbox can't run here: {problem}", EXIT_USAGE, "work_refused")
         before = {"coding": (self.session.coding, self.coding_from, self.coding_override),
                   "files": set(self.approved_files), "messages": None, "queue": None}
-        self.session.held = {"coding": self.session.coding, "messages": list(self.session.messages)}
+        # a deep copy: pruning old tool output during the session rewrites the messages themselves
+        self.session.held = {"coding": self.session.coding, "messages": copy.deepcopy(self.session.messages)}
         try:
             if not self.session.coding:
                 try:
@@ -3627,24 +3669,26 @@ class Engine:
         except GenaiError as e:
             problems.append(f"what was left could not be committed: {e}")
         try:
-            lost = w.tree.ignored(w.written)
+            lost = w.tree.missing(w.written)
             if lost:
-                problems.append(f"git ignores {len(lost)} file{'s' if len(lost) != 1 else ''} the model wrote, so "
-                                f"{'they are' if len(lost) != 1 else 'it is'} not on the branch: "
+                problems.append(f"{len(lost)} file{'s' if len(lost) != 1 else ''} the model wrote "
+                                f"{'are' if len(lost) != 1 else 'is'} not in its commits (git ignores "
+                                f"{'them' if len(lost) != 1 else 'it'}, or a submodule holds the directory): "
                                 + ", ".join(lost[:5]) + (" …" if len(lost) > 5 else ""))
         except GenaiError as e:
-            problems.append(f"could not check for files git ignores: {e}")
+            problems.append(f"could not check that the files the model wrote were committed: {e}")
         try:
             commits, stat = w.tree.summary()
         except GenaiError as e:
-            problems.append(f"the branch could not be read: {e}")
-            stat = f"(could not read the branch: {e})"
-        if not problems:
-            try:
-                w.tree.publish()            # commits made in the copy and not on the branch yet, if any
-            except GenaiError as e:
-                problems.append(f"the branch could not be updated: {e}")
-        keep = w.tree.published != w.tree.base     # the branch exists: it has the session's commits
+            problems.append(f"the commits could not be read: {e}")
+            stat = f"(could not read the commits: {e})"
+        published = True
+        try:
+            w.tree.publish()                # what is committed goes to the branch, whatever else went wrong
+        except GenaiError as e:
+            published = False
+            problems.append(f"the branch could not be updated: {e}")
+        keep = published and w.tree.published != w.tree.base     # the branch has all the session's commits
         removed = False
         if not problems:            # before anything is said: if the front end has gone, saying it fails
             try:
@@ -3668,7 +3712,7 @@ class Engine:
         self.session.save()
         if not removed:
             self.ui.notice(f"[!] {'; '.join(problems)}. The copy is still at {w.tree.path}"
-                           + (f", and what reached the branch {w.tree.branch} is there" if keep else ""))
+                           + (f", and its commits are on the branch {w.tree.branch}" if keep else ""))
         elif problems:
             self.ui.notice(f"[!] {'; '.join(problems)}")
         base = w.tree.base[:12]
@@ -4042,6 +4086,11 @@ class Engine:
                 self.prepare_auto_read(p)
             else:
                 p.auto = True
+        elif kind == "read" and any(secret_name(x) for x in parts):    # named like one: warned as content would be
+            p.fields["secret"] = True
+            p.fields["to"] = to = self.active()[0].base_url
+            self.ui.notice(f"{path} is named like a file that holds secrets, so reading it needs your OK; allowing "
+                           f"sends it to {to}")
         return p
 
     def no_git(self, path):
@@ -4713,6 +4762,8 @@ class Engine:
             self.work.planner, self.work.reports = None, []
             if self.work.before and self.work.before["messages"] is not None:
                 self.work.before["messages"] = []
+            if self.session.held:       # what is saved in place of the conversation: a resume mustn't bring it back
+                self.session.held["messages"] = []
         self.audit.log("clear", dropped=dropped)
         self.session.save()
         return dropped
@@ -4737,7 +4788,7 @@ class Engine:
         self.session.usage = None
         after = self.used()
         report = {"pruned": pruned, "before": before, "after": after, "summary": None}
-        if after >= WARN_FRACTION * self.endpoint.context_limit and keep_from > 0:
+        if after >= WARN_FRACTION * self.active()[0].context_limit and keep_from > 0:
             older, tail = msgs[:keep_from], msgs[keep_from:]
             req = wire(older) + [{"role": "user", "content":
                    f"Summarize the conversation so far in at most {SUMMARY_WORDS} words for your own later use: "
@@ -4775,6 +4826,7 @@ class PlainUI:
         self.out = out
         self._open = False
         self._flagged = False
+        self.queue = []          # the REPL's attachments waiting for the next message: (label, text)
 
     def text(self, chunk):
         # Escaping is per character, so a chunk boundary can't split or hide anything.
@@ -4945,7 +4997,8 @@ class TtyUI(PlainUI):
         elif state == "ended":
             eprint(f"genai: work session {'done' if ev['why'] == 'done' else 'ended'}.")
             if not ev["branch"]:
-                eprint("  nothing was changed, so the branch was deleted")
+                eprint(f"  the work is not on a branch; it is in the copy at {one_line(ev['path'])[0]}" if ev["path"]
+                       else "  nothing was changed, so no branch was made")
                 return
             if ev["unfinished"]:
                 eprint(f"  changes not yet finished were committed as {ev['unfinished']}")
@@ -4998,7 +5051,7 @@ def plan_choice(p, msg):
         return False
     p.approve, p.edits = (sorted(set(approve)) if approve is not None else None), {}
     for key, cmd in edits.items():
-        n = int(key) if str(key).isdigit() else None
+        n = int(key) if str(key).isdecimal() else None
         if n not in numbers or numbers[n]["kind"] != "command" or not isinstance(cmd, str) or not cmd.strip():
             return False
         p.edits[n] = cmd
@@ -5166,8 +5219,7 @@ class JsonUI:
                 return False
             if e and e.halt != "end":
                 e.halt = why
-        if Sandbox.running:
-            Sandbox.stop.set()
+        Sandbox.stop.set()          # a run going on ends, and so does one being set up (cleared when a turn starts)
         self.lines.put(HALT)        # wakes a wait for decisions
         return True
 
@@ -5373,8 +5425,17 @@ class Repl:
     def __init__(self, engine):
         self.e = engine
         self.capture = False
-        self.attachments = []
         self.turns = []          # for :raw: each turn's [first, last] exchange with the endpoint, or None
+
+    @property
+    def attachments(self):
+        """Attachments waiting for the next message. They live on the UI, as genai-tui's do, so a work session with
+        the planner elsewhere sets them aside the same way."""
+        return self.e.ui.queue
+
+    @attachments.setter
+    def attachments(self, value):
+        self.e.ui.queue = value
 
     def in_sandbox(self):
         """Is genai itself running in a sandbox? Then the prompt and banner say so."""
@@ -5483,6 +5544,7 @@ class Repl:
         try:
             self.e.user_turn(text, att)
         except KeyboardInterrupt:
+            self.e.session.close_dangling("stopped: the user interrupted before deciding")
             print("\n(interrupted)")
         except GenaiError as err:
             print(f"genai: {exact(str(err))[0]}")
@@ -5496,7 +5558,7 @@ class Repl:
         named = {n: t for t, r in enumerate(self.turns, 1) if r for n in range(r[0], r[1] + 1)}
         if arg == "all":
             lo, hi = 1, 1 << 30
-        elif arg and not arg.isdigit():
+        elif arg and not arg.isdecimal():
             print("usage: :raw, :raw N (a turn) or :raw all")
             return
         else:
@@ -5532,7 +5594,7 @@ class Repl:
             return
         steps = secs = None
         words = arg.split()
-        while len(words) >= 2 and words[0] in ("--steps", "--minutes") and words[1].isdigit():
+        while len(words) >= 2 and words[0] in ("--steps", "--minutes") and words[1].isdecimal():
             if words[0] == "--steps":
                 steps = int(words[1])
             else:
@@ -5545,6 +5607,7 @@ class Repl:
         try:
             self.e.start_work(task, steps, secs)
         except KeyboardInterrupt:       # as in any other turn: the session pauses, genai goes on
+            self.e.session.close_dangling("stopped: the user interrupted before deciding")
             print("\n(interrupted; the work session pauses: send a message to go on, or :work end)")
 
     def command(self, line):
@@ -5617,7 +5680,7 @@ class Repl:
             elif cmd == "system":
                 self.do_system()
             elif cmd == "context":
-                print(f"context: {self.e.used()}/{self.e.endpoint.context_limit} tokens (estimated)")
+                print(f"context: {self.e.used()}/{self.e.active()[0].context_limit} tokens (estimated)")
             elif cmd == "skills":
                 print("\n".join(skill_lines(skill_rows(self.e.cfg, [s.name for s in self.e.skills]), mark=True)))
             elif cmd == "skill":
@@ -5934,7 +5997,7 @@ def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()
         elif t == "clear":
             n = engine.clear()
             ui.emit({"type": "cleared", "dropped": n, "context": {"used": engine.used(),
-                                                                   "limit": engine.endpoint.context_limit}})
+                                                                   "limit": engine.active()[0].context_limit}})
         elif t == "coding":
             on = msg.get("on")
             if not isinstance(on, bool):

@@ -898,6 +898,47 @@ class TestWorkFeature(unittest.TestCase):
         m.submit("/work")
         self.assertIn("1. t", self.shown(m))
 
+    def test_how_a_session_ended_is_told_apart(self):
+        m = self.model()
+        m.handle({"type": "work", "state": "started", "branch": "genai/work-1", "base": "abc", "items": []})
+        m.handle({"type": "work", "state": "ended", "why": "ended", "branch": None, "path": "/s/copy/tree",
+                  "problems": ["1 file the model wrote is not in its commits"], "commits": ["abc one"]})
+        text = self.shown(m)
+        self.assertIn("the work is not on a branch; it is in the copy at /s/copy/tree", text)
+        self.assertNotIn("nothing was changed", text)
+        m.submit("/work")
+        self.assertIn("the work is in the copy at /s/copy/tree", self.shown(m, 1))
+        m.handle({"type": "work", "state": "started", "branch": "genai/work-2", "base": "abc", "items": []})
+        m.handle({"type": "work", "state": "ended", "why": ["odd"], "branch": None, "path": None})
+        self.assertIn("nothing was changed, so no branch was made", self.shown(m, 1))
+
+    def test_work_end_reaches_a_session_still_starting(self):
+        m = self.model(features=("work", "stop", "halt"))
+        m.submit("/work t")
+        m.submit("/work end")                           # genai hasn't said started yet
+        self.assertEqual(m.outbox[-1], {"type": "work_end"})
+        m.handle({"type": "error", "code": "not_running", "message": "no work session is on"})
+        self.assertIn("no work session is on", self.shown(m, 1))
+        self.assertNotIn("sandbox", self.shown(m, 1))
+
+    def test_genai_exiting_mid_session_says_where_the_work_is(self):
+        m = self.model()
+        m.handle({"type": "work", "state": "started", "branch": "genai/work-1", "base": "abc", "path": "/s/c/tree",
+                  "items": []})
+        m.exit(1)
+        self.assertIn("the copy is at /s/c/tree", self.shown(m))
+        self.assertNotIn("WORK", self.panel(m))
+        m.submit("/work end")
+        self.assertIn("no work session is on", self.shown(m, 1))
+
+    def test_a_failed_finish_test_shows_its_output(self):
+        m = self.model()
+        m.handle({"type": "proposal", "id": "p1", "kind": "finish", "n": 1, "summary": "s", "test": "make test",
+                  "auto": True})
+        m.handle({"type": "result", "id": "p1", "status": "error", "detail": "the test command failed (exit 1)",
+                  "output": "FAILED test_core"})
+        self.assertIn("FAILED test_core", text_of(m.cards["p1"], 100))
+
     def test_ctrl_c_in_the_prompt_pane_stops_a_turn_even_during_a_question(self):
         p = C_PROMPT.Prompt.__new__(C_PROMPT.Prompt)
         sent = []

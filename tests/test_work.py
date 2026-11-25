@@ -426,7 +426,7 @@ class WorkTest(FakePodman):
             started = g.until("work")
             self.approve(g)
             g.until("done")
-            open(os.path.join(started["path"], ".git", "index.lock"), "w").close()       # so git add fails
+            open(os.path.join(os.path.dirname(started["path"]), "git", "index.lock"), "w").close()  # git add fails
             g.send({"type": "work_end"})
             ended = self.ended(g)
             g.close()
@@ -894,7 +894,7 @@ class WorkTest(FakePodman):
             ended = self.ended(g)
             g.close()
         self.assertFalse(ended["removed"])
-        self.assertIn("git ignores 1 file the model wrote", ended["problems"][0])
+        self.assertIn("1 file the model wrote is not in its commits (git ignores it", ended["problems"][0])
         self.assertTrue(os.path.exists(os.path.join(ended["path"], "gen.txt")))
 
     def test_a_stop_while_the_model_writes_tool_calls_ends_the_turn(self):
@@ -1061,6 +1061,210 @@ class WorkTest(FakePodman):
         self.assertEqual(git(root, "rev-parse", "genai/work-1").strip(), git(root, "rev-parse", "main").strip())
 
 
+    # -- what the third audit found
+
+    def test_the_sandbox_mounts_the_copys_files_but_not_its_git_directory(self):
+        turns = [reply("looking")]
+        self.repo({"a.txt": "hi\n", "service.key": "opaque\n"})
+        with FakeAPI(turns) as api:
+            g = self.start(api)
+            g.send({"type": "work", "task": "t"})
+            started = g.until("work")
+            g.until("done")
+            tree = started["path"]
+            self.assertTrue(os.path.isfile(os.path.join(tree, ".git")))       # a pointer, not the objects
+            self.assertEqual(os.path.commonpath([tree, git(tree, "rev-parse", "--absolute-git-dir").strip()]),
+                             os.path.dirname(tree))                          # beside the files, not among them
+            g.close()
+
+    def test_ending_with_a_problem_still_puts_the_commits_on_the_branch(self):
+        turns = [call("propose_work_plan", goal="g", items=["one"]),
+                 call("write_file", path="gen.txt", content="g\n", reason="r"),
+                 call("write_file", path="b.txt", content="b\n", reason="r"), reply("pausing")]
+        root = self.repo({"a.txt": "hi\n", ".gitignore": "gen.txt\n"})
+        with FakeAPI(turns) as api:
+            g = self.start(api)
+            g.send({"type": "work", "task": "t"})
+            self.approve(g)
+            g.until("done")
+            g.send({"type": "work_end"})
+            ended = self.ended(g)
+            g.close()
+        self.assertEqual((ended["branch"], ended["removed"]), ("genai/work-1", False))    # the copy has gen.txt
+        self.assertEqual(git(root, "show", "genai/work-1:b.txt"), "b\n")
+        self.assertTrue(ended["commands"])
+
+    def test_a_file_written_inside_a_submodule_keeps_the_copy(self):
+        turns = [call("propose_work_plan", goal="g", items=["one"]),
+                 call("write_file", path="lib/new.txt", content="n\n", reason="r"), reply("pausing")]
+        root = self.repo()
+        git(root, "update-index", "--add", "--cacheinfo", f"160000,{git(root, 'rev-parse', 'HEAD').strip()},lib")
+        git(root, "commit", "-qm", "a submodule")
+        os.mkdir(os.path.join(root, "lib"))             # as a submodule that isn't checked out leaves it
+        with FakeAPI(turns) as api:
+            g = self.start(api)
+            g.send({"type": "work", "task": "t"})
+            self.approve(g)
+            g.until("done")
+            g.send({"type": "work_end"})
+            ended = self.ended(g)
+            g.close()
+        self.assertFalse(ended["removed"])
+        self.assertIn("lib/new.txt", ended["problems"][0])
+        self.assertTrue(os.path.exists(os.path.join(ended["path"], "lib", "new.txt")))
+
+    def test_a_branch_deleted_when_nothing_new_is_left_keeps_the_copy(self):
+        turns = [call("propose_work_plan", goal="g", items=["one", "two"]),
+                 call("write_file", path="b.txt", content="b\n", reason="r"),
+                 call("finish_item", n=1, summary="b"), reply("pausing")]
+        root = self.repo()
+        with FakeAPI(turns) as api:
+            g = self.start(api)
+            g.send({"type": "work", "task": "t"})
+            self.approve(g)
+            g.until("done")
+            git(root, "branch", "-D", "genai/work-1")
+            g.send({"type": "work_end"})
+            ended = self.ended(g)
+            g.close()
+        self.assertIn("was moved or deleted outside the session", ended["problems"][0])
+        self.assertEqual((ended["branch"], ended["commands"], ended["removed"]), (None, [], False))
+        self.assertTrue(os.path.exists(os.path.join(ended["path"], "b.txt")))
+
+    def test_edits_ask_during_a_session_forgets_the_approved_files(self):
+        turns = [call("edit_file", path="a.txt", old_text="hi", new_text="one", reason="r"), reply("ok"),
+                 call("propose_work_plan", goal="g", items=["one"]), reply("pausing"),
+                 call("edit_file", path="a.txt", old_text="one", new_text="two", reason="r"), reply("ok")]
+        self.repo()
+        with FakeAPI(turns) as api:
+            g = self.start(api)
+            g.send({"type": "edits", "mode": "approved-files"})
+            g.until("edits")
+            g.send({"type": "user", "text": "edit"})
+            p = g.until("proposal")
+            g.send({"type": "decision", "id": p["id"], "digest": p["digest"], "decision": "accept"})
+            g.until("done")
+            git(self.path("wd"), "commit", "-qam", "one")
+            g.send({"type": "work", "task": "t"})
+            self.approve(g)
+            g.until("done")
+            g.send({"type": "edits", "mode": "ask"})
+            g.until("edits")
+            g.send({"type": "edits", "mode": "approved-files"})
+            g.until("edits")
+            g.send({"type": "work_end"})
+            self.ended(g)
+            self.assertEqual(g.until("edits")["files"], [])
+            g.send({"type": "user", "text": "edit again"})
+            p = g.until("proposal")
+            self.assertIsNone(p.get("auto"))
+            g.send({"type": "decision", "id": p["id"], "digest": p["digest"], "decision": "decline"})
+            g.until("done")
+            g.close()
+
+    def test_a_clear_during_the_session_is_saved_as_cleared(self):
+        works = [reply("EARLIER-ANSWER"), reply("looking")]
+        self.repo()
+        with FakeAPI(works) as api:
+            g = self.start(api, session="named")
+            g.send({"type": "user", "text": "EARLIER-TEXT"})
+            g.until("done")
+            g.send({"type": "work", "task": "t"})
+            g.until("done")
+            g.send({"type": "clear"})
+            g.until("cleared")
+            with open(os.path.join(self.home, "sessions", "named.json")) as f:
+                saved = json.load(f)
+            g.close()
+        self.assertNotIn("EARLIER-TEXT", json.dumps(saved["messages"]))
+
+
+class TestCopy(unittest.TestCase):
+    """The copy and the branch, with git alone: no model, no sandbox."""
+
+    def setUp(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        self.tmp = d.name
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        env.update(GIT_ENV, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+                   XDG_STATE_HOME=os.path.join(self.tmp, "state"))
+        patch = mock.patch.dict(os.environ, env, clear=True)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def repo(self, *init):
+        root = os.path.join(self.tmp, "repo")
+        os.makedirs(root)
+        git(root, "init", "-q", "-b", "main", *init)
+        with open(os.path.join(root, "a.txt"), "w") as f:
+            f.write("a\n")
+        git(root, "add", "a.txt")
+        git(root, "commit", "-qm", "a")
+        return root
+
+    def item(self, c, name):
+        with open(os.path.join(c.path, name), "w") as f:
+            f.write(name)
+        self.assertTrue(c.commit(name))
+
+    def test_a_fetch_that_finished_before_a_signal_counts_as_published(self):
+        root = self.repo()
+        c, _ = G.Copy.create(root)
+        self.addCleanup(c.remove)
+        self.item(c, "b")
+        git(root, "fetch", "-q", c.path, f"{c.head()}:refs/heads/{c.branch}")   # done, but not yet recorded
+        c.publish()
+        self.assertEqual((c.branch, c.published), ("genai/work-1", c.head()))
+        self.assertNotIn("genai/work-2", git(root, "branch"))
+        self.item(c, "c")
+        git(root, "fetch", "-q", c.path, f"{c.head()}:refs/heads/{c.branch}")
+        c.publish()                                                         # no false "moved or deleted"
+        self.assertEqual(git(root, "rev-parse", c.branch).strip(), c.head())
+
+    def test_branch_names_in_the_way(self):
+        root = self.repo()
+        git(root, "branch", "genai/work-1/x")
+        c, _ = G.Copy.create(root)
+        self.addCleanup(c.remove)
+        self.assertEqual(c.branch, "genai/work-2")      # genai/work-1 can't be made beside genai/work-1/x
+        git(root, "branch", "-D", "genai/work-1/x")
+        git(root, "branch", "genai")
+        with self.assertRaisesRegex(G.GenaiError, "a branch named genai"):
+            G.Copy.create(root)
+
+    def test_a_repository_with_git_lfs_files_is_refused(self):
+        root = self.repo()
+        with open(os.path.join(root, ".gitattributes"), "w") as f:
+            f.write("*.bin filter=lfs diff=lfs merge=lfs -text\n")
+        with open(os.path.join(root, "big.bin"), "w") as f:
+            f.write("version https://git-lfs.github.com/spec/v1\n")
+        git(root, "add", "-A")
+        git(root, "commit", "-qm", "lfs")
+        with self.assertRaisesRegex(G.GenaiError, "don't support Git LFS yet, and 1 file here is stored with it "
+                                                  r"\(big.bin\)"):
+            G.Copy.create(root)
+        self.assertEqual(os.listdir(os.path.join(self.tmp, "state", "genai", "work")) if os.path.exists(
+            os.path.join(self.tmp, "state", "genai", "work")) else [], [])
+
+    def test_a_sha256_repository(self):
+        root = self.repo("--object-format=sha256")
+        c, _ = G.Copy.create(root)
+        self.addCleanup(c.remove)
+        self.item(c, "b")
+        c.publish()
+        self.assertEqual(len(git(root, "rev-parse", c.branch).strip()), 64)
+
+    def test_each_copy_gets_a_directory_of_its_own(self):
+        root = self.repo()
+        a, _ = G.Copy.create(root)
+        self.addCleanup(a.remove)
+        with mock.patch.object(G.Copy, "free", return_value=1):
+            b, _ = G.Copy.create(root)
+        self.addCleanup(b.remove)
+        self.assertNotEqual(a.home, b.home)
+
+
 class TestWorkParts(unittest.TestCase):
     def test_a_pyvenv_cfg_directory_doesnt_count_as_a_virtual_environment(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1071,7 +1275,7 @@ class TestWorkParts(unittest.TestCase):
             box = G.Sandbox(G.parse_sandbox({"image": "i:1"}, "p.json"), root, print)
             self.assertEqual(box.masks(), (["conf/lib/k.pem"], []))
 
-    def test_a_signal_waits_while_a_copy_is_made_or_removed(self):
+    def test_a_signal_waits_for_the_end_of_signals_held(self):
         script = (f"import importlib.machinery, importlib.util, os, signal, sys, time\n"
                   f"l = importlib.machinery.SourceFileLoader('g', {SCRIPT!r})\n"
                   "s = importlib.util.spec_from_loader('g', l); G = importlib.util.module_from_spec(s); l.exec_module(G)\n"
@@ -1160,6 +1364,57 @@ class TestWorkParts(unittest.TestCase):
                     f.write(text)
             box = G.Sandbox(G.parse_sandbox({"image": "i:1"}, "p.json"), root, print)
             self.assertEqual(box.masks(), (["conf/keys.txt"], []))
+
+    def test_the_repl_queues_attachments_where_a_session_sets_them_aside(self):
+        ui = G.PlainUI(out=open(os.devnull, "w"))
+        self.addCleanup(ui.out.close)
+        r = G.Repl(mock.Mock(ui=ui))
+        r.attachments.append(("file notes.txt", "x"))
+        self.assertEqual(ui.queue, [("file notes.txt", "x")])
+        ui.queue = []                   # what start_work does with a planner elsewhere
+        self.assertEqual(r.attachments, [])
+
+    def test_ctrl_c_at_a_question_answers_the_tool_call(self):
+        s = G.Session.__new__(G.Session)
+        s.messages = [{"role": "user", "content": "go"},
+                      {"role": "assistant", "content": None, "tool_calls": [{"id": "c1"}, {"id": "c2"}]},
+                      {"role": "tool", "tool_call_id": "c1", "content": "ok"}]
+        s.history = list(s.messages)
+        r = G.Repl.__new__(G.Repl)
+        r.e, r.turns = mock.Mock(session=s, client=None), []
+        r.e.user_turn.side_effect = KeyboardInterrupt
+        r.e.ui.queue = []
+        with mock.patch("builtins.print"):
+            r.send("go on")
+        self.assertEqual(s.messages[-1], {"role": "tool", "tool_call_id": "c2",
+                                          "content": "stopped: the user interrupted before deciding"})
+
+    def test_a_superscript_digit_isnt_a_step_count(self):
+        r = G.Repl.__new__(G.Repl)
+        r.e = mock.Mock(work=None)
+        with mock.patch("builtins.print"):
+            r.do_work("--steps ² a task")
+        r.e.start_work.assert_called_once_with("--steps ² a task", None, None)
+
+    def test_secret_file_names_are_hidden_from_the_file_tools_too(self):
+        for name in ("service.key", "id_rsa", "conf/.env", "certs/store.p12"):
+            self.assertTrue(G.is_hidden(name.split("/")), name)
+        self.assertFalse(G.is_hidden(["src", "keys.py"]))
+
+    def test_a_stop_while_a_run_is_set_up_stops_it_before_podman(self):
+        box = G.Sandbox(G.parse_sandbox({"image": "i:1"}, "p.json"), tempfile.gettempdir(), print)
+        G.Sandbox.stop.set()
+        self.addCleanup(G.Sandbox.stop.clear)
+        with mock.patch("subprocess.Popen") as popen, mock.patch.object(box, "_kill"):
+            with self.assertRaises(KeyboardInterrupt):
+                box._podman(["podman", "run"], "n", 100, time.monotonic() + 60)
+        popen.assert_not_called()
+
+    def test_a_run_whose_time_is_up_doesnt_start(self):
+        box = G.Sandbox(G.parse_sandbox({"image": "i:1"}, "p.json"), tempfile.gettempdir(), print)
+        with mock.patch("subprocess.Popen") as popen:
+            self.assertEqual(box._podman(["podman", "run"], "n", 100, time.monotonic() - 1), ("timeout", ""))
+        popen.assert_not_called()
 
     def test_ctrl_c_while_starting_work_in_the_repl_doesnt_exit(self):
         r = G.Repl.__new__(G.Repl)

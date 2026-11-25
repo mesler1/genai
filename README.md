@@ -82,7 +82,8 @@ model, default skills, sampling settings and coding mode:
   mode came from.
 - `"edits": "approved-files"` (default `"ask"`): once you approve an edit or write to a file, further
   edits and writes to that same file apply without asking, for the rest of the session. They are
-  still shown with their diff, logged, and bound to the file as it was. New files, hidden files,
+  still shown with their diff, logged, and bound to the file as it was. New files, hidden files (a
+  name starting with `.`, or one the sandbox hides as a secret, such as `id_rsa` or `*.key`),
   anything that looks like a secret, and a whole replacement of a file that can't be diffed always
   ask; declining an edit to a file takes it out of the set. `:edits` (or `/edits` in genai-tui)
   shows the files, `:edits reset` forgets them, and `:edits ask|approved-files` switches for this
@@ -514,8 +515,9 @@ and merge what you want, with git.
    model's short summary; its body names the plan item and holds the model's notes for later items.
 5. **At the end** genai commits anything left, removes the copy and shows the branch: its commits,
    the diff stat, and the commands to review it, merge it or delete it. genai never touches your
-   own branch. A session that changed nothing leaves no branch. If git fails at any point here,
-   the copy isn't deleted: genai says where it is.
+   own branch. A session that changed nothing leaves no branch. If git fails here, or a file the
+   model wrote isn't in its commits (git ignores it, or it is inside a submodule's directory), the
+   copy isn't deleted: genai says where it is, and what is committed still goes to the branch.
 
 **Contexts.** Each plan item runs in a fresh context: the model sees the task, the plan and the
 notes earlier items left, not their conversations, so a long session doesn't fill up. The context
@@ -566,13 +568,15 @@ the first it lists); if the server can't be asked, the session doesn't start.
 **Git stays on your side.** genai runs every git command itself, on your machine, with hooks,
 fsmonitor and signing off. The copy has no config of its own beyond what `git init` writes, so your
 repository's own config (its filters, hooks and includes) never applies there; your global and
-system config does, so drivers such as Git LFS still give the copy the real files. genai touches
+system config does. Work sessions don't support Git LFS yet: a repository with LFS files is
+refused, as the copy can't reach the LFS store. genai touches
 your repository only to read your last commit into the copy and to fetch the copy's commits into
 `genai/work-N`. No file tool may write anything under `.git`, and the sandbox only ever gets an
-overlay of the copy. So nothing the model or a test writes can make git run a program on your
-machine. Commits use your git identity, or `genai` if you have none. If a session ends with a
-problem (git fails, or git ignores a file the model wrote), the copy stays where it is for you to
-look at; so does one left by a genai that was killed outright.
+overlay of the copy's files: its git directory is beside them, out of the sandbox's reach. So
+nothing the model or a test writes can make git run a program on your machine. Commits use your
+git identity, or `genai` if you have none. If a session ends with a problem (git fails, or a file
+the model wrote isn't in its commits), the copy stays where it is for you to look at; so does one
+left by a genai that was killed outright.
 
 ## JSON protocol
 
@@ -661,7 +665,7 @@ reconnect to a new genai whose IDs start again at `p1`), not a wrapper that mean
 | `edits` | optional `mode` (`ask` or `approved-files`), optional `reset: true` | Switches edits for this session, or forgets the approved files. Switching to `ask` forgets them too. Always answered by `edits`: `mode` and `files` (the approved set, as relative paths). genai also sends `edits` when the set changes, and `hello` has the same `edits` object. |
 | `network` | optional `on` (true or false) | Turns the sandbox's network on or off for this session (error `no_sandbox` without one). Answered by `network`: `runner` as in `hello`, and `available` (whether `run_in_sandbox` is offered now). |
 | `work` | `task`, optional `steps_per_item`, `time_limit` (seconds) | Starts a work session (see Work sessions) and sends the task; the turn ends with `done` as for `user`. Refused with `work_refused`: no one to approve the plan, no sandbox, the sandbox's network on or unable to run, coding mode refused here, not a git repository, no commits, uncommitted changes, nothing committed in this directory, a planner endpoint or model that isn't there, or a session already on. Turning coding mode on for the session, and back off at its end, sends `coding`. Later `user` messages go on with the session. |
-| `work_end` | | Ends the work session: answered by a `work` event with `state` `ended` (or `not_running`). Read even while genai is busy (feature `halt`), including while a `work` message is starting the session: the turn stops as with `stop`, then the session ends. The `ended` event's `problems` lists what git couldn't do; then nothing was deleted and `path` is where the copy still is. |
+| `work_end` | | Ends the work session: answered by a `work` event with `state` `ended` (or the error `not_running`, when no session is on). Read even while genai is busy (feature `halt`), including while a `work` message is starting the session: the turn stops as with `stop`, then the session ends. The `ended` event's `problems` lists what went wrong; then nothing was deleted and `path` is where the copy still is. |
 
 While proposals are waiting for decisions, only `decision`, `result`, `attach`, `trace` and `system` are accepted.
 Anything else gets the error `busy`, so coding mode and skills never change halfway through a
@@ -678,7 +682,7 @@ decision.
 | `context` | The conversation is getting near the context limit. |
 | `notice` | Something the user should know. |
 | `error` | `code` and `message`. Among the codes: `api` (the endpoint failed or couldn't be reached; nothing was performed), `busy` (not allowed while proposals wait), `unknown_id` (no waiting proposal with that ID and kind), `digest_mismatch` (see Digests), `not_running` (a `stop` with nothing running), `work_refused` and `work` (a work session can't start, or git failed; `work` also refuses the network on, or coding mode off, during a session), `bad_message`, `unknown_type`, and, at the start, `session_endpoint_changed` (a resumed session was made with another endpoint; `--allow-session-endpoint-change` allows it). |
-| `work` | A work session changed. `state` is `started` (`branch`, `base`, `path`, `steps_per_item`, `time_limit`, `test`, `planner`: `endpoint` and `model` for planning, or `null` when the profile's own model plans), `plan` (the plan was approved: `items`, each `n`, `title`, `status`, `commit`, and `current`), `item` (an item was committed), `context` (a fresh context: `role` `item`, or `review` for the planner taking back a stuck item; `item`; `why`), or `ended` (`why`: `done`, `ended` or `genai exited`; `branch`, `null` if nothing changed, so there is none; `commits`, `stat`, `unfinished` (the commit of work left when it ended), `commands` to review and merge, `items`, `removed` (whether the copy was removed), `path` (where the copy still is, if it wasn't) and `problems` (what went wrong, such as a git failure or a file git ignores that the model wrote)). |
+| `work` | A work session changed. `state` is `started` (`branch`, `base`, `path`, `steps_per_item`, `time_limit`, `test`, `planner`: `endpoint` and `model` for planning, or `null` when the profile's own model plans), `plan` (the plan was approved: `items`, each `n`, `title`, `status`, `commit`, and `current`), `item` (an item was committed), `context` (a fresh context: `role` `item`, or `review` for the planner taking back a stuck item; `item`; `why`), or `ended` (`why`: `done`, `ended` or `genai exited`; `branch`, which has all the session's commits, or `null`: nothing changed, or (with `problems` and `path`) not all of the work reached it; `commits`, `stat`, `unfinished` (the commit of work left when it ended), `commands` to review and merge, `items`, `removed` (whether the copy was removed), `path` (where the copy still is, if it wasn't) and `problems` (what went wrong, such as a git failure or a file the model wrote that isn't in its commits)). |
 | `plan` | The approved plan changed: approved, a step done, or dropped. `plan` has `id`, `goal` and `steps`, each with `approved`, `status` (`todo`, `done`, `left out`) and `edited` when the user changed its command; `null` when there is none. A plan is never saved with the session. |
 | `attached`, `registered`, `compacted`, `cleared`, `models`, `model`, `coding`, `skills`, `files`, `file`, `trace`, `system`, `network`, `plugins`, `ran`, `edits` | Answers to the messages above. |
 

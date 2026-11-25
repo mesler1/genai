@@ -86,7 +86,8 @@ advice is to remove one of the three, or put a human in front of it.
   same masking; files that look like secrets are hidden from it.
 
 What remains: the endpoint receives every prompt, attachment and file the model reads. In
-coding mode the model reads non-hidden files in the working directory without asking (a file
+coding mode the model reads non-hidden files in the working directory without asking (hidden: a
+name starting with `.`, or one the sandbox hides as a secret, such as `id_rsa` or `*.key`; a file
 that looks like it holds secrets still asks), so treat the directory as shared with the
 endpoint.
 
@@ -235,18 +236,26 @@ in between.
     your last commit and nothing else, fetched with depth 1, so neither the model nor the sandbox
     can read your history, other branches or tags, including a secret that was committed once and
     removed. Your own files and branch are never written; you merge the branch yourself, with git.
-  - genai touches your repository in two places only: `git status` before the session, in your
-    own checkout with your own config, as you would run it; and `git fetch` of each commit made in
-    the copy into `refs/heads/genai/work-N`. That fetch only adds to the branch: a branch moved or
-    deleted meanwhile is an error, never overwritten, and a name taken meanwhile moves to the next
-    free one. SIGTERM and SIGHUP wait for it, so git is never killed halfway with a lock file left.
+  - genai reads your repository at the start: `git status`, in your own checkout with your own
+    config, as you would run it, and read-only lookups of your last commit and branch names (and
+    the fetch of that commit into the copy reads it too). It writes it in one place only: `git
+    fetch` of each commit made in the copy into `refs/heads/genai/work-N`, without recursing into
+    submodules or running maintenance. That fetch only adds to the branch: a branch moved or
+    deleted meanwhile is an error, never overwritten, and so is one found changed at the end when
+    nothing new is left to add; a name taken meanwhile moves to the next free one, and a branch
+    named `genai` refuses the session. SIGTERM and SIGHUP wait for the fetch, so git is never
+    killed halfway with a lock file left, and one that finished just as a signal came counts as
+    done.
   - The copy's config is only what `git init` writes, so your repository's own config (filters,
-    hooks, includes) never applies there; your global and system config does, so drivers such as
-    Git LFS stay on. genai runs every git command itself, on the host, with `GIT_DIR` set to the
-    copy's `.git` directory, all `GIT_*` variables from the environment dropped, and
+    hooks, includes) never applies there; your global and system config does, so a filter driver
+    set there still runs. A repository with Git LFS files is refused: the copy can't reach the
+    LFS store. genai runs every git command itself, on the host, with `GIT_DIR` set to the
+    copy's git directory, all `GIT_*` variables from the environment dropped, and
     `core.hooksPath=/dev/null`, `core.fsmonitor=false`, signing, external diff and textconv, and
     bare-repository discovery off. No file tool may write under `.git`, and the sandbox still runs
-    on a throwaway overlay of the copy, so a test can't leave anything behind.
+    on a throwaway overlay of the copy, so a test can't leave anything behind. The copy's git
+    directory is beside its files, not among them, and the sandbox mounts only the files: the
+    git directory holds every file of the commit, the ones the sandbox hides as secrets too.
   - Edits and writes apply without asking only while an item of an approved plan is worked on;
     before approval, and while the planner reviews an item, they ask, whatever the edits mode:
     files you approved with `approved-files` count only outside the session. Hidden and
@@ -258,18 +267,20 @@ in between.
     the network can't be turned on during one, and a finish test checks again before it runs.
   - Only the tools offered at that point can be called: a call to any other is refused.
   - The session's state is its own: coding mode, if the session turned it on, and approved files
-    go back to what they were when it ends, or when starting fails (`:edits reset` during it
-    forgets the set-aside ones too). While it is on, the saved session keeps the conversation and
-    coding mode from before it, so one resumed after a crash doesn't carry the session's. A planner
-    on another endpoint starts from the task alone, without the earlier conversation or queued
-    attachments; every read question while it plans names the endpoint the file would go to; and
-    when an item's context replaces the plan, the planner keeps its own context and is only told
-    the new plan. `/clear` drops the planner's waiting context as well.
+    go back to what they were when it ends, or when starting fails (`:edits reset` or `:edits ask`
+    during it forgets the set-aside ones too). While it is on, the saved session keeps a copy of the
+    conversation and coding mode from before it, so one resumed after a crash doesn't carry the
+    session's. A planner on another endpoint starts from the task alone, without the earlier
+    conversation or attachments queued in genai-tui or the REPL; every read question while it plans
+    names the endpoint the file would go to; and when an item's context replaces the plan, the
+    planner keeps its own context and is only told the new plan. `/clear` drops the planner's
+    waiting context as well, and the saved conversation from before the session.
   - The user can stop the turn at any time (`stop`, Ctrl-C, `/stop`), including while the model
     writes tool calls or rollover notes, and end the session mid-turn (`work_end`), even while it
     is starting; quitting the front end, SIGTERM and SIGHUP end it too, committing what is there
-    and removing the copy. If git fails while ending, or git ignores a file the model wrote (the
-    commit would leave it out), the copy is not deleted. A genai killed outright (SIGKILL, a
+    and removing the copy. If git fails while ending, or a file the model wrote is not in its
+    commits (git ignores it, or it is inside a submodule's directory), the copy is not deleted;
+    what is committed still goes to the branch. A genai killed outright (SIGKILL, a
     crash) leaves its copy in `~/.local/state/genai/work/`; your repository has whatever reached
     the branch. Once a plan, finish or retry takes effect, the rest of
     that reply's calls are not run: they were decided for the state before it.
@@ -284,8 +295,8 @@ in between.
   - What remains: the branch contains whatever the model wrote, including test files and build
     configuration, and nothing in it has been reviewed until you review it. Running its tests or
     build on your machine before reading the diff runs the model's code as you. Filter drivers
-    from your global and system config (such as Git LFS) still run when git checks out and
-    commits the copy, and the model's `.gitattributes` can choose which files they get.
+    from your global and system config still run when git checks out and commits the copy, and
+    the model's `.gitattributes` can choose which files they get.
 
 What remains: the indicator is display only. A command you approve outside a sandbox can do
 anything you can. Inside `sandbox/run genai` the network is open, because genai has to reach
