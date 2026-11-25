@@ -560,7 +560,7 @@ class TestSandboxStatus(unittest.TestCase):
     def test_panel_states(self):
         self.assertIn("genai    in the podman sandbox", self.panel(self.model(sandbox={"name": "podman"})))
         text = self.panel(self.model())
-        self.assertIn("genai    NOT sandboxed", text)
+        self.assertIn("genai    not sandboxed", text)
         self.assertIn("model's  ready · offline · dev:1", text)
         self.assertIn("model's  none", self.panel(self.model(runner=None)))
         self.assertIn("model's  can't run: no podman", self.panel(self.model(runner=dict(self.RUNNER, problem="no podman"))))
@@ -575,7 +575,7 @@ class TestSandboxStatus(unittest.TestCase):
 
     def test_tmux_status_holds_only_fixed_words_and_a_checked_id(self):
         self.assertEqual(C.Model().tmux_status(), "")
-        self.assertIn("NO SANDBOX", self.model().tmux_status())
+        self.assertIn("not sandboxed", self.model().tmux_status())
         self.assertIn("⊡ sandbox", self.model(sandbox={"name": "podman"}).tmux_status())
         m = self.model()
         card = self.start(m)
@@ -671,7 +671,7 @@ class TestSandboxStatus(unittest.TestCase):
         card = self.start(m)
         m.submit("/sandbox")
         text = "\n".join(text_of(b, 200) for b in m.blocks)
-        self.assertIn("genai: NOT sandboxed", text)
+        self.assertIn("genai: not sandboxed", text)
         self.assertIn("sandbox/run genai runs it in a podman sandbox", text)
         self.assertIn("image dev:1, offline, 300s time limit, 4g memory, 1024 processes", text)
         self.assertIn(f"RUNNING {card.id}", text)
@@ -1605,7 +1605,7 @@ class TestGenaiTui(TmuxCase):
         turns = [call("run_in_sandbox", command="echo started; sleep 30", reason="t"), reply("it was stopped")]
         with FakeAPI(turns) as api, mock.patch.dict(os.environ, {"FAKE_PODMAN_LOG": log}):
             self.start(api, path=path, args="-p coder")
-            self.assertIn("NO SANDBOX", self.tmux("show", "-gv", "@genai_sandbox"))
+            self.assertIn("not sandboxed", self.tmux("show", "-gv", "@genai_sandbox"))
             self.type("go")
             self.wait_for("Ctrl-C (or /stop) stops it", pane="genai")
             self.wait_for("RUNNING p", pane="info")
@@ -1621,7 +1621,7 @@ class TestGenaiTui(TmuxCase):
             self.assertTrue(any("stopped by the user" in str(m.get("content"))
                                 for m in api.requests[-1]["body"]["messages"]))
             self.assertTrue(any("kill" in ln for ln in open(log)))
-            self.assertIn("NO SANDBOX", self.tmux("show", "-gv", "@genai_sandbox"))
+            self.assertIn("not sandboxed", self.tmux("show", "-gv", "@genai_sandbox"))
             self.assertNotIn("genai exited", self.screen())
 
     def test_starts_with_no_arguments(self):

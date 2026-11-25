@@ -23,8 +23,8 @@ class SandboxInfo(Feature):
             name = clean(sb.get("name", "?") if isinstance(sb, dict) else sb)
             note(f"genai: in the {name} sandbox (it says so in its hello: an indicator, not a guarantee)", c.D)
         else:
-            note("genai: NOT sandboxed: it runs directly on " + ("that host" if m.remote() else "this machine")
-                 + ", as you", c.R)
+            note("genai: not sandboxed: it runs directly on " + ("that host" if m.remote() else "this machine")
+                 + ", as you")
             if not m.remote():
                 note("  sandbox/run genai runs it in a podman sandbox; sandbox/run shell opens a shell in that one")
         note("your commands: " + (f"run {clean(m.shell_where)} when you approve them" if m.shell_where
