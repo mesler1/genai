@@ -60,7 +60,7 @@ def view(st, w, sel):
         add([("genai    ", Q), (fit(clean(gw[0].removeprefix("genai runs ")), w - 9), R if gw[1] == R else W)])
     where = h.get("shell_where")
     if where:
-        add([("commands ", Q), (fit("run " + clean(where), w - 9), D if where.startswith("inside") else R)])
+        add([("commands ", Q), (fit("run " + clean(where), w - 9), D if where.startswith("inside") else W)])
     else:
         add([("commands ", Q), ("shown for manual execution", Q)])
     coding = st.get("coding")
@@ -70,7 +70,7 @@ def view(st, w, sel):
     if h.get("sandbox"):
         add([("genai    ", Q), (fit(f"in the {clean(h['sandbox'])} sandbox", w - 9), D)])
     else:
-        add([("genai    ", Q), (fit("NOT sandboxed", w - 9), R)])
+        add([("genai    ", Q), (fit("not sandboxed", w - 9), "")])      # the usual way to run it: not a fault
     run, going = st.get("runner"), st.get("running")
     if going:
         add([("model's  ", Q), (fit(f"RUNNING {clean(going.get('id', '?'))} · {going.get('secs', 0)}s", w - 9), W)])

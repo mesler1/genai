@@ -758,7 +758,7 @@ class Model:
             return f" #[fg=yellow,bold]⏵ sandbox {card.elapsed()}s#[default] │"
         if self.hello.get("sandbox"):
             return " #[fg=green]⊡ sandbox#[default] │"
-        return " #[fg=red,bold]NO SANDBOX#[default] │"
+        return " not sandboxed │"
 
     def network_text(self):
         r = self.runner

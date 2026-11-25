@@ -444,10 +444,10 @@ An offline run needs no approval: you see the command, then its exit code and ou
 the model. Ctrl-C stops it and ends the turn. Every run is in the audit log, by fingerprint.
 
 **Seeing it in genai-tui.** The info panel has a SANDBOX section: whether genai itself runs in a
-sandbox (`in the podman sandbox`, green, or `NOT sandboxed`, red, from `hello`'s `sandbox`), and
+sandbox (`in the podman sandbox`, green, or `not sandboxed`, the usual way to run it, from `hello`'s `sandbox`), and
 the model's sandbox: `none`, `ready · offline` or `ONLINE` with its image, `can't run: …`, or
-`RUNNING p3 · 12s` while a run is going. tmux's status line says `⊡ sandbox` or a red
-`NO SANDBOX`, and `⏵ sandbox p3 12s` during a run. A running card counts its seconds. Ctrl-C on an
+`RUNNING p3 · 12s` while a run is going. tmux's status line says `⊡ sandbox` or `not sandboxed`,
+and `⏵ sandbox p3 12s` during a run. A running card counts its seconds. Ctrl-C on an
 empty input, or `/stop`, stops the run: genai-tui sends genai the `stop` message, which works in
 remote mode too (an older genai without it gets a SIGINT here, and in remote mode its run ends at
 its time limit). `/sandbox` prints all of it, with the image, network and limits.
