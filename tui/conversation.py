@@ -733,7 +733,8 @@ class Model:
         from an older genai here, a SIGINT to the genai child."""
         card = self.running_card()
         if not card:
-            self.note("nothing is running in the sandbox")
+            self.note("nothing is running in the sandbox. A command in the shell pane stops with Ctrl-C there "
+                      "(/shell shows it).")
         elif "stop" in ((self.hello or {}).get("features") or []):
             self.note(f"stopping the sandboxed run {clean(card.id)}…", W)
             self.send({"type": "stop"})
@@ -2024,7 +2025,8 @@ class App:
             self.m.shell_where = self.shell.execution_where(context[0])
             return context
         except (Busy, OSError, subprocess.SubprocessError) as e:
-            self.m.note(f"the shell pane is busy ({e})", R)
+            self.m.note(f"the shell pane is busy ({e}), so nothing was typed there. /shell shows it; when it is back "
+                        f"at its prompt, try again.", R)
             return None
 
     def review_run(self, ask):
@@ -2120,8 +2122,8 @@ class App:
         try:
             self.shell.type(command, expected=context)
         except Busy as e:
-            self.m.note(f"{card.id} not run: the shell pane is busy ({e}). When it is back at a prompt, /run "
-                        f"{card.id} again.", R)
+            self.m.note(f"{card.id} not run: the shell pane is busy ({e}). /shell shows it; when it is back at its "
+                        f"prompt, /run {card.id} again.", R)
             return
         except (OSError, subprocess.SubprocessError) as e:
             self.m.note(f"{card.id} not run: tmux failed ({e})", R)
