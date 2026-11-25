@@ -847,6 +847,21 @@ class TestEndToEnd(Tmp):
             self.assertEqual(r.returncode, G.EXIT_USAGE)
             self.assertIn("coding mode is refused", r.stderr)
 
+    def test_coding_refusal_sees_through_links(self):
+        real = self.path("u", "home", "me")                           # home reached through a link, and ~/.ssh a
+        os.makedirs(os.path.join(real, "proj"))                       # link to a directory somewhere else
+        os.makedirs(self.path("home"))
+        os.makedirs(self.path("keys"))
+        os.symlink(real, self.path("home", "me"))
+        os.symlink(self.path("keys"), os.path.join(real, ".ssh"))
+        os.symlink(real, os.path.join(real, "proj", "up"))
+        with mock.patch.dict(os.environ, {"HOME": self.path("home", "me")}):
+            for d in (self.path("home", "me"), real, os.path.join(real, "proj", "up")):
+                self.assertEqual(G.coding_refusal(d)[1], "home", d)
+            for d in (self.path("keys"), self.path("home", "me", ".ssh")):
+                self.assertEqual(G.coding_refusal(d)[1], "credentials", d)
+            self.assertIsNone(G.coding_refusal(self.path("home", "me", "proj")))
+
     def test_wrapper_turns_coding_on_and_off(self):
         turns = [call("read_file", path="a.txt", reason="r"), reply("done"),
                  call("read_file", path="a.txt", reason="r"), reply("done")]
