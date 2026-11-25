@@ -346,9 +346,9 @@ class WorkTest(FakePodman):
                  call("read_file", path="b.txt", reason="polish")]
         self.repo()
         with FakeAPI(works) as api, FakeAPI(plans) as big:
-            g = self.start(api, {"steps_per_item": 2, "planner": "big"}, planner_api=big)
+            g = self.start(api, {"steps_per_item": 2, "planner": {"endpoint": "big"}}, planner_api=big)
             g.send({"type": "work", "task": "t"})
-            self.assertEqual(g.until("work")["planner"], "big")
+            self.assertEqual(g.until("work")["planner"], {"endpoint": "big", "model": "big-model"})
             self.approve(g)
             ended = g.until("work")
             while ended["state"] != "ended":
@@ -362,10 +362,36 @@ class WorkTest(FakePodman):
         start = next(e for e in self.audit() if e["event"] == "work_start")
         self.assertEqual(start["planner"]["model"], "big-model")
 
+    def test_a_planner_model_on_the_same_endpoint(self):
+        turns = [call("propose_work_plan", goal="g", items=["one"]),
+                 call("write_file", path="b.txt", content="x\n", reason="r"),
+                 call("finish_item", n=1, summary="b"), reply("done")]
+        self.repo()
+        models = [{"id": "fake-model"}, {"id": "big-model", "max_model_len": 50000}]
+        with FakeAPI(turns, models=models) as api:
+            g = self.start(api, {"planner": {"model": "big-model"}})
+            g.send({"type": "work", "task": "t"})
+            self.assertEqual(g.until("work")["planner"], {"endpoint": "test", "model": "big-model"})
+            self.approve(g)
+            g.until("done")
+            g.close()
+        used = [r["body"]["model"] for r in api.requests if r.get("body")]
+        self.assertEqual(used, ["big-model", "fake-model", "fake-model", "fake-model"])   # the plan, then the item
+
+    def test_a_planner_model_the_server_doesnt_list_refuses_the_session(self):
+        self.repo()
+        with FakeAPI([]) as api:
+            g = self.start(api, {"planner": {"model": "typo-model"}})
+            g.send({"type": "work", "task": "t"})
+            err = g.until("error")
+            g.close()
+        self.assertEqual(err["code"], "work_refused")
+        self.assertIn("typo-model", err["message"])
+
     def test_an_unknown_planner_endpoint_refuses_the_session(self):
         self.repo()
         with FakeAPI([]) as api:
-            g = self.start(api, {"planner": "nope"})
+            g = self.start(api, {"planner": {"endpoint": "nope"}})
             g.send({"type": "work", "task": "t"})
             err = g.until("error")
             g.close()
@@ -385,10 +411,14 @@ class TestWorkProfile(unittest.TestCase):
         p = G.Profile({"name": "p", "sandbox": {"image": "i:1"}, "work": {"test": "make test"}}, "p.json")
         self.assertEqual(p.work, {"test": "make test", "steps_per_item": 20, "time_limit": 7200, "planner": None})
         self.assertIn("20 steps per plan item", p.summary()[0])
-        with self.assertRaisesRegex(G.GenaiError, "endpoint's name"):
-            G.Profile({"name": "p", "sandbox": {"image": "i:1"}, "work": {"planner": "../x"}}, "p.json")
-        p = G.Profile({"name": "p", "sandbox": {"image": "i:1"}, "work": {"planner": "big"}}, "p.json")
+        box = {"image": "i:1"}
+        for bad in ("big", {}, {"endpoint": "../x"}, {"model": "a b"}, {"model": "m", "key": "k"}):
+            with self.subTest(planner=bad), self.assertRaisesRegex(G.GenaiError, "planner"):
+                G.Profile({"name": "p", "sandbox": box, "work": {"planner": bad}}, "p.json")
+        p = G.Profile({"name": "p", "sandbox": box, "work": {"planner": {"endpoint": "big"}}}, "p.json")
         self.assertIn("plans with endpoint big, which also sees the project", p.summary()[0])
+        p = G.Profile({"name": "p", "sandbox": box, "work": {"planner": {"model": "m2"}}}, "p.json")
+        self.assertIn("plans with model m2, on the same endpoint", p.summary()[0])
 
 
 if __name__ == "__main__":
