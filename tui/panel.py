@@ -103,6 +103,14 @@ def view(st, w, sel):
         add([("commands run on their own" if plan.get("auto") else "each planned command asks once",
               W if plan.get("auto") else Q)])
         add([("/plan clear drops it", Q)])
+    work = st.get("work")
+    if work:
+        head("WORK")
+        add([(fit(clean(work.get("branch", "")), w), A)])
+        add([(fit(clean(work.get("status", "")), w), "")])
+        for line in (work.get("items") or [])[:14]:
+            add([(fit(clean(line), w), D if line.startswith("✓") else Q)])
+        add([("/work end stops it", Q)])
     edits = st.get("edits") or {}
     if edits.get("mode") == "approved-files":
         head("EDITS")

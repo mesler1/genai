@@ -733,6 +733,99 @@ class TestEditsFeature(unittest.TestCase):
         self.assertEqual(card.state, "done")
 
 
+class TestWorkFeature(unittest.TestCase):
+    ITEMS = [{"n": 1, "title": "Core model", "status": "todo", "commit": None},
+             {"n": 2, "title": "Curses \x1b[2J front end", "status": "todo", "commit": None}]
+
+    def model(self, features=("work",)):
+        m = C.Model()
+        m.handle({"type": "hello", "version": "1", "endpoint": {"name": "e", "model": "m", "base_url": "u"},
+                  "sandbox": None, "features": list(features)})
+        m.outbox.clear()
+        return m
+
+    def panel(self, m):
+        PANEL = load("panel", os.path.join(REPO, "tui", "panel.py"))
+        lines, _ = PANEL.view(m.snapshot(), 42, None)
+        return "\n".join("".join(t for t, _ in ln) for ln in lines)
+
+    def shown(self, m, n=12):
+        return "\n".join(text_of(b, 200) for b in m.blocks[-n:])
+
+    def test_a_session_from_start_to_end(self):
+        m = self.model()
+        m.submit("/work make a game")
+        self.assertEqual(m.outbox, [{"type": "work", "task": "make a game"}])
+        self.assertTrue(m.busy)
+        m.handle({"type": "work", "state": "started", "branch": "genai/work-1", "base": "abc1234def", "path": "/x",
+                  "steps_per_item": 30, "time_limit": 3600, "test": None, "current": None, "items": [],
+                  "role": "plan", "planner": {"endpoint": "e", "model": "big"}})
+        self.assertIn("work session on branch genai/work-1", self.shown(m))
+        self.assertIn("plans with big on e", self.shown(m))
+        m.handle({"type": "proposal", "id": "p1", "kind": "work_plan", "goal": "a game",
+                  "reason": "a game", "items": ["Core model", "Curses front end"], "digest": "d"})
+        card = m.cards["p1"]
+        self.assertEqual(m.pending, [card])
+        self.assertEqual(card.title(), "work plan · 2 items")
+        self.assertIn(" 2. Curses front end", text_of(card, 100))
+        self.assertEqual(text_of(card, 100).count("a game"), 1)
+        m.decide(True)
+        self.assertEqual(m.outbox[-1]["id"], "p1")
+        m.handle({"type": "work", "state": "plan", "items": self.ITEMS, "current": 1, "role": "item"})
+        m.handle({"type": "proposal", "id": "p2", "kind": "write", "path": "a.py", "content": "x", "auto": True,
+                  "work": True})
+        self.assertIn("(work session)", text_of(m.cards["p2"], 100))
+        self.assertIn("WORK", self.panel(m))
+        self.assertIn("0 of 2 done · on item 1", self.panel(m))
+        done = [dict(self.ITEMS[0], status="done", commit="1234567890"), self.ITEMS[1]]
+        m.handle({"type": "proposal", "id": "p3", "kind": "finish", "n": 1, "summary": "core", "notes": "n",
+                  "auto": True})
+        self.assertIn("finish item 1: core  (work session)", text_of(m.cards["p3"], 100))
+        m.handle({"type": "work", "state": "item", "items": done, "current": 2, "role": "item"})
+        self.assertIn("item 1 committed as 1234567: Core model", self.shown(m))
+        self.assertIn("✓  1. Core model  1234567", self.panel(m))
+        self.assertIn("next, item 2 of 2", self.shown(m))
+        self.assertNotIn("\x1b", self.panel(m))
+        m.handle({"type": "work", "state": "context", "role": "review", "item": 2, "why": "the item used its steps"})
+        self.assertIn("the planner, to review item 2", self.shown(m))
+        self.assertIn("1 of 2 done · planner reviews item 2", self.panel(m))
+        m.handle({"type": "done", "reason": "work_limit"})
+        self.assertIn("paused at a limit", self.shown(m))
+        self.assertFalse(m.busy)
+        m.submit("/work")
+        self.assertIn("1 of 2 done", self.shown(m))
+        m.submit("/work end")
+        self.assertEqual(m.outbox[-1], {"type": "work_end"})
+        m.handle({"type": "work", "state": "ended", "why": "ended", "branch": "genai/work-1", "base": "abc1234def",
+                  "commits": ["1234567 1. core"], "stat": " 1 file changed", "unfinished": "89abcdef",
+                  "commands": ["git merge genai/work-1"], "items": done})
+        text = self.shown(m)
+        self.assertIn("the work is on branch genai/work-1", text)
+        self.assertIn("committed as 89abcde", text)
+        self.assertIn("git merge genai/work-1", text)
+        self.assertNotIn("WORK", self.panel(m))
+        m.submit("/work")
+        self.assertIn("the last work session ended", self.shown(m, 1))
+
+    def test_refusals_and_waiting(self):
+        m = self.model()
+        m.submit("/work end")
+        self.assertIn("no work session is on", self.shown(m, 1))
+        m.submit("/work t")
+        m.handle({"type": "error", "code": "work_refused", "message": "uncommitted changes"})
+        self.assertIn("no work session: uncommitted changes", self.shown(m, 1))
+        self.assertFalse(m.busy)
+        m.submit("hi")
+        m.outbox.clear()
+        m.submit("/work t")
+        self.assertEqual(m.outbox, [])
+        self.assertIn("has to wait", self.shown(m, 1))
+        m = self.model(features=())
+        m.submit("/work t")
+        self.assertEqual(m.outbox, [])
+        self.assertIn("this genai can't run work sessions", self.shown(m, 1))
+
+
 class TestPluginsFeature(unittest.TestCase):
     ROWS = [{"name": "slurm", "description": "cluster", "enabled": True, "blessed": True, "status": "blessed",
              "pane": "slurm.py", "dir": "/opt/genai/plugins/slurm",
@@ -1079,17 +1172,17 @@ class TestFeatures(unittest.TestCase):
 
     def test_all_built_in_features_load(self):
         on = F.load(core=C.CORE)
-        self.assertEqual([f.name for f in on], ["model", "copy", "decline", "raw", "ssh", "files", "sandbox", "edits", "plugins"])
+        self.assertEqual([f.name for f in on], ["model", "copy", "decline", "raw", "ssh", "files", "sandbox", "edits", "plugins", "work"])
         m = C.Model()
         self.assertEqual([f.name for f in m.features], [f.name for f in on])
-        self.assertEqual(list(m.commands())[-9:], ["/model", "/copy", "/decline", "/raw", "/system", "/files", "/sandbox", "/edits", "/plugins"])
+        self.assertEqual(list(m.commands())[-10:], ["/model", "/copy", "/decline", "/raw", "/system", "/files", "/sandbox", "/edits", "/plugins", "/work"])
         self.assertEqual(C.feature_requests(on), {"panel": {"models"}, "menu": {"model", "copy", "raw", "system"},
                           "files": {"list", "view", "attach", "insert"}})
 
     def test_environment_disables_a_feature(self):
         m, warning = self.model(self.environ(GENAI_TUI_DISABLE="copy, model"))
         self.assertIsNone(warning)
-        self.assertEqual([f.name for f in m.features], ["decline", "raw", "ssh", "files", "sandbox", "edits", "plugins"])
+        self.assertEqual([f.name for f in m.features], ["decline", "raw", "ssh", "files", "sandbox", "edits", "plugins", "work"])
         m.submit("/copy")
         self.assertIn("unknown command /copy (/help lists them)", text_of(m.blocks[-1]))
         m.submit("/help")
@@ -1105,7 +1198,7 @@ class TestFeatures(unittest.TestCase):
         self.write_config('{"disable": ["decline", "raw"]}')
         m, warning = self.model(self.environ())
         self.assertIsNone(warning)
-        self.assertEqual([f.name for f in m.features], ["model", "copy", "ssh", "files", "sandbox", "edits", "plugins"])
+        self.assertEqual([f.name for f in m.features], ["model", "copy", "ssh", "files", "sandbox", "edits", "plugins", "work"])
         m.submit("/decline")
         self.assertIn("unknown command /decline", text_of(m.blocks[-1]))
 
@@ -1117,7 +1210,7 @@ class TestFeatures(unittest.TestCase):
         for text in ("{not json", '{"disable": "copy"}', '["copy"]', '{"disable": [1]}'):
             self.write_config(text)
             m, warning = self.model(self.environ())
-            self.assertEqual(len(m.features), 9, text)
+            self.assertEqual(len(m.features), 10, text)
             self.assertIn("was ignored, so every feature is on", warning)
 
     def test_the_hub_refuses_the_requests_of_a_disabled_feature(self):
