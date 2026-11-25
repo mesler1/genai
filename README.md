@@ -397,7 +397,7 @@ another, set `GENAI_TUI_PAGER` (for example `GENAI_TUI_PAGER=less`).
 
 ### Features
 
-genai-tui's `/model`, `/copy`, `/decline`, `/raw`, `/system`, `/files`, `/sandbox`, `/edits` and `/plugins`, and the `genai-ssh` handshake, are
+genai-tui's `/model`, `/copy`, `/decline`, `/raw`, `/system`, `/files`, `/sandbox`, `/edits`, `/plugins` and `/work`, and the `genai-ssh` handshake, are
 features, each in its own module under `tui/features/`. To switch some off, list them in
 `~/.config/genai/tui.json` (`$XDG_CONFIG_HOME/genai/tui.json`):
 
@@ -406,7 +406,7 @@ features, each in its own module under `tui/features/`. To switch some off, list
 ```
 
 or set `GENAI_TUI_DISABLE=copy,model` for one run. Names are `model`, `copy`, `decline`, `raw`,
-`ssh`, `files`, `sandbox`, `edits` and `plugins` (without it, no plugin pane can connect). A disabled feature has no command, help line or menu item, and genai-tui's socket
+`ssh`, `files`, `sandbox`, `edits`, `plugins` (without it, no plugin pane can connect) and `work`. A disabled feature has no command, help line or menu item, and genai-tui's socket
 refuses its requests. Without `ssh`, a genai-ssh session isn't followed. No file means
 everything is on; a file that can't be read is ignored, with a note in the conversation.
 
@@ -519,7 +519,9 @@ what it changed and its last words; the planner finishes it, starts a fresh atte
 proposes a new plan. If the planner uses up its steps too, or the item gets stuck again, the session
 pauses. There is also a time
 limit, 2 hours without you by default. A message from you, such as "go on", gives a fresh budget
-and time. `:work end` (or exiting genai) ends the session; `:work` shows how far it has got. Ctrl-C
+and time. `:work end` (or exiting genai) ends the session; `:work` shows how far it has got. In
+genai-tui, `/work TASK`, `/work` and `/work end` do the same, and the info panel's WORK section shows
+the branch and each item as it is committed. Ctrl-C
 stops a sandboxed run, as usual.
 
 The profile sets the defaults, and `:work --steps N --minutes M TASK` overrides them for one session:

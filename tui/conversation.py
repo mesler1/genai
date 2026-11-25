@@ -432,7 +432,10 @@ class Card(Block):
                 "sandbox": f"sandbox · {'ONLINE' if ev.get('network') else 'offline'}",
                 "trusted": f"{clean(str(ev.get('plugin', '?')))} · {clean(str(ev.get('command', '?')))}"
                            + (" · read-only" if ev.get("read_only") else ""),
-                "plan": f"plan · {len(ev.get('steps') or [])} steps"}.get(k, str(k))
+                "plan": f"plan · {len(ev.get('steps') or [])} steps",
+                "work_plan": f"work plan · {len(ev.get('items') or [])} items",
+                "finish": f"finish item {ev.get('n', '?')}: {clean(str(ev.get('summary', '')))}",
+                "retry": f"the planner retries item {ev.get('n', '?')}"}.get(k, str(k))
 
     def body(self, full=False):
         """(text, role) lines inside the card. A sandboxed run's output is cut to its last lines unless full."""
@@ -485,6 +488,14 @@ class Card(Block):
             out.append((f"{ev['size']} bytes", Q))
         elif k == "external":
             out.append((clean(json.dumps(ev.get("args", {}), ensure_ascii=False)), ""))
+        elif k == "work_plan":
+            if ev.get("goal") != ev.get("reason"):              # genai sends the goal as the reason too
+                out.append((clean(str(ev.get("goal", ""))), A))
+            out += [(f"{n:>2}. {clean(str(it))}", "") for n, it in enumerate(ev.get("items") or [], 1)]
+        elif k == "finish" and ev.get("notes"):
+            out += [("notes for later items:", Q)] + [("  " + ln, Q) for ln in clean(str(ev["notes"])).split("\n")]
+        elif k == "retry" and ev.get("hint"):
+            out += [("  " + ln, Q) for ln in clean(str(ev["hint"])).split("\n")]
         elif k == "plan":
             for st in ev.get("steps") or []:
                 out.append((f"{st.get('n', '?'):>2}. {step_text(st)}", ""))
@@ -496,7 +507,9 @@ class Card(Block):
 
     def lines(self, w):
         if self.state == "auto":
-            return [[("  ↳ ", Q), (fit(f"{self.title()}  (coding mode: no approval needed)", w - 4), Q)]]
+            why = "work session" if self.ev.get("work") or self.ev.get("kind") in ("finish", "retry") else \
+                "coding mode: no approval needed"
+            return [[("  ↳ ", Q), (fit(f"{self.title()}  ({why})", w - 4), Q)]]
         role = self.STATE_ROLE.get(self.state, Q)
         inner = max(w - 4, 8)
         head = f"─ {self.id} · {self.title()}{f' · Alt+{self.key}' if self.key else ''} "
@@ -662,6 +675,8 @@ class Model:
             self.context = ((ev.get("context") or {}).get("used"), (ev.get("context") or {}).get("limit"))
             if ev.get("reason") == "step_limit":
                 self.note("genai stopped after its step limit; send a message to continue", W)
+            elif ev.get("reason") == "work_limit":
+                self.note("the work session paused at a limit: send a message to go on, or /work end", W)
             self.next_queued()
         elif t == "context":
             self.context = (ev.get("used"), ev.get("limit"))
@@ -1663,6 +1678,9 @@ class App:
             if c.ev.get("kind") == "sandbox":
                 lines.append([("  $ ", A), (fit(command_text(c.ev.get("command", "")).replace("\n", "⏎"), w - 6), "")])
                 lines.append([("  The network is on: on a throwaway copy, but it could send what it reads anywhere.", R)])
+            if c.ev.get("kind") == "work_plan":
+                lines.append([("  Once approved, each item is coded, tested and committed on the session's branch "
+                               "without asking.", Q)])
             if c.ev.get("secret"):
                 ep = (self.m.hello or {}).get("endpoint") or {}
                 lines.append([(f"It looks like it holds secrets; allowing sends it to {ep.get('base_url', 'the endpoint')}", R)])
