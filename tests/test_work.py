@@ -4,9 +4,13 @@ Run: python3 -m unittest discover -s tests"""
 
 import json
 import os
+import signal
 import subprocess
 import sys
+import tempfile
+import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fakeapi import FakeAPI, call, reply  # noqa: E402
@@ -34,7 +38,7 @@ class WorkTest(FakePodman):
         git(root, "commit", "-q", "-m", "start")
         return root
 
-    def start(self, api, work=None, sandbox=None, context_limit=100000, planner_api=None):
+    def start(self, api, work=None, sandbox=None, context_limit=100000, planner_api=None, coding=True):
         if os.path.exists(self.path("home")):
             subprocess.run(["rm", "-rf", self.path("home")], check=True)
         home, ep = make_home(self.tmp, api.url, context_limit=context_limit)
@@ -43,7 +47,7 @@ class WorkTest(FakePodman):
             bless_path(home, write_json(os.path.join(home, "endpoints", "big.json"),
                                         {"name": "big", "base_url": planner_api.url, "model": "big-model",
                                          "context_limit": 100000}))
-        prof = {"name": "coder", "endpoint": "test", "coding": True, "sandbox": sandbox or {"image": "img:1"}}
+        prof = {"name": "coder", "endpoint": "test", "coding": coding, "sandbox": sandbox or {"image": "img:1"}}
         if work is not None:
             prof["work"] = work
         bless_path(home, write_json(os.path.join(home, "profiles", "coder.json"), prof))
@@ -398,6 +402,369 @@ class WorkTest(FakePodman):
         self.assertEqual(err["code"], "work_refused")
         self.assertIn("planner endpoint", err["message"])
         self.assertEqual(git(self.path("wd"), "branch").split(), ["*", "main"])     # nothing was made
+
+    # -- what the audit before 1.1.0 found
+
+    def ended(self, g):
+        ev = g.until("work")
+        while ev["state"] != "ended":
+            ev = g.until("work")
+        return ev
+
+    def tool_replies(self, api):
+        return [m["content"] for r in api.requests for m in r["body"]["messages"] if m["role"] == "tool"]
+
+    def test_a_git_failure_at_the_end_keeps_the_copy_and_the_branch(self):
+        turns = [call("propose_work_plan", goal="g", items=["one"]),
+                 call("write_file", path="b.txt", content="x\n", reason="r"), reply("pausing")]
+        root = self.repo()
+        with FakeAPI(turns) as api:
+            g = self.start(api)
+            g.send({"type": "work", "task": "t"})
+            started = g.until("work")
+            self.approve(g)
+            g.until("done")
+            gitdir = os.path.join(root, ".git", "worktrees", os.path.basename(started["path"]))
+            open(os.path.join(gitdir, "index.lock"), "w").close()       # so git add fails
+            g.send({"type": "work_end"})
+            ended = self.ended(g)
+            g.close()
+        self.assertTrue(ended["problems"] and "could not be committed" in ended["problems"][0])
+        self.assertEqual((ended["branch"], ended["path"], ended["removed"]), ("genai/work-1", started["path"], False))
+        self.assertTrue(os.path.exists(os.path.join(started["path"], "b.txt")))     # the work is still there
+        self.assertIn("genai/work-1", git(root, "branch"))
+
+    def test_a_filter_driver_in_the_repository_config_never_runs(self):
+        turns = [call("propose_work_plan", goal="g", items=["one"]),
+                 call("write_file", path="b.txt", content="x\n", reason="r"),
+                 call("finish_item", n=1, summary="b"), reply("done")]
+        root = self.repo({"a.txt": "hi\n", ".gitattributes": "*.txt filter=evil\n"})
+        marker = self.path("filter-ran")
+        for key in ("clean", "smudge"):
+            git(root, "config", f"filter.evil.{key}", f"touch {marker}; cat")
+        git(root, "config", "filter.evil.required", "true")
+        with FakeAPI(turns) as api:
+            g = self.start(api)
+            g.send({"type": "work", "task": "t"})
+            self.approve(g)
+            ended = self.ended(g)
+            g.close()
+        self.assertEqual(len(ended["commits"]), 1)
+        self.assertFalse(os.path.exists(marker))
+
+    def test_writes_ask_until_the_plan_is_approved(self):
+        turns = [call("write_file", path="b.txt", content="x\n", reason="early"), reply("ok")]
+        self.repo()
+        with FakeAPI(turns) as api:
+            g = self.start(api)
+            g.send({"type": "work", "task": "t"})
+            p = g.until("proposal")
+            self.assertEqual(p["kind"], "write")
+            self.assertIsNone(p.get("auto"))                    # no plan yet: it asks
+            g.send({"type": "decision", "id": p["id"], "digest": p["digest"], "decision": "decline"})
+            g.until("done")
+            g.close()
+
+    def test_a_pyvenv_cfg_asks_in_a_work_session(self):
+        turns = [call("propose_work_plan", goal="g", items=["one"]),
+                 call("write_file", path="conf/pyvenv.cfg", content="home = /usr\n", reason="r"), reply("ok")]
+        self.repo()
+        with FakeAPI(turns) as api:
+            g = self.start(api)
+            g.send({"type": "work", "task": "t"})
+            self.approve(g)
+            p = g.until("proposal")
+            self.assertIsNone(p.get("auto"))
+            g.send({"type": "decision", "id": p["id"], "digest": p["digest"], "decision": "decline"})
+            g.until("done")
+            g.close()
+
+    def test_the_network_stays_off_during_a_session(self):
+        turns = [call("propose_work_plan", goal="g", items=["one"]), reply("pausing")]
+        self.repo()
+        with FakeAPI(turns) as api:
+            g = self.start(api)
+            g.send({"type": "work", "task": "t"})
+            self.approve(g)
+            g.until("done")
+            g.send({"type": "network", "on": True})
+            err = g.until("error")
+            self.assertFalse(g.until("network")["runner"]["network"])
+            g.close()
+        self.assertIn("network stays off during a work session", err["message"])
+
+    def test_a_tool_the_session_doesnt_offer_is_refused(self):
+        turns = [call("propose_command", command="rm -rf ~", reason="r"), reply("ok")]
+        self.repo()
+        with FakeAPI(turns) as api:
+            g = self.start(api)
+            g.send({"type": "work", "task": "t"})
+            g.until("done")
+            g.close()
+        self.assertIn("propose_command is not available in a work session", self.tool_replies(api)[0])
+        self.assertNotIn("command", [e.get("kind") for e in g.events if e["type"] == "proposal"])
+
+    def test_coding_mode_goes_back_to_off_after_a_refusal_and_after_the_session(self):
+        root = self.repo()
+        with open(os.path.join(root, "a.txt"), "a") as f:
+            f.write("dirty\n")
+        with FakeAPI([reply("ok")]) as api:
+            g = self.start(api, coding=False)
+            self.assertFalse(g.until("hello")["coding"])
+            g.send({"type": "work", "task": "t"})
+            g.until("error")
+            g.close()
+        coding = [e["on"] for e in g.events if e["type"] == "coding"]
+        self.assertEqual(coding, [True, False])
+        git(root, "checkout", "a.txt")
+        with FakeAPI([call("propose_work_plan", goal="g", items=["one"]), reply("pausing")]) as api:
+            g = self.start(api, coding=False)
+            g.send({"type": "work", "task": "t"})
+            self.approve(g)
+            g.until("done")
+            g.send({"type": "work_end"})
+            self.ended(g)
+            g.close()
+        self.assertEqual([e["on"] for e in g.events if e["type"] == "coding"], [True, False])
+
+    def test_approved_files_are_set_aside_for_the_session(self):
+        turns = [call("write_file", path="a.txt", content="mine\n", reason="r"), reply("ok"),
+                 call("propose_work_plan", goal="g", items=["one"]), reply("pausing")]
+        root = self.repo()
+        with FakeAPI(turns) as api:
+            g = self.start(api)
+            g.send({"type": "edits", "mode": "approved-files"})
+            g.until("edits")
+            g.send({"type": "user", "text": "write a"})
+            p = g.until("proposal")
+            g.send({"type": "decision", "id": p["id"], "digest": p["digest"], "decision": "accept"})
+            g.until("done")
+            git(root, "commit", "-qam", "mine")
+            g.send({"type": "edits"})
+            before = g.until("edits")["files"]
+            g.send({"type": "work", "task": "t"})
+            self.approve(g)
+            g.until("done")
+            g.send({"type": "edits"})
+            during = g.until("edits")["files"]
+            g.send({"type": "work_end"})
+            self.ended(g)
+            g.send({"type": "edits"})
+            after = g.until("edits")["files"]
+            g.close()
+        self.assertEqual((before, during, after), (["a.txt"], [], ["a.txt"]))
+
+    def test_a_planner_elsewhere_starts_from_the_task_alone(self):
+        plans = [call("propose_work_plan", goal="g", items=["one"]), reply("pausing")]
+        works = [reply("SECRET-CHAT-ANSWER"), reply("back again")]
+        self.repo()
+        with FakeAPI(works) as api, FakeAPI(plans) as big:
+            g = self.start(api, {"planner": {"endpoint": "big"}}, planner_api=big)
+            g.send({"type": "user", "text": "PRIVATE-EARLIER-TEXT"})
+            g.until("done")
+            g.send({"type": "work", "task": "t"})
+            self.approve(g)
+            g.until("done")
+            g.send({"type": "work_end"})
+            self.ended(g)
+            g.send({"type": "user", "text": "and now?"})
+            g.until("done")
+            g.close()
+        self.assertNotIn("PRIVATE-EARLIER-TEXT", json.dumps([r["body"] for r in big.requests]))
+        self.assertIn("PRIVATE-EARLIER-TEXT", json.dumps(api.requests[-1]["body"]["messages"]))   # back after
+
+    def test_a_secret_read_names_where_it_would_go(self):
+        plans = [call("read_file", path="notes.txt", reason="r"), reply("ok")]
+        self.repo({"notes.txt": "-----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY-----\n"})
+        with FakeAPI([]) as api, FakeAPI(plans) as big:
+            g = self.start(api, {"planner": {"endpoint": "big"}}, planner_api=big)
+            g.send({"type": "work", "task": "t"})
+            p = g.until("proposal")
+            g.send({"type": "decision", "id": p["id"], "digest": p["digest"], "decision": "decline"})
+            g.until("done")
+            g.close()
+        self.assertEqual((p["secret"], p["to"]), (True, big.url))
+
+    def test_clear_drops_the_planners_waiting_context_too(self):
+        turns = [call("propose_work_plan", goal="PLANNED-GOAL", items=["one"]),
+                 call("write_file", path="b.txt", content="x\n", reason="r"), reply("pausing"),
+                 call("read_file", path="b.txt", reason="r"), call("read_file", path="b.txt", reason="r"),
+                 reply("what now?")]
+        self.repo()
+        with FakeAPI(turns) as api:
+            g = self.start(api, {"steps_per_item": 2})
+            g.send({"type": "work", "task": "t"})
+            self.approve(g)
+            g.until("done")
+            g.send({"type": "clear"})
+            g.until("cleared")
+            g.send({"type": "user", "text": "go on"})
+            g.until("done")
+            g.close()
+        review = api.requests[-1]["body"]["messages"]
+        self.assertIn("used its budget", review[-1]["content"])
+        self.assertEqual([m["role"] for m in review], ["system", "user"])     # the planner's old context is gone
+
+    def test_finish_with_every_item_done_is_refused(self):
+        turns = [call("propose_work_plan", goal="g", items=["one"]),
+                 call("write_file", path="b.txt", content="x\n", reason="r"),
+                 call("finish_item", n=1, summary="b"), call("finish_item", n=0, summary="again"), reply("done")]
+        self.repo()
+        with FakeAPI(turns) as api:
+            g = self.start(api)
+            g.send({"type": "work", "task": "t"})
+            self.approve(g)
+            self.assertEqual(self.ended(g)["why"], "done")
+            g.close()
+        self.assertIn("every item is done", self.tool_replies(api)[-1])
+
+    def test_plan_items_are_one_line_and_odd_characters_dont_break_a_commit(self):
+        turns = [call("propose_work_plan", goal="g", items=["one\n2. fake item"]),
+                 call("propose_work_plan", goal="g\x00", items=["one\x07"]),
+                 call("write_file", path="b.txt", content="x\n", reason="r"),
+                 call("finish_item", n=1, summary="b\x00\ud800c", notes="n\x00"), reply("done")]
+        root = self.repo()
+        with FakeAPI(turns) as api:
+            g = self.start(api)
+            g.send({"type": "work", "task": "t"})
+            p = self.approve(g)
+            ended = self.ended(g)
+            g.close()
+        self.assertIn("each item must be one line", self.tool_replies(api)[0])
+        self.assertEqual((p["goal"], p["items"]), ("g", ["one"]))
+        self.assertEqual(len(ended["commits"]), 1)
+        self.assertIn("b?c", git(root, "log", "-1", "--format=%s", "genai/work-1"))
+
+    def test_a_new_plan_drops_the_old_plans_reports(self):
+        turns = [call("propose_work_plan", goal="g", items=["a", "b"]),
+                 call("write_file", path="a.txt", content="a\n", reason="r"),
+                 call("finish_item", n=1, summary="a", notes="OLD-NOTE"),
+                 call("propose_work_plan", goal="g2", items=["c"]), reply("pausing")]
+        self.repo()
+        with FakeAPI(turns) as api:
+            g = self.start(api)
+            g.send({"type": "work", "task": "t"})
+            self.approve(g)
+            p = g.until("proposal")
+            while p["kind"] != "work_plan":
+                p = g.until("proposal")
+            g.send({"type": "decision", "id": p["id"], "digest": p["digest"], "decision": "accept"})
+            g.until("done")
+            g.close()
+        brief = api.requests[-1]["body"]["messages"][1]["content"]
+        self.assertIn("item 1 of 1: c", brief)
+        self.assertNotIn("OLD-NOTE", brief)
+
+    # -- stopping a session
+
+    def test_stop_ends_the_turn_and_the_session_pauses(self):
+        turns = [call("propose_work_plan", goal="g", items=["one"]),
+                 call("run_in_sandbox", command="sleep 30", reason="r"), reply("never")]
+        self.repo()
+        with FakeAPI(turns) as api:
+            g = self.start(api)
+            g.send({"type": "work", "task": "t"})
+            self.approve(g)
+            p = g.until("proposal")
+            while p["kind"] != "sandbox":
+                p = g.until("proposal")
+            t = time.monotonic()
+            g.send({"type": "stop"})
+            self.assertEqual(g.until("done")["reason"], "stopped")
+            self.assertLess(time.monotonic() - t, 20)
+            g.send({"type": "work"})            # a bad message: genai is listening again
+            g.until("error")
+            g.close()
+        self.assertEqual(len(api.requests), 2)      # never asked the model again
+        self.assertIn("halt", [e["event"] for e in self.audit()])
+
+    def test_work_end_mid_turn_stops_and_ends_the_session(self):
+        turns = [call("propose_work_plan", goal="g", items=["one"]),
+                 call("write_file", path="b.txt", content="x\n", reason="r"),
+                 call("finish_item", n=1, summary="b"), reply("done")]
+        root = self.repo()
+        with FakeAPI(turns) as api:
+            g = self.start(api, {"test": "sleep 30"})
+            g.send({"type": "work", "task": "t"})
+            self.approve(g)
+            p = g.until("proposal")
+            while p["kind"] != "finish":
+                p = g.until("proposal")
+            g.send({"type": "work_end"})            # while the finish test runs
+            self.assertEqual(g.until("done")["reason"], "stopped")
+            ended = self.ended(g)
+            g.close()
+        self.assertEqual((ended["why"], ended["branch"]), ("ended", "genai/work-1"))
+        self.assertEqual(git(root, "show", "genai/work-1:b.txt"), "x\n")    # committed as unfinished
+        self.assertEqual(os.listdir(self.path("state", "genai", "work")), [])
+
+    def test_sigterm_mid_turn_commits_the_work_and_removes_the_copy(self):
+        turns = [call("propose_work_plan", goal="g", items=["one"]),
+                 call("write_file", path="b.txt", content="x\n", reason="r"),
+                 call("run_in_sandbox", command="sleep 30", reason="r"), reply("never")]
+        root = self.repo()
+        with FakeAPI(turns) as api:
+            g = self.start(api)
+            g.send({"type": "work", "task": "t"})
+            self.approve(g)
+            p = g.until("proposal")
+            while p["kind"] != "sandbox":
+                p = g.until("proposal")
+            g.p.send_signal(signal.SIGTERM)
+            rc = g.close()
+        self.assertEqual(rc, 128 + signal.SIGTERM)
+        self.assertEqual(git(root, "show", "genai/work-1:b.txt"), "x\n")
+        self.assertEqual(os.listdir(self.path("state", "genai", "work")), [])
+        self.assertEqual(len(git(root, "worktree", "list").splitlines()), 1)
+
+
+class TestWorkParts(unittest.TestCase):
+    def test_finishing_an_item_doesnt_renew_the_time_without_the_user(self):
+        w = G.Work(None, "t", 5, 60, None, None)
+        w.since -= 100
+        w.used = 3
+        w.fresh()
+        self.assertEqual(w.used, 0)
+        self.assertIn("min without you", w.limit())
+        w.fresh(renew=True)
+        self.assertIsNone(w.limit())
+
+    def test_plain_text_and_git_paths(self):
+        self.assertEqual(G.plain_text("a\x00b\x1b[1m\ud800\n\tc"), "ab[1m?\n\tc")
+        self.assertEqual(G.git_line("/p/ends in space \n"), "/p/ends in space ")
+
+    def test_git_refuses_a_nul_without_crashing(self):
+        with self.assertRaisesRegex(G.GenaiError, "could not run"):
+            G.run_git(["log", "a\x00b"], os.getcwd())
+
+    def test_a_directory_with_nothing_committed_is_refused(self):
+        with tempfile.TemporaryDirectory() as root:
+            git(root, "init", "-q")
+            with open(os.path.join(root, "a"), "w") as f:
+                f.write("a")
+            git(root, "add", "a")
+            git(root, "commit", "-qm", "a")
+            os.makedirs(os.path.join(root, "new"))
+            with self.assertRaisesRegex(G.GenaiError, "nothing in this directory is committed"):
+                G.Worktree.create(os.path.join(root, "new"))
+
+    def test_a_pyvenv_cfg_doesnt_hide_a_secret_from_the_scan(self):
+        with tempfile.TemporaryDirectory() as root:
+            for rel, text in {"conf/pyvenv.cfg": "home = /usr\n", "conf/keys.txt": "password = hunter2hunter2\n",
+                              "conf/lib/pkg.pem": "-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----\n"}.items():
+                os.makedirs(os.path.dirname(os.path.join(root, rel)), exist_ok=True)
+                with open(os.path.join(root, rel), "w") as f:
+                    f.write(text)
+            box = G.Sandbox(G.parse_sandbox({"image": "i:1"}, "p.json"), root, print)
+            self.assertEqual(box.masks(), (["conf/keys.txt"], []))
+
+    def test_ctrl_c_while_starting_work_in_the_repl_doesnt_exit(self):
+        r = G.Repl.__new__(G.Repl)
+        r.e = mock.Mock(work=None)
+        r.e.start_work.side_effect = KeyboardInterrupt
+        with mock.patch("builtins.print"):
+            r.do_work("a task")
+        r.e.start_work.assert_called_once()
 
 
 class TestWorkProfile(unittest.TestCase):

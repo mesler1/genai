@@ -280,6 +280,13 @@ def one_line(text):
     return "".join(out), flagged
 
 
+def plain_text(text):
+    """text git and a terminal can take: control characters other than newline and tab dropped, and unpaired
+    surrogates (which no encoding takes) replaced."""
+    text = "".join(ch for ch in text if ch in "\n\t" or not (ord(ch) < 32 or 127 <= ord(ch) < 160))
+    return text.encode("utf-8", "replace").decode("utf-8")
+
+
 def show_exact(text):
     disp, flagged = exact(text)
     if flagged:
@@ -424,6 +431,9 @@ SECRET_NAMES = {".env", ".envrc", ".netrc", ".npmrc", ".pypirc", ".pgpass", ".gi
                 ".aws", ".ssh", ".gnupg", ".docker", ".kube", ".password-store", ".azure", ".config"}
 SECRET_PREFIXES = (".env.", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519")
 SECRET_SUFFIXES = (".key", ".p12", ".pfx", ".jks", ".keystore")
+# A virtual environment (a directory with a pyvenv.cfg) is scanned too, except for the parts that hold installed
+# packages: a pyvenv.cfg written beside a secret can't hide it from the scan, only what is in these.
+VENV_PARTS = {"lib", "lib64", "Lib", "include", "Include", "bin", "Scripts", "share"}
 SCAN_SKIP = {"node_modules", "__pycache__", ".tox", ".nox", ".mypy_cache", ".pytest_cache", ".ruff_cache"}
 _GUARD_EXIT = 97
 # Runs first inside the container: every hidden path must really be empty, or the command doesn't run.
@@ -497,9 +507,9 @@ class Sandbox:
 
     def masks(self, values=()):
         """Files and directories to hide in the sandbox, relative to the project: secret-looking names, and
-        files whose contents look like secrets. Virtual environments and dependency caches are not scanned;
-        a .git directory only has its config checked. Raises GenaiError if the project is too big to check."""
-        files, dirs, seen = [], [], 0
+        files whose contents look like secrets. Dependency caches and a virtual environment's packages (VENV_PARTS)
+        are not scanned; a .git directory only has its config checked. Raises GenaiError if the project is too big to check."""
+        files, dirs, seen, venvs = [], [], 0, set()
         stack = [""]
         while stack:
             rel = stack.pop()
@@ -523,8 +533,10 @@ class Sandbox:
                         elif e.name == ".git":
                             if self.secret_file(os.path.join(e.path, "config"), values):
                                 files.append(r + "/config")
-                        elif e.name not in SCAN_SKIP and not os.path.exists(os.path.join(e.path, "pyvenv.cfg")):
+                        elif e.name not in SCAN_SKIP and not (e.name in VENV_PARTS and rel in venvs):
                             stack.append(r)
+                            if os.path.exists(os.path.join(e.path, "pyvenv.cfg")):
+                                venvs.add(r)
                     elif e.is_file() and (secret_name(e.name) or self.secret_file(e.path, values)):
                         files.append(r)
                 except OSError:
@@ -604,7 +616,6 @@ class Sandbox:
                     chunks.append(chunk)
                 size[0] += len(chunk)
 
-        Sandbox.stop.clear()
         deadline = time.monotonic() + self.conf["timeout"]
         try:                                # everything from here on, so a Ctrl-C at any point kills the container
             Sandbox.running = True
@@ -622,7 +633,7 @@ class Sandbox:
                         self._kill(name, proc)
                         rc = "timeout"
                         break
-        except KeyboardInterrupt:
+        except BaseException:              # Ctrl-C, a stop, or genai exiting on a signal
             self._kill(name, proc)
             raise
         finally:
@@ -659,26 +670,44 @@ class Sandbox:
 # Work sessions: a git worktree the model works in
 
 # Every git command genai runs for a work session: hooks, fsmonitor and signing off, so nothing in the copy or the
-# repository's config can make git run a program; external diff and textconv drivers off for the same reason.
+# repository's config can make git run a program; external diff and textconv drivers off for the same reason, and
+# no bare repository found by searching. Filter drivers are turned off one by one (filter_off), by name.
 GIT_SAFE = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false",
-            "-c", "diff.external=", "-c", "core.pager=cat")
+            "-c", "diff.external=", "-c", "core.pager=cat", "-c", "safe.bareRepository=explicit")
 
 
-def run_git(args, cwd, env=None, ok=(0,)):
+def run_git(args, cwd, env=None, ok=(0,), safe=()):
     """git on the host: (exit code, output). GIT_* variables from the environment are dropped, so only what genai
-    sets here decides which repository is used. Raises GenaiError for an exit code not in ok."""
+    sets here decides which repository is used. safe: more -c settings, after GIT_SAFE. Raises GenaiError for an
+    exit code not in ok, and for an argument git can't be given (a NUL)."""
     full = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     full.update({"GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C"}, **(env or {}))
     try:
-        r = subprocess.run(["git", *GIT_SAFE, *args], cwd=cwd, env=full, stdin=subprocess.DEVNULL,
+        r = subprocess.run(["git", *GIT_SAFE, *safe, *args], cwd=cwd, env=full, stdin=subprocess.DEVNULL,
                            capture_output=True, text=True, errors="replace", timeout=120)
     except FileNotFoundError:
         raise GenaiError("git is not installed", EXIT_USAGE, "work_refused") from None
     except subprocess.TimeoutExpired:
         raise GenaiError(f"git {args[0]} took more than 120 s", EXIT_USAGE, "work") from None
+    except (ValueError, OSError) as e:
+        raise GenaiError(f"git {args[0]} could not run: {e}", EXIT_USAGE, "work") from None
     if r.returncode not in ok:
         raise GenaiError(f"git {args[0]} failed: {one_line((r.stderr or r.stdout).strip())[0]}", EXIT_USAGE, "work")
     return r.returncode, r.stdout
+
+
+def filter_off(cwd, env=None):
+    """-c settings that turn off every filter driver the repository's config names (clean, smudge and process
+    commands), so adding or checking out a file in the copy runs no program from the config."""
+    _, out = run_git(["config", "--null", "--name-only", "--get-regexp", r"^filter\."], cwd, env, ok=(0, 1))
+    names = {k[len("filter."):].rsplit(".", 1)[0] for k in out.split("\0") if k.count(".") >= 2}
+    return tuple(a for n in sorted(names) for a in ("-c", f"filter.{n}.clean=", "-c", f"filter.{n}.smudge=",
+                                                     "-c", f"filter.{n}.process=", "-c", f"filter.{n}.required=false"))
+
+
+def git_line(out):
+    """A path git printed: its line, without the newline but with any spaces it ends with."""
+    return out.rstrip("\n")
 
 
 def work_home():
@@ -711,12 +740,16 @@ class Worktree:
         if rc:
             raise GenaiError("a work session needs a git repository: this directory isn't in one", EXIT_USAGE,
                              "work_refused")
-        top = os.path.realpath(out.strip())
+        top = os.path.realpath(git_line(out))
         sub = os.path.relpath(os.path.realpath(cwd), top)
+        if sub != "." and run_git(["ls-files", "-z", "--", sub], top)[1] == "":
+            raise GenaiError("nothing in this directory is committed, so the copy wouldn't have it: cd to a "
+                             "directory with committed files, or commit some here first", EXIT_USAGE, "work_refused")
         rc, head = run_git(["rev-parse", "--verify", "-q", "HEAD^{commit}"], top, ok=(0, 1))
         if rc:
             raise GenaiError("the repository has no commits yet: commit something first", EXIT_USAGE, "work_refused")
-        _, status = run_git(["status", "--porcelain", "--untracked-files=all"], top)
+        off = filter_off(top)       # status may run a clean filter, as add does
+        _, status = run_git(["status", "--porcelain", "--untracked-files=all"], top, safe=off)
         lines = status.splitlines()
         changed = [ln for ln in lines if not ln.startswith("??")]
         if changed:
@@ -729,17 +762,18 @@ class Worktree:
         branch = f"genai/work-{n}"
         name = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(top)) or "project"
         path = os.path.join(ensure_dir(work_home()), f"{name}-{n}-{secrets.token_hex(3)}")
-        run_git(["worktree", "add", "-q", "-b", branch, path, head.strip()], top)
+        run_git(["worktree", "add", "-q", "-b", branch, path, head.strip()], top, safe=off)
         _, gitdir = run_git(["rev-parse", "--absolute-git-dir"], path)   # now, before anything could change it
-        return cls(top, os.path.realpath(path), gitdir.strip(), branch, head.strip(), sub), \
+        return cls(top, os.path.realpath(path), git_line(gitdir), branch, head.strip(), sub), \
             sum(1 for ln in lines if ln.startswith("??"))
 
     def git(self, args, ok=(0,), env=None):
-        return run_git(args, self.path, dict({"GIT_DIR": self.gitdir, "GIT_WORK_TREE": self.path}, **(env or {})),
-                       ok)
+        env = dict({"GIT_DIR": self.gitdir, "GIT_WORK_TREE": self.path}, **(env or {}))
+        return run_git(args, self.path, env, ok, safe=filter_off(self.path, env))
 
     def commit(self, message):
         """Commit everything in the copy: the short hash, or None if nothing changed."""
+        message = plain_text(message)
         self.git(["add", "-A"])
         if self.git(["diff", "--cached", "--quiet", "--no-ext-diff"], ok=(0, 1))[0] == 0:
             return None
@@ -755,6 +789,9 @@ class Worktree:
         _, log = self.git(["log", "--reverse", "--format=%h %s", f"{self.base}..HEAD"])
         _, stat = self.git(["diff", "--no-ext-diff", "--no-textconv", "--stat", self.base, "HEAD"])
         return log.splitlines(), stat.rstrip()
+
+    def head(self):
+        return self.git(["rev-parse", "HEAD"])[1].strip()
 
     def remove(self, keep):
         """Remove the copy. The branch stays if keep (it has the session's commits); otherwise it goes too."""
@@ -782,11 +819,16 @@ class Work:
         self.swap = None            # (role, hint): a context swap due after the current step's tool results
         self.cleared_at = 0         # tokens in use when old output was last dropped
         self.planner_ep = None      # (Endpoint, Client) the planner's contexts go to, if not the session's own
+        self.before = None          # what the session put aside, to be put back when it ends: approved files,
+                                    # coding mode, and the conversation if the planner is elsewhere
 
-    def fresh(self):
-        """A new item, or a message from the user: a new budget of steps and time."""
-        self.used, self.since = 0, time.monotonic()
+    def fresh(self, renew=False):
+        """A new item or a fresh attempt: a new budget of steps. renew: the user has just spoken (a message, or the
+        plan's approval), so the time without them starts again too; finishing an item doesn't renew it."""
+        self.used = 0
         self.reviewed = set()
+        if renew:
+            self.since = time.monotonic()
 
     def stuck(self):
         """The current item used its steps, and the planner hasn't reviewed it yet in this stretch."""
@@ -3138,6 +3180,18 @@ def coding_refusal(cwd):
     return None
 
 
+UNOFFERED = {"search_files": "is only available in coding mode",
+             "propose_work_plan": "is only available in a work session",
+             "finish_item": "is only available in a work session",
+             "retry_item": "is only for reviewing an item that used its steps",
+             "propose_command": "is not available in a work session: run_in_sandbox runs commands there",
+             "propose_plan": "is not available in a work session: propose_work_plan plans one"}
+
+
+class Halted(Exception):
+    """The user asked the turn to stop (Engine.halt), while the model's reply was coming in."""
+
+
 class Engine:
     """The loop: send, turn tool calls into proposals, collect decisions, send again."""
 
@@ -3179,6 +3233,7 @@ class Engine:
         self.work = None                # the work session in progress (Work), if any; never saved
         self.edits = profile.edits if profile else "ask"
         self.approved_files = set()     # files an edit or write was approved for, this process only; never saved
+        self.halt = None                # set from the JSON listener's thread: "stop" the turn, or "end" the work too
         self.coding_from = "session" if session.coding else None
         refused = coding_refusal(os.getcwd()) if session.coding else None
         if refused and not anywhere:    # an override is per run: a resumed session needs the flag again
@@ -3399,12 +3454,16 @@ class Engine:
         return not any(looks_secret(t) or any(k in t for k in secrets_) for t in (old, new or ""))
 
     def work_edit(self, p):
-        """Does this edit or write apply without asking, in a work session? Yes, in the copy, unless the file is hidden,
-        or it or the new content looks secret."""
-        if not self.work or not self.ui.performs:
+        """Does this edit or write apply without asking, in a work session? Yes, in the copy, while an item of the
+        approved plan is being worked on, unless the file is hidden, or it or the new content looks secret. Before the
+        plan is approved, and while the planner reviews an item, every edit asks. So does a pyvenv.cfg, which would
+        change what the sandbox's secret scan looks at."""
+        w = self.work
+        if not w or not self.ui.performs or not w.items or not w.current or w.role != "item":
             return False
         key = self.file_key(p.fields.get("path"))
-        if key is None or is_hidden(key.split("/")) or p.fields.get("undiffable"):
+        if (key is None or is_hidden(key.split("/")) or p.fields.get("undiffable")
+                or key.split("/")[-1] == "pyvenv.cfg"):
             return False
         new = p.fields.get("_content") if p.kind == "edit" else p.fields.get("content")
         texts = [new or ""]
@@ -3438,17 +3497,31 @@ class Engine:
             {"test": None, "steps_per_item": WORK_STEPS, "time_limit": WORK_TIME, "planner": None}
         steps, seconds = work_limits(steps, seconds, "work")
         planner = self.planner_for(work["planner"]) if work["planner"] else None
-        if not self.session.coding:
-            self.set_coding(True, source)
-            self.coding_from = source
         problem = self.box.problem()
         if problem:
             raise GenaiError(f"the sandbox can't run here: {problem}", EXIT_USAGE, "work_refused")
-        tree, untracked = Worktree.create(os.getcwd())
+        before = {"coding": (self.session.coding, self.coding_from, self.coding_override),
+                  "files": set(self.approved_files), "messages": None}
+        if not self.session.coding:
+            try:
+                self.set_coding(True, source)
+            except GenaiError as e:
+                raise GenaiError(str(e), EXIT_USAGE, "work_refused") from None
+            self.ui.coding(True, source, self.coding_override)
+        try:
+            tree, untracked = Worktree.create(os.getcwd())
+        except BaseException:
+            self.put_back_coding(before)
+            raise
         self.clear_plan()
+        self.approved_files.clear()     # approvals are for files in the project, not the copy; they come back after
         self.work = Work(tree, task.strip(), steps or work["steps_per_item"], seconds or work["time_limit"],
                          work["test"], self.wd)
         self.work.planner_ep = planner
+        self.work.before = before
+        if planner:     # the planner is elsewhere: it starts from the task alone, not the conversation so far
+            before["messages"] = self.session.messages
+            self.session.messages, self.session.usage = [], None
         self.wd = Workdir(tree.wd)
         self.box.root = os.path.realpath(tree.wd)
         self.audit.log("work_start", branch=tree.branch, base=tree.base, path=tree.path, steps=self.work.steps,
@@ -3462,34 +3535,63 @@ class Engine:
                            "the work starts from your last commit")
         return self.user_turn(f"Work session. The task:\n\n{self.work.task}")
 
+    def put_back_coding(self, before):
+        """Coding mode as it was before a work session (it turns it on for the session), and say so."""
+        on, frm, override = before["coding"]
+        if on == self.session.coding:
+            return
+        self.session.coding, self.coding_from, self.coding_override = on, frm, override
+        self.session.save()
+        self.ui.coding(on, frm, override)
+
     def end_work(self, why="ended"):
         """End the work session: commit what is left, remove the copy, keep the branch if it has any commits, and go
-        back to the project. Returns what happened, for the user."""
+        back to the project. If git fails at any point, the copy and the branch both stay, and the user is told where
+        they are. Returns what happened, for the user."""
         w = self.work
         if not w:
             raise GenaiError("no work session is on", EXIT_USAGE, "not_running")
-        left = None
+        left, problems, commits, stat, keep = None, [], [], "", True
         try:
             left = w.tree.commit("Unfinished work, left when the session ended")
+        except GenaiError as e:
+            problems.append(f"what was left could not be committed: {e}")
+        try:
             commits, stat = w.tree.summary()
         except GenaiError as e:
-            commits, stat = [], f"(could not read the branch: {e})"
-        keep = bool(commits)
+            problems.append(f"the branch could not be read: {e}")
+            stat = f"(could not read the branch: {e})"
+        if not problems:
+            try:
+                keep = w.tree.head() != w.tree.base
+            except GenaiError as e:
+                problems.append(f"the branch could not be read: {e}")
         self.work, self.wd = None, w.home
         self.box.root = os.path.realpath(w.home.root)
-        try:
-            w.tree.remove(keep)
-            removed = True
-        except GenaiError as e:
-            removed = False
-            self.ui.notice(f"the copy at {w.tree.path} could not be removed: {e}")
+        if w.before:
+            self.approved_files.clear()
+            self.approved_files.update(w.before["files"])
+            if w.before["messages"] is not None:
+                self.session.messages, self.session.usage = w.before["messages"], None
+            self.put_back_coding(w.before)
+        removed = False
+        if problems:
+            self.ui.notice(f"[!] {'; '.join(problems)}. Nothing was deleted: the copy is still at {w.tree.path} "
+                           f"and the branch {w.tree.branch} is kept")
+        else:
+            try:
+                w.tree.remove(keep)
+                removed = True
+            except GenaiError as e:
+                self.ui.notice(f"the copy at {w.tree.path} could not be removed: {e}")
         base = w.tree.base[:12]
         commands = [f"git log --stat {base}..{w.tree.branch}", f"git diff {base} {w.tree.branch}",
                     f"git merge {w.tree.branch}", f"git branch -D {w.tree.branch}"] if keep else []
         info = {"state": "ended", "why": why, "branch": w.tree.branch if keep else None, "base": base,
                 "commits": commits, "stat": stat, "unfinished": left, "removed": removed, "commands": commands,
-                "items": w.items}
-        self.audit.log("work_end", why=why, branch=w.tree.branch, kept=keep, commits=len(commits), unfinished=left)
+                "items": w.items, "path": None if removed else w.tree.path, "problems": problems}
+        self.audit.log("work_end", why=why, branch=w.tree.branch, kept=keep, commits=len(commits), unfinished=left,
+                       removed=removed, problems=problems)
         self.ui.work(info)
         return info
 
@@ -3503,7 +3605,7 @@ class Engine:
 
     # -- a work session's contexts
 
-    def swap_context(self, role, text, why):
+    def swap_context(self, role, text, why, renew=True):
         """Send a different context from the next step on: a fresh one for the current item (text: a hint), or the
         planner's, to review a stuck item (text: the report). The planner's context is kept, its bulk dropped."""
         w = self.work
@@ -3516,7 +3618,7 @@ class Engine:
         self.session.history.append(dict(msg))
         self.session.usage = None
         w.role, w.cleared_at = role, 0
-        if role == "item":
+        if role == "item" and renew:    # a context that filled up goes on with the steps it has left
             w.used = 0
         self.audit.log("work_context", role=role, item=w.current, why=why, dropped=before, tokens=self.used())
         self.ui.work({"state": "context", "role": role, "item": w.current, "why": why})
@@ -3571,11 +3673,14 @@ class Engine:
             finally:
                 self.session.messages = msgs
             self.swap_context("item", "Your previous attempt at this item filled its context, so this is a fresh "
-                              "one. Its notes:\n" + (notes or "(none)"), "the context was full")
+                              "one. Its notes:\n" + (notes or "(none)"), "the context was full", renew=False)
 
     def set_network(self, on, source=":network"):
         if not self.box:
             raise GenaiError("there is no sandbox: the profile has no 'sandbox'", EXIT_USAGE, "no_sandbox")
+        if on and self.work:
+            raise GenaiError("the network stays off during a work session, whose tests run without asking; end the "
+                             "session first", EXIT_USAGE, "work")
         self.box.network = on
         self.audit.log("network", on=on, source=source)
         if on:
@@ -3655,7 +3760,12 @@ class Engine:
 
     def send(self, max_tokens=None, tools=True):
         msgs = [self.system()] + wire(self.session.messages)
-        msg, usage = self.active()[1].chat(msgs, self.tools() if tools else None, self.ui.text, max_tokens)
+
+        def text(chunk):
+            if self.halt:
+                raise Halted
+            self.ui.text(chunk)
+        msg, usage = self.active()[1].chat(msgs, self.tools() if tools else None, text, max_tokens)
         self.ui.text_end()
         if usage and usage.get("total_tokens"):
             self.session.usage = (int(usage["total_tokens"]), len(self.session.messages) + 1)
@@ -3663,7 +3773,7 @@ class Engine:
 
     def user_turn(self, text, attachments=()):
         if self.work:
-            self.work.fresh()
+            self.work.fresh(renew=True)
         content = text
         for label, body in attachments:
             content += f"\n\n[{label}]\n{body}"
@@ -3686,9 +3796,18 @@ class Engine:
         finally:
             self.session.save()
 
+    def halted(self):
+        """The user asked the turn to stop: say so, and end it."""
+        self.audit.log("halt", why=self.halt, item=self.work.current if self.work else None)
+        self.ui.notice("stopped; " + ("the work session pauses: send a message to go on, or end it"
+                                      if self.work and self.halt == "stop" else "send a message to continue"))
+        return "stopped"
+
     def loop(self, checked=False):
         step = 0
         while True:
+            if self.halt:
+                return self.halted()
             if self.work and self.work.stuck():
                 self.review_item()
             if self.work:
@@ -3708,7 +3827,11 @@ class Engine:
             step += 1
             if self.work:
                 self.work.used += 1
-            msg = self.send()
+            try:
+                msg = self.send()
+            except Halted:
+                self.ui.text_end()
+                return self.halted()
             self.session.add(msg)
             self.session.save()
             calls = msg.get("tool_calls")
@@ -3718,6 +3841,7 @@ class Engine:
             self.decide(props)
             ended = stopped = False
             for p in props:
+                stopped = stopped or bool(self.halt)
                 result = "not run: the user stopped an earlier command" if stopped else self.perform(p)
                 tool_msg = {"role": "tool", "tool_call_id": p.call_id, "content": result}
                 kind = PROPOSAL_KINDS.get(p.kind)
@@ -3732,6 +3856,8 @@ class Engine:
                 self.work.swap = None
                 self.swap_context(role, hint, why)
             self.session.save()
+            if stopped and self.halt:
+                return self.halted()
             if stopped:
                 self.ui.notice("stopped; send a message to continue")
                 return "stopped"
@@ -3758,6 +3884,8 @@ class Engine:
                                          PROPOSAL_KINDS["trusted"] if name in self.trusted_tools() else None)
             if kind is None:
                 raise ValueError(f"unknown tool '{name}'")
+            if name not in {t["function"]["name"] for t in self.tools()}:     # a tool not offered at this point
+                raise ValueError(f"{name} {UNOFFERED.get(name, 'is not available now')}")
             return getattr(Engine, kind.build)(self, pid, tc["id"], args, reason, name)
         except (ValueError, OSError) as e:
             p = Proposal(pid, "invalid", tc["id"], tool=name)
@@ -3872,7 +4000,11 @@ class Engine:
         if (not isinstance(items, list) or not 1 <= len(items) <= PLAN_STEPS
                 or not all(isinstance(x, str) and x.strip() for x in items)):
             raise ValueError(f"items must be a list of 1 to {PLAN_STEPS} lines of text")
-        return Proposal(pid, "work_plan", call_id, goal=goal, items=[x.strip() for x in items], reason=goal)
+        items = [plain_text(x).strip() for x in items]
+        if any("\n" in x or "\t" in x for x in items) or not all(items):
+            raise ValueError("each item must be one line of text")
+        goal = plain_text(goal).strip()
+        return Proposal(pid, "work_plan", call_id, goal=goal, items=items, reason=goal)
 
     def build_finish(self, pid, call_id, args, reason, name):
         if not self.work:
@@ -3882,13 +4014,18 @@ class Engine:
         n, summary = args.get("n"), args.get("summary")
         if type(n) is not int or not isinstance(summary, str) or not summary.strip():
             raise ValueError("n (the item's number) and summary are required")
+        if not self.work.current:
+            raise ValueError("every item is done: reply with a short summary of the work")
         if n != self.work.current:
             raise ValueError(f"item {n} is not the current item: finish item {self.work.current} first")
         notes = args.get("notes")
         if notes is not None and not isinstance(notes, str):
             raise ValueError("notes must be text")
-        p = Proposal(pid, "finish", call_id, n=n, summary=one_line(summary.strip())[0][:200], reason=summary,
-                     test=self.work.test, notes=(notes or "").strip()[:WORK_NOTES_MAX])
+        summary = plain_text(summary).strip()
+        if not summary:
+            raise ValueError("n (the item's number) and summary are required")
+        p = Proposal(pid, "finish", call_id, n=n, summary=one_line(summary)[0][:200], reason=summary,
+                     test=self.work.test, notes=plain_text(notes or "").strip()[:WORK_NOTES_MAX])
         p.auto = True
         return p
 
@@ -3901,7 +4038,7 @@ class Engine:
             raise ValueError("n (the item's number) and hint are required")
         if n != w.current:
             raise ValueError(f"item {n} is not the one under review: that is item {w.current}")
-        p = Proposal(pid, "retry", call_id, n=n, hint=hint.strip()[:WORK_NOTES_MAX], reason=hint)
+        p = Proposal(pid, "retry", call_id, n=n, hint=plain_text(hint).strip()[:WORK_NOTES_MAX], reason=hint)
         p.auto = True
         return p
 
@@ -4020,7 +4157,9 @@ class Engine:
             return
         if looks_secret(text) or any(key and key in text for key in self.secrets()):
             proposal.fields["secret"] = True
-            self.ui.notice(f"{path} looks like it contains secrets, so reading it needs your OK")
+            proposal.fields["to"] = to = self.active()[0].base_url     # where it goes: a planner may be elsewhere
+            self.ui.notice(f"{path} looks like it contains secrets, so reading it needs your OK; allowing sends it "
+                           f"to {to}")
             return
         proposal.fields["_read_text"] = text
         proposal.auto = True
@@ -4182,7 +4321,8 @@ class Engine:
         w.goal = p.fields["goal"]
         w.items = [{"n": n, "title": t, "status": "todo", "commit": None} for n, t in enumerate(p.fields["items"], 1)]
         w.current = 1
-        w.fresh()
+        w.reports = []          # a new plan numbers its items afresh; what was done is committed on the branch
+        w.fresh(renew=True)
         w.role, w.swap = "plan", ("item", None, "the plan was approved")   # whoever proposed it plans from now on
         self.audit.log("work_plan", id=p.id, items=len(w.items))
         self.ui.work({"state": "plan", **w.info()})
@@ -4192,6 +4332,9 @@ class Engine:
     def perform_finish(self, p):
         """Finish the current item: the test command must pass in the sandbox, then everything is committed."""
         w, n = self.work, p.fields["n"]
+        if w.test and self.box.network:     # set_network refuses this; checked again, as the test doesn't ask
+            self.ui.result(p, "error", f"item {n} not finished: the sandbox's network is on")
+            return "not finished: the sandbox's network is on, and the test only runs offline. Ask the user."
         if w.test:
             try:
                 ran, rc, out, note = self.box.run(w.test, self.secrets())
@@ -4431,6 +4574,11 @@ class Engine:
         self.session.messages = []
         self.session.usage = None
         self.clear_plan()
+        if self.work:       # the planner's waiting context goes too, and what earlier items reported
+            dropped += len(self.work.planner or [])
+            self.work.planner, self.work.reports = None, []
+            if self.work.before and self.work.before["messages"] is not None:
+                self.work.before["messages"] = []
         self.audit.log("clear", dropped=dropped)
         self.session.save()
         return dropped
@@ -4542,6 +4690,9 @@ class PlainUI:
 
     def plan(self, plan):
         pass
+
+    def coding(self, on, source, override=None):
+        self.notice(f"coding mode is {'on' if on else 'off'} ({source or 'as before the work session'})")
 
     def work(self, ev):
         pass
@@ -4731,6 +4882,9 @@ def digest(ev):
     return hashlib.sha256(DIGEST_NONCE + body.encode()).hexdigest()[:16]
 
 
+HALT = object()     # put in JsonUI.lines to wake a read() when a turn is asked to stop
+
+
 class JsonUI:
     """JSON Lines over stdio for wrappers and TUIs."""
     performs = True
@@ -4740,6 +4894,8 @@ class JsonUI:
         self.queue = []          # attachments waiting for the next user message
         self.engine = None
         self.lines = None        # stdin's lines, read by a thread of their own once reading starts
+        self.busy = False        # a turn is going on (run_json sets it, under lock)
+        self.lock = threading.Lock()
 
     def emit(self, ev):
         self.out.write(json.dumps(ev, ensure_ascii=False) + "\n")
@@ -4778,6 +4934,10 @@ class JsonUI:
     def edits(self, info):
         self.emit({"type": "edits", **info})
 
+    def coding(self, on, source, override=None):
+        self.emit({"type": "coding", "on": on, "coding_from": source if on else None,
+                   "coding_override": override if on else None})
+
     def work(self, ev):
         self.emit({"type": "work", **ev})
 
@@ -4806,9 +4966,11 @@ class JsonUI:
         waiting = {p.id: p for p in pending}
         while waiting:
             msg = self.read()
-            if msg is None:
+            if msg is None or (self.engine and self.engine.halt):
                 break
             t = msg.get("type")
+            if t == "halt":
+                continue
             pid = msg.get("id")
             if t in ("decision", "result") and pid in waiting and msg.get("digest") != waiting[pid].digest:
                 self.error(f"{pid}: that answer is for a proposal other than the one waiting (its digest is "
@@ -4854,18 +5016,40 @@ class JsonUI:
         ev.update(extra)
         self.emit(ev)
 
+    def halt(self, why):
+        """Ask the turn going on to stop (why: "stop"), or to stop and end the work session after it ("end"): any
+        sandboxed run ends now, a model reply as its next words arrive, and a wait for decisions declines what is
+        left. False if no turn is going on, so the message waits for read() instead."""
+        with self.lock:
+            if not self.busy:
+                return False
+            e = self.engine
+            if why == "end" and not (e and e.work):
+                return False
+            if e and e.halt != "end":
+                e.halt = why
+        if Sandbox.running:
+            Sandbox.stop.set()
+        self.lines.put(HALT)        # wakes a wait for decisions
+        return True
+
     def listen(self):
-        """Read stdin on a thread of its own, so a stop message is seen while genai is busy: it stops the
-        sandboxed run going on now. Every other line waits in order for read()."""
+        """Read stdin on a thread of its own, so stop and work_end are seen while genai is busy: they stop the turn
+        (see halt). Every other line waits in order for read(). At the end of input, a turn still going on stops
+        and its work session ends: nobody is left to answer it."""
         for line in iter(self.inp.readline, ""):
             try:
                 msg = json.loads(line)
             except ValueError:
                 msg = None
-            if isinstance(msg, dict) and msg.get("type") == "stop" and Sandbox.running:
+            t = msg.get("type") if isinstance(msg, dict) else None
+            if t == "stop" and (self.halt("stop") or Sandbox.running):
                 Sandbox.stop.set()
                 continue
+            if t == "work_end" and self.halt("end"):
+                continue
             self.lines.put(line)
+        self.halt("end")
         self.lines.put("")
 
     def read(self):
@@ -4874,6 +5058,8 @@ class JsonUI:
             threading.Thread(target=self.listen, daemon=True).start()
         while True:
             line = self.lines.get()
+            if line is HALT:
+                return {"type": "halt"}
             if not line:
                 self.lines.put("")      # stdin has ended: so does every later read
                 return None
@@ -5213,7 +5399,10 @@ class Repl:
         if not task:
             print("usage: :work [--steps N] [--minutes M] TASK, :work end, or :work")
             return
-        self.e.start_work(task, steps, secs)
+        try:
+            self.e.start_work(task, steps, secs)
+        except KeyboardInterrupt:       # as in any other turn: the session pauses, genai goes on
+            print("\n(interrupted; the work session pauses: send a message to go on, or :work end)")
 
     def command(self, line):
         cmd, _, arg = line[1:].partition(" ")
@@ -5440,6 +5629,18 @@ def whoami():
         return str(uid), uid
 
 
+def exit_on_signals():
+    """SIGTERM and SIGHUP (a front end closing, a terminal going away) end genai the way the end of input does: the
+    finally blocks run, so a work session commits what it has and removes its copy. A second one is ignored while
+    that happens."""
+    def on_signal(signum, frame):
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, signal.SIG_IGN)
+        raise SystemExit(128 + signum)
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, on_signal)
+
+
 def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()):
     ui.engine = engine
 
@@ -5454,7 +5655,7 @@ def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()
              "host": socket.gethostname(), "user": user, "uid": uid, "remote": remote,
              "features": ["proposals", "decisions", "attach", "register_tools", "compact", "context", "coding",
                           "set_coding", "skills", "files", "read", "trace", "system", "plan", "network", "clear",
-                          "models", "plugins", "interrupt", "edits", "stop", "digest", "work"],
+                          "models", "plugins", "interrupt", "edits", "stop", "digest", "work", "halt"],
              "endpoint": engine.endpoint.info(),
              "profile": {"name": engine.profile.name, "description": engine.profile.description}
              if engine.profile else None,
@@ -5476,6 +5677,9 @@ def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()
 
     def turn(text, att, start=None):
         first = getattr(engine.client, "exchanges", 0) + 1
+        with ui.lock:
+            engine.halt, ui.busy = None, True
+            Sandbox.stop.clear()        # a stop from now on ends this turn's runs, even one about to start
         try:
             reason = start() if start else engine.user_turn(text, att)
             ui.emit({"type": "done", "reason": reason, "context": {"used": engine.used(),
@@ -5483,6 +5687,14 @@ def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()
                      "exchanges": exchanges(first)})
         except GenaiError as err:
             ui.error(str(err), err.kind, exchanges=exchanges(first))
+        finally:
+            with ui.lock:
+                ui.busy, why, engine.halt = False, engine.halt, None
+        if why == "end" and engine.work:        # work_end came during the turn
+            try:
+                engine.end_work("ended")
+            except GenaiError as err:
+                ui.error(str(err), err.kind)
 
     def exchanges(first):
         """The numbers of this turn's exchanges with the endpoint, for the trace message; None if there were none."""
@@ -5550,7 +5762,9 @@ def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()
             except GenaiError as err:
                 ui.error(str(err), err.kind)
         elif t == "stop":
-            ui.error("nothing is running in the sandbox", "not_running")
+            ui.error("nothing is running", "not_running")
+        elif t == "halt":
+            pass            # a stop that came as a turn ended
         elif t == "clear":
             n = engine.clear()
             ui.emit({"type": "cleared", "dropped": n, "context": {"used": engine.used(),
@@ -5826,6 +6040,7 @@ def main(argv=None):
         if session.resumed and session.coding and engine.coding_from == "session":
             ui.notice("coding mode is on for this session")
 
+        exit_on_signals()
         if args.json:
             try:
                 return run_json(engine, ui, prompt, attachments, args.config_stdin, after_hello)

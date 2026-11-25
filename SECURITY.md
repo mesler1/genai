@@ -237,10 +237,24 @@ in between.
     every git command itself, on the host, with `GIT_DIR` set to the git directory it recorded
     when it made the copy (before the model could write anything), with all `GIT_*` variables
     from the environment dropped, and with `core.hooksPath=/dev/null`, `core.fsmonitor=false`,
-    signing, external diff and textconv off. No file tool may write under `.git`, and the
-    sandbox still runs on a throwaway overlay of the copy, so a test can't leave anything behind.
-  - Hidden and secret-looking files still ask, and the sandbox still hides secrets and runs
-    offline: a session can't start with the network on.
+    signing, external diff and textconv, bare-repository discovery, and every `filter.*` driver
+    the repository's config names (clean, smudge and process) off. No file tool may write under
+    `.git`, and the sandbox still runs on a throwaway overlay of the copy, so a test can't leave
+    anything behind.
+  - Edits and writes apply without asking only while an item of an approved plan is worked on;
+    before approval, and while the planner reviews an item, they ask. Hidden and secret-looking
+    files always ask, and so does a `pyvenv.cfg`, as the sandbox's secret scan treats a virtual
+    environment differently (it skips only its package directories, never the whole directory).
+  - The sandbox still hides secrets and runs offline: a session can't start with the network on,
+    the network can't be turned on during one, and a finish test checks again before it runs.
+  - Only the tools offered at that point can be called: a call to any other is refused.
+  - The session's state is its own: coding mode, if the session turned it on, and approved files
+    go back to what they were when it ends, or when starting fails. A planner on another endpoint
+    starts from the task alone, without the earlier conversation, and a secret-read question names
+    the endpoint the file would go to. `/clear` drops the planner's waiting context as well.
+  - The user can stop the turn at any time (`stop`, Ctrl-C, `/stop`) and end the session mid-turn
+    (`work_end`); quitting the front end, SIGTERM and SIGHUP end it too, committing what is there
+    and removing the copy. If git fails while ending, nothing is deleted.
   - A profile can plan with another model (`work.planner`). On the same endpoint, nothing new
     is trusted. A second endpoint must be blessed like any other, the profile's summary says it
     sees the project, and its key is masked in output too. It reads files, so whatever the

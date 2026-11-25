@@ -825,6 +825,44 @@ class TestWorkFeature(unittest.TestCase):
         self.assertEqual(m.outbox, [])
         self.assertIn("this genai can't run work sessions", self.shown(m, 1))
 
+    def test_work_end_and_stop_reach_a_busy_genai_that_can_halt(self):
+        m = self.model(features=("work", "stop", "halt"))
+        m.submit("/work t")
+        m.handle({"type": "work", "state": "started", "branch": "genai/work-1", "base": "abc", "items": []})
+        self.assertTrue(m.busy)
+        m.stop()
+        self.assertEqual(m.outbox[-1], {"type": "stop"})
+        self.assertIn("stopping genai's turn", self.shown(m, 1))
+        m.submit("/work end")
+        self.assertEqual(m.outbox[-1], {"type": "work_end"})
+        m.handle({"type": "work", "state": "ended", "why": "ended", "branch": "genai/work-1", "path": "/s/copy",
+                  "problems": ["what was left could not be committed: git add failed"], "commits": "not a list"})
+        text = self.shown(m)
+        self.assertIn("could not be committed", text)
+        self.assertIn("the copy is still at /s/copy", text)
+
+    def test_a_finish_test_runs_with_a_clock_and_stops(self):
+        m = self.model(features=("work", "stop"))
+        m.handle({"type": "proposal", "id": "p1", "kind": "finish", "n": 1, "summary": "s", "test": "make test",
+                  "auto": True})
+        self.assertIs(m.running_card(), m.cards["p1"])
+        m.stop()
+        self.assertEqual(m.outbox[-1], {"type": "stop"})
+
+    def test_odd_event_fields_are_shown_safely(self):
+        m = self.model()
+        m.handle({"type": "work", "state": "started", "branch": "b\nFAKE", "items": "nope", "time_limit": "x"})
+        m.handle({"type": "work", "state": "plan", "current": "1", "role": "item",
+                  "items": [{"n": 1, "title": "one\n✓  2. fake", "status": "todo"}, "junk", 3]})
+        panel = self.panel(m)
+        self.assertIn("one⏎✓  2. fake", panel)
+        self.assertIn("b⏎FAKE", panel)
+        self.assertNotIn("\n✓  2. fake", panel)
+        m.handle({"type": "work", "state": "item", "current": 1, "items": [{"n": "1", "status": "done"}]})
+        self.assertIn("✓  ?. ", self.panel(m))
+        m.handle({"type": "proposal", "id": "p1", "kind": "work_plan", "goal": "g", "items": ["a\nb"], "digest": "d"})
+        self.assertIn(" 1. a⏎b", text_of(m.cards["p1"], 100))
+
 
 class TestPluginsFeature(unittest.TestCase):
     ROWS = [{"name": "slurm", "description": "cluster", "enabled": True, "blessed": True, "status": "blessed",

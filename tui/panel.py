@@ -14,7 +14,7 @@ import os
 import queue
 import sys
 
-from conversation import A, D, Q, R, STATE_MARK, W, clean, fit, width
+from conversation import A, D, Q, R, STATE_MARK, W, clean, fit, one_row, width
 from ipc import Client
 
 STATE = os.environ.get("GENAI_TUI_STATE", "")
@@ -106,10 +106,10 @@ def view(st, w, sel):
     work = st.get("work")
     if work:
         head("WORK")
-        add([(fit(clean(work.get("branch", "")), w), A)])
-        add([(fit(clean(work.get("status", "")), w), "")])
+        add([(fit(one_row(work.get("branch", "")), w), A)])
+        add([(fit(one_row(work.get("status", "")), w), "")])
         for line in (work.get("items") or [])[:14]:
-            add([(fit(clean(line), w), D if line.startswith("✓") else Q)])
+            add([(fit(one_row(line), w), D if str(line).startswith("✓") else Q)])
         add([("/work end stops it", Q)])
     edits = st.get("edits") or {}
     if edits.get("mode") == "approved-files":

@@ -54,7 +54,7 @@ COMMANDS = {
     "/shell": "show the shell and move there (`` on its empty prompt hides it again)",
     "/panel": "show or hide the info panel on the right",
     "/plan": "[clear]: show the approved plan, or drop it so everything asks again",
-    "/stop": "stop the sandboxed run going on now (Ctrl-C on an empty input does the same)",
+    "/stop": "stop the sandboxed run going on now, or genai's turn (Ctrl-C on an empty input does the same)",
     "/compact": "shrink the conversation when the context is getting full",
     "/context": "show how full the context is",
     "/clear": "start over: the model forgets this conversation, and the screen clears (the saved session keeps it)",
@@ -88,6 +88,11 @@ def clean(text):
             out.append(ch)
     return "".join(out)
 
+
+
+def one_row(text):
+    """clean(text) for a place that is one row on screen: a line break shows as ⏎ instead of starting a new row."""
+    return clean(text).replace("\n", "⏎")
 
 def command_text(command):
     """A command as it is shown for review: exactly as it runs, backslashes and all, with tabs as ⇥. Characters
@@ -390,6 +395,7 @@ def parse_plan_edit(text, steps):
 
 
 MARK = {R: "✗", W: "⚠", D: "✓"}      # notes: the symbol before one in that role (a plain note has none)
+RUNS = ("sandbox", "finish")     # kinds of card that run something in the sandbox: a clock, and /stop stops them
 STATE_MARK = {"waiting": "◆", "shown": "▸", "running": "…", "accepted": "✓", "done": "✓", "ran": "✓",
               "declined": "⊘", "cancelled": "⊘", "error": "✗", "auto": "↳", "stopped": "■"}
 # A proposal id, as it may go into a tmux format (the status line): genai's are p1, p2 ...
@@ -459,7 +465,7 @@ class Card(Block):
                 out.append((("$ " if i == 0 else "  ") + ln, ""))
         elif k == "trusted":                             # a plugin's trusted command: what runs, as genai shows it
             out.append(("$ " + command_text(str(ev.get("argv", ""))).replace("\n", " "), ""))
-        if k == "sandbox" and self.state == "running":
+        if k in RUNS and self.state == "running":
             self.shown_secs = self.elapsed()
             out.append((f"running {self.shown_secs}s · " + ("Ctrl-C (or /stop) stops it" if self.stoppable else
                         "it can't be stopped from here in remote mode yet"), A))
@@ -491,7 +497,8 @@ class Card(Block):
         elif k == "work_plan":
             if ev.get("goal") != ev.get("reason"):              # genai sends the goal as the reason too
                 out.append((clean(str(ev.get("goal", ""))), A))
-            out += [(f"{n:>2}. {clean(str(it))}", "") for n, it in enumerate(ev.get("items") or [], 1)]
+            items = ev.get("items") if isinstance(ev.get("items"), list) else []
+            out += [(f"{n:>2}. {one_row(it)}", "") for n, it in enumerate(items, 1)]
         elif k == "finish" and ev.get("notes"):
             out += [("notes for later items:", Q)] + [("  " + ln, Q) for ln in clean(str(ev["notes"])).split("\n")]
         elif k == "retry" and ev.get("hint"):
@@ -630,7 +637,7 @@ class Model:
         elif t == "proposal":
             card = self.add(Card(ev))
             self.cards[card.id] = card
-            if ev.get("auto") and ev.get("kind") == "sandbox":
+            if ev.get("auto") and (ev.get("kind") == "sandbox" or (ev.get("kind") == "finish" and ev.get("test"))):
                 card.start(self.can_stop())
             elif ev.get("auto") and ev.get("kind") == "trusted":
                 card.state = "running"
@@ -737,17 +744,24 @@ class Model:
     def running_card(self):
         """The sandboxed run going on now, if any."""
         return next((c for c in reversed(list(self.cards.values()))
-                     if c.ev.get("kind") == "sandbox" and c.state == "running"), None)
+                     if c.ev.get("kind") in RUNS and c.state == "running"), None)
 
     def can_stop(self):
         features = (self.hello or {}).get("features") or []
         return "stop" in features or ("interrupt" in features and not self.remote())
 
+    def can_halt(self):
+        """genai stops a whole turn on the stop message, not only a sandboxed run."""
+        return "halt" in ((self.hello or {}).get("features") or [])
+
     def stop(self):
         """/stop and Ctrl-C: ask genai to stop the sandboxed run: the stop message, which works over ssh too, or
-        from an older genai here, a SIGINT to the genai child."""
+        from an older genai here, a SIGINT to the genai child. A genai that can halt stops the whole turn."""
         card = self.running_card()
-        if not card:
+        if not card and self.busy and self.can_halt() and self.exited is None:
+            self.note("stopping genai's turn: its reply ends at the next words, and what is waiting is declined…", W)
+            self.send({"type": "stop"})
+        elif not card:
             self.note("nothing is running in the sandbox. A command in the shell pane stops with Ctrl-C there "
                       "(/shell shows it).")
         elif "stop" in ((self.hello or {}).get("features") or []):
@@ -787,7 +801,7 @@ class Model:
     def exit(self, code, err=""):
         self.exited, self.busy, self.pending = code, False, []
         for card in self.cards.values():   # nothing runs once genai has gone: no clock, and Ctrl-C quits again
-            if card.ev.get("kind") == "sandbox" and card.state == "running":
+            if card.ev.get("kind") in RUNS and card.state == "running":
                 card.state, card.detail = "error", "genai exited before it finished"
                 card.changed()
         for ln in err.strip().splitlines()[-5:]:
@@ -1538,7 +1552,11 @@ class Child:
                 self.p.stdin.close()
             self.p.wait(5)
         except (OSError, subprocess.TimeoutExpired):
-            self.p.kill()
+            try:            # still busy: SIGTERM lets genai end a work session, committing it, before it exits
+                self.p.terminate()
+                self.p.wait(30)
+            except (OSError, subprocess.TimeoutExpired):
+                self.p.kill()
 
 
 # --------------------------------------------------------------------------
@@ -1683,7 +1701,8 @@ class App:
                                "without asking.", Q)])
             if c.ev.get("secret"):
                 ep = (self.m.hello or {}).get("endpoint") or {}
-                lines.append([(f"It looks like it holds secrets; allowing sends it to {ep.get('base_url', 'the endpoint')}", R)])
+                to = c.ev.get("to") if isinstance(c.ev.get("to"), str) else ep.get("base_url", "the endpoint")
+                lines.append([(f"It looks like it holds secrets; allowing sends it to {clean(str(to))}", R)])
             lines.append([("  y", A), (" yes   ", ""), ("n", A), (" no   ", ""), ("v", A), (" view it all", "")])
             return lines, None, "y allow · n or Esc decline · v view in full"
         rows, cur = self.ed.view(w)
@@ -1821,6 +1840,8 @@ class App:
             elif m.running_card():
                 m.stop()
                 now = 0.0                              # stopping a run doesn't count towards quitting
+            elif m.busy and m.can_halt() and now - self.ctrl_c >= 2:
+                m.stop()                               # stopping the turn: a second Ctrl-C soon after still quits
             elif now - self.ctrl_c < 2:
                 m.quit = True
             else:
