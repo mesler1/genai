@@ -241,8 +241,9 @@ in between.
     sandbox still runs on a throwaway overlay of the copy, so a test can't leave anything behind.
   - Hidden and secret-looking files still ask, and the sandbox still hides secrets and runs
     offline: a session can't start with the network on.
-  - Each plan item has a step budget and the session a time limit without you; at either, it
-    pauses. Every step, edit, test and commit is in the audit log.
+  - Each plan item has a step budget and the session a time limit without you. A stuck item goes
+    back to the planning context once; after that, or at the time limit, it pauses. Every step,
+    edit, test, commit and context swap is in the audit log.
   - What remains: the branch contains whatever the model wrote, including test files and build
     configuration, and nothing in it has been reviewed until you review it. Running its tests or
     build on your machine before reading the diff runs the model's code as you. Git still

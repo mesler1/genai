@@ -34,10 +34,10 @@ class WorkTest(FakePodman):
         git(root, "commit", "-q", "-m", "start")
         return root
 
-    def start(self, api, work=None, sandbox=None):
+    def start(self, api, work=None, sandbox=None, context_limit=100000):
         if os.path.exists(self.path("home")):
             subprocess.run(["rm", "-rf", self.path("home")], check=True)
-        home, ep = make_home(self.tmp, api.url)
+        home, ep = make_home(self.tmp, api.url, context_limit=context_limit)
         bless_path(home, ep)
         prof = {"name": "coder", "endpoint": "test", "coding": True, "sandbox": sandbox or {"image": "img:1"}}
         if work is not None:
@@ -86,7 +86,7 @@ class WorkTest(FakePodman):
             g.close()
         self.assertEqual(ended["why"], "done")
         self.assertEqual(ended["branch"], "genai/work-1")
-        self.assertEqual([c.split(" ", 1)[1] for c in ended["commits"]], ["1. change hi to fixed", "2. add b"])
+        self.assertEqual([c.split(" ", 1)[1] for c in ended["commits"]], ["1. a.txt says fixed", "2. add b.txt"])
         self.assertIn("git merge genai/work-1", ended["commands"])
         with open(os.path.join(root, "a.txt")) as f:
             self.assertEqual(f.read(), "hi\n")                       # your own files are untouched
@@ -139,7 +139,7 @@ class WorkTest(FakePodman):
         self.assertNotIn("genai/work-1", git(self.path("wd"), "branch"))
 
     def test_the_step_budget_pauses_and_a_message_renews_it(self):
-        reads = [call("read_file", path="a.txt", reason="r")] * 3
+        reads = [call("read_file", path="a.txt", reason="r")] * 5
         turns = [call("propose_work_plan", goal="g", items=["one"])] + reads + [reply("ok")]
         self.repo()
         with FakeAPI(turns) as api:
@@ -147,14 +147,14 @@ class WorkTest(FakePodman):
             g.send({"type": "work", "task": "t"})
             self.approve(g)
             self.assertEqual(g.until("done")["reason"], "work_limit")
-            self.assertEqual(len(api.requests), 3)          # the plan, then item 1's two steps
+            self.assertEqual(len(api.requests), 5)          # the plan, item 1's two steps, the planner's two
             g.send({"type": "user", "text": "go on"})
             self.assertEqual(g.until("done")["reason"], "reply")
             g.close()
         self.assertIn("work_pause", [e["event"] for e in self.audit()])
 
     def test_steps_can_be_overridden_for_one_session(self):
-        turns = [call("propose_work_plan", goal="g", items=["one"])] + [call("read_file", path="a.txt", reason="r")]
+        turns = [call("propose_work_plan", goal="g", items=["one"])] + [call("read_file", path="a.txt", reason="r")] * 2
         self.repo()
         with FakeAPI(turns) as api:
             g = self.start(api, {"steps_per_item": 50})
@@ -237,6 +237,102 @@ class WorkTest(FakePodman):
             g.close()
         self.assertEqual(git(root, "show", "genai/work-1:b.txt"), "x\n")
         self.assertEqual(os.listdir(self.path("state", "genai", "work")), [])
+
+    def test_each_item_starts_in_a_fresh_context_with_the_notes(self):
+        turns = [call("propose_work_plan", goal="g", items=["make b", "make c"]),
+                 call("write_file", path="b.txt", content="b\n", reason="r"),
+                 call("finish_item", n=1, summary="Add b.txt with the letter b in it, as the first of several "
+                      "files the task needs", notes="b.txt holds one letter; c.txt should match"),
+                 call("write_file", path="c.txt", content="c\n", reason="r"),
+                 call("finish_item", n=2, summary="add c.txt"),
+                 reply("done")]
+        root = self.repo()
+        with FakeAPI(turns) as api:
+            g = self.start(api)
+            g.send({"type": "work", "task": "the task"})
+            self.approve(g)
+            ctx = g.until("work")
+            while ctx["state"] != "context":
+                ctx = g.until("work")
+            self.assertEqual((ctx["role"], ctx["item"]), ("item", 1))
+            g.until("done")
+            g.close()
+        msgs = [r["body"]["messages"] for r in api.requests]
+        item1, item2 = msgs[1], msgs[3]
+        self.assertEqual([m["role"] for m in item1], ["system", "user"])      # nothing of the planning
+        self.assertIn("item 1 of 2: make b", item1[1]["content"])
+        self.assertIn("the task", item1[1]["content"])
+        self.assertEqual([m["role"] for m in item2], ["system", "user"])
+        self.assertIn("item 2 of 2: make c", item2[1]["content"])
+        self.assertIn("c.txt should match", item2[1]["content"])              # the handoff
+        log = git(root, "log", "--format=%s%n%b", "-1", "genai/work-1~1")
+        title = log.splitlines()[0]
+        self.assertTrue(title.startswith("1. Add b.txt") and title.endswith("\u2026") and len(title) <= 67, title)
+        self.assertIn("Plan item: make b", log)
+        self.assertIn("c.txt should match", log)
+        self.assertIn("work_context", [e["event"] for e in self.audit()])
+
+    def test_a_stuck_item_goes_back_to_the_planner(self):
+        turns = [call("propose_work_plan", goal="g", items=["one"]),
+                 call("write_file", path="b.txt", content="x\n", reason="r"),
+                 call("read_file", path="b.txt", reason="polish"),
+                 call("retry_item", n=1, hint="b.txt is written: just finish it"),
+                 call("finish_item", n=1, summary="b"),
+                 reply("done")]
+        self.repo()
+        with FakeAPI(turns) as api:
+            g = self.start(api, {"steps_per_item": 2})
+            g.send({"type": "work", "task": "t"})
+            self.approve(g)
+            self.assertEqual(g.until("done")["reason"], "reply")
+            g.close()
+        review = api.requests[3]["body"]
+        self.assertIn("used its budget of 2 model steps", review["messages"][-1]["content"])
+        self.assertIn("b.txt", review["messages"][-1]["content"])           # what the attempt changed
+        self.assertIn("propose_work_plan", json.dumps(review["messages"]))    # the planner's own context
+        self.assertIn("retry_item", [t["function"]["name"] for t in review["tools"]])
+        retry = api.requests[4]["body"]["messages"]
+        self.assertEqual([m["role"] for m in retry], ["system", "user"])
+        self.assertIn("just finish it", retry[1]["content"])
+        self.assertNotIn("retry_item", [t["function"]["name"] for t in api.requests[4]["body"]["tools"]])
+        events = [e["event"] for e in self.audit()]
+        self.assertIn("work_retry", events)
+        self.assertIn("work_item", events)
+
+    def test_old_output_is_dropped_as_the_context_fills(self):
+        big = "x" * 4000 + "\n"
+        turns = ([call("propose_work_plan", goal="g", items=["one"])]
+                 + [call("read_file", path="big.txt", reason="r")] * 6 + [reply("ok")])
+        self.repo({"big.txt": big})
+        with FakeAPI(turns) as api:
+            g = self.start(api, context_limit=20000)
+            g.send({"type": "work", "task": "t"})
+            self.approve(g)
+            g.until("done")
+            g.close()
+        last = api.requests[-1]["body"]["messages"]
+        results = [m["content"] for m in last if m["role"] == "tool"]
+        self.assertTrue(any("dropped to save room" in r for r in results))
+        self.assertTrue(any(big.strip() in r for r in results))            # the latest are kept in full
+        self.assertIn("work_clear", [e["event"] for e in self.audit()])
+
+    def test_an_item_that_fills_the_context_goes_on_in_a_fresh_one(self):
+        big = "x" * 4000 + "\n"
+        turns = ([call("propose_work_plan", goal="g", items=["one"])]
+                 + [call("read_file", path="big.txt", reason="r")] * 5 + [reply("NOTES: big.txt is all x"), reply("ok")])
+        self.repo({"big.txt": big})
+        with FakeAPI(turns) as api:
+            g = self.start(api, context_limit=8000)
+            g.send({"type": "work", "task": "t"})
+            self.approve(g)
+            self.assertEqual(g.until("done")["reason"], "reply")
+            g.close()
+        asked = [r for r in api.requests if "nearly full" in json.dumps(r["body"]["messages"][-1:])]
+        self.assertEqual(len(asked), 1)
+        self.assertNotIn("tools", asked[0]["body"])                          # notes only, nothing run
+        fresh = api.requests[-1]["body"]["messages"]
+        self.assertEqual([m["role"] for m in fresh], ["system", "user"])
+        self.assertIn("NOTES: big.txt is all x", fresh[1]["content"])
 
 
 class TestWorkProfile(unittest.TestCase):

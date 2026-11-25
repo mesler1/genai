@@ -68,7 +68,7 @@ EXIT_OK, EXIT_ERROR, EXIT_USAGE, EXIT_PROFILE, EXIT_API, EXIT_CONTEXT = 0, 1, 2,
 EXIT_INTERRUPT = 130
 
 INTRINSICS = ("propose_command", "read_file", "list_dir", "write_file", "edit_file", "propose_plan", "run_in_sandbox",
-              "search_files", "propose_work_plan", "finish_item")
+              "search_files", "propose_work_plan", "finish_item", "retry_item")
 PLAN_STEPS = 30                # steps one plan may have
 ENDPOINT_KEYS = {"name", "base_url", "model", "key_env", "key_file", "context_limit", "timeout",
                  "ca_bundle", "headers", "params", "allow_http", "proxy", "description"}
@@ -408,6 +408,11 @@ WORK_STEPS = 20                # model steps one plan item may take in a work se
 WORK_STEPS_MAX = 500
 WORK_TIME = 7200               # seconds a work session may run unattended, by default
 WORK_TIME_MAX = 86400
+WORK_CLEAR_FRACTION = 0.4      # a work session drops old file contents and output once its context is this full
+WORK_CLEAR_AGAIN = 0.1         # ... and again only after it has grown by this much more (keeps the prompt cacheable)
+WORK_KEEP_OUTPUTS = 4          # tool results kept in full when it does
+WORK_NOTES_MAX = 2000          # characters of handoff notes kept per finished item
+COMMIT_TITLE = 64              # characters of a work commit's title, after "N. "
 SANDBOX_TIMEOUT = 300          # seconds a sandboxed command may run before it is killed
 SANDBOX_TMP = "1g"             # size of the sandbox's /tmp, which is also its HOME
 SANDBOX_MEMORY = "4g"
@@ -768,10 +773,23 @@ class Work:
         self.current = 0            # the item being worked on (0: no plan yet)
         self.used = 0
         self.since = time.monotonic()
+        # Each item runs in a fresh context; the planner's context waits meanwhile, and gets a stuck item back.
+        self.role = "plan"          # whose context is being sent: "plan", "item" or "review" (the planner, again)
+        self.planner = None         # the planner's messages while an item's context runs
+        self.reports = []           # finished items, for the next item's context: {"n", "summary", "notes", "commit"}
+        self.reviewed = set()       # items the planner has already reviewed in this stretch
+        self.swap = None            # (role, hint): a context swap due after the current step's tool results
+        self.cleared_at = 0         # tokens in use when old output was last dropped
 
     def fresh(self):
         """A new item, or a message from the user: a new budget of steps and time."""
         self.used, self.since = 0, time.monotonic()
+        self.reviewed = set()
+
+    def stuck(self):
+        """The current item used its steps, and the planner hasn't reviewed it yet in this stretch."""
+        return (self.role == "item" and self.current and self.used >= self.steps
+                and self.current not in self.reviewed and time.monotonic() - self.since < self.seconds)
 
     def limit(self):
         """Why the session must pause now, or None."""
@@ -788,7 +806,75 @@ class Work:
     def info(self):
         return {"branch": self.tree.branch, "base": self.tree.base[:12], "path": self.tree.path,
                 "steps_per_item": self.steps, "time_limit": self.seconds, "test": self.test,
-                "current": self.current, "items": self.items}
+                "current": self.current, "items": self.items, "role": self.role}
+
+
+def short_title(text, n=COMMIT_TITLE):
+    """text cut to n characters at a word, for a commit title."""
+    if len(text) <= n:
+        return text
+    cut = text[:n - 1].rsplit(" ", 1)[0] if " " in text[:n - 1] else text[:n - 1]
+    return cut.rstrip(" ,;:.-\u2014") + "\u2026"
+
+
+def item_brief(work, hint=None):
+    """The first message of an item's fresh context: the task, the item, and what earlier items left for it."""
+    it = work.items[work.current - 1]
+    parts = [f"Work session. The task:\n\n{work.task}",
+             f"You are working on item {it['n']} of {len(work.items)}: {it['title']}",
+             "This is a fresh context: the conversations about earlier items are gone, but their changes are in the "
+             "working directory, committed. Read the files you need before you change them."]
+    if work.reports:
+        lines = []
+        for r in work.reports:
+            lines.append(f"- {r['n']}. {r['summary']} ({r['commit']})")
+            if r["notes"]:
+                lines += ["    " + ln for ln in r["notes"].splitlines()]
+        parts.append("Finished so far, with the notes each left for later items:\n" + "\n".join(lines))
+    if hint:
+        parts.append("For this attempt:\n" + hint)
+    parts.append(f"When the item is done and tested, call finish_item with n={it['n']}, and leave notes for the "
+                 "items after it.")
+    return "\n\n".join(parts)
+
+
+def prune_bulk(msgs, upto):
+    """Drop the bodies of bulky messages before index upto: file contents, command output, and whole files or texts
+    the model wrote with write_file or edit_file. They are on disk or can be run again. Returns how many."""
+    n = 0
+    for m in msgs[:upto]:
+        if m.get("_pruned"):
+            continue
+        if m.get("_bulk"):
+            if m.get("role") == "tool":
+                m["content"] = "[contents dropped to save room; read again if needed]"
+            else:
+                first = (m.get("content") or "").split("\n\n[", 1)[0]
+                m["content"] = first + "\n\n[attached contents dropped to save room; ask for them again if needed]"
+            m["_pruned"] = True
+            n += 1
+        elif m.get("role") == "assistant" and m.get("tool_calls"):
+            calls, changed = json.loads(json.dumps(m["tool_calls"])), False     # history shares the old ones
+            for tc in calls:
+                f = tc.get("function") or {}
+                if f.get("name") not in ("write_file", "edit_file"):
+                    continue
+                try:
+                    a = json.loads(f.get("arguments") or "{}")
+                except ValueError:
+                    continue
+                if not isinstance(a, dict):
+                    continue
+                for k in ("content", "old_text", "new_text"):
+                    if isinstance(a.get(k), str) and len(a[k]) > 200:
+                        a[k] = "[dropped to save room; the file is on disk]"
+                        changed = True
+                f["arguments"] = json.dumps(a, ensure_ascii=False)
+            if changed:
+                m["tool_calls"] = calls
+                m["_pruned"] = True
+                n += 1
+    return n
 
 
 # --------------------------------------------------------------------------
@@ -2530,9 +2616,18 @@ FINISH_TOOL = _tool("finish_item", "Finish the current plan item: genai runs the
                     "commits everything you changed since the last item. If the test fails or nothing changed, the "
                     "item is not finished and you are told why.",
                     {"n": {"type": "integer", "description": "The current item's number."},
-                     "summary": {"type": "string", "description": "One line: what you changed. It becomes the "
-                                 "commit message."}},
+                     "summary": {"type": "string", "description": "One short line, under 60 characters: what you "
+                                 "changed. It becomes the commit title."},
+                     "notes": {"type": "string", "description": "For the later items, which start in a fresh context "
+                               "and won't see this conversation: what you built and where, names and conventions to "
+                               "follow, how to run things, anything you had to find out. A few lines."}},
                     ["n", "summary"])
+RETRY_TOOL = _tool("retry_item", "Start a fresh attempt at the item you are reviewing, in a new context, with your "
+                   "hint. The changes made so far stay.",
+                   {"n": {"type": "integer", "description": "The item's number."},
+                    "hint": {"type": "string", "description": "What the fresh attempt should do differently, or "
+                             "what is left to do."}},
+                   ["n", "hint"])
 
 SYSTEM_PROMPT = """You are genai, an assistant working alongside a human in their terminal.
 
@@ -2568,8 +2663,10 @@ WORK_RULES = """
 - First call propose_work_plan: the items, in order, each small enough to finish, test and commit on its own. Wait for the user's approval. Then work through the items in order, without asking.
 - read_file, list_dir and search_files run without asking. write_file and edit_file apply without asking too, except to hidden or secret-looking files, which ask. Look before you change: read the files involved first. Prefer edit_file, with a few unchanged lines of context, to rewriting a file.
 - run_in_sandbox runs a command in /work, a throwaway overlay of the copy: it sees your edits, but its own changes are discarded, so change files only with edit_file and write_file. The sandbox is {net}. Build and test there after each change, read the output, and fix what fails.
-- When the current item is done and tested, call finish_item with its number and a one-line summary. genai {test}, and commits your changes. Then go on to the next item.
-- Each item has a budget of {steps} model steps; if you use them all, the session pauses for the user. Don't stop to ask unless you are truly stuck: then say what you need in a plain reply, and the session waits for the user.
+- When the current item is done and tested, call finish_item with its number, a short summary and notes. genai {test}, and commits your changes.
+- Each item runs in a fresh context: it sees the task, the plan, and the notes earlier items left, not their conversations. So make the notes count: what you built and where, the names and conventions to follow, how to run things, what you had to find out.
+- Old file contents and command output may be dropped from the conversation to save room; read them again if you need them.
+- Each item has a budget of {steps} model steps. Don't polish: when the item does what it says and its tests pass, finish it. An item that uses up its budget goes back to whoever planned the session, who decides what happens next. Don't stop to ask unless you are truly stuck: then say what you need in a plain reply, and the session waits for the user.
 - If the plan turns out wrong, propose a new one with propose_work_plan; it needs the user's approval again."""
 
 CODING_NO_RUN = ("- You still cannot run anything. When a change is ready, propose ONE command that builds or tests it. "
@@ -2980,6 +3077,7 @@ PROPOSAL_KINDS = {k.name: k for k in (       # every kind of proposal there is; 
     Kind("plan", "propose_plan", "build_plan", "perform_plan", answered=True),
     Kind("work_plan", "propose_work_plan", "build_work_plan", "perform_work_plan"),
     Kind("finish", "finish_item", "build_finish", "perform_finish"),
+    Kind("retry", "retry_item", "build_retry", "perform_retry"),
     Kind("external", None, "build_external", "perform_external", bulk=True, answered=True),
     Kind("trusted", None, "build_trusted", "perform_trusted", bulk=True),
 )}
@@ -3342,6 +3440,78 @@ class Engine:
             except Exception:       # exiting anyway; the branch and the copy are still there to look at
                 pass
 
+    # -- a work session's contexts
+
+    def swap_context(self, role, text, why):
+        """Send a different context from the next step on: a fresh one for the current item (text: a hint), or the
+        planner's, to review a stuck item (text: the report). The planner's context is kept, its bulk dropped."""
+        w = self.work
+        before = len(self.session.messages)
+        if w.role in ("plan", "review"):
+            w.planner = self.session.messages
+            prune_bulk(w.planner, len(w.planner))
+        msg = {"role": "user", "content": item_brief(w, text) if role == "item" else text}
+        self.session.messages = ([] if role == "item" else list(w.planner or [])) + [msg]
+        self.session.history.append(dict(msg))
+        self.session.usage = None
+        w.role, w.cleared_at = role, 0
+        if role == "item":
+            w.used = 0
+        self.audit.log("work_context", role=role, item=w.current, why=why, dropped=before, tokens=self.used())
+        self.ui.work({"state": "context", "role": role, "item": w.current, "why": why})
+
+    def review_item(self):
+        """The current item used its steps: give it to the planner, with what it changed and its last words."""
+        w = self.work
+        n = w.current
+        w.reviewed.add(n)
+        w.used = 0
+        try:
+            changed = w.tree.git(["status", "--short", "--untracked-files=all"])[1].strip()
+        except GenaiError as e:
+            changed = f"(could not tell: {e})"
+        last = next((m.get("content") for m in reversed(self.session.messages)
+                     if m.get("role") == "assistant" and (m.get("content") or "").strip()), "")
+        report = (f"Item {n} ({w.items[n - 1]['title']}) used its budget of {w.steps} model steps without being "
+                  f"finished. You planned this session: decide what happens next.\n\n"
+                  f"Files changed since the last finished item:\n{changed or '(none)'}\n\n"
+                  f"The last thing the attempt said:\n{clip(last.strip()) if last.strip() else '(nothing)'}\n\n"
+                  "Choose one. If the item does what it says, call finish_item: the test runs and it is committed. "
+                  "If not, call retry_item with a hint, and a fresh attempt starts (the changes so far stay). If the "
+                  "plan is wrong, propose a new one with propose_work_plan. If you need the user, reply in plain text "
+                  "and the session waits for them.")
+        self.swap_context("review", report, "the item used its steps")
+
+    def work_context(self):
+        """Keep a work session's context small, before each step: drop old file contents and output once it is
+        WORK_CLEAR_FRACTION full; if one item still fills it, start the item again in a fresh context, with notes."""
+        w = self.work
+        limit = self.endpoint.context_limit
+        used = self.used()
+        if used < WORK_CLEAR_FRACTION * limit or used < w.cleared_at + WORK_CLEAR_AGAIN * limit:
+            return
+        msgs = self.session.messages
+        results = [i for i, m in enumerate(msgs) if m.get("role") == "tool"]
+        n = prune_bulk(msgs, results[-WORK_KEEP_OUTPUTS]) if len(results) > WORK_KEEP_OUTPUTS else 0
+        if n:
+            self.session.usage = None
+            after = self.used()
+            self.audit.log("work_clear", item=w.current, role=w.role, pruned=n, before=used, after=after)
+            used = after
+        w.cleared_at = used
+        if used >= WARN_FRACTION * limit and w.role == "item":
+            self.session.messages = msgs + [{"role": "user", "content":
+                "Your context is nearly full, so this item goes on in a fresh one. Write notes for it: what is done, "
+                "what is left, and what you found out (files, names, commands). Plain text only."}]
+            try:
+                notes = (self.send(max_tokens=SUMMARY_WORDS * 3, tools=False).get("content") or "").strip()
+            except GenaiError as e:
+                notes = f"(none: asking for them failed: {e})"
+            finally:
+                self.session.messages = msgs
+            self.swap_context("item", "Your previous attempt at this item filled its context, so this is a fresh "
+                              "one. Its notes:\n" + (notes or "(none)"), "the context was full")
+
     def set_network(self, on, source=":network"):
         if not self.box:
             raise GenaiError("there is no sandbox: the profile has no 'sandbox'", EXIT_USAGE, "no_sandbox")
@@ -3362,7 +3532,8 @@ class Engine:
         host = socket.gethostname()
         if self.work:       # the copy only: nothing for the real system, and the work session's own plan
             return ([t for t in TOOLS if t["function"]["name"] not in ("propose_command", "propose_plan")]
-                    + [SEARCH_TOOL, RUN_TOOL, WORK_PLAN_TOOL, FINISH_TOOL])
+                    + [SEARCH_TOOL, RUN_TOOL, WORK_PLAN_TOOL, FINISH_TOOL]
+                    + ([RETRY_TOOL] if self.work.role == "review" else []))
         return (TOOLS + ([SEARCH_TOOL] if self.can_search() else []) + ([RUN_TOOL] if self.can_run() else [])
                 + [c.schema(host) for c in self.trusted_tools().values()]
                 + list(self.external.values()))
@@ -3450,6 +3621,8 @@ class Engine:
     def loop(self, checked=False):
         step = 0
         while True:
+            if self.work and self.work.stuck():
+                self.review_item()
             if self.work:
                 why = self.work.limit()
                 if why:
@@ -3460,6 +3633,8 @@ class Engine:
             elif step >= STEP_LIMIT:
                 self.ui.notice(f"step limit ({STEP_LIMIT}) reached; send a message to continue")
                 return "step_limit"
+            if self.work:
+                self.work_context()
             if step or not checked:
                 self.check_budget()
             step += 1
@@ -3484,6 +3659,10 @@ class Engine:
                 if kind and kind.shown and not p.error:
                     ended = True
                 stopped = stopped or p.stopped
+            if self.work and self.work.swap:
+                role, hint, why = self.work.swap
+                self.work.swap = None
+                self.swap_context(role, hint, why)
             self.session.save()
             if stopped:
                 self.ui.notice("stopped; send a message to continue")
@@ -3637,8 +3816,24 @@ class Engine:
             raise ValueError("n (the item's number) and summary are required")
         if n != self.work.current:
             raise ValueError(f"item {n} is not the current item: finish item {self.work.current} first")
+        notes = args.get("notes")
+        if notes is not None and not isinstance(notes, str):
+            raise ValueError("notes must be text")
         p = Proposal(pid, "finish", call_id, n=n, summary=one_line(summary.strip())[0][:200], reason=summary,
-                     test=self.work.test)
+                     test=self.work.test, notes=(notes or "").strip()[:WORK_NOTES_MAX])
+        p.auto = True
+        return p
+
+    def build_retry(self, pid, call_id, args, reason, name):
+        w = self.work
+        if not w or w.role != "review":
+            raise ValueError("retry_item is only for reviewing an item that used its steps")
+        n, hint = args.get("n"), args.get("hint")
+        if type(n) is not int or not isinstance(hint, str) or not hint.strip():
+            raise ValueError("n (the item's number) and hint are required")
+        if n != w.current:
+            raise ValueError(f"item {n} is not the one under review: that is item {w.current}")
+        p = Proposal(pid, "retry", call_id, n=n, hint=hint.strip()[:WORK_NOTES_MAX], reason=hint)
         p.auto = True
         return p
 
@@ -3920,6 +4115,7 @@ class Engine:
         w.items = [{"n": n, "title": t, "status": "todo", "commit": None} for n, t in enumerate(p.fields["items"], 1)]
         w.current = 1
         w.fresh()
+        w.role, w.swap = "plan", ("item", None, "the plan was approved")   # whoever proposed it plans from now on
         self.audit.log("work_plan", id=p.id, items=len(w.items))
         self.ui.work({"state": "plan", **w.info()})
         return ("The user approved this plan. Work through it item by item, without asking; call finish_item when "
@@ -3945,7 +4141,13 @@ class Engine:
                 self.ui.result(p, "error", f"item {n} not finished: {why}", output=out, exit=rc)
                 return f"not finished: {why}. Output:\n" + (out if out.strip() else "(none)")
         try:
-            sha = w.tree.commit(f"{n}. {w.items[n - 1]['title'][:72]}\n\n{p.fields['summary']}")
+            summary, notes = p.fields["summary"], p.fields["notes"]
+            title = short_title(summary)
+            body = [summary] if title != summary else []
+            body.append(f"Plan item: {w.items[n - 1]['title']}")
+            if notes:
+                body.append("Notes for later items:\n" + notes)
+            sha = w.tree.commit(f"{n}. {title}\n\n" + "\n\n".join(body))
         except GenaiError as e:
             self.ui.result(p, "error", f"item {n} not committed: {e}")
             return f"error: not committed: {e}"
@@ -3953,15 +4155,25 @@ class Engine:
             self.ui.result(p, "error", f"item {n} not finished: nothing changed since the last item")
             return "not finished: no files changed since the last item. Make the changes first."
         w.items[n - 1].update(status="done", commit=sha)
+        w.reports.append({"n": n, "summary": p.fields["summary"], "notes": p.fields["notes"], "commit": sha})
         self.audit.log("work_item", id=p.id, item=n, commit=sha)
         nxt = next((it for it in w.items if it["status"] == "todo"), None)
         w.current = nxt["n"] if nxt else 0
         w.fresh()
+        if nxt:
+            w.swap = ("item", None, f"item {n} was finished")
         self.ui.result(p, "ok", f"item {n} committed as {sha}")
         self.ui.work({"state": "item", **w.info()})
         if nxt is None:
             return f"Item {n} committed as {sha}. Every item is done: reply with a short summary of the work."
         return f"Item {n} committed as {sha}. Next: item {nxt['n']}: {nxt['title']}"
+
+    def perform_retry(self, p):
+        w = self.work
+        w.swap = ("item", p.fields["hint"], "the planner asked for a fresh attempt")
+        self.audit.log("work_retry", id=p.id, item=p.fields["n"])
+        self.ui.result(p, "ok", f"a fresh attempt at item {p.fields['n']} starts now")
+        return f"A fresh attempt at item {p.fields['n']} starts now, with your hint."
 
     def perform_external(self, p):
         status = p.decision if p.decision in ("ok", "declined", "error") else "declined"
@@ -4298,6 +4510,8 @@ class TtyUI(PlainUI):
             eprint(f"  (coding mode) search {show_exact(p.fields['pattern'])} in {one_line(p.fields['path'])[0]}")
         elif p.kind == "finish":
             eprint(f"  [{p.id}] finish item {p.fields['n']}: {one_line(p.fields['summary'])[0]}")
+        elif p.kind == "retry":
+            eprint(f"  [{p.id}] try item {p.fields['n']} again: {one_line(p.fields['hint'])[0]}")
         elif p.fields.get("work"):
             what = "edit" if p.kind == "edit" else "write"
             eprint(f"  [{p.id}] (work session) {what} {one_line(p.fields['path'])[0]}")
@@ -4369,6 +4583,9 @@ class TtyUI(PlainUI):
         elif state == "item" and ev["current"]:
             it = ev["items"][ev["current"] - 1]
             eprint(f"genai: next, item {it['n']} of {len(ev['items'])}: {one_line(it['title'])[0]}")
+        elif state == "context":
+            who = f"item {ev['item']}" if ev["role"] == "item" else f"the planner, to review item {ev['item']}"
+            eprint(f"genai: a fresh context for {who} ({ev['why']})")
         elif state == "ended":
             eprint(f"genai: work session {'done' if ev['why'] == 'done' else 'ended'}.")
             if not ev["branch"]:
