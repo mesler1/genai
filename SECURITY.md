@@ -229,6 +229,26 @@ in between.
   - The command's output is masked and clipped before the model sees it, and the user sees the
     same output. The audit log records each run by fingerprint, with its exit code and duration.
 
+- **Work sessions** (`:work`, or the JSON `work` message) let the model edit, test and commit
+  without asking, so the boundary moves from each edit to the branch you review at the end:
+  - The model works in a git worktree outside your project, on a branch of its own. Your own
+    files and branch are never written; you merge the branch yourself, with git.
+  - The copy's `.git` file and the repository's hooks could make git run a program. genai runs
+    every git command itself, on the host, with `GIT_DIR` set to the git directory it recorded
+    when it made the copy (before the model could write anything), with all `GIT_*` variables
+    from the environment dropped, and with `core.hooksPath=/dev/null`, `core.fsmonitor=false`,
+    signing, external diff and textconv off. No file tool may write under `.git`, and the
+    sandbox still runs on a throwaway overlay of the copy, so a test can't leave anything behind.
+  - Hidden and secret-looking files still ask, and the sandbox still hides secrets and runs
+    offline: a session can't start with the network on.
+  - Each plan item has a step budget and the session a time limit without you; at either, it
+    pauses. Every step, edit, test and commit is in the audit log.
+  - What remains: the branch contains whatever the model wrote, including test files and build
+    configuration, and nothing in it has been reviewed until you review it. Running its tests or
+    build on your machine before reading the diff runs the model's code as you. Git still
+    applies `.gitattributes` filters you have configured globally (such as Git LFS) when it
+    checks out and commits the copy.
+
 What remains: the indicator is display only. A command you approve outside a sandbox can do
 anything you can. Inside `sandbox/run genai` the network is open, because genai has to reach
 the endpoint, so a command run there can reach any host. It can also read whatever your user

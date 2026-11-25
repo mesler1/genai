@@ -68,7 +68,7 @@ EXIT_OK, EXIT_ERROR, EXIT_USAGE, EXIT_PROFILE, EXIT_API, EXIT_CONTEXT = 0, 1, 2,
 EXIT_INTERRUPT = 130
 
 INTRINSICS = ("propose_command", "read_file", "list_dir", "write_file", "edit_file", "propose_plan", "run_in_sandbox",
-              "search_files")
+              "search_files", "propose_work_plan", "finish_item")
 PLAN_STEPS = 30                # steps one plan may have
 ENDPOINT_KEYS = {"name", "base_url", "model", "key_env", "key_file", "context_limit", "timeout",
                  "ca_bundle", "headers", "params", "allow_http", "proxy", "description"}
@@ -76,7 +76,7 @@ REMOTE_URL = re.compile(r"http://127\.0\.0\.1:([0-9]{1,5})((?:/[A-Za-z0-9._~-]+)
 TOKEN_RE = re.compile(r"[0-9A-Fa-f]{32,128}")
 TOKEN_HEADER = "X-Genai-Token"
 PROFILE_KEYS = {"name", "description", "endpoint", "persona", "skills", "plugins", "params", "coding", "sandbox",
-                "edits"}
+                "edits", "work"}
 EDITS_MODES = ("ask", "approved-files")   # "approved-files": a further edit to a file you approved applies
 NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
 ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -403,6 +403,11 @@ def where_runs(sb):
 # Sandbox runner: commands the model runs itself, in a container, on a throwaway copy of the project
 
 SANDBOX_KEYS = {"engine", "image", "network", "timeout", "memory", "pids"}
+WORK_KEYS = {"test", "steps_per_item", "time_limit"}
+WORK_STEPS = 20                # model steps one plan item may take in a work session, by default
+WORK_STEPS_MAX = 500
+WORK_TIME = 7200               # seconds a work session may run unattended, by default
+WORK_TIME_MAX = 86400
 SANDBOX_TIMEOUT = 300          # seconds a sandboxed command may run before it is killed
 SANDBOX_TMP = "1g"             # size of the sandbox's /tmp, which is also its HOME
 SANDBOX_MEMORY = "4g"
@@ -642,6 +647,148 @@ class Sandbox:
                 signal.signal(signal.SIGINT, before)
 
 
+
+
+# --------------------------------------------------------------------------
+# Work sessions: a git worktree the model works in
+
+# Every git command genai runs for a work session: hooks, fsmonitor and signing off, so nothing in the copy or the
+# repository's config can make git run a program; external diff and textconv drivers off for the same reason.
+GIT_SAFE = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false",
+            "-c", "diff.external=", "-c", "core.pager=cat")
+
+
+def run_git(args, cwd, env=None, ok=(0,)):
+    """git on the host: (exit code, output). GIT_* variables from the environment are dropped, so only what genai
+    sets here decides which repository is used. Raises GenaiError for an exit code not in ok."""
+    full = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    full.update({"GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C"}, **(env or {}))
+    try:
+        r = subprocess.run(["git", *GIT_SAFE, *args], cwd=cwd, env=full, stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True, errors="replace", timeout=120)
+    except FileNotFoundError:
+        raise GenaiError("git is not installed", EXIT_USAGE, "work_refused") from None
+    except subprocess.TimeoutExpired:
+        raise GenaiError(f"git {args[0]} took more than 120 s", EXIT_USAGE, "work") from None
+    if r.returncode not in ok:
+        raise GenaiError(f"git {args[0]} failed: {one_line((r.stderr or r.stdout).strip())[0]}", EXIT_USAGE, "work")
+    return r.returncode, r.stdout
+
+
+def work_home():
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
+    return os.path.join(base, "genai", "work")
+
+
+class Worktree:
+    """A work session's copy of the project: a git worktree on a branch of its own, outside the project. genai runs
+    every git command for it on the host, naming the worktree's git directory explicitly, so a .git file in the copy
+    is never trusted, and with hooks off. The model reaches the copy only through genai's file tools, and the sandbox
+    runs on a throwaway overlay of it, so neither can write the .git file or anything git reads from it."""
+
+    def __init__(self, top, path, gitdir, branch, base, sub):
+        self.top, self.path, self.gitdir, self.branch, self.base, self.sub = top, path, gitdir, branch, base, sub
+
+    @property
+    def wd(self):
+        """The working directory inside the copy: the same place in the project that genai was started in."""
+        return os.path.join(self.path, self.sub) if self.sub != "." else self.path
+
+    @classmethod
+    def create(cls, cwd):
+        """A new worktree for the repository cwd is in, from its last commit: (Worktree, untracked file count).
+        Refuses outside a repository, before the first commit, and with uncommitted changes to tracked files."""
+        try:
+            rc, out = run_git(["rev-parse", "--show-toplevel"], cwd, ok=(0, 128))
+        except GenaiError as e:
+            raise GenaiError(str(e), EXIT_USAGE, "work_refused") from None
+        if rc:
+            raise GenaiError("a work session needs a git repository: this directory isn't in one", EXIT_USAGE,
+                             "work_refused")
+        top = os.path.realpath(out.strip())
+        sub = os.path.relpath(os.path.realpath(cwd), top)
+        rc, head = run_git(["rev-parse", "--verify", "-q", "HEAD^{commit}"], top, ok=(0, 1))
+        if rc:
+            raise GenaiError("the repository has no commits yet: commit something first", EXIT_USAGE, "work_refused")
+        _, status = run_git(["status", "--porcelain", "--untracked-files=all"], top)
+        lines = status.splitlines()
+        changed = [ln for ln in lines if not ln.startswith("??")]
+        if changed:
+            raise GenaiError(f"the repository has uncommitted changes ({len(changed)} file"
+                             f"{'s' if len(changed) != 1 else ''}): commit or stash them first, so the work starts "
+                             "from what you have", EXIT_USAGE, "work_refused")
+        n = 1
+        while run_git(["show-ref", "--verify", "-q", f"refs/heads/genai/work-{n}"], top, ok=(0, 1))[0] == 0:
+            n += 1
+        branch = f"genai/work-{n}"
+        name = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(top)) or "project"
+        path = os.path.join(ensure_dir(work_home()), f"{name}-{n}-{secrets.token_hex(3)}")
+        run_git(["worktree", "add", "-q", "-b", branch, path, head.strip()], top)
+        _, gitdir = run_git(["rev-parse", "--absolute-git-dir"], path)   # now, before anything could change it
+        return cls(top, os.path.realpath(path), gitdir.strip(), branch, head.strip(), sub), \
+            sum(1 for ln in lines if ln.startswith("??"))
+
+    def git(self, args, ok=(0,), env=None):
+        return run_git(args, self.path, dict({"GIT_DIR": self.gitdir, "GIT_WORK_TREE": self.path}, **(env or {})),
+                       ok)
+
+    def commit(self, message):
+        """Commit everything in the copy: the short hash, or None if nothing changed."""
+        self.git(["add", "-A"])
+        if self.git(["diff", "--cached", "--quiet", "--no-ext-diff"], ok=(0, 1))[0] == 0:
+            return None
+        who = {}
+        if self.git(["config", "user.email"], ok=(0, 1))[0]:     # no identity configured: commit as genai
+            who = {"GIT_AUTHOR_NAME": "genai", "GIT_AUTHOR_EMAIL": "genai@localhost",
+                   "GIT_COMMITTER_NAME": "genai", "GIT_COMMITTER_EMAIL": "genai@localhost"}
+        self.git(["commit", "-q", "--no-verify", "-m", message], env=who)
+        return self.git(["rev-parse", "--short", "HEAD"])[1].strip()
+
+    def summary(self):
+        """(commits as "hash subject" lines, diff stat) since the session started."""
+        _, log = self.git(["log", "--reverse", "--format=%h %s", f"{self.base}..HEAD"])
+        _, stat = self.git(["diff", "--no-ext-diff", "--no-textconv", "--stat", self.base, "HEAD"])
+        return log.splitlines(), stat.rstrip()
+
+    def remove(self, keep):
+        """Remove the copy. The branch stays if keep (it has the session's commits); otherwise it goes too."""
+        run_git(["worktree", "remove", "--force", self.path], self.top)
+        if not keep:
+            run_git(["branch", "-q", "-D", self.branch], self.top)
+
+
+class Work:
+    """A work session in progress: the copy, the task, the approved plan items and the limits."""
+
+    def __init__(self, tree, task, steps, seconds, test, home):
+        self.tree, self.task, self.steps, self.seconds, self.test = tree, task, steps, seconds, test
+        self.home = home            # the Workdir genai goes back to when the session ends
+        self.goal = None
+        self.items = None           # the approved plan: [{"n", "title", "status", "commit"}]
+        self.current = 0            # the item being worked on (0: no plan yet)
+        self.used = 0
+        self.since = time.monotonic()
+
+    def fresh(self):
+        """A new item, or a message from the user: a new budget of steps and time."""
+        self.used, self.since = 0, time.monotonic()
+
+    def limit(self):
+        """Why the session must pause now, or None."""
+        what = f"item {self.current}" if self.current else "the plan"
+        if self.used >= self.steps:
+            return f"{what} has used its {self.steps} model steps without being finished"
+        if time.monotonic() - self.since >= self.seconds:
+            return f"the session has run {self.seconds // 60} min without you"
+        return None
+
+    def done(self):
+        return bool(self.items) and all(it["status"] == "done" for it in self.items)
+
+    def info(self):
+        return {"branch": self.tree.branch, "base": self.tree.base[:12], "path": self.tree.path,
+                "steps_per_item": self.steps, "time_limit": self.seconds, "test": self.test,
+                "current": self.current, "items": self.items}
 
 
 # --------------------------------------------------------------------------
@@ -1492,6 +1639,9 @@ class Profile:
         if self.edits not in EDITS_MODES:
             raise GenaiError(f"{path}: 'edits' must be \"ask\" or \"approved-files\"", EXIT_PROFILE)
         self.sandbox = parse_sandbox(data["sandbox"], path) if "sandbox" in data else None
+        self.work = parse_work(data["work"], path) if "work" in data else None
+        if self.work and not self.sandbox:
+            raise GenaiError(f"{path}: 'work' needs a 'sandbox': a work session tests in it", EXIT_PROFILE)
 
     @classmethod
     def load(cls, path):
@@ -1537,6 +1687,11 @@ class Profile:
             if b["network"]:
                 lines.append("  [!] the sandbox starts with the network ON: code the model writes could send your "
                              "project anywhere, so each run asks first")
+        if self.work:
+            w = self.work
+            test = f"test command {one(w['test'])}" if w["test"] else "no test command"
+            lines.append(f"  work:     {w['steps_per_item']} steps per plan item, {w['time_limit'] // 60} min unattended, "
+                         f"{test}")
         if self.persona:
             lines.append("  persona (sent to the model with every request):")
             lines += ["    | " + ln for ln in show_exact(self.persona).splitlines()]
@@ -2328,11 +2483,56 @@ SEARCH_TOOL = _tool("search_files", "Search the text files under a directory for
                      "ignore_case": {"type": "boolean"}, "reason": _REASON}, ["pattern", "reason"])
 
 # Offered only in coding mode, when the profile gives a sandbox that can run here.
+def work_limits(steps, seconds, where):
+    """A work session's limits, checked: model steps per plan item, and seconds unattended."""
+    if steps is not None and (type(steps) is not int or not 1 <= steps <= WORK_STEPS_MAX):
+        raise GenaiError(f"{where}: steps per item must be a number from 1 to {WORK_STEPS_MAX}", EXIT_USAGE,
+                         "bad_message")
+    if seconds is not None and (type(seconds) is not int or not 60 <= seconds <= WORK_TIME_MAX):
+        raise GenaiError(f"{where}: the time limit must be seconds, from 60 to {WORK_TIME_MAX}", EXIT_USAGE,
+                         "bad_message")
+    return steps, seconds
+
+
+def parse_work(data, path):
+    """A profile's "work" object, checked: the defaults for work sessions, and the command that must pass before a
+    plan item counts as done."""
+    if not isinstance(data, dict):
+        raise GenaiError(f"{path}: 'work' must be an object", EXIT_PROFILE)
+    unknown = set(data) - WORK_KEYS
+    if unknown:
+        raise GenaiError(f"{path}: unknown work fields: {', '.join(sorted(unknown))}", EXIT_PROFILE)
+    test = data.get("test")
+    if test is not None and (not isinstance(test, str) or not test.strip() or "\n" in test):
+        raise GenaiError(f"{path}: work 'test' must be one command line", EXIT_PROFILE)
+    try:
+        steps, seconds = work_limits(data.get("steps_per_item"), data.get("time_limit"), path)
+    except GenaiError as e:
+        raise GenaiError(str(e), EXIT_PROFILE) from None
+    return {"test": test, "steps_per_item": steps or WORK_STEPS, "time_limit": seconds or WORK_TIME}
+
+
 RUN_TOOL = _tool("run_in_sandbox", "Run ONE shell command (build, test, lint, try something) in a sandbox and get its "
                  "exit code and output back. It runs in /work, a throwaway copy of the working directory: changes it "
                  "makes are discarded, so change files with edit_file or write_file. No home directory; files that "
                  "look like secrets are hidden. Use it to check your work, then fix what fails.",
                  {"command": {"type": "string"}, "reason": _REASON}, ["command", "reason"])
+
+# Offered only in a work session, in place of propose_plan and propose_command.
+WORK_PLAN_TOOL = _tool("propose_work_plan", "Propose the plan for this work session: the items, in order, each a "
+                       "piece of the task you can finish and commit on its own. The user approves it before you start. "
+                       "A new plan replaces the old one and needs approval again.",
+                       {"goal": {"type": "string", "description": "One line: what the session achieves."},
+                        "items": {"type": "array", "items": {"type": "string"},
+                                  "description": "One line each: what the item changes, and how you will know it works."}},
+                       ["goal", "items"])
+FINISH_TOOL = _tool("finish_item", "Finish the current plan item: genai runs the test command, if there is one, and "
+                    "commits everything you changed since the last item. If the test fails or nothing changed, the "
+                    "item is not finished and you are told why.",
+                    {"n": {"type": "integer", "description": "The current item's number."},
+                     "summary": {"type": "string", "description": "One line: what you changed. It becomes the "
+                                 "commit message."}},
+                    ["n", "summary"])
 
 SYSTEM_PROMPT = """You are genai, an assistant working alongside a human in their terminal.
 
@@ -2359,6 +2559,18 @@ CODING_RULES = """
 - Writes and edits are shown to the user as diffs and may be declined; if one is, ask rather than retrying the same change.
 {run}
 - For a task of more than two or three steps, call propose_plan first and wait for approval. Then follow the plan: propose planned commands exactly as approved. If you need to go outside it, say why, or propose a new plan."""
+
+# The system prompt's rules during a work session, in place of CODING_RULES.
+WORK_RULES = """
+
+# This is a work session
+- You are working on your own, on a copy of the user's project (a git branch of its own), until the task is done. Nothing you do reaches the user's own files: at the end they review everything you changed as one diff and decide what to keep.
+- First call propose_work_plan: the items, in order, each small enough to finish, test and commit on its own. Wait for the user's approval. Then work through the items in order, without asking.
+- read_file, list_dir and search_files run without asking. write_file and edit_file apply without asking too, except to hidden or secret-looking files, which ask. Look before you change: read the files involved first. Prefer edit_file, with a few unchanged lines of context, to rewriting a file.
+- run_in_sandbox runs a command in /work, a throwaway overlay of the copy: it sees your edits, but its own changes are discarded, so change files only with edit_file and write_file. The sandbox is {net}. Build and test there after each change, read the output, and fix what fails.
+- When the current item is done and tested, call finish_item with its number and a one-line summary. genai {test}, and commits your changes. Then go on to the next item.
+- Each item has a budget of {steps} model steps; if you use them all, the session pauses for the user. Don't stop to ask unless you are truly stuck: then say what you need in a plain reply, and the session waits for the user.
+- If the plan turns out wrong, propose a new one with propose_work_plan; it needs the user's approval again."""
 
 CODING_NO_RUN = ("- You still cannot run anything. When a change is ready, propose ONE command that builds or tests it. "
                  "That ends your turn, and the user may send you the output.")
@@ -2711,6 +2923,15 @@ def plan_text(plan):
     return "\n".join(lines)
 
 
+def work_text(work):
+    """The approved work plan for the model: each item and how far it has got."""
+    lines = [f"Goal: {work.goal}"]
+    for it in work.items:
+        note = {"done": " (done)", "todo": " (CURRENT)" if it["n"] == work.current else ""}[it["status"]]
+        lines.append(f"{it['n']}. {it['title']}{note}")
+    return "\n".join(lines)
+
+
 def audit_step(st):
     return {"n": st["n"], "kind": st["kind"], **({"path": st["path"]} if "path" in st else
                                                  command_fingerprint(st["command"]))}
@@ -2757,6 +2978,8 @@ PROPOSAL_KINDS = {k.name: k for k in (       # every kind of proposal there is; 
     Kind("write", "write_file", "build_write", "perform_file"),
     Kind("edit", "edit_file", "build_edit", "perform_file"),
     Kind("plan", "propose_plan", "build_plan", "perform_plan", answered=True),
+    Kind("work_plan", "propose_work_plan", "build_work_plan", "perform_work_plan"),
+    Kind("finish", "finish_item", "build_finish", "perform_finish"),
     Kind("external", None, "build_external", "perform_external", bulk=True, answered=True),
     Kind("trusted", None, "build_trusted", "perform_trusted", bulk=True),
 )}
@@ -2833,6 +3056,7 @@ class Engine:
         self.anywhere = anywhere
         self.coding_override = None     # the refused place coding mode is on in, when --coding-anywhere allowed it
         self.plan = None                # the plan the user approved, if any; never saved with the session
+        self.work = None                # the work session in progress (Work), if any; never saved
         self.edits = profile.edits if profile else "ask"
         self.approved_files = set()     # files an edit or write was approved for, this process only; never saved
         self.coding_from = "session" if session.coding else None
@@ -2887,6 +3111,9 @@ class Engine:
         return plugin_rows(self.cfg, [p.name for p in self.plugins], found)
 
     def set_coding(self, on, source=":coding"):
+        if self.work and not on:
+            raise GenaiError("coding mode stays on during a work session; end the session first", EXIT_USAGE,
+                             "work")
         refused = coding_refusal(os.getcwd()) if on else None
         if refused and not self.anywhere:
             raise GenaiError(f"coding mode is refused in {refused[0]}; cd into a project first "
@@ -3016,6 +3243,105 @@ class Engine:
         secrets_ = [k for k in self.secrets() if k]
         return not any(looks_secret(t) or any(k in t for k in secrets_) for t in (old, new or ""))
 
+    def work_edit(self, p):
+        """Does this edit or write apply without asking, in a work session? Yes, in the copy, unless the file is hidden,
+        or it or the new content looks secret."""
+        if not self.work or not self.ui.performs:
+            return False
+        key = self.file_key(p.fields.get("path"))
+        if key is None or is_hidden(key.split("/")) or p.fields.get("undiffable"):
+            return False
+        new = p.fields.get("_content") if p.kind == "edit" else p.fields.get("content")
+        texts = [new or ""]
+        if p.kind == "edit" or p.fields.get("exists"):
+            try:
+                texts.append(self.wd.read(p.fields["path"]))
+            except (ValueError, OSError):
+                return False
+        keys = [k for k in self.secrets() if k]
+        return not any(looks_secret(t) or any(k in t for k in keys) for t in texts)
+
+    # -- work sessions
+
+    def start_work(self, task, steps=None, seconds=None, source=":work"):
+        """Start a work session on a git worktree of the project, and send the task. Returns how the turn ended."""
+        if self.work:
+            raise GenaiError(f"a work session is already on ({self.work.tree.branch}); end it first", EXIT_USAGE,
+                             "work_refused")
+        if not self.ui.performs:
+            raise GenaiError("a work session needs someone to approve its plan: the REPL or genai-tui", EXIT_USAGE,
+                             "work_refused")
+        if not self.box:
+            raise GenaiError("a work session needs a profile with a 'sandbox', to build and test in", EXIT_USAGE,
+                             "work_refused")
+        if self.box.network:
+            raise GenaiError("the sandbox's network is on: turn it off first, so the work runs offline", EXIT_USAGE,
+                             "work_refused")
+        if not isinstance(task, str) or not task.strip():
+            raise GenaiError("a work session needs a task", EXIT_USAGE, "bad_message")
+        work = self.profile.work if self.profile and self.profile.work else \
+            {"test": None, "steps_per_item": WORK_STEPS, "time_limit": WORK_TIME}
+        steps, seconds = work_limits(steps, seconds, "work")
+        if not self.session.coding:
+            self.set_coding(True, source)
+            self.coding_from = source
+        problem = self.box.problem()
+        if problem:
+            raise GenaiError(f"the sandbox can't run here: {problem}", EXIT_USAGE, "work_refused")
+        tree, untracked = Worktree.create(os.getcwd())
+        self.clear_plan()
+        self.work = Work(tree, task.strip(), steps or work["steps_per_item"], seconds or work["time_limit"],
+                         work["test"], self.wd)
+        self.wd = Workdir(tree.wd)
+        self.box.root = os.path.realpath(tree.wd)
+        self.audit.log("work_start", branch=tree.branch, base=tree.base, path=tree.path, steps=self.work.steps,
+                       seconds=self.work.seconds, source=source,
+                       **(command_fingerprint(self.work.test) if self.work.test else {}))
+        self.ui.work({"state": "started", **self.work.info()})
+        if untracked:
+            self.ui.notice(f"{untracked} untracked file{'s are' if untracked != 1 else ' is'} not in the copy: "
+                           "the work starts from your last commit")
+        return self.user_turn(f"Work session. The task:\n\n{self.work.task}")
+
+    def end_work(self, why="ended"):
+        """End the work session: commit what is left, remove the copy, keep the branch if it has any commits, and go
+        back to the project. Returns what happened, for the user."""
+        w = self.work
+        if not w:
+            raise GenaiError("no work session is on", EXIT_USAGE, "not_running")
+        left = None
+        try:
+            left = w.tree.commit("Unfinished work, left when the session ended")
+            commits, stat = w.tree.summary()
+        except GenaiError as e:
+            commits, stat = [], f"(could not read the branch: {e})"
+        keep = bool(commits)
+        self.work, self.wd = None, w.home
+        self.box.root = os.path.realpath(w.home.root)
+        try:
+            w.tree.remove(keep)
+            removed = True
+        except GenaiError as e:
+            removed = False
+            self.ui.notice(f"the copy at {w.tree.path} could not be removed: {e}")
+        base = w.tree.base[:12]
+        commands = [f"git log --stat {base}..{w.tree.branch}", f"git diff {base} {w.tree.branch}",
+                    f"git merge {w.tree.branch}", f"git branch -D {w.tree.branch}"] if keep else []
+        info = {"state": "ended", "why": why, "branch": w.tree.branch if keep else None, "base": base,
+                "commits": commits, "stat": stat, "unfinished": left, "removed": removed, "commands": commands,
+                "items": w.items}
+        self.audit.log("work_end", why=why, branch=w.tree.branch, kept=keep, commits=len(commits), unfinished=left)
+        self.ui.work(info)
+        return info
+
+    def leave_work(self):
+        """genai is exiting: end a work session still on, so its work is committed to its branch."""
+        if self.work:
+            try:
+                self.end_work("genai exited")
+            except Exception:       # exiting anyway; the branch and the copy are still there to look at
+                pass
+
     def set_network(self, on, source=":network"):
         if not self.box:
             raise GenaiError("there is no sandbox: the profile has no 'sandbox'", EXIT_USAGE, "no_sandbox")
@@ -3034,6 +3360,9 @@ class Engine:
 
     def tools(self):
         host = socket.gethostname()
+        if self.work:       # the copy only: nothing for the real system, and the work session's own plan
+            return ([t for t in TOOLS if t["function"]["name"] not in ("propose_command", "propose_plan")]
+                    + [SEARCH_TOOL, RUN_TOOL, WORK_PLAN_TOOL, FINISH_TOOL])
         return (TOOLS + ([SEARCH_TOOL] if self.can_search() else []) + ([RUN_TOOL] if self.can_run() else [])
                 + [c.schema(host) for c in self.trusted_tools().values()]
                 + list(self.external.values()))
@@ -3043,6 +3372,11 @@ class Engine:
         if not self.ui.performs:
             parts.append("\n- This run is non-interactive: nobody can approve file operations (they will be "
                          "declined) and commands are only printed. Give your whole answer as plain text.")
+        elif self.work:
+            test = (f"runs the test command ({self.work.test}) in the sandbox, and only if it passes"
+                    if self.work.test else "checks that you changed something")
+            parts.append(WORK_RULES.replace("{net}", SANDBOX_NET[False]).replace("{test}", test)
+                         .replace("{steps}", str(self.work.steps)))
         elif self.session.coding:
             run = CODING_RUN.replace("{net}", SANDBOX_NET[self.box.network]) if self.can_run() else CODING_NO_RUN
             parts.append(CODING_RULES.replace("{run}", run))
@@ -3055,6 +3389,8 @@ class Engine:
             parts.append(f"\n\n# Skill: {s.name}\n\n{s.text()}")
         if self.plan:
             parts.append("\n\n# The plan the user approved\n\n" + plan_text(self.plan))
+        if self.work and self.work.items:
+            parts.append("\n\n# The work plan the user approved\n\n" + work_text(self.work))
         return {"role": "system", "content": "".join(parts)}
 
     # -- context budget
@@ -3087,6 +3423,8 @@ class Engine:
         return msg
 
     def user_turn(self, text, attachments=()):
+        if self.work:
+            self.work.fresh()
         content = text
         for label, body in attachments:
             content += f"\n\n[{label}]\n{body}"
@@ -3101,6 +3439,8 @@ class Engine:
             raise
         try:
             ended = self.loop(checked=True)
+            if self.work and self.work.done() and ended == "reply":
+                self.end_work("done")
             if ended != "command":      # a proposed command has already said so
                 self.notify("reply")    # the turn is over: genai now waits for the person
             return ended
@@ -3108,9 +3448,23 @@ class Engine:
             self.session.save()
 
     def loop(self, checked=False):
-        for step in range(STEP_LIMIT):
+        step = 0
+        while True:
+            if self.work:
+                why = self.work.limit()
+                if why:
+                    self.audit.log("work_pause", reason=why, item=self.work.current)
+                    self.ui.notice(f"work session paused: {why}. Send a message to go on with a fresh budget, "
+                                   "or end the session")
+                    return "work_limit"
+            elif step >= STEP_LIMIT:
+                self.ui.notice(f"step limit ({STEP_LIMIT}) reached; send a message to continue")
+                return "step_limit"
             if step or not checked:
                 self.check_budget()
+            step += 1
+            if self.work:
+                self.work.used += 1
             msg = self.send()
             self.session.add(msg)
             self.session.save()
@@ -3136,8 +3490,6 @@ class Engine:
                 return "stopped"
             if ended:
                 return "command"
-        self.ui.notice(f"step limit ({STEP_LIMIT}) reached; send a message to continue")
-        return "step_limit"
 
     # -- proposals
 
@@ -3212,9 +3564,15 @@ class Engine:
                 p.auto = True
         return p
 
+    def no_git(self, path):
+        """In a work session, the copy's .git is genai's alone: no file tool may write it."""
+        if getattr(self, "work", None) and ".git" in split_rel(path):
+            raise ValueError("in a work session, nothing under .git can be written: genai keeps the copy's git")
+
     def build_write(self, pid, call_id, args, reason, name):
         path, content = args.get("path"), args.get("content")
         split_rel(path)
+        Engine.no_git(self, path)
         if not isinstance(content, str):
             raise ValueError("content must be a string")
         state, previous = self.wd.snapshot(path)
@@ -3234,6 +3592,7 @@ class Engine:
         if not isinstance(old, str) or not isinstance(new, str) or not old:
             raise ValueError("old_text and new_text are required")
         parts = split_rel(path)
+        Engine.no_git(self, path)
         try:
             state, previous = self.wd.snapshot(path)
             if state is None:
@@ -3256,6 +3615,32 @@ class Engine:
 
     def build_plan(self, pid, call_id, args, reason, name):
         return Proposal(pid, "plan", call_id, **parse_plan(args))
+
+    def build_work_plan(self, pid, call_id, args, reason, name):
+        if not self.work:
+            raise ValueError("propose_work_plan is only available in a work session")
+        goal, items = args.get("goal"), args.get("items")
+        if not isinstance(goal, str) or not goal.strip():
+            raise ValueError("goal is required")
+        if (not isinstance(items, list) or not 1 <= len(items) <= PLAN_STEPS
+                or not all(isinstance(x, str) and x.strip() for x in items)):
+            raise ValueError(f"items must be a list of 1 to {PLAN_STEPS} lines of text")
+        return Proposal(pid, "work_plan", call_id, goal=goal, items=[x.strip() for x in items], reason=goal)
+
+    def build_finish(self, pid, call_id, args, reason, name):
+        if not self.work:
+            raise ValueError("finish_item is only available in a work session")
+        if not self.work.items:
+            raise ValueError("there is no approved plan yet: propose one with propose_work_plan")
+        n, summary = args.get("n"), args.get("summary")
+        if type(n) is not int or not isinstance(summary, str) or not summary.strip():
+            raise ValueError("n (the item's number) and summary are required")
+        if n != self.work.current:
+            raise ValueError(f"item {n} is not the current item: finish item {self.work.current} first")
+        p = Proposal(pid, "finish", call_id, n=n, summary=one_line(summary.strip())[0][:200], reason=summary,
+                     test=self.work.test)
+        p.auto = True
+        return p
 
     def build_external(self, pid, call_id, args, reason, name):
         return Proposal(pid, "external", call_id, tool=name, args=args)
@@ -3400,7 +3785,10 @@ class Engine:
             self.audit.log("proposal", **rec)
         live = [p for p in props if not p.error]
         for p in live:
-            if p.kind in ("edit", "write") and not p.auto and self.auto_edit(p):
+            if p.kind in ("edit", "write") and not p.auto and self.work_edit(p):
+                p.auto, p.fields["work"] = True, True
+                self.audit.log("auto_edit", id=p.id, kind=p.kind, path=p.fields["path"], work=True)
+            elif p.kind in ("edit", "write") and not p.auto and self.auto_edit(p):
                 p.auto, p.fields["approved_file"] = True, True
                 self.audit.log("auto_edit", id=p.id, kind=p.kind, path=p.fields["path"])
         for p in live:
@@ -3523,6 +3911,57 @@ class Engine:
         if p.decision != "accept" or not self.plan or self.plan["id"] != p.id:
             return "declined by the user: the plan was not approved. Ask what they want instead."
         return "The user approved this plan. Carry it out step by step, without asking first.\n" + plan_text(self.plan)
+
+    def perform_work_plan(self, p):
+        w = self.work
+        if p.decision != "accept" or not w:
+            return "declined by the user: the plan was not approved. Stop and ask what they want instead."
+        w.goal = p.fields["goal"]
+        w.items = [{"n": n, "title": t, "status": "todo", "commit": None} for n, t in enumerate(p.fields["items"], 1)]
+        w.current = 1
+        w.fresh()
+        self.audit.log("work_plan", id=p.id, items=len(w.items))
+        self.ui.work({"state": "plan", **w.info()})
+        return ("The user approved this plan. Work through it item by item, without asking; call finish_item when "
+                "each is done.\n" + work_text(w))
+
+    def perform_finish(self, p):
+        """Finish the current item: the test command must pass in the sandbox, then everything is committed."""
+        w, n = self.work, p.fields["n"]
+        if w.test:
+            try:
+                ran, rc, out, note = self.box.run(w.test, self.secrets())
+            except KeyboardInterrupt:
+                p.stopped = True
+                self.ui.result(p, "stopped", "the test command was stopped")
+                return "stopped by the user before the test command finished"
+            except GenaiError as e:
+                ran, rc, out, note = False, None, "", str(e)
+            out = clip(redact(out, self.secrets())[0])
+            self.audit.log("work_test", id=p.id, item=n, exit=rc, ran=ran)
+            if not ran or rc != 0:
+                why = f"the test command could not run: {note}" if not ran else \
+                    (f"the test command failed (exit {rc})" if rc is not None else f"the test command was {note}")
+                self.ui.result(p, "error", f"item {n} not finished: {why}", output=out, exit=rc)
+                return f"not finished: {why}. Output:\n" + (out if out.strip() else "(none)")
+        try:
+            sha = w.tree.commit(f"{n}. {w.items[n - 1]['title'][:72]}\n\n{p.fields['summary']}")
+        except GenaiError as e:
+            self.ui.result(p, "error", f"item {n} not committed: {e}")
+            return f"error: not committed: {e}"
+        if sha is None:
+            self.ui.result(p, "error", f"item {n} not finished: nothing changed since the last item")
+            return "not finished: no files changed since the last item. Make the changes first."
+        w.items[n - 1].update(status="done", commit=sha)
+        self.audit.log("work_item", id=p.id, item=n, commit=sha)
+        nxt = next((it for it in w.items if it["status"] == "todo"), None)
+        w.current = nxt["n"] if nxt else 0
+        w.fresh()
+        self.ui.result(p, "ok", f"item {n} committed as {sha}")
+        self.ui.work({"state": "item", **w.info()})
+        if nxt is None:
+            return f"Item {n} committed as {sha}. Every item is done: reply with a short summary of the work."
+        return f"Item {n} committed as {sha}. Next: item {nxt['n']}: {nxt['title']}"
 
     def perform_external(self, p):
         status = p.decision if p.decision in ("ok", "declined", "error") else "declined"
@@ -3823,6 +4262,9 @@ class PlainUI:
     def plan(self, plan):
         pass
 
+    def work(self, ev):
+        pass
+
 
 def margin(text):
     """Escape a multi-line body and put a margin on every line, so it can't pass for genai's own prompts."""
@@ -3854,6 +4296,11 @@ class TtyUI(PlainUI):
             eprint(f"  [{p.id}] sandbox, offline: {one_line(p.fields['reason'])[0]}\n    $ {show_exact(p.fields['command'])}")
         elif p.kind == "search":
             eprint(f"  (coding mode) search {show_exact(p.fields['pattern'])} in {one_line(p.fields['path'])[0]}")
+        elif p.kind == "finish":
+            eprint(f"  [{p.id}] finish item {p.fields['n']}: {one_line(p.fields['summary'])[0]}")
+        elif p.fields.get("work"):
+            what = "edit" if p.kind == "edit" else "write"
+            eprint(f"  [{p.id}] (work session) {what} {one_line(p.fields['path'])[0]}")
         elif p.fields.get("approved_file"):
             what = "Edit" if p.kind == "edit" else "Overwrite"
             self.out.write(f"\n\033[1m[{p.id}] {p.kind}\033[0m — {one_line(p.fields.get('reason', ''))[0]}\n"
@@ -3898,11 +4345,39 @@ class TtyUI(PlainUI):
                 self.out.flush()
                 p.decision, p.approve = pick_steps(p, f["steps"])
                 continue
+            elif p.kind == "work_plan":
+                items = "\n".join(f"{n:>2}. {t}" for n, t in enumerate(f["items"], 1))
+                self.out.write(f"\n\033[1m[{p.id}] work plan\033[0m — {one_line(f['goal'])[0]}\n{margin(items)}\n"
+                               "Once approved, the model works through the items on its branch without asking, "
+                               "committing each one.\n")
+                self.out.flush()
+                p.decision = "accept" if ask_yes(f"Approve {p.id} and start?") else "decline"
+                continue
             else:
                 head = f"Call {p.kind}?"
             self.out.write(f"\n\033[1m[{p.id}] {p.kind}\033[0m — {one_line(f.get('reason', ''))[0]}\n{head}\n")
             self.out.flush()
             p.decision = "accept" if ask_yes(f"Accept {p.id}?") else "decline"
+
+    def work(self, ev):
+        state = ev["state"]
+        if state == "started":
+            test = f"test command: {show_exact(ev['test'])}" if ev["test"] else "no test command"
+            eprint(f"genai: work session on branch {ev['branch']}, a copy of your last commit ({ev['base'][:7]}). "
+                   f"Your own files are not touched.\n  limits: {ev['steps_per_item']} model steps per plan item, "
+                   f"{ev['time_limit'] // 60} min without you; {test}. :work end stops it.")
+        elif state == "item" and ev["current"]:
+            it = ev["items"][ev["current"] - 1]
+            eprint(f"genai: next, item {it['n']} of {len(ev['items'])}: {one_line(it['title'])[0]}")
+        elif state == "ended":
+            eprint(f"genai: work session {'done' if ev['why'] == 'done' else 'ended'}.")
+            if not ev["branch"]:
+                eprint("  nothing was changed, so the branch was deleted")
+                return
+            if ev["unfinished"]:
+                eprint(f"  changes not yet finished were committed as {ev['unfinished']}")
+            eprint(f"  branch {ev['branch']}:\n" + margin("\n".join(ev["commits"]) + "\n" + ev["stat"]))
+            eprint("  review and merge it yourself:\n" + "\n".join(f"    {c}" for c in ev["commands"]))
 
     def result(self, p, status, note, output=None, **extra):
         if output:
@@ -4015,6 +4490,9 @@ class JsonUI:
     def edits(self, info):
         self.emit({"type": "edits", **info})
 
+    def work(self, ev):
+        self.emit({"type": "work", **ev})
+
     def plan(self, plan):
         self.emit({"type": "plan", "plan": None if plan is None else {
             "id": plan["id"], "goal": plan["goal"],
@@ -4033,6 +4511,8 @@ class JsonUI:
                         ev.setdefault("flagged", []).append(key)
             if p.kind == "plan" and any(exact(st.get("command") or st.get("path") or "")[1] for st in ev["steps"]):
                 ev.setdefault("flagged", []).append("steps")
+            if p.kind == "work_plan" and any(exact(t)[1] for t in ev["items"] + [ev["goal"]]):
+                ev.setdefault("flagged", []).append("items")
             ev["digest"] = p.digest = digest(ev)
             self.emit(ev)
         waiting = {p.id: p for p in pending}
@@ -4192,6 +4672,9 @@ Commands (on an empty buffer):
   :network [on|off]  the sandbox's network, for this session (on: each sandboxed run asks)
   :edits [ask|approved-files|reset]  approved-files: a further edit to a file you approved applies without asking
   :plan [clear]   show the approved plan and how far it has got, or drop it
+  :work TASK      a work session: the model plans, then codes and tests on a git branch of its own without
+                  asking; you review and merge the branch. --steps N, --minutes M first override the limits.
+                  :work shows how far it has got, :work end stops it
   :compact [-e]   prune old file contents and output; summarize if still large
   :context        show how full the context is
   :raw [N|all]    what was sent to the endpoint and what came back: the last turn, turn N, or all kept
@@ -4417,6 +4900,33 @@ class Repl:
                          "── System prompt " + "─" * 60, self.e.system()["content"], "",
                          "── Tools " + "─" * 68, json.dumps(self.e.tools(), indent=2, ensure_ascii=False)]))
 
+    def do_work(self, arg):
+        """:work TASK starts a work session (--steps N and --minutes M before the task override the limits),
+        :work end ends it, and :work alone shows how far it has got."""
+        w = self.e.work
+        if arg == "end":
+            self.e.end_work("ended")
+            return
+        if not arg:
+            if not w:
+                print("no work session; :work TASK starts one")
+            else:
+                print(f"work session on {w.tree.branch}: " + (show_exact(work_text(w)) if w.items else "no plan yet"))
+            return
+        steps = secs = None
+        words = arg.split()
+        while len(words) >= 2 and words[0] in ("--steps", "--minutes") and words[1].isdigit():
+            if words[0] == "--steps":
+                steps = int(words[1])
+            else:
+                secs = int(words[1]) * 60
+            words = words[2:]
+        task = " ".join(words) if words != arg.split() else arg
+        if not task:
+            print("usage: :work [--steps N] [--minutes M] TASK, :work end, or :work")
+            return
+        self.e.start_work(task, steps, secs)
+
     def command(self, line):
         cmd, _, arg = line[1:].partition(" ")
         arg = arg.strip()
@@ -4444,6 +4954,8 @@ class Repl:
                     print("no plan approved")
                 else:
                     print(show_exact(plan_text(self.e.plan)))
+            elif cmd == "work":
+                self.do_work(arg)
             elif cmd == "coding":
                 self.e.set_coding(arg == "on")
                 self.e.session.save()
@@ -4654,7 +5166,7 @@ def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()
              "host": socket.gethostname(), "user": user, "uid": uid, "remote": remote,
              "features": ["proposals", "decisions", "attach", "register_tools", "compact", "context", "coding",
                           "set_coding", "skills", "files", "read", "trace", "system", "plan", "network", "clear",
-                          "models", "plugins", "interrupt", "edits", "stop", "digest"],
+                          "models", "plugins", "interrupt", "edits", "stop", "digest", "work"],
              "endpoint": engine.endpoint.info(),
              "profile": {"name": engine.profile.name, "description": engine.profile.description}
              if engine.profile else None,
@@ -4674,10 +5186,10 @@ def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()
         ui.notice(n)
     ui.emit({"type": "plugins", "plugins": engine.plugin_rows()})
 
-    def turn(text, att):
+    def turn(text, att, start=None):
         first = getattr(engine.client, "exchanges", 0) + 1
         try:
-            reason = engine.user_turn(text, att)
+            reason = start() if start else engine.user_turn(text, att)
             ui.emit({"type": "done", "reason": reason, "context": {"used": engine.used(),
                                                                     "limit": engine.endpoint.context_limit},
                      "exchanges": exchanges(first)})
@@ -4706,6 +5218,17 @@ def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()
                 engine.share("attach", body, ref)
             ui.queue = []
             turn(text, att)
+        elif t == "work":
+            task, steps, secs = msg.get("task"), msg.get("steps_per_item"), msg.get("time_limit")
+            if not isinstance(task, str) or not task.strip():
+                ui.error("work needs 'task': what the session is to do", "bad_message")
+                continue
+            turn(None, (), lambda: engine.start_work(task, steps, secs, "wrapper"))
+        elif t == "work_end":
+            try:
+                engine.end_work("ended")
+            except GenaiError as err:
+                ui.error(str(err), err.kind)
         elif t == "attach":
             ui.queue_attach(msg)
         elif t == "register_tools":
@@ -5016,7 +5539,10 @@ def main(argv=None):
             ui.notice("coding mode is on for this session")
 
         if args.json:
-            return run_json(engine, ui, prompt, attachments, args.config_stdin, after_hello)
+            try:
+                return run_json(engine, ui, prompt, attachments, args.config_stdin, after_hello)
+            finally:
+                engine.leave_work()
         cfg.audit.log("start", mode="repl" if prompt is None else "oneshot", endpoint=endpoint.info(),
                       profile=persona.name if persona else None,
                       session=session.id, sandbox=engine.sandbox)
@@ -5025,7 +5551,10 @@ def main(argv=None):
                 raise GenaiError("no prompt given and no terminal for the REPL", EXIT_USAGE)
             repl = Repl(engine)
             repl.attachments = attachments
-            return repl.run()
+            try:
+                return repl.run()
+            finally:
+                engine.leave_work()
         if isinstance(ui, TtyUI):
             eprint(f"genai: {(one_line(persona.name)[0] + ' on ') if persona else ''}{one_line(endpoint.name)[0]} "
                    f"({one_line(endpoint.model)[0]} at {one_line(endpoint.base_url)[0]}); "
