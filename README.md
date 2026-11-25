@@ -501,13 +501,23 @@ and merge what you want, with git.
    edits, and their own changes are discarded.
 4. **It finishes each item with `finish_item`.** genai runs the profile's test command in the
    sandbox, if there is one, and commits the changes on the branch. An item whose test fails, or
-   that changed nothing, isn't finished, and the model is told why.
+   that changed nothing, isn't finished, and the model is told why. The commit's title is the
+   model's short summary; its body names the plan item and holds the model's notes for later items.
 5. **At the end** genai commits anything left, removes the copy and shows the branch: its commits,
    the diff stat, and the commands to review it, merge it or delete it. genai never touches your
    own branch. A session that changed nothing deletes its branch.
 
+**Contexts.** Each plan item runs in a fresh context: the model sees the task, the plan and the
+notes earlier items left, not their conversations, so a long session doesn't fill up. The context
+that made the plan waits meanwhile. Within an item, old file contents and command output are
+dropped once the context is 40% full (the model reads them again if it needs to), and an item
+that still fills it goes on in a fresh context, with notes the model writes first.
+
 **Limits.** Each plan item gets a budget of model steps (default 20). Finishing an item starts the
-next with a fresh budget; an item that uses up its budget pauses the session. There is also a time
+next with a fresh budget. An item that uses up its budget goes back to the planning context, with
+what it changed and its last words; the planner finishes it, starts a fresh attempt with a hint, or
+proposes a new plan. If the planner uses up its steps too, or the item gets stuck again, the session
+pauses. There is also a time
 limit, 2 hours without you by default. A message from you, such as "go on", gives a fresh budget
 and time. `:work end` (or exiting genai) ends the session; `:work` shows how far it has got. Ctrl-C
 stops a sandboxed run, as usual.
@@ -523,6 +533,16 @@ The profile sets the defaults, and `:work --steps N --minutes M TASK` overrides 
   "work": {"test": "python3 -m unittest -q", "steps_per_item": 20, "time_limit": 7200}
 }
 ```
+
+**A model for planning.** `planner` in `work` sends the planning contexts (making the plan, and
+reviewing a stuck item) to another model, such as a stronger one, while the items run on the
+profile's own:
+
+- `"planner": {"model": "big-model"}`: another model on the same endpoint. genai checks the server
+  lists it before the session starts, and uses the context length the server gives for it.
+- `"planner": {"endpoint": "other", "model": "big-model"}`: another blessed endpoint (without
+  `model`, its own default). It reads files, so it sees the project too. In remote mode only the
+  profile's endpoint can be reached, so it plans as well, with a notice.
 
 **Git stays on your side.** genai runs every git command itself, on your machine, with hooks,
 fsmonitor and signing off, and it names the copy's git directory explicitly instead of trusting
@@ -629,13 +649,13 @@ decision.
 | `type` | Meaning |
 |---|---|
 | `text` | A piece of the model's reply. |
-| `proposal` | `id`, `kind` (`read`, `list`, `search`, `write`, `edit`, `command`, `plan`, `sandbox`, `trusted`, `external`, `invalid`), `digest` when it waits for an answer, and the proposal's fields, such as `path`, `content`, `diff`, `command` and `reason`. `auto: true` means it needed no approval: coding mode, or a read the approved plan names. A `plan` proposal has `goal` and numbered `steps` (`n`, `kind`: `read`, `edit`, `write` or `command`, a `path` or the exact `command`, and `why`). While a plan is approved, a proposal it covers has `plan_step`; a command matching an approved step character for character also has `preapproved: true`, so the wrapper may run it without asking again; a command, edit or write the plan doesn't cover has `off_plan: true`. Edits and writes ask, except with edits `approved-files`, where one to a file you already approved has `auto: true` and `approved_file: true` (it is applied at once; show its diff). `secret: true` means the file looks like it holds secrets. A command is only shown: the wrapper runs it, if the user wants to, and can share the output with `attach`. A `sandbox` proposal (`command`, `reason`, `network`, `image`) is genai running the command in the sandbox: offline it has `auto: true` and runs at once; online it waits for a `decision`. A `trusted` proposal (`plugin`, `command`, `params`, `argv`, `read_only`) is a plugin's trusted command: `read_only` ones have `auto: true` and run at once; others wait for a `decision`. A `search` proposal (`pattern`, `path`, optional `glob` and `ignore_case`) is the model's `search_files`, offered only in coding mode, and always `auto`. In a work session, a `work_plan` proposal (`goal`, `items`: lines of text) waits for a `decision`; an edit or write in the copy has `auto: true` and `work: true`; a `finish` proposal (`n`, `summary`, `test`) is always `auto`, and its `result` says whether the item was committed. |
+| `proposal` | `id`, `kind` (`read`, `list`, `search`, `write`, `edit`, `command`, `plan`, `sandbox`, `trusted`, `external`, `invalid`), `digest` when it waits for an answer, and the proposal's fields, such as `path`, `content`, `diff`, `command` and `reason`. `auto: true` means it needed no approval: coding mode, or a read the approved plan names. A `plan` proposal has `goal` and numbered `steps` (`n`, `kind`: `read`, `edit`, `write` or `command`, a `path` or the exact `command`, and `why`). While a plan is approved, a proposal it covers has `plan_step`; a command matching an approved step character for character also has `preapproved: true`, so the wrapper may run it without asking again; a command, edit or write the plan doesn't cover has `off_plan: true`. Edits and writes ask, except with edits `approved-files`, where one to a file you already approved has `auto: true` and `approved_file: true` (it is applied at once; show its diff). `secret: true` means the file looks like it holds secrets. A command is only shown: the wrapper runs it, if the user wants to, and can share the output with `attach`. A `sandbox` proposal (`command`, `reason`, `network`, `image`) is genai running the command in the sandbox: offline it has `auto: true` and runs at once; online it waits for a `decision`. A `trusted` proposal (`plugin`, `command`, `params`, `argv`, `read_only`) is a plugin's trusted command: `read_only` ones have `auto: true` and run at once; others wait for a `decision`. A `search` proposal (`pattern`, `path`, optional `glob` and `ignore_case`) is the model's `search_files`, offered only in coding mode, and always `auto`. In a work session, a `work_plan` proposal (`goal`, `items`: lines of text) waits for a `decision`; an edit or write in the copy has `auto: true` and `work: true`; a `finish` proposal (`n`, `summary`, `notes`, `test`) is always `auto`, and its `result` says whether the item was committed; a `retry` proposal (`n`, `hint`) is the planner starting a fresh attempt at a stuck item, always `auto`. |
 | `result` | `id`, `status`, `detail`: what happened to a proposal that was performed. For a `sandbox` or `trusted` run, also `exit` (`null` if it was killed at the time limit or never ran) and `output`, exactly what the model is sent. |
 | `done` | The turn ended. `reason` is `reply`, `command`, `stopped` (Ctrl-C during a sandboxed run), `step_limit` or `work_limit` (a work session paused at a limit); `context` gives `used` and `limit`; `exchanges` gives the first and last exchange numbers of this turn, for `trace` (also on an `error` that ends a turn). |
 | `context` | The conversation is getting near the context limit. |
 | `notice` | Something the user should know. |
 | `error` | `code` and `message`. Among the codes: `api` (the endpoint failed or couldn't be reached; nothing was performed), `busy` (not allowed while proposals wait), `unknown_id` (no waiting proposal with that ID and kind), `digest_mismatch` (see Digests), `not_running` (a `stop` with nothing running), `work_refused` and `work` (a work session can't start, or git failed), `bad_message`, `unknown_type`, and, at the start, `session_endpoint_changed` (a resumed session was made with another endpoint; `--allow-session-endpoint-change` allows it). |
-| `work` | A work session changed. `state` is `started` (`branch`, `base`, `path`, `steps_per_item`, `time_limit`, `test`), `plan` (the plan was approved: `items`, each `n`, `title`, `status`, `commit`, and `current`), `item` (an item was committed), or `ended` (`why`: `done`, `ended` or `genai exited`; `branch`, `null` if nothing changed; `commits`, `stat`, `unfinished` (the commit of work left when it ended), `commands` to review and merge). |
+| `work` | A work session changed. `state` is `started` (`branch`, `base`, `path`, `steps_per_item`, `time_limit`, `test`, `planner`: `endpoint` and `model` for planning, or `null` when the profile's own model plans), `plan` (the plan was approved: `items`, each `n`, `title`, `status`, `commit`, and `current`), `item` (an item was committed), `context` (a fresh context: `role` `item`, or `review` for the planner taking back a stuck item; `item`; `why`), or `ended` (`why`: `done`, `ended` or `genai exited`; `branch`, `null` if nothing changed; `commits`, `stat`, `unfinished` (the commit of work left when it ended), `commands` to review and merge). |
 | `plan` | The approved plan changed: approved, a step done, or dropped. `plan` has `id`, `goal` and `steps`, each with `approved`, `status` (`todo`, `done`, `left out`) and `edited` when the user changed its command; `null` when there is none. A plan is never saved with the session. |
 | `attached`, `registered`, `compacted`, `cleared`, `models`, `model`, `coding`, `skills`, `files`, `file`, `trace`, `system`, `network`, `plugins`, `ran`, `edits` | Answers to the messages above. |
 

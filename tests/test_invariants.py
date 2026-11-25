@@ -22,7 +22,7 @@ def proposal(kind, n=1):
 
 class TestTable(unittest.TestCase):
     def test_every_tool_genai_offers_has_a_kind(self):
-        offered = [t["function"]["name"] for t in G.TOOLS + [G.SEARCH_TOOL, G.RUN_TOOL, G.WORK_PLAN_TOOL, G.FINISH_TOOL]]
+        offered = [t["function"]["name"] for t in G.TOOLS + [G.SEARCH_TOOL, G.RUN_TOOL, G.WORK_PLAN_TOOL, G.FINISH_TOOL, G.RETRY_TOOL]]
         self.assertEqual(sorted(set(offered)), sorted(G.INTRINSICS))
         self.assertEqual(sorted(G.BY_TOOL), sorted(G.INTRINSICS))
 

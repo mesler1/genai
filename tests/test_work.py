@@ -34,11 +34,15 @@ class WorkTest(FakePodman):
         git(root, "commit", "-q", "-m", "start")
         return root
 
-    def start(self, api, work=None, sandbox=None):
+    def start(self, api, work=None, sandbox=None, context_limit=100000, planner_api=None):
         if os.path.exists(self.path("home")):
             subprocess.run(["rm", "-rf", self.path("home")], check=True)
-        home, ep = make_home(self.tmp, api.url)
+        home, ep = make_home(self.tmp, api.url, context_limit=context_limit)
         bless_path(home, ep)
+        if planner_api:
+            bless_path(home, write_json(os.path.join(home, "endpoints", "big.json"),
+                                        {"name": "big", "base_url": planner_api.url, "model": "big-model",
+                                         "context_limit": 100000}))
         prof = {"name": "coder", "endpoint": "test", "coding": True, "sandbox": sandbox or {"image": "img:1"}}
         if work is not None:
             prof["work"] = work
@@ -86,7 +90,7 @@ class WorkTest(FakePodman):
             g.close()
         self.assertEqual(ended["why"], "done")
         self.assertEqual(ended["branch"], "genai/work-1")
-        self.assertEqual([c.split(" ", 1)[1] for c in ended["commits"]], ["1. change hi to fixed", "2. add b"])
+        self.assertEqual([c.split(" ", 1)[1] for c in ended["commits"]], ["1. a.txt says fixed", "2. add b.txt"])
         self.assertIn("git merge genai/work-1", ended["commands"])
         with open(os.path.join(root, "a.txt")) as f:
             self.assertEqual(f.read(), "hi\n")                       # your own files are untouched
@@ -139,7 +143,7 @@ class WorkTest(FakePodman):
         self.assertNotIn("genai/work-1", git(self.path("wd"), "branch"))
 
     def test_the_step_budget_pauses_and_a_message_renews_it(self):
-        reads = [call("read_file", path="a.txt", reason="r")] * 3
+        reads = [call("read_file", path="a.txt", reason="r")] * 5
         turns = [call("propose_work_plan", goal="g", items=["one"])] + reads + [reply("ok")]
         self.repo()
         with FakeAPI(turns) as api:
@@ -147,14 +151,14 @@ class WorkTest(FakePodman):
             g.send({"type": "work", "task": "t"})
             self.approve(g)
             self.assertEqual(g.until("done")["reason"], "work_limit")
-            self.assertEqual(len(api.requests), 3)          # the plan, then item 1's two steps
+            self.assertEqual(len(api.requests), 5)          # the plan, item 1's two steps, the planner's two
             g.send({"type": "user", "text": "go on"})
             self.assertEqual(g.until("done")["reason"], "reply")
             g.close()
         self.assertIn("work_pause", [e["event"] for e in self.audit()])
 
     def test_steps_can_be_overridden_for_one_session(self):
-        turns = [call("propose_work_plan", goal="g", items=["one"])] + [call("read_file", path="a.txt", reason="r")]
+        turns = [call("propose_work_plan", goal="g", items=["one"])] + [call("read_file", path="a.txt", reason="r")] * 2
         self.repo()
         with FakeAPI(turns) as api:
             g = self.start(api, {"steps_per_item": 50})
@@ -238,6 +242,163 @@ class WorkTest(FakePodman):
         self.assertEqual(git(root, "show", "genai/work-1:b.txt"), "x\n")
         self.assertEqual(os.listdir(self.path("state", "genai", "work")), [])
 
+    def test_each_item_starts_in_a_fresh_context_with_the_notes(self):
+        turns = [call("propose_work_plan", goal="g", items=["make b", "make c"]),
+                 call("write_file", path="b.txt", content="b\n", reason="r"),
+                 call("finish_item", n=1, summary="Add b.txt with the letter b in it, as the first of several "
+                      "files the task needs", notes="b.txt holds one letter; c.txt should match"),
+                 call("write_file", path="c.txt", content="c\n", reason="r"),
+                 call("finish_item", n=2, summary="add c.txt"),
+                 reply("done")]
+        root = self.repo()
+        with FakeAPI(turns) as api:
+            g = self.start(api)
+            g.send({"type": "work", "task": "the task"})
+            self.approve(g)
+            ctx = g.until("work")
+            while ctx["state"] != "context":
+                ctx = g.until("work")
+            self.assertEqual((ctx["role"], ctx["item"]), ("item", 1))
+            g.until("done")
+            g.close()
+        msgs = [r["body"]["messages"] for r in api.requests]
+        item1, item2 = msgs[1], msgs[3]
+        self.assertEqual([m["role"] for m in item1], ["system", "user"])      # nothing of the planning
+        self.assertIn("item 1 of 2: make b", item1[1]["content"])
+        self.assertIn("the task", item1[1]["content"])
+        self.assertEqual([m["role"] for m in item2], ["system", "user"])
+        self.assertIn("item 2 of 2: make c", item2[1]["content"])
+        self.assertIn("c.txt should match", item2[1]["content"])              # the handoff
+        log = git(root, "log", "--format=%s%n%b", "-1", "genai/work-1~1")
+        title = log.splitlines()[0]
+        self.assertTrue(title.startswith("1. Add b.txt") and title.endswith("\u2026") and len(title) <= 67, title)
+        self.assertIn("Plan item: make b", log)
+        self.assertIn("c.txt should match", log)
+        self.assertIn("work_context", [e["event"] for e in self.audit()])
+
+    def test_a_stuck_item_goes_back_to_the_planner(self):
+        turns = [call("propose_work_plan", goal="g", items=["one"]),
+                 call("write_file", path="b.txt", content="x\n", reason="r"),
+                 call("read_file", path="b.txt", reason="polish"),
+                 call("retry_item", n=1, hint="b.txt is written: just finish it"),
+                 call("finish_item", n=1, summary="b"),
+                 reply("done")]
+        self.repo()
+        with FakeAPI(turns) as api:
+            g = self.start(api, {"steps_per_item": 2})
+            g.send({"type": "work", "task": "t"})
+            self.approve(g)
+            self.assertEqual(g.until("done")["reason"], "reply")
+            g.close()
+        review = api.requests[3]["body"]
+        self.assertIn("used its budget of 2 model steps", review["messages"][-1]["content"])
+        self.assertIn("b.txt", review["messages"][-1]["content"])           # what the attempt changed
+        self.assertIn("propose_work_plan", json.dumps(review["messages"]))    # the planner's own context
+        self.assertIn("retry_item", [t["function"]["name"] for t in review["tools"]])
+        retry = api.requests[4]["body"]["messages"]
+        self.assertEqual([m["role"] for m in retry], ["system", "user"])
+        self.assertIn("just finish it", retry[1]["content"])
+        self.assertNotIn("retry_item", [t["function"]["name"] for t in api.requests[4]["body"]["tools"]])
+        events = [e["event"] for e in self.audit()]
+        self.assertIn("work_retry", events)
+        self.assertIn("work_item", events)
+
+    def test_old_output_is_dropped_as_the_context_fills(self):
+        big = "x" * 4000 + "\n"
+        turns = ([call("propose_work_plan", goal="g", items=["one"])]
+                 + [call("read_file", path="big.txt", reason="r")] * 6 + [reply("ok")])
+        self.repo({"big.txt": big})
+        with FakeAPI(turns) as api:
+            g = self.start(api, context_limit=20000)
+            g.send({"type": "work", "task": "t"})
+            self.approve(g)
+            g.until("done")
+            g.close()
+        last = api.requests[-1]["body"]["messages"]
+        results = [m["content"] for m in last if m["role"] == "tool"]
+        self.assertTrue(any("dropped to save room" in r for r in results))
+        self.assertTrue(any(big.strip() in r for r in results))            # the latest are kept in full
+        self.assertIn("work_clear", [e["event"] for e in self.audit()])
+
+    def test_an_item_that_fills_the_context_goes_on_in_a_fresh_one(self):
+        big = "x" * 4000 + "\n"
+        turns = ([call("propose_work_plan", goal="g", items=["one"])]
+                 + [call("read_file", path="big.txt", reason="r")] * 5 + [reply("NOTES: big.txt is all x"), reply("ok")])
+        self.repo({"big.txt": big})
+        with FakeAPI(turns) as api:
+            g = self.start(api, context_limit=8000)
+            g.send({"type": "work", "task": "t"})
+            self.approve(g)
+            self.assertEqual(g.until("done")["reason"], "reply")
+            g.close()
+        asked = [r for r in api.requests if "nearly full" in json.dumps(r["body"]["messages"][-1:])]
+        self.assertEqual(len(asked), 1)
+        self.assertNotIn("tools", asked[0]["body"])                          # notes only, nothing run
+        fresh = api.requests[-1]["body"]["messages"]
+        self.assertEqual([m["role"] for m in fresh], ["system", "user"])
+        self.assertIn("NOTES: big.txt is all x", fresh[1]["content"])
+
+
+    def test_a_planner_endpoint_plans_and_reviews(self):
+        plans = [call("propose_work_plan", goal="g", items=["one"]),
+                 call("finish_item", n=1, summary="b is there"), reply("done")]
+        works = [call("write_file", path="b.txt", content="x\n", reason="r"),
+                 call("read_file", path="b.txt", reason="polish")]
+        self.repo()
+        with FakeAPI(works) as api, FakeAPI(plans) as big:
+            g = self.start(api, {"steps_per_item": 2, "planner": {"endpoint": "big"}}, planner_api=big)
+            g.send({"type": "work", "task": "t"})
+            self.assertEqual(g.until("work")["planner"], {"endpoint": "big", "model": "big-model"})
+            self.approve(g)
+            ended = g.until("work")
+            while ended["state"] != "ended":
+                ended = g.until("work")
+            g.close()
+        self.assertEqual(len(big.requests), 3)          # the plan; then the review, which finishes; then the summary
+        self.assertEqual(len(api.requests), 2)          # item 1's two steps
+        self.assertTrue(all(r["body"]["model"] == "big-model" for r in big.requests))
+        self.assertIn("used its budget", big.requests[1]["body"]["messages"][-1]["content"])
+        self.assertEqual(ended["why"], "done")
+        start = next(e for e in self.audit() if e["event"] == "work_start")
+        self.assertEqual(start["planner"]["model"], "big-model")
+
+    def test_a_planner_model_on_the_same_endpoint(self):
+        turns = [call("propose_work_plan", goal="g", items=["one"]),
+                 call("write_file", path="b.txt", content="x\n", reason="r"),
+                 call("finish_item", n=1, summary="b"), reply("done")]
+        self.repo()
+        models = [{"id": "fake-model"}, {"id": "big-model", "max_model_len": 50000}]
+        with FakeAPI(turns, models=models) as api:
+            g = self.start(api, {"planner": {"model": "big-model"}})
+            g.send({"type": "work", "task": "t"})
+            self.assertEqual(g.until("work")["planner"], {"endpoint": "test", "model": "big-model"})
+            self.approve(g)
+            g.until("done")
+            g.close()
+        used = [r["body"]["model"] for r in api.requests if r.get("body")]
+        self.assertEqual(used, ["big-model", "fake-model", "fake-model", "fake-model"])   # the plan, then the item
+
+    def test_a_planner_model_the_server_doesnt_list_refuses_the_session(self):
+        self.repo()
+        with FakeAPI([]) as api:
+            g = self.start(api, {"planner": {"model": "typo-model"}})
+            g.send({"type": "work", "task": "t"})
+            err = g.until("error")
+            g.close()
+        self.assertEqual(err["code"], "work_refused")
+        self.assertIn("typo-model", err["message"])
+
+    def test_an_unknown_planner_endpoint_refuses_the_session(self):
+        self.repo()
+        with FakeAPI([]) as api:
+            g = self.start(api, {"planner": {"endpoint": "nope"}})
+            g.send({"type": "work", "task": "t"})
+            err = g.until("error")
+            g.close()
+        self.assertEqual(err["code"], "work_refused")
+        self.assertIn("planner endpoint", err["message"])
+        self.assertEqual(git(self.path("wd"), "branch").split(), ["*", "main"])     # nothing was made
+
 
 class TestWorkProfile(unittest.TestCase):
     def test_work_needs_a_sandbox_and_checks_its_fields(self):
@@ -248,8 +409,16 @@ class TestWorkProfile(unittest.TestCase):
         with self.assertRaisesRegex(G.GenaiError, "unknown work fields"):
             G.Profile({"name": "p", "sandbox": {"image": "i:1"}, "work": {"steps": 3}}, "p.json")
         p = G.Profile({"name": "p", "sandbox": {"image": "i:1"}, "work": {"test": "make test"}}, "p.json")
-        self.assertEqual(p.work, {"test": "make test", "steps_per_item": 20, "time_limit": 7200})
+        self.assertEqual(p.work, {"test": "make test", "steps_per_item": 20, "time_limit": 7200, "planner": None})
         self.assertIn("20 steps per plan item", p.summary()[0])
+        box = {"image": "i:1"}
+        for bad in ("big", {}, {"endpoint": "../x"}, {"model": "a b"}, {"model": "m", "key": "k"}):
+            with self.subTest(planner=bad), self.assertRaisesRegex(G.GenaiError, "planner"):
+                G.Profile({"name": "p", "sandbox": box, "work": {"planner": bad}}, "p.json")
+        p = G.Profile({"name": "p", "sandbox": box, "work": {"planner": {"endpoint": "big"}}}, "p.json")
+        self.assertIn("plans with endpoint big, which also sees the project", p.summary()[0])
+        p = G.Profile({"name": "p", "sandbox": box, "work": {"planner": {"model": "m2"}}}, "p.json")
+        self.assertIn("plans with model m2, on the same endpoint", p.summary()[0])
 
 
 if __name__ == "__main__":
