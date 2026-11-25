@@ -613,6 +613,8 @@ class Sandbox:
                               "wasn't, so the command did not run")
         if rc == "timeout":
             return True, None, out, f"killed after {limit} s"
+        if rc == "late":
+            return False, None, "", f"not run: the {limit} s time limit was used up before it could start"
         if rc in (125, 126, 127) and out.startswith("Error:"):
             hint = f" (podman pull {self.conf['image']} first)" if "image not known" in out else ""
             return False, None, "", f"the sandbox could not start: {one_line(out.strip())[0]}{hint}"
@@ -629,7 +631,7 @@ class Sandbox:
 
         deadline = deadline or time.monotonic() + self.conf["timeout"]
         if time.monotonic() >= deadline:
-            return "timeout", ""
+            return "late", ""
         try:                                # everything from here on, so a Ctrl-C at any point kills the container
             Sandbox.running = True
             if Sandbox.stop.is_set():       # a stop that came while the run was being set up
@@ -730,7 +732,9 @@ class Copy:
     commit made in the copy into the branch genai/work-N, which only genai writes. The model reaches the copy only
     through genai's file tools, which never write .git, and the sandbox runs on a throwaway overlay of it.
     The copy's files are in DIR/tree and its git directory in DIR/git, beside them: the sandbox mounts only the
-    files, so it can't read the commit's objects, which hold every file the sandbox hides as a secret."""
+    files, so it can't read the commit's objects, which hold every file the sandbox hides as a secret. The tree has
+    no .git while the session runs (genai names the git directory in every command), so git in the sandbox finds no
+    repository rather than a broken one; a copy kept at the end gets one pointing at DIR/git, for you to look at."""
 
     def __init__(self, top, home, branch, base, sub):
         self.top, self.home, self.branch, self.base, self.sub = top, home, branch, base, sub
@@ -782,10 +786,15 @@ class Copy:
         fmt = git_line(run_git(["rev-parse", "--show-object-format"], top)[1]) or "sha1"
         name = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(top)) or "project"
         n = cls.free(top)
-        home = os.path.realpath(tempfile.mkdtemp(prefix=f"{name}-{n}-", dir=ensure_dir(work_home())))  # ours alone
+        try:
+            home = os.path.realpath(tempfile.mkdtemp(prefix=f"{name}-{n}-", dir=ensure_dir(work_home())))  # ours
+        except OSError as e:
+            raise GenaiError(f"can't make the copy under {work_home()}: {e.strerror or e}", EXIT_USAGE,
+                             "work_refused") from None
         try:
             run_git(["init", "-q", f"--object-format={fmt}", f"--separate-git-dir={home}/git", "--", f"{home}/tree"],
                     home)
+            os.remove(os.path.join(home, "tree", ".git"))  # it would name a host path the sandbox can't reach
             c = cls(top, home, f"genai/work-{n}", head, sub)
             c.git(["fetch", "-q", "--depth", "1", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules",
                    "--", top, head])
@@ -853,7 +862,7 @@ class Copy:
                 raise GenaiError(f"the branch {self.branch} was moved or deleted outside the session: its commits are "
                                  f"still in the copy at {self.path}", EXIT_USAGE, "work")
             run_git(["fetch", "-q", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules",
-                     "--no-auto-maintenance", "--", self.path, f"{head}:refs/heads/{self.branch}"], self.top)
+                     "--no-auto-maintenance", "--", self.gitdir, f"{head}:refs/heads/{self.branch}"], self.top)
             self.published = head
 
     def summary(self):
@@ -875,6 +884,14 @@ class Copy:
         _, out = self.git(["ls-tree", "-r", "-z", "--name-only", "HEAD", "--", *(f":(literal){p}" for p in here)])
         have = set(out.split("\0"))
         return [p for p in here if p not in have]
+
+    def keep(self):
+        """A copy left for you: give its files a .git, so git works there as in any checkout."""
+        try:
+            with open(os.path.join(self.path, ".git"), "x") as f:
+                f.write("gitdir: ../git\n")
+        except OSError:
+            pass                    # the model's own .git can't be there (no tool writes one), but don't fail on it
 
     def remove(self):
         try:
@@ -3696,6 +3713,8 @@ class Engine:
                 removed = True
             except GenaiError as e:
                 problems.append(f"the copy could not be removed: {e}")
+        if not removed:
+            w.tree.keep()
         self.audit.log("work_end", why=why, branch=w.tree.branch, kept=keep, commits=len(commits), unfinished=left,
                        removed=removed, problems=problems)
         self.work, self.wd = None, w.home
@@ -5219,7 +5238,7 @@ class JsonUI:
                 return False
             if e and e.halt != "end":
                 e.halt = why
-        Sandbox.stop.set()          # a run going on ends, and so does one being set up (cleared when a turn starts)
+            Sandbox.stop.set()      # a run going on ends, and so does one being set up (cleared when a turn starts)
         self.lines.put(HALT)        # wakes a wait for decisions
         return True
 

@@ -1012,11 +1012,13 @@ class WorkTest(FakePodman):
             g.send({"type": "work", "task": "t"})
             started = g.until("work")
             g.until("done")
-            copy = started["path"]
-            self.assertEqual(git(copy, "rev-list", "--all").split(), [git(root, "rev-parse", "HEAD").strip()])
-            self.assertNotEqual(subprocess.run(["git", "-C", copy, "cat-file", "-e", old]).returncode, 0)
-            self.assertFalse([k for k in git(copy, "config", "--local", "--list", "--name-only").split()
-                              if not k.startswith("core.")])        # no remote, no filters: nothing of yours
+            gitdir = os.path.join(os.path.dirname(started["path"]), "git")
+            self.assertEqual(git(root, "--git-dir", gitdir, "rev-list", "--all").split(),
+                             [git(root, "rev-parse", "HEAD").strip()])
+            self.assertNotEqual(subprocess.run(["git", "--git-dir", gitdir, "cat-file", "-e", old],
+                                               capture_output=True).returncode, 0)
+            local = git(root, "--git-dir", gitdir, "config", "--local", "--list", "--name-only").split()
+            self.assertFalse([k for k in local if not k.startswith("core.")])   # no remote, no filters: none of yours
             self.assertNotIn("genai/work", git(root, "branch"))     # nothing is on a branch until an item is done
             g.close()
 
@@ -1072,9 +1074,8 @@ class WorkTest(FakePodman):
             started = g.until("work")
             g.until("done")
             tree = started["path"]
-            self.assertTrue(os.path.isfile(os.path.join(tree, ".git")))       # a pointer, not the objects
-            self.assertEqual(os.path.commonpath([tree, git(tree, "rev-parse", "--absolute-git-dir").strip()]),
-                             os.path.dirname(tree))                          # beside the files, not among them
+            self.assertFalse(os.path.lexists(os.path.join(tree, ".git")))     # not even a pointer to it
+            self.assertTrue(os.path.isdir(os.path.join(os.path.dirname(tree), "git")))   # beside the files
             g.close()
 
     def test_ending_with_a_problem_still_puts_the_commits_on_the_branch(self):
@@ -1112,6 +1113,7 @@ class WorkTest(FakePodman):
         self.assertFalse(ended["removed"])
         self.assertIn("lib/new.txt", ended["problems"][0])
         self.assertTrue(os.path.exists(os.path.join(ended["path"], "lib", "new.txt")))
+        self.assertTrue(git(ended["path"], "rev-parse", "HEAD").strip())   # a kept copy: plain git works in it
 
     def test_a_branch_deleted_when_nothing_new_is_left_keeps_the_copy(self):
         turns = [call("propose_work_plan", goal="g", items=["one", "two"]),
@@ -1213,12 +1215,12 @@ class TestCopy(unittest.TestCase):
         c, _ = G.Copy.create(root)
         self.addCleanup(c.remove)
         self.item(c, "b")
-        git(root, "fetch", "-q", c.path, f"{c.head()}:refs/heads/{c.branch}")   # done, but not yet recorded
+        git(root, "fetch", "-q", c.gitdir, f"{c.head()}:refs/heads/{c.branch}")   # done, but not yet recorded
         c.publish()
         self.assertEqual((c.branch, c.published), ("genai/work-1", c.head()))
         self.assertNotIn("genai/work-2", git(root, "branch"))
         self.item(c, "c")
-        git(root, "fetch", "-q", c.path, f"{c.head()}:refs/heads/{c.branch}")
+        git(root, "fetch", "-q", c.gitdir, f"{c.head()}:refs/heads/{c.branch}")
         c.publish()                                                         # no false "moved or deleted"
         self.assertEqual(git(root, "rev-parse", c.branch).strip(), c.head())
 
@@ -1254,6 +1256,24 @@ class TestCopy(unittest.TestCase):
         self.item(c, "b")
         c.publish()
         self.assertEqual(len(git(root, "rev-parse", c.branch).strip()), 64)
+
+    def test_the_copys_files_have_no_git_until_it_is_kept(self):
+        root = self.repo()
+        c, _ = G.Copy.create(root)
+        self.addCleanup(c.remove)
+        self.assertFalse(os.path.lexists(os.path.join(c.path, ".git")))    # git in the sandbox finds no repository
+        self.item(c, "b")
+        c.publish()                 # fetched from the git directory itself
+        self.assertEqual(git(root, "rev-parse", c.branch).strip(), c.head())
+        c.keep()
+        self.assertEqual(git(c.path, "rev-parse", "HEAD").strip(), c.head())
+
+    def test_a_copy_that_cant_be_made_is_a_refusal(self):
+        root = self.repo()
+        with mock.patch("tempfile.mkdtemp", side_effect=OSError(28, "No space left on device")):
+            with self.assertRaisesRegex(G.GenaiError, "can't make the copy under .*No space left") as cm:
+                G.Copy.create(root)
+        self.assertEqual(cm.exception.kind, "work_refused")
 
     def test_each_copy_gets_a_directory_of_its_own(self):
         root = self.repo()
@@ -1413,7 +1433,7 @@ class TestWorkParts(unittest.TestCase):
     def test_a_run_whose_time_is_up_doesnt_start(self):
         box = G.Sandbox(G.parse_sandbox({"image": "i:1"}, "p.json"), tempfile.gettempdir(), print)
         with mock.patch("subprocess.Popen") as popen:
-            self.assertEqual(box._podman(["podman", "run"], "n", 100, time.monotonic() - 1), ("timeout", ""))
+            self.assertEqual(box._podman(["podman", "run"], "n", 100, time.monotonic() - 1), ("late", ""))
         popen.assert_not_called()
 
     def test_ctrl_c_while_starting_work_in_the_repl_doesnt_exit(self):

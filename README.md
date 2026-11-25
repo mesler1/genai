@@ -575,8 +575,9 @@ your repository only to read your last commit into the copy and to fetch the cop
 overlay of the copy's files: its git directory is beside them, out of the sandbox's reach. So
 nothing the model or a test writes can make git run a program on your machine. Commits use your
 git identity, or `genai` if you have none. If a session ends with a problem (git fails, or a file
-the model wrote isn't in its commits), the copy stays where it is for you to look at; so does one
-left by a genai that was killed outright.
+the model wrote isn't in its commits), the copy stays where it is for you to look at, and git works
+in it as in any checkout. One left by a genai that was killed outright stays too; there, git needs
+`--git-dir=../git` (the sandbox gets no `.git` at all, so a build that runs git sees no repository).
 
 ## JSON protocol
 
