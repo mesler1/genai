@@ -388,10 +388,17 @@ class TestEndpoints(Tmp):
         bless_path(home, shared)
         self.assertEqual(G.select_endpoint(G.Config(home), "team").base_url, "https://team.example/v1")
 
-    def test_example_endpoint_is_valid(self):
-        p = G.Endpoint.load(os.path.join(os.path.dirname(HERE), "endpoints", "example.json"))
-        self.assertTrue(p.base_url.startswith("https://"))
-        self.assertEqual(p.key_env, "GENAI_API_KEY")
+    def test_the_quick_start_endpoint_is_valid_once_filled_in(self):
+        with open(os.path.join(os.path.dirname(HERE), "README.md")) as f:
+            readme = f.read()
+        block = readme[readme.index("## Quick start"):readme.index("## Endpoints and profiles")]
+        text = block[block.index("```json\n") + 8:]
+        text = text[:text.index("```")].replace("YOUR-SERVER-ADDRESS", "https://llm.internal")
+        p = self.path("work-llm.json")
+        with open(p, "w") as f:
+            f.write(text)
+        e = G.Endpoint.load(p)
+        self.assertEqual((e.name, e.base_url, e.key_env), ("work-llm", "https://llm.internal/v1", "GENAI_API_KEY"))
 
 
 class TestSkills(Tmp):
