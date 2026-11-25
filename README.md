@@ -16,10 +16,24 @@ From a clone of this repository:
 mkdir -p ~/.local/bin                       # any directory on your PATH will do
 ln -s "$PWD/genai" "$PWD/tui/genai-tui" ~/.local/bin/
 genai --list-endpoints                      # the first run creates ~/.config/genai (none yet)
-cp endpoints/example.json ~/.config/genai/endpoints/work-llm.json   # edit name, base_url, model, key_env
+$EDITOR ~/.config/genai/endpoints/work-llm.json         # write your endpoint: see below
 genai --bless ~/.config/genai/endpoints/work-llm.json   # shows URL, model, key source; asks you to confirm
 export GENAI_API_KEY=...                    # the endpoint names the variable, never the key
 genai -e work-llm "what does 'set -euo pipefail' do?"
+```
+
+The endpoint file says where your prompts go. Fill in your server's OpenAI-compatible API address
+(usually ending in `/v1`), its model name, the environment variable that will hold your API key (never
+the key itself) and the model's context size in tokens:
+
+```json
+{
+  "name": "work-llm",
+  "base_url": "YOUR-SERVER-ADDRESS/v1",
+  "model": "YOUR-MODEL-NAME",
+  "key_env": "GENAI_API_KEY",
+  "context_limit": 128000
+}
 ```
 
 To use the example persona, which grants coding mode and uses a bundled skill, add
@@ -98,7 +112,6 @@ Exit codes: 0 ok, 1 error, 2 usage, 3 endpoint or profile (none, unblessed, chan
 
 ```
 genai                      the client (one file)
-endpoints/example.json     endpoint template: copy, fill in, bless
 profiles/coder.json        example persona with coding mode
 skills/genai-endpoint/     helps you write an endpoint
 skills/genai-profile/      helps you write a profile (persona)
