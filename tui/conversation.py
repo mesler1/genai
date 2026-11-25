@@ -51,7 +51,7 @@ COMMANDS = {
               "mark, or all",
     "/commands": "list the commands run in the shell pane, numbered for /share N (also in the info panel)",
     "/mark": "shell context starts at the shell's current prompt (or right-click a line in the shell)",
-    "/shell": "show the shell and move there (`` on its empty prompt hides it again)",
+    "/shell": "show the shell and move there (Ctrl-` hides it again)",
     "/panel": "show or hide the info panel on the right",
     "/plan": "[clear]: show the approved plan, or drop it so everything asks again",
     "/stop": "stop the sandboxed run going on now, or genai's turn (Ctrl-C on an empty input does the same)",

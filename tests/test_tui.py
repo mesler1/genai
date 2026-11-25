@@ -2262,35 +2262,28 @@ class TestGenaiTui(TmuxCase):
         return [r[3] for r in rows if r[1] == 0], next(r[3] for r in rows if r[2] == "1")
 
     def show_shell(self):
-        self.type("`", enter=False)
-        self.type("`", enter=False)
+        self.at_terminal("\x00")             # Ctrl-` as most terminals send it
         time.sleep(0.6)
 
-    def test_shell_hidden_until_backticks(self):
+    def test_ctrl_backtick_shows_and_hides_the_shell_from_any_pane(self):
         with FakeAPI([reply("hello")]) as api:
             self.start(api)
             self.assertEqual(self.window(), (["genai", "you"], "you"))          # the shell starts hidden
             self.type("hi")
             self.wait_for("● hello")
-            self.type("`", enter=False)
-            time.sleep(0.8)                                                   # however slowly it is typed
-            self.type("`", enter=False)
+            self.type("a `` b", enter=False)                                  # backticks are only text now
+            self.at_terminal("\x00")                                          # Ctrl-`, sent as NUL
             time.sleep(0.6)
             self.assertEqual(self.window(), (["shell", "genai", "you"], "shell"))   # above the conversation
-            self.tmux("send-keys", "-t", self.panes()["shell"], "-l", "``")
-            time.sleep(1)
-            self.assertEqual(self.window(), (["genai", "you"], "you"))
-            self.assertNotIn("`", self.screen("you").splitlines()[0])           # the taps didn't stay in the input
-            self.type("a ``code`` b", enter=False)                             # not on an empty input: just text
-            time.sleep(0.3)
-            self.assertEqual(self.window()[0], ["genai", "you"])
-            self.assertIn("a ``code`` b", self.screen("you"))
-            self.tmux("send-keys", "-t", self.panes()["you"], "C-u")
-            self.show_shell()
-            self.tmux("send-keys", "-t", self.panes()["shell"], "-l", "echo ``x")   # mid-command: typed as is
-            time.sleep(1)
-            self.assertEqual(self.window()[0], ["shell", "genai", "you"])
+            self.shell("echo ``x")
             self.assertIn("echo ``x", self.screen("shell"))
+            self.at_terminal("\x00")                                          # from the shell: hides it
+            time.sleep(0.6)
+            self.assertEqual(self.window(), (["genai", "you"], "you"))
+            self.assertIn("a `` b", self.screen("you"))                        # the input is untouched
+            self.at_terminal("\x1b[96;5u")                                    # Ctrl-` reported in full
+            time.sleep(0.6)
+            self.assertEqual(self.window()[0], ["shell", "genai", "you"])
 
     def test_an_answer_must_name_the_question_showing(self):
         with FakeAPI([call("write_file", path="x.txt", content="x\n", reason="r"), reply("done")]) as api:

@@ -4,8 +4,8 @@
 Typing, history, paste and Tab completion happen here. What you send, and your answers to
 approval and run questions, go to the conversation pane over genai-tui's private socket (see
 ipc.py); the conversation pane owns genai and decides everything, and pushes back what this pane
-should show. Every answer names the question it answers. Typing `` on an empty input shows your shell
-above the conversation, or hides it again.
+should show. Every answer names the question it answers. Ctrl-` (a tmux binding, set by genai-tui) shows
+your shell above the conversation, or hides it again.
 Standard library only; Python 3.10 or newer.
 """
 
@@ -30,16 +30,6 @@ def tmux(*args):
         return subprocess.run(["tmux", *args], capture_output=True, text=True, timeout=5).stdout
     except (OSError, subprocess.SubprocessError):
         return ""
-
-
-def toggle_shell():
-    """Show the shell above the conversation and go there, or hide it; `` on its empty prompt hides it."""
-    toggle = os.environ.get("GENAI_TUI_TOGGLE")
-    if toggle:
-        try:
-            subprocess.run([toggle, "toggle", "--focus"], capture_output=True, timeout=5)
-        except (OSError, subprocess.SubprocessError):
-            pass
 
 
 class Prompt:
@@ -118,7 +108,7 @@ class Prompt:
                     pass
                 x += width(text)
         v = self.view
-        hints = v.get("hints") or "Enter send · Alt+Enter new line · ↑ earlier · `` shell · /help"
+        hints = v.get("hints") or "Enter send · Alt+Enter new line · ↑ earlier · Ctrl-` shell · /help"
         if v.get("mode", "input") == "input" and v.get("running"):
             hints = f"{SPIN[int(time.time() * 10) % len(SPIN)]} a sandboxed run is going · Ctrl-C or /stop stops it"
         elif v.get("mode", "input") == "input" and v.get("busy"):
@@ -184,10 +174,6 @@ class Prompt:
         if asking:
             if isinstance(k, str) and k.isprintable() and time.time() - self.asked_at >= SETTLE:
                 self.answer(k.lower())
-            return
-        if k == "`" and ed.text == "`":       # `` on an empty input, at any speed; backticks in a message stay text
-            ed.text, ed.pos = "", 0
-            toggle_shell()
             return
         if k in ("\n", "\r", curses.KEY_ENTER):
             if ed.text.endswith("\\") and ed.pos == len(ed.text):
