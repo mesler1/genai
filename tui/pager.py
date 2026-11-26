@@ -15,6 +15,7 @@ import locale
 import os
 import sys
 
+import palette
 from conversation import A, Q, clean, cut, width
 
 HINT = "Esc or q closes · ↑↓ PgUp PgDn scroll · / searches, n N next"
@@ -51,11 +52,8 @@ class Pager:
         self.scr, self.lines = scr, lines or [""]
         self.top, self.term, self.note, self.hit = 0, "", "", None
         curses.curs_set(0)
-        curses.use_default_colors()
-        self.roles = {"": 0, Q: curses.A_DIM, A: curses.A_BOLD}
-        if curses.has_colors():
-            curses.init_pair(1, curses.COLOR_BLUE, -1)
-            self.roles[A] = curses.color_pair(1) | curses.A_BOLD
+        self.roles = palette.roles(curses)
+        self.roles[A] |= curses.A_BOLD
         curses.mousemask(getattr(curses, "BUTTON4_PRESSED", 0) | getattr(curses, "BUTTON5_PRESSED", 0x200000))
         scr.keypad(True)
 

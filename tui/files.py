@@ -16,6 +16,7 @@ import os
 import queue
 import sys
 
+import palette
 from conversation import A, D, Q, R, W, clean, fit, width
 from ipc import Client
 
@@ -301,14 +302,7 @@ class Pane:
         self.scr, self.link = scr, link
         self.tree, self.msg, self.top, self.seen = Tree(), "", 0, None
         curses.curs_set(0)
-        curses.use_default_colors()
-        self.roles = {"": 0}
-        if curses.has_colors():
-            quiet = 8 if curses.COLORS >= 16 else curses.COLOR_WHITE
-            for i, (role, fg) in enumerate([(Q, quiet), (A, curses.COLOR_BLUE), (W, curses.COLOR_YELLOW),
-                                            (D, curses.COLOR_GREEN), (R, curses.COLOR_RED)], 1):
-                curses.init_pair(i, fg, -1)
-                self.roles[role] = curses.color_pair(i)
+        self.roles = palette.roles(curses)
         self.roles[A] |= curses.A_BOLD
         self.wheel_up = getattr(curses, "BUTTON4_PRESSED", 0)
         self.wheel_down = getattr(curses, "BUTTON5_PRESSED", 0)

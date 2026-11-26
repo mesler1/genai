@@ -37,6 +37,7 @@ IPC = load("ipc", os.path.join(REPO, "tui", "ipc.py"))
 REC = load("recorder", os.path.join(REPO, "tui", "recorder.py"))
 RAW = C.Model().feature("raw")
 F = importlib.import_module("features")
+P = importlib.import_module("palette")
 G = load("hoplon_for_tui", os.path.join(REPO, "hoplon"))
 
 
@@ -47,6 +48,55 @@ def slurp(path):
 
 def text_of(block, w=60):
     return "\n".join("".join(t for t, _ in ln) for ln in block.lines(w))
+
+
+class TestPalette(unittest.TestCase):
+    class Curses:
+        A_DIM, A_BOLD, COLOR_YELLOW, COLOR_RED, COLOR_CYAN, COLOR_WHITE, COLOR_BLACK = 1, 2, 3, 1, 6, 7, 0
+        error = Exception
+
+        def __init__(self, colors):
+            self.COLORS, self.pairs = colors, {}
+
+        def use_default_colors(self):
+            pass
+
+        def has_colors(self):
+            return self.COLORS > 0
+
+        def init_pair(self, i, fg, bg):
+            self.pairs[i] = fg
+
+        def color_pair(self, i):
+            return 1000 + i
+
+    def test_256_colours_use_the_design_codes(self):
+        c = self.Curses(256)
+        roles = P.roles(c, environ={})
+        self.assertEqual(sorted(c.pairs.values()), sorted([245, 179, 178, 109, 167]))
+        self.assertEqual(c.pairs[list(P.ROLES).index("risk") + 1], 167)
+        self.assertEqual(set(roles), {"", *P.ROLES})
+
+    def test_16_and_8_colours_fall_back(self):
+        c = self.Curses(16)
+        P.roles(c, environ={})
+        self.assertEqual(c.pairs[1], 8)                                   # quiet: bright black
+        c = self.Curses(8)
+        P.roles(c, environ={})
+        self.assertEqual((c.pairs[1], c.pairs[2]), (c.COLOR_WHITE, c.COLOR_YELLOW))
+
+    def test_no_color_keeps_only_bold_and_dim(self):
+        c = self.Curses(256)
+        roles = P.roles(c, environ={"NO_COLOR": "1"})
+        self.assertEqual(c.pairs, {})
+        self.assertEqual((roles["quiet"], roles["accent"], roles["waiting"]), (c.A_DIM, c.A_BOLD, 0))
+        self.assertEqual(P.tmux("bronze", bold=True, environ={"NO_COLOR": "1"}), "#[bold]")
+        self.assertEqual(P.tmux("patina", environ={"NO_COLOR": "1"}), "")
+        self.assertEqual(P.tmux("iron", "brass", bold=True, environ={}), "#[fg=#0E1113,bg=#E3B341,bold]")
+
+    def test_brass_bronze_and_ember_stay_apart_on_256_colours(self):
+        codes = [P.TOKENS[t][1] for t in ("bronze", "brass", "ember", "patina", "dim")]
+        self.assertEqual(len(set(codes)), len(codes))
 
 
 class TestText(unittest.TestCase):
@@ -639,7 +689,7 @@ class TestSandboxStatus(unittest.TestCase):
         waiting.submit("go")
         waiting.handle({"type": "proposal", "id": "p1", "kind": "write", "path": "a", "content": "x", "reason": "r",
                         "digest": "d"})
-        self.assertTrue(waiting.tmux_status().startswith(" #[fg=black,bg=yellow,bold] ⏸ waiting for you"))
+        self.assertTrue(waiting.tmux_status().startswith(" #[fg=#0E1113,bg=#E3B341,bold] ⏸ waiting for you"))
         waiting.decide(False)                                   # answered: no longer waiting
         self.assertNotIn("waiting for you", waiting.tmux_status())
         m = self.model()
@@ -649,7 +699,7 @@ class TestSandboxStatus(unittest.TestCase):
         m2 = self.model()
         self.start(m2, pid="#[fg=red]x")                       # not an id hoplon would send: left out
         status = m2.tmux_status()
-        self.assertNotIn("x", status.replace("fg=yellow", "").replace("#[default]", "").replace("box", ""))
+        self.assertNotIn("x", re.sub(r"#\[[^]]*\]", "", status).replace("box", ""))
         self.assertIn("⏵ sandbox 0s", status)
 
     def test_running_card_shows_its_clock_and_ends_stopped(self):

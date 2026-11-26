@@ -17,6 +17,7 @@ import subprocess
 import sys
 import time
 
+import palette
 from conversation import A, D, Q, R, SPIN, W, Editor, complete, edit_key, fit, width
 from ipc import Client
 
@@ -39,14 +40,7 @@ class Prompt:
         self.paste, self.ctrl_c = None, 0.0
         self.asked_at = 0.0
         curses.raw()
-        curses.use_default_colors()
-        self.roles = {"": 0}
-        if curses.has_colors():
-            quiet = 8 if curses.COLORS >= 16 else curses.COLOR_WHITE
-            for i, (role, fg) in enumerate([(Q, quiet), (A, curses.COLOR_BLUE), (W, curses.COLOR_YELLOW),
-                                            (D, curses.COLOR_GREEN), (R, curses.COLOR_RED)], 1):
-                curses.init_pair(i, fg, -1)
-                self.roles[role] = curses.color_pair(i)
+        self.roles = palette.roles(curses)
         self.roles["bold"] = curses.A_BOLD
         self.roles["key"] = self.roles[A] | curses.A_BOLD | curses.A_REVERSE
         self.roles["question"] = self.roles[A] | curses.A_BOLD

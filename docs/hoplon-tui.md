@@ -87,7 +87,7 @@ Another user of that host can reach the forwarded port, which is why the token m
 ## Files that look like secrets
 
 In coding mode, reading a file that looks like it holds secrets asks first. If it doesn't (code
-like `token = token.strip()` can look like a password), answer `a` instead of `y`: hoplon
+like `token = token.strip()` can look like a password), answer `a` (not secrets) instead of `y`: hoplon
 remembers that exact text in `~/.config/hoplon/not-secret.json` and won't ask about it again, skip
 it in searches or hide it from sandboxed runs, until the file changes. A file holding the endpoint's
 key always asks. Remove an entry from that file, or the file, to be asked again.
@@ -149,3 +149,9 @@ the start, and `HOPLON_TUI_ALERTS=off` or `on` overrides that for one run. The s
 
 hoplon-tui shows a splash while tmux starts, for about a second, on a terminal of at least 60×24.
 `HOPLON_TUI_SPLASH=0` or `NO_COLOR` turns it off.
+
+The colours are "bronze on iron": bronze for hoplon's badge, the focused pane and key hints; brass
+for what waits on you and for anything live, outside the sandbox; patina for the sandbox and for
+what ran fine; ember for errors and risks. They need a 256-colour terminal and fall back to the
+basic 16 otherwise. Your terminal's own background is kept. `NO_COLOR` turns colour off, leaving
+bold and dim.

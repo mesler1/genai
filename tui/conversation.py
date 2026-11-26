@@ -28,6 +28,7 @@ import time
 import unicodedata
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import palette  # noqa: E402
 from features import disabled_names, load as load_features, tui_setting  # noqa: E402
 from ipc import Hub  # noqa: E402
 from recorder import Recorder, ago, fifo_path, label, trim  # noqa: E402
@@ -822,7 +823,7 @@ class Model:
         is a tmux format, so only fixed words, a checked proposal id and a number go in."""
         if self.hello is None:
             return ""
-        wait = " #[fg=black,bg=yellow,bold] ⏸ waiting for you #[default] │" if self.pending else ""
+        wait = f" {palette.tmux('iron', 'brass', bold=True)} ⏸ waiting for you #[default] │" if self.pending else ""
         return wait + self.sandbox_status()
 
     def shell_title(self):
@@ -831,7 +832,7 @@ class Model:
         hints = " · Ctrl-` hides it · right-click: shell context"
         where = self.shell_where or ""
         if where.startswith("inside"):
-            return f"#[fg=#6ed6c0,bold]⊡ your shell, {where}#[default]{hints}"
+            return f"{palette.tmux('patina', bold=True)}⊡ your shell, {where}#[default]{hints}"
         if where.startswith("ON ANOTHER HOST"):
             host, how = (self.hello or {}).get("host"), ", over ssh"
         elif where.startswith("OUTSIDE"):
@@ -839,19 +840,19 @@ class Model:
         else:
             return f"your shell, isolation unverified{hints}"
         host = re.sub(r"[^A-Za-z0-9._@-]", "", str(host or "")) or "?"
-        return f"#[fg=#d6b26e,bold]▲ LIVE: your shell on {host}{how}#[default]{hints}"
+        return f"{palette.tmux('brass', bold=True)}▲ LIVE: your shell on {host}{how}#[default]{hints}"
 
     def sandbox_status(self):
         card = self.running_card()
         if card and PROPOSAL_ID.fullmatch(card.id):
-            return f" #[fg=yellow,bold]⏵ sandbox {card.id} {card.elapsed()}s#[default] │"
+            return f" {palette.tmux('patina', bold=True)}⏵ sandbox {card.id} {card.elapsed()}s#[default] │"
         if card:
-            return f" #[fg=yellow,bold]⏵ sandbox {card.elapsed()}s#[default] │"
+            return f" {palette.tmux('patina', bold=True)}⏵ sandbox {card.elapsed()}s#[default] │"
         if self.hello.get("sandbox"):
-            return " #[fg=green]⊡ sandbox#[default] │"
+            return f" {palette.tmux('patina')}⊡ sandbox#[default] │"
         if self.runner and not self.runner.get("problem"):
-            return " #[fg=green]⊡ model's runs sandboxed#[default] │"
-        return " #[fg=yellow]▲ no sandbox#[default] │"
+            return f" {palette.tmux('patina')}⊡ model's runs sandboxed#[default] │"
+        return f" {palette.tmux('brass')}▲ no sandbox#[default] │"
 
     def network_text(self):
         r = self.runner
@@ -1689,14 +1690,7 @@ class App:
         self.shell_title = None    # the shell pane's title, as last set
         self.paste = None          # text of a bracketed paste in progress
         curses.curs_set(1)
-        curses.use_default_colors()
-        self.roles = {"": 0}
-        if curses.has_colors():
-            quiet = 8 if curses.COLORS >= 16 else curses.COLOR_WHITE
-            for i, (role, fg) in enumerate([(Q, quiet), (A, curses.COLOR_BLUE), (W, curses.COLOR_YELLOW),
-                                            (D, curses.COLOR_GREEN), (R, curses.COLOR_RED)], 1):
-                curses.init_pair(i, fg, -1)
-                self.roles[role] = curses.color_pair(i)
+        self.roles = palette.roles(curses)
         self.roles["bold"] = curses.A_BOLD
         self.roles["code"] = self.roles[A]
         curses.raw()               # Ctrl-C, Ctrl-S and friends arrive as keys instead of signals
@@ -1790,10 +1784,9 @@ class App:
                 ep = (self.m.hello or {}).get("endpoint") or {}
                 to = c.ev.get("to") if isinstance(c.ev.get("to"), str) else ep.get("base_url", "the endpoint")
                 lines.append([(f"It looks like it holds secrets; allowing sends it to {clean(str(to))}", R)])
-                lines.append([("  y", A), (" yes   ", ""), ("a", A), (" yes, it holds none: don't ask until it changes   ",
-                                                                           ""), ("n", A), (" no   ", ""),
+                lines.append([("  y", A), (" yes   ", ""), ("a", A), (" not secrets   ", ""), ("n", A), (" no   ", ""),
                               ("v", A), (" view it all", "")])
-                return lines, None, "y allow · a allow, not secrets · n or Esc decline · v view in full"
+                return lines, None, "y allow · a not secrets (until it changes) · n no · v view"
             elif isinstance(c.ev.get("to"), str):
                 lines.append([(f"  Allowing sends it to the planner, at {one_row(c.ev['to'])}", W)])
             lines.append([("  y", A), (" yes   ", ""), ("n", A), (" no   ", ""), ("v", A), (" view it all", "")])
