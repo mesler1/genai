@@ -219,10 +219,14 @@ else
   t set -g pane-active-border-style 'bold'
   badge='#[bold] ◆ hoplon #[default] ' hint='' host='#[bold]'
 fi
-t set -g status-style 'bg=default,fg=default'
-t set -g status-left "$badge"
-t set -g status-left-length 20
-keys="$hint│ Ctrl-\` shell · Ctrl-b o other pane · Ctrl-b d detach "
+# The header: tmux's status line, at the top. hoplon's badge, then what the conversation pane reports
+# (endpoint and model, profile, session, state, mode, context); on the right, what waits on you, the
+# sandbox, the host, and the keys when the terminal is wide enough for them.
+t set -g status-position top
+if [ -z "${NO_COLOR:-}" ]; then t set -g status-style 'bg=#161B1F,fg=default'; else t set -g status-style 'bg=default,fg=default'; fi
+t set -g status-left "$badge#{@hoplon_header}"
+t set -g status-left-length 120
+keys="#{?#{e|>:#{client_width},170},$hint│ Ctrl-\` shell · Ctrl-b o other pane · Ctrl-b d detach #[default],}"
 if [ -n "$remote" ]; then       # the host that matters is the one hoplon runs on
   t set -g status-right "#{@hoplon_sandbox} ${hint}hoplon on#[default] $host${remote//#/##}#[default] $keys"
 else

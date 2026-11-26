@@ -541,6 +541,28 @@ class TestSandboxRuns(unittest.TestCase):
                   "sandbox": None, "coding": True, "runner": dict(self.RUNNER, **runner)})
         return m
 
+    def test_the_header_says_what_hoplon_is_doing_and_how_full_the_context_is(self):
+        m = C.Model()
+        self.assertEqual(m.tmux_header(), "")                       # nothing before hello
+        m.handle({"type": "hello", "version": "1", "session": "tui-ab#[x]",
+                  "endpoint": {"name": "work#{pane}", "model": "big-model", "base_url": "u"},
+                  "profile": {"name": "coder"}, "sandbox": None, "coding": False, "runner": self.RUNNER})
+        h = m.tmux_header()
+        self.assertNotIn("#{", h)                                   # names can't carry tmux formats
+        self.assertNotIn("#[x", h)
+        for want in ("workpane", "big-model", "coder", "tui-abx", "● ready", "chat", "──────── ctx"):
+            self.assertIn(want, h)
+        m.handle({"type": "context", "used": 75000, "limit": 100000})
+        m.handle({"type": "coding", "on": True})
+        h = m.tmux_header()
+        self.assertIn("#[fg=#E3B341]━━━━━━", h)                    # 75%: brass, 6 of 8
+        self.assertIn("75%", h)
+        self.assertIn("◆ coding", h)
+        m.handle({"type": "context", "used": 95000, "limit": 100000})
+        self.assertIn("#[fg=#E8776A]━━━━━━━━", m.tmux_header())    # 95%: ember
+        m.submit("go")
+        self.assertIn("● working", m.tmux_header())
+
     def test_banner_says_the_model_runs_things_offline(self):
         self.assertIn("offline", text_of(self.model().blocks[0], 200))
         self.assertIn("WITH the network", text_of(self.model(network=True).blocks[0], 200))
@@ -689,9 +711,10 @@ class TestSandboxStatus(unittest.TestCase):
         waiting.submit("go")
         waiting.handle({"type": "proposal", "id": "p1", "kind": "write", "path": "a", "content": "x", "reason": "r",
                         "digest": "d"})
-        self.assertTrue(waiting.tmux_status().startswith(" #[fg=#0E1113,bg=#E3B341,bold] ⏸ waiting for you"))
+        self.assertIn("#[fg=#0E1113,bg=#E3B341,bold] ⏸ waiting for you", waiting.tmux_header())
+        self.assertNotIn("waiting", waiting.tmux_status())
         waiting.decide(False)                                   # answered: no longer waiting
-        self.assertNotIn("waiting for you", waiting.tmux_status())
+        self.assertNotIn("waiting for you", waiting.tmux_header())
         m = self.model()
         card = self.start(m)
         card.started -= 5
@@ -2144,6 +2167,10 @@ class TestHoplonTui(TmuxCase):
         time.sleep(C_PROMPT.SETTLE + 0.1)
         self.tmux("send-keys", "-t", self.panes()["you"], k)
 
+    def header(self):
+        """Rows above the panes: the header, tmux's status line at the top."""
+        return 1 if self.tmux("show", "-gv", "status-position").strip() == "top" else 0
+
     def at_terminal(self, keys):
         """Keys typed at the terminal itself, so they reach tmux (and its menus) first."""
         self.proc.stdin.write(keys.encode())
@@ -2155,7 +2182,7 @@ class TestHoplonTui(TmuxCase):
         y = next(i for i, ln in enumerate(self.screen(pane).splitlines()) if text in ln)
         top, left = (int(v) for v in self.tmux("display", "-p", "-t", self.panes()[pane],
                                                  "#{pane_top} #{pane_left}").split())
-        at = f"{button};{left + 5};{top + y + 1}"
+        at = f"{button};{left + 5};{top + y + 1 + self.header()}"
         self.at_terminal(f"\x1b[<{at}M")
         time.sleep(hold)
         self.at_terminal(f"\x1b[<{at}m")
@@ -2629,10 +2656,10 @@ class TestHoplonTui(TmuxCase):
             self.key("a")
             self.wait_for("Allow p3: edit a.txt?")                     # the read didn't ask; the edit does
             self.assertIn("step 2 of the plan", self.screen())
-            end = time.time() + 5                                       # tmux's status line says so too
-            while "waiting for you" not in self.tmux("show", "-gv", "@hoplon_sandbox") and time.time() < end:
+            end = time.time() + 5                                       # the header says so too
+            while "waiting for you" not in self.tmux("show", "-gv", "@hoplon_header") and time.time() < end:
                 time.sleep(0.1)
-            self.assertIn("⏸ waiting for you", self.tmux("show", "-gv", "@hoplon_sandbox"))
+            self.assertIn("⏸ waiting for you", self.tmux("show", "-gv", "@hoplon_header"))
             self.key("y")
             self.wait_for("p4 finished (exit 0). Share the output")    # run without another question
             self.assertIn("planned-new", self.screen("shell"))
@@ -2655,7 +2682,7 @@ class TestHoplonTui(TmuxCase):
                 self.shell(c)
             y = next(i for i, ln in enumerate(self.screen("shell").splitlines()) if ln.endswith("echo in-context"))
             top = int(self.tmux("display", "-p", "-t", sh, "#{pane_top}"))
-            self.at_terminal(f"\x1b[<2;5;{top + y + 1}M")
+            self.at_terminal(f"\x1b[<2;5;{top + y + 1 + self.header()}M")
             time.sleep(0.5)
             self.at_terminal("m")
             time.sleep(0.5)

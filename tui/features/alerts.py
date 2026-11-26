@@ -23,7 +23,7 @@ class Alerts(Feature):
         if arg:
             self.on = arg == "on"
         m.note("alerts: on: the bell rings when a decision starts waiting" if self.on else
-               "alerts: off: no bell; the status line still shows ⏸ waiting for you"
+               "alerts: off: no bell; the header still shows ⏸ waiting for you"
                + ("" if arg else " ({\"alerts\": true} in tui.json, or /alerts on, turns it back on)"))
 
     def poll(self, app):

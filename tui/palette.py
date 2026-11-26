@@ -16,6 +16,7 @@ TOKENS = {
     "patina": ("#7FC1B8", 109, "CYAN"),      # ok, running, done
     "ember":  ("#E8776A", 167, "RED"),       # failed, denied, risky
     "iron":   ("#0E1113", 233, "BLACK"),     # text on a bronze badge
+    "plate":  ("#161B1F", 234, "BLACK"),     # the header's band
 }
 
 # The screens' roles (conversation's Q, A, W, D, R) and the token each one uses.

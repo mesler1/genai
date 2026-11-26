@@ -819,12 +819,54 @@ class Model:
             self.actions.append(("interrupt",))
 
     def tmux_status(self):
-        """The sandbox part of tmux's status-right, after a "waiting for you" while a card waits for a decision. It
-        is a tmux format, so only fixed words, a checked proposal id and a number go in."""
+        """The sandbox part of tmux's status-right (the header's right side; "waiting for you" is on its left, in
+        tmux_header). A tmux format, so only fixed words, a checked proposal id and a number go in."""
         if self.hello is None:
             return ""
-        wait = f" {palette.tmux('iron', 'brass', bold=True)} ⏸ waiting for you #[default] │" if self.pending else ""
-        return wait + self.sandbox_status()
+        return self.sandbox_status()
+
+    def tmux_header(self):
+        """The header's information, after hoplon's badge: the endpoint and model, profile, session, what hoplon is
+        doing, a work session and the context gauge. A tmux format, so names are cut to the characters they may
+        hold (no "#")."""
+        if self.hello is None:
+            return ""
+        T = palette.tmux
+
+        def safe(v, n=32):
+            return re.sub(r"[^A-Za-z0-9._:@/+=-]", "", str(v or ""))[:n]
+        ep, prof = self.hello.get("endpoint") or {}, self.hello.get("profile") or {}
+        dim = T("dim")
+        parts = [f"{dim}{safe(ep.get('name')) or '?'}·#[fg=default]{T(bold=True)}{safe(ep.get('model'), 40) or '?'}"
+                 f"#[nobold]"]
+        if prof.get("name"):
+            parts.append(f"{T('bronze')}{safe(prof['name'])}#[fg=default]")
+        if self.hello.get("session"):
+            parts.append(f"{dim}{safe(self.hello['session'])}#[fg=default]")
+        if self.exited is not None:
+            parts.append(f"{T('ember', bold=True)}■ exited#[default]")
+        elif self.pending:
+            parts.append(f"{T('iron', 'brass', bold=True)} ⏸ waiting for you #[default]")
+        elif self.busy:
+            parts.append(f"{T('brass', bold=True)}● working#[default]")
+        else:
+            parts.append(f"{T('patina')}● ready#[default]")
+        parts.append(f"{T('patina', bold=True)}◆ coding#[default]" if self.coding else f"{dim}chat#[default]")
+        work = self.feature("work")
+        info = getattr(work, "info", None) if work else None
+        if isinstance(info, dict):
+            n, cur = len(info.get("items") or []), info.get("current")
+            at = f" {cur}/{n}" if isinstance(cur, int) and n else ""
+            parts.append(f"{T('patina', bold=True)}⚒ work{at}#[default]")
+        used, limit = self.context if self.context else (None, None)
+        if isinstance(used, int) and isinstance(limit, int) and limit > 0:
+            pct = min(100, 100 * used // limit)
+            tone = "patina" if pct < 70 else "brass" if pct < 90 else "ember"
+            full = min(8, round(pct * 8 / 100))
+            parts.append(f"{T(tone)}{'━' * full}{dim}{'─' * (8 - full)} {T(tone)}{pct}%#[fg=default]")
+        else:
+            parts.append(f"{dim}──────── ctx#[fg=default]")
+        return " " + f" {dim}│#[fg=default] ".join(parts) + " "
 
     def shell_title(self):
         """The shell pane's title: whether what you type there is live. A tmux format, so the host is reduced to
@@ -1687,6 +1729,7 @@ class App:
         self.last_total = 0
         self.ctrl_c = 0.0
         self.status = None         # the sandbox part of tmux's status line, as last set
+        self.header = None         # the header's information (tmux_header), as last set
         self.shell_title = None    # the shell pane's title, as last set
         self.paste = None          # text of a bracketed paste in progress
         curses.curs_set(1)
@@ -2589,6 +2632,10 @@ class App:
             if status != self.status:
                 self.status = status
                 self.shell.tmux("set", "-g", "@hoplon_sandbox", status)
+            header = self.m.tmux_header()
+            if header != self.header:
+                self.header = header
+                self.shell.tmux("set", "-g", "@hoplon_header", header)
             title = self.m.shell_title()
             if title != self.shell_title:
                 self.shell_title = title
