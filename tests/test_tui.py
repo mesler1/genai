@@ -1334,7 +1334,7 @@ class TestSamplesAndLeftovers(unittest.TestCase):
     def model(self):
         m = C.Model()
         m.handle({"type": "hello", "version": "1", "endpoint": {"name": "e", "model": "m", "base_url": "u"},
-                  "sandbox": None, "features": ["fixtures", "leftovers"]})
+                  "sandbox": None, "features": ["fixtures", "leftovers", "alerts"]})
         m.outbox.clear()
         return m
 
@@ -1397,6 +1397,48 @@ class TestSamplesAndLeftovers(unittest.TestCase):
         self.assertEqual(m.outbox, [{"type": "leftovers", "action": "clean", "ids": ["temp:1"]}])
 
 
+class TestAlerts(unittest.TestCase):
+    def setUp(self):
+        self.home = tempfile.mkdtemp(prefix="hoplon-test-")
+        self.addCleanup(shutil.rmtree, self.home, True)
+
+    def feature(self, env=None, tui=None):
+        if tui is not None:
+            os.makedirs(os.path.join(self.home, "hoplon"), exist_ok=True)
+            with open(os.path.join(self.home, "hoplon", "tui.json"), "w") as f:
+                json.dump(tui, f)
+        alerts = importlib.import_module("features.alerts")
+        with mock.patch.dict(os.environ, dict({"XDG_CONFIG_HOME": self.home}, **(env or {}))):
+            os.environ.pop("HOPLON_TUI_ALERTS", None) if not env else None
+            return alerts.Alerts()
+
+    def run_polls(self, feature, cards):
+        import types
+        rang = []
+        app = types.SimpleNamespace(m=types.SimpleNamespace(pending=[]), bell=lambda: rang.append(1))
+        for ids in cards:
+            app.m.pending = [types.SimpleNamespace(id=i) for i in ids]
+            feature.poll(app)
+        return len(rang)
+
+    def test_the_bell_rings_once_per_card_as_it_starts_to_wait(self):
+        self.assertEqual(self.run_polls(self.feature(), [["p1"], ["p1"], ["p1", "p2"], []]), 2)
+
+    def test_off_in_tui_json_or_the_environment_or_by_command(self):
+        self.assertEqual(self.run_polls(self.feature(tui={"alerts": False}), [["p1"]]), 0)
+        self.assertEqual(self.run_polls(self.feature(env={"HOPLON_TUI_ALERTS": "off"}, tui={"alerts": True}),
+                                        [["p1"]]), 0)
+        self.assertTrue(self.feature(tui={"alerts": "no"}).on)          # malformed: the default
+        f = self.feature()
+        m = C.Model(features=[f])
+        f.core = C.CORE
+        m.submit("/alerts off")
+        self.assertIn("no bell", text_of(m.blocks[-1]))
+        self.assertEqual(self.run_polls(f, [["p1"]]), 0)
+        m.submit("/alerts sometimes")
+        self.assertIn("usage", text_of(m.blocks[-1]))
+
+
 class TestFeatures(unittest.TestCase):
     """tui/features: the registry, and switching features off."""
 
@@ -1418,17 +1460,17 @@ class TestFeatures(unittest.TestCase):
 
     def test_all_built_in_features_load(self):
         on = F.load(core=C.CORE)
-        self.assertEqual([f.name for f in on], ["model", "copy", "decline", "raw", "ssh", "files", "sandbox", "edits", "plugins", "work", "fixtures", "leftovers"])
+        self.assertEqual([f.name for f in on], ["model", "copy", "decline", "raw", "ssh", "files", "sandbox", "edits", "plugins", "work", "fixtures", "leftovers", "alerts"])
         m = C.Model()
         self.assertEqual([f.name for f in m.features], [f.name for f in on])
-        self.assertEqual(list(m.commands())[-12:], ["/model", "/copy", "/decline", "/raw", "/system", "/files", "/sandbox", "/edits", "/plugins", "/work", "/fixtures", "/leftovers"])
+        self.assertEqual(list(m.commands())[-13:], ["/model", "/copy", "/decline", "/raw", "/system", "/files", "/sandbox", "/edits", "/plugins", "/work", "/fixtures", "/leftovers", "/alerts"])
         self.assertEqual(C.feature_requests(on), {"panel": {"models"}, "menu": {"model", "copy", "raw", "system"},
                           "files": {"list", "view", "attach", "insert"}})
 
     def test_environment_disables_a_feature(self):
         m, warning = self.model(self.environ(HOPLON_TUI_DISABLE="copy, model"))
         self.assertIsNone(warning)
-        self.assertEqual([f.name for f in m.features], ["decline", "raw", "ssh", "files", "sandbox", "edits", "plugins", "work", "fixtures", "leftovers"])
+        self.assertEqual([f.name for f in m.features], ["decline", "raw", "ssh", "files", "sandbox", "edits", "plugins", "work", "fixtures", "leftovers", "alerts"])
         m.submit("/copy")
         self.assertIn("unknown command /copy (/help lists them)", text_of(m.blocks[-1]))
         m.submit("/help")
@@ -1444,7 +1486,7 @@ class TestFeatures(unittest.TestCase):
         self.write_config('{"disable": ["decline", "raw"]}')
         m, warning = self.model(self.environ())
         self.assertIsNone(warning)
-        self.assertEqual([f.name for f in m.features], ["model", "copy", "ssh", "files", "sandbox", "edits", "plugins", "work", "fixtures", "leftovers"])
+        self.assertEqual([f.name for f in m.features], ["model", "copy", "ssh", "files", "sandbox", "edits", "plugins", "work", "fixtures", "leftovers", "alerts"])
         m.submit("/decline")
         self.assertIn("unknown command /decline", text_of(m.blocks[-1]))
 
@@ -1456,7 +1498,7 @@ class TestFeatures(unittest.TestCase):
         for text in ("{not json", '{"disable": "copy"}', '["copy"]', '{"disable": [1]}'):
             self.write_config(text)
             m, warning = self.model(self.environ())
-            self.assertEqual(len(m.features), 12, text)
+            self.assertEqual(len(m.features), 13, text)
             self.assertIn("was ignored, so every feature is on", warning)
 
     def test_the_hub_refuses_the_requests_of_a_disabled_feature(self):

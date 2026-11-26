@@ -27,6 +27,10 @@ cp /path/to/hoplon/hooks/notify-desktop ~/.config/hoplon/hooks/notify
 hoplon --bless ~/.config/hoplon/hooks/notify
 ```
 
+To keep it quiet without removing it, set `"alerts": false` in `config.json`; `:alerts off` and
+`:alerts on` switch it for one session. It runs only when hoplon is at a terminal, never under
+`--json` (hoplon-tui has its own bell: `/alerts`).
+
 Anything else, such as another front end or automatic decisions, belongs in a wrapper over
 `--json`.
 

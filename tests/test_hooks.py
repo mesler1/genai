@@ -8,6 +8,8 @@ import select
 import subprocess
 import sys
 import threading
+import shutil
+import tempfile
 import time
 import unittest
 from types import SimpleNamespace
@@ -592,6 +594,46 @@ class TestCli(HookCase):
         out, rc = self.pty_run([], [("> ", ":quit\n")])
         self.assertEqual(rc, 0, out)
         self.assertNotIn("hook", out.lower())
+
+
+
+class TestAlertsSwitch(unittest.TestCase):
+    """alerts: false (config.json) or :alerts off keeps the notify hook quiet."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="hoplon-test-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def engine(self, alerts=None):
+        home = os.path.join(self.tmp, "home", "hoplon")
+        cfg = G.Config(home)
+        cfg.ensure()
+        if alerts is not None:
+            with open(os.path.join(home, "config.json"), "w") as f:
+                json.dump({"alerts": alerts}, f)
+            cfg = G.Config(home)
+        ep = G.Endpoint({"name": "t", "base_url": "https://llm.invalid/v1", "model": "m"}, "t.json")
+        eng = G.Engine(cfg, ep, G.Session(cfg), G.PlainUI())
+        eng.notifier = mock.Mock()
+        return eng
+
+    def test_on_by_default_off_in_config_and_switched_by_command(self):
+        eng = self.engine()
+        eng.notify("reply")
+        self.assertEqual(eng.notifier.fire.call_count, 1)
+        quiet = self.engine(alerts=False)
+        quiet.notify("reply")
+        quiet.notifier.fire.assert_not_called()
+        out = io.StringIO()
+        with mock.patch.object(sys, "stdout", out):
+            G.Repl(quiet).command(":alerts on")
+            G.Repl(quiet).command(":alerts sometimes")
+        quiet.notify("approval", count=1, kinds=["edit"])
+        self.assertEqual(quiet.notifier.fire.call_count, 1)
+        self.assertIn("alerts: on", out.getvalue())
+        self.assertIn("usage: :alerts", out.getvalue())
+        with self.assertRaisesRegex(G.HoplonError, "alerts must be true or false"):
+            self.engine(alerts="no")
 
 
 if __name__ == "__main__":

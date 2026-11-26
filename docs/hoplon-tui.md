@@ -94,13 +94,16 @@ features, each in its own module under `tui/features/`. To switch some off, list
 ```
 
 or set `HOPLON_TUI_DISABLE=copy,model` for one run. Names are `model`, `copy`, `decline`, `raw`,
-`ssh`, `files`, `sandbox`, `edits`, `plugins` (without it, no plugin pane can connect) and `work`. A disabled feature has no command, help line or menu item, and hoplon-tui's socket
+`ssh`, `files`, `sandbox`, `edits`, `plugins` (without it, no plugin pane can connect), `work`, `fixtures`, `leftovers` and `alerts` (without it, no bell). A disabled feature has no command, help line or menu item, and hoplon-tui's socket
 refuses its requests. Without `ssh`, a hoplon-ssh session isn't followed. No file means
 everything is on; a file that can't be read is ignored, with a note in the conversation.
 
 When something waits for your decision, hoplon-tui rings the terminal bell once and tmux's status
 line shows `⏸ waiting for you` until you answer, so you notice from another window. Most terminals
-turn the bell into an alert or a highlighted window.
+turn the bell into an alert or a highlighted window. `/alerts off` silences the bell for this run
+(`/alerts on` brings it back); `{"alerts": false}` in `~/.config/hoplon/tui.json` keeps it off from
+the start, and `HOPLON_TUI_ALERTS=off` or `on` overrides that for one run. The status line shows
+`⏸ waiting for you` either way. (hoplon's notify hook doesn't run under hoplon-tui.)
 
 hoplon-tui shows a splash while tmux starts, for about a second, on a terminal of at least 60×24.
 `HOPLON_TUI_SPLASH=0` or `NO_COLOR` turns it off.

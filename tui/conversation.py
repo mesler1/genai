@@ -1683,7 +1683,6 @@ class App:
         self.ctrl_c = 0.0
         self.status = None         # the sandbox part of tmux's status line, as last set
         self.shell_title = None    # the shell pane's title, as last set
-        self.rung = set()          # cards the terminal bell has rung for: once each, as it starts to wait
         self.paste = None          # text of a bracketed paste in progress
         curses.curs_set(1)
         curses.use_default_colors()
@@ -2494,6 +2493,13 @@ class App:
             if self.hub:
                 self.hub.close()
 
+    def bell(self):
+        """Ring the terminal bell (the alerts feature decides when)."""
+        try:
+            curses.beep()
+        except curses.error:
+            pass
+
     def pump(self):
         self.poll_run()
         for f in self.m.features:
@@ -2575,13 +2581,6 @@ class App:
         card = self.m.running_card()
         if card and card.shown_secs != card.elapsed():
             card.changed()                             # its elapsed time, once a second
-        fresh = {c.id for c in self.m.pending} - self.rung
-        if fresh:                                      # a decision is waiting: ring, so you hear it from elsewhere
-            self.rung |= fresh
-            try:
-                curses.beep()
-            except curses.error:
-                pass
         if self.shell:
             status = self.m.tmux_status()
             if status != self.status:

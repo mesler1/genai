@@ -1238,6 +1238,7 @@ STARTER_CONFIG = {
              "endpoint_dirs, profile_dirs, skill_dirs, plugin_dirs: extra directories to search, after the ones here. "
              "fixtures_dir: where /fixtures keeps real samples for the model's test runs (default: "
              "~/.local/state/hoplon/fixtures); outside any project. "
+             "alerts: false keeps the notify hook quiet (:alerts on|off switches it for a session). "
              "Endpoints, profiles, skills and plugins must be blessed: hoplon --bless PATH",
     "default_profile": None,
     "default_endpoint": None,
@@ -1248,6 +1249,7 @@ STARTER_CONFIG = {
     "skill_dirs": [],
     "plugin_dirs": [],
     "fixtures_dir": None,
+    "alerts": True,
 }
 
 
@@ -1273,6 +1275,9 @@ class Config:
         if fx is not None and not (isinstance(fx, str) and fx.strip()):
             raise HoplonError("config.json: fixtures_dir must be a directory or null")
         self.fixtures_dir = os.path.abspath(os.path.expanduser(fx)) if fx else fixtures_home()
+        if not isinstance(data.get("alerts", True), bool):
+            raise HoplonError("config.json: alerts must be true or false")
+        self.alerts = data.get("alerts", True)
         self.default_profile = data.get("default_profile")
         self.default_endpoint = data.get("default_endpoint")
         self.default_skills = list(data.get("default_skills", []))
@@ -3553,6 +3558,7 @@ class Engine:
         self.sandbox = sandbox_info()
         self.box = Sandbox(profile.sandbox, os.getcwd(), ui.notice) if profile and profile.sandbox else None
         self.notifier = None     # the notify hook, set by main() when a person is at the terminal
+        self.alerts = cfg.alerts  # False: the notify hook stays quiet (:alerts); it never runs under --json
         self.commands = []       # command proposals shown in this process, newest last
         self.offered = offered
         self.skills = []
@@ -4750,8 +4756,13 @@ class Engine:
 
     def notify(self, event, **fields):
         """Tell the notify hook, if there is one, that hoplon is now waiting for the person."""
-        if self.notifier:
+        if self.notifier and self.alerts:
             self.notifier.fire(event, **fields)
+
+    def set_alerts(self, on, source):
+        if on != self.alerts:
+            self.alerts = on
+            self.audit.log("alerts", on=on, source=source)
 
     def perform(self, p):
         """Carry out a decided proposal and return what the model is told. A kind the wrapper answers runs whatever
@@ -5719,6 +5730,7 @@ Commands (on an empty buffer):
   :coding on|off  let the model read and list files here without asking
   :network [on|off]  the sandbox's network, for this session (on: each sandboxed run asks)
   :fixtures [add FILE…|use|drop|clear]  real samples, read-only at /fixtures in sandboxed runs once you approve them
+  :alerts [on|off]  whether the notify hook runs when hoplon waits for you
   :leftovers [clean]  what hoplon made for sandboxes and jobs that is still there, what is stale, how to remove it
   :edits [ask|approved-files|reset]  approved-files: a further edit to a file you approved applies without asking
   :plan [clear]   show the approved plan and how far it has got, or drop it
@@ -6038,6 +6050,14 @@ class Repl:
                 self.do_fixtures(arg)
             elif cmd == "leftovers":
                 self.do_leftovers(arg)
+            elif cmd == "alerts":
+                if arg in ("on", "off"):
+                    self.e.set_alerts(arg == "on", ":alerts")
+                elif arg:
+                    print("usage: :alerts, :alerts on or :alerts off")
+                    return None
+                print(f"alerts: {'on' if self.e.alerts else 'off'}" + ("" if self.e.notifier else
+                      " (there is no notify hook, so there is nothing to hear either way)"))
             elif cmd == "network":
                 if arg in ("on", "off"):
                     self.e.set_network(arg == "on")

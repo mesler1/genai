@@ -16,6 +16,7 @@ default. It says so once on stderr and never changes what is already there.
 | `profile_dirs` | `[]` | Extra directories searched for profiles, after `~/.config/hoplon/profiles/`. |
 | `skill_dirs` | `[]` | Extra directories searched for skills, after `~/.config/hoplon/skills/`. |
 | `plugin_dirs` | `[]` | Extra directories searched for plugins, after `~/.config/hoplon/plugins/`. |
+| `alerts` | `true` | `false` keeps the notify hook quiet ([Hooks](hooks.md)); `:alerts on` or `off` switches it for a session. hoplon-tui's bell is set in `tui.json` (`/alerts`). |
 | `fixtures_dir` | `null` | Where `/fixtures` keeps real samples for sandboxed runs; `null` means `~/.local/state/hoplon/fixtures` (`$XDG_STATE_HOME/hoplon/fixtures`). It must be outside every project and must not be or hold your home directory. See [Sandbox](sandbox.md). |
 
 Keys starting with `_` are comments. Any other unknown key gets a warning, so a typo isn't silently

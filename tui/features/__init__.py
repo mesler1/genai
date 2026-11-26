@@ -14,7 +14,7 @@ import importlib
 import json
 import os
 
-BUILTIN = ("model", "copy", "decline", "raw", "ssh", "files", "sandbox", "edits", "plugins", "work", "fixtures", "leftovers")
+BUILTIN = ("model", "copy", "decline", "raw", "ssh", "files", "sandbox", "edits", "plugins", "work", "fixtures", "leftovers", "alerts")
 
 
 class Feature:
@@ -101,6 +101,23 @@ def disabled_names(environ=None):
         warning = f"{path} was ignored, so every feature is on: {e}"
     names.update(n.strip() for n in (env.get("HOPLON_TUI_DISABLE") or "").split(",") if n.strip())
     return names, warning
+
+
+def tui_setting(key, default, kind, env=None, environ=None):
+    """A setting from tui.json (beside the "disable" list), or the environment variable env (on/off for a bool),
+    which wins. A missing or malformed value is the default: a typo can't stop the program."""
+    envs = os.environ if environ is None else environ
+    raw = envs.get(env) if env else None
+    if raw is not None and kind is bool and raw.strip().lower() in ("on", "off", "1", "0", "true", "false"):
+        return raw.strip().lower() in ("on", "1", "true")
+    base = envs.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    try:
+        with open(os.path.join(base, "hoplon", "tui.json"), encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return default
+    value = data.get(key, default) if isinstance(data, dict) else default
+    return value if isinstance(value, kind) else default
 
 
 def load(disabled=(), core=None):
