@@ -61,6 +61,15 @@ class TestWalk(Tmp):
             self.assertEqual(len(os.listdir("/proc/self/fd")), before)
         with self.assertRaises(G.DiskError):
             list(wd.walk("link"))
+        self.assertEqual(list(wd.walk("a/b/two")), ["a/b/two"])         # one file: just that file
+        self.assertEqual(list(wd.walk("./a//one")), ["a/one"])
+        self.assertEqual(list(wd.walk(".env")), [])                     # hidden, as in a directory walk
+        self.assertEqual(list(wd.walk(".git/x")), [])
+        os.symlink(os.path.join(root, "top"), os.path.join(root, "flink"))
+        with self.assertRaises(G.DiskError):
+            list(wd.walk("flink"))                                      # a symlink to a file is still refused
+        with self.assertRaises(FileNotFoundError):
+            list(wd.walk("missing"))
 
 
 class TestWorkdir(Tmp):

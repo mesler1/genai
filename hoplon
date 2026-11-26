@@ -2753,8 +2753,15 @@ class Workdir:
 
     def walk(self, path):
         """The regular files under a directory, as relative paths, in order. Hidden names and symlinks are skipped
-        (never followed), and directories are opened one component at a time like everything else here."""
+        (never followed), and directories are opened one component at a time like everything else here.
+        A path naming one regular file gives just that file, unless its name is hidden."""
         start = split_rel(path) if path not in ("", ".", "./") else []
+        if start:
+            st = self.stat(path)                       # lstat: a symlink is not a regular file, and is refused below
+            if st is not None and stat.S_ISREG(st.st_mode):
+                if not is_hidden(start):
+                    yield "/".join(start)
+                return
         stack = [(start, self._open_dir(start))]
         try:
             while stack:
@@ -2912,13 +2919,13 @@ TOOLS = [
 ]
 
 # Offered only in coding mode, where reads run without asking.
-SEARCH_TOOL = _tool("search_files", "Search the text files under a directory for a literal string (not a regular "
+SEARCH_TOOL = _tool("search_files", "Search one text file, or the text files under a directory, for a literal string (not a regular "
                     "expression) and get back each matching line as path:line: text. Hidden files and directories, "
                     "symlinks, binary and large files, and files that look like they hold secrets are skipped. "
                     f"At most {SEARCH_MATCHES} matches; narrow it with path or glob when there are more.",
                     {"pattern": {"type": "string", "description": "The text to look for, on one line."},
-                     "path": {"type": "string", "description": "A directory relative to the working directory; "
-                                                               "'.' (the default) for all of it."},
+                     "path": {"type": "string", "description": "A directory or one file, relative to the working "
+                                                               "directory; '.' (the default) for all of it."},
                      "glob": {"type": "string", "description": "Only files whose name matches, like '*.py'."},
                      "ignore_case": {"type": "boolean"}, "reason": _REASON}, ["pattern", "reason"])
 
