@@ -25,6 +25,29 @@ lustre/
 - **No secrets.** No passwords, tokens or keys, and nothing that would be harmful if a colleague read it. Skills get shared and blessed by other people.
 - **Stable.** Any edit unblesses the skill, so keep facts that change weekly out of it.
 
+## Generic and site skills
+
+A convention, not a mechanism: hoplon doesn't load one skill because of another.
+
+- A **generic** skill (such as `slurm` or `hpc`) holds only what is true on every site, so it rarely conflicts with anything.
+- A **site** skill holds only one site's facts, and says plainly that it wins where it disagrees with a generic one. Don't repeat the generic skill's advice in it.
+- hoplon puts a `# Skill: NAME` heading in front of each skill that is on, so a site skill can say what to do when its generic skill isn't on. You don't write that heading yourself.
+
+A site skill starts like this; fill in what the user tells you and drop what doesn't apply:
+
+```
+# SITE: facts about the SITE cluster (site skill; overrides the generic slurm skill)
+
+This skill holds only SITE's own facts. Where it disagrees with a generic skill (slurm, hpc), follow
+this one. If the slurm skill is not on (no "# Skill: slurm" heading), say that your general Slurm
+knowledge comes from training and may not match this site, and suggest switching on slurm.
+
+Partitions and limits: each partition, what it is for, its time limit, its nodes; the default one.
+Accounts and QOS: which account to charge and how the user finds theirs; each QOS and what it allows.
+File systems: home, scratch (path, purge policy, Lustre or GPFS) and project space (path, group).
+Local rules: what the site forbids or asks for; who to contact, and how.
+```
+
 ## How to work
 
 1. Ask what the skill is for and what the user wants the model to know, one question at a time. Ask for real examples: commands they run, error messages they see, paths.

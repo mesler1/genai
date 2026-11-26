@@ -41,6 +41,14 @@ and can't be blessed or switched on. Every listing (`--list-skills`, hoplon-tui'
 `skills` message) escapes names and descriptions and cuts descriptions to 160 characters, so what a
 skill's files say can't fake or break the list.
 
+### Generic and site skills
+
+A convention, not a mechanism. A generic skill (`slurm`, `hpc`) holds only what is true on every site.
+A site skill holds only one site's facts and says that it wins where they disagree; if its generic
+skill isn't on, it tells the model to say its general knowledge may not match the site and to suggest
+switching that skill on. hoplon never loads one skill because of another. The `hoplon-skill`
+authoring skill has a template for a site skill.
+
 ### Skills the model can suggest
 
 The model sees one line for each blessed skill: its name and description (the first line of its
@@ -66,7 +74,8 @@ skills/hoplon-endpoint/     helps you write an endpoint
 skills/hoplon-profile/      helps you write a profile (persona)
 skills/hoplon-skill/        helps you write a skill
 skills/bash-scripts/       conventions for small, safe bash scripts
-skills/hpc/                working on a Slurm cluster: login nodes, srun/sbatch, modules, scratch
+skills/hpc/                a shared cluster: login nodes, modules, file systems (any scheduler)
+skills/slurm/              generic Slurm: srun/sbatch, batch scripts, job arrays, failed jobs
 plugins/slurm/             trusted read-only Slurm commands: sinfo, squeue, scontrol show, sacct
 sandbox/run                podman sandbox for running hoplon and its tests, on this machine's OS
 sandbox/hooks/modules.sh   sandbox hook: makes loaded environment modules work inside the sandbox
