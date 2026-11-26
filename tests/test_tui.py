@@ -1417,6 +1417,19 @@ class TestSessionName(unittest.TestCase):
         self.assertEqual(given["session_file"], os.path.join(home, "hoplon", "sessions", "mine.json"))
         self.assertNotIn("session_file", self.check("--remote", "host.invalid"))     # remote has no sessions yet
 
+    def test_not_saved_with_no_save_or_save_sessions_false(self):
+        home = tempfile.mkdtemp(prefix="hoplon-test-")
+        self.addCleanup(shutil.rmtree, home, True)
+        env = {"XDG_CONFIG_HOME": home}
+        self.assertEqual(self.check("--no-save", environ=env), {})
+        os.makedirs(os.path.join(home, "hoplon"))
+        with open(os.path.join(home, "hoplon", "tui.json"), "w") as f:
+            json.dump({"save_sessions": False}, f)
+        self.assertEqual(self.check(environ=env), {})
+        self.assertIn("session_file", self.check("-S", "mine", environ=env))     # naming one always saves it
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            C.parse_args(["--no-save", "-S", "mine"])
+
     def test_a_made_up_name_is_never_one_in_use(self):
         where = tempfile.mkdtemp(prefix="hoplon-test-")
         self.addCleanup(shutil.rmtree, where, True)

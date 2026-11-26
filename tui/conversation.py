@@ -28,7 +28,7 @@ import time
 import unicodedata
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from features import disabled_names, load as load_features  # noqa: E402
+from features import disabled_names, load as load_features, tui_setting  # noqa: E402
 from ipc import Hub  # noqa: E402
 from recorder import Recorder, ago, fifo_path, label, trim  # noqa: E402
 import remote  # noqa: E402
@@ -2602,6 +2602,9 @@ def parse_args(argv):
     ap.add_argument("-e", "--endpoint", help="endpoint name (overrides the profile's)")
     ap.add_argument("-S", "--session", help="the session to keep the conversation in, created or resumed "
                                             "(default: a new one with a made-up name, shown when you quit)")
+    ap.add_argument("--no-save", action="store_true",
+                    help="keep nothing of this conversation on disk: no session, nothing to resume "
+                         "(\"save_sessions\": false in tui.json makes this the default)")
     ap.add_argument("-k", "--skill", action="append", default=[], help="use a blessed skill (repeatable)")
     ap.add_argument("--allow-session-endpoint-change", action="store_true",
                     help="allow sending saved context to a changed or unrecorded destination")
@@ -2623,6 +2626,8 @@ def parse_args(argv):
     for name, given in (("--dir", args.dir), ("--as", args.as_user), ("ssh options after --", ssh_opts)):
         if given and not args.remote:
             ap.error(f"{name} needs --remote")
+    if args.no_save and args.session:
+        ap.error("--no-save and -S can't go together: -S keeps the conversation in that session")
     if args.remote:
         if args.session:
             ap.error("--remote can't use -S yet: a saved session would stay on the host hoplon runs on")
@@ -2672,7 +2677,8 @@ def fresh_session(where, pick=None):
 def main(argv):
     args = parse_args(argv)
     if args.check:
-        if not args.remote:       # every local conversation is kept in a session, so it can be resumed
+        save = not args.no_save and (args.session or tui_setting("save_sessions", True, bool))
+        if not args.remote and save:  # a local conversation is kept in a session, so it can be resumed
             where = sessions_dir()
             if not args.session:
                 args.session = fresh_session(where)

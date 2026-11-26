@@ -15,6 +15,10 @@ Resume this conversation: hoplon-tui -S tui-k7f3qa
 It prints that only once something was said, so there is a session to resume. `hoplon --list-sessions`
 lists them all. Not yet with `--remote`.
 
+`--no-save` keeps nothing of the conversation on disk: no session is written, and nothing is printed
+to resume. `{"save_sessions": false}` in `~/.config/hoplon/tui.json` makes that the default; `-S NAME`
+still saves to the session you name.
+
 ## Another host from hoplon-tui
 
 In hoplon-tui's shell pane, connect with `hoplon-ssh` instead of `ssh`:
