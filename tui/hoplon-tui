@@ -205,7 +205,8 @@ t set -g history-limit 50000
 t set -g mouse on
 t set -g focus-events on
 t set -g pane-border-status top
-t set -g pane-border-format ' #{@hoplon_title} '
+# The right column's active pane shows its tabs (tui/dock.py) instead of its title when there are two or more.
+t set -g pane-border-format ' #{?#{@hoplon_tabs},#{@hoplon_tabs},#{@hoplon_title}} '
 t set -g pane-border-lines single
 # The palette (tui/palette.py, "bronze on iron"): the brand badge and focused border in bronze, the host in
 # bronze, quiet hints and unfocused borders in grey. NO_COLOR keeps only bold.
@@ -266,6 +267,9 @@ bind -n MouseDown3Pane {
 EOF
 # A click on the model in the header (its range, "model") opens the /model drop-down; elsewhere on the
 # status line a click does what tmux's does.
+# A click on the top border of a pane with tabs opens the tab menu, on the button's release: a menu a program
+# opens closes at the next mouse event, which on a press would be its release.
+echo "bind -n MouseUp1Border if -F \"#{@hoplon_tabs}\" { run-shell -b \"$req tabs\" }" >> "$state/menu.conf"
 echo "bind -n MouseDown1Status if -F \"#{==:#{mouse_status_range},model}\" { run-shell -b \"$req models\" } { switch-client -t= }" >> "$state/menu.conf"
 # Alt+1 .. Alt+9: the menu of a command proposal, from the keyboard. In the shell pane they stay the shell's.
 for n in 1 2 3 4 5 6 7 8 9; do

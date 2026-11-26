@@ -27,7 +27,7 @@ SEND_TIMEOUT = 2            # seconds a send may wait on a pane that has stopped
 ROLES = {
     "prompt": {"input", "key", "scroll", "quit", "stop"},
     "panel": {"coding", "skill", "skills", "command"},
-    "menu": {"share", "menu", "mark"},
+    "menu": {"share", "menu", "mark", "tabs", "tab"},
     "files": set(),          # the files feature adds what this pane may ask for
     "pipe": set(),           # hoplon-share in the shell pane; the shared feature adds what it may send
 }

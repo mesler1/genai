@@ -38,6 +38,7 @@ REC = load("recorder", os.path.join(REPO, "tui", "recorder.py"))
 RAW = C.Model().feature("raw")
 F = importlib.import_module("features")
 P = importlib.import_module("palette")
+Dock = importlib.import_module("dock")
 G = load("hoplon_for_tui", os.path.join(REPO, "hoplon"))
 
 
@@ -48,6 +49,100 @@ def slurp(path):
 
 def text_of(block, w=60):
     return "\n".join("".join(t for t, _ in ln) for ln in block.lines(w))
+
+
+class FakeTmux:
+    """Just enough tmux for the dock: which window each pane is in, and pane options."""
+
+    def __init__(self, **panes):
+        self.win, self.opts, self.calls, self.n = dict(panes), {}, [], 10
+
+    def __call__(self, *a):
+        self.calls.append(a)
+        if a[0] == "display":
+            pane = a[a.index("-t") + 1]
+            if pane not in self.win:
+                return ""
+            return (self.win[pane] if a[-1] == "#{window_id}" else pane) + "\n"
+        if a[0] == "swap-pane":
+            s, t = a[a.index("-s") + 1], a[a.index("-t") + 1]
+            self.win[s], self.win[t] = self.win[t], self.win[s]
+        elif a[0] == "join-pane":
+            self.win[a[a.index("-s") + 1]] = self.win[a[a.index("-t") + 1]]
+        elif a[0] == "break-pane":
+            self.n += 1
+            self.win[a[a.index("-s") + 1]] = f"@{self.n}"
+        elif a[0] == "set" and "-pu" in a:
+            self.opts.pop(a[a.index("-t") + 1], None)
+        elif a[0] == "set":
+            self.opts[a[a.index("-t") + 1]] = a[-1]
+        return ""
+
+
+class TestDock(unittest.TestCase):
+    def dock(self):
+        t = FakeTmux(**{"%conv": "@0", "%info": "@0", "%slurm": "@5", "%top": "@6"})
+        d = Dock.Dock(t, "%conv", environ={})
+        d.add("info", "%info", 42, select=False)
+        return t, d
+
+    def test_one_tab_shows_its_title_and_toggles(self):
+        t, d = self.dock()
+        self.assertTrue(d.shown())
+        self.assertEqual(t.opts, {})                                    # one tab: no strip
+        d.toggle()
+        self.assertFalse(d.shown())
+        d.toggle()
+        self.assertTrue(d.shown())
+        self.assertIn(("join-pane", "-d", "-h", "-f", "-l", "42", "-s", "%info", "-t", "%conv"), t.calls)
+
+    def test_a_second_tab_swaps_in_and_the_first_keeps_running_parked(self):
+        t, d = self.dock()
+        d.add("slurm", "%slurm", 60)
+        self.assertEqual((d.active, t.win["%slurm"]), ("slurm", "@0"))
+        self.assertNotEqual(t.win["%info"], "@0")                       # parked, not closed
+        self.assertIn(("resize-pane", "-t", "%slurm", "-x", "60"), t.calls)
+        self.assertEqual(list(t.opts), ["%slurm"])                      # the strip is on the pane on screen
+        strip = t.opts["%slurm"]
+        self.assertLess(strip.index("info"), strip.index("slurm"))
+        self.assertIn("#[fg=#0E1113,bg=#D4A05A,bold] slurm ", strip)
+        d.next()
+        self.assertEqual((d.active, t.win["%info"]), ("info", "@0"))
+        self.assertIn("#[fg=#0E1113,bg=#D4A05A,bold] info ", t.opts["%info"])
+
+    def test_hiding_and_showing_keeps_the_active_tab(self):
+        t, d = self.dock()
+        d.add("slurm", "%slurm", 60)
+        d.hide()
+        self.assertFalse(d.shown())
+        d.show()
+        self.assertEqual((d.active, t.win["%slurm"]), ("slurm", "@0"))
+
+    def test_removing_the_tab_on_screen_brings_another_and_a_dead_pane_is_forgotten(self):
+        t, d = self.dock()
+        d.add("slurm", "%slurm", 60)
+        d.remove("slurm")
+        self.assertEqual((d.names(), d.active, t.win["%info"]), (["info"], "info", "@0"))
+        self.assertIn("%slurm", t.win)                                  # still running, parked
+        self.assertEqual(t.opts, {})
+        d.add("slurm", "%slurm", 60)
+        del t.win["%slurm"]                                             # its program ended
+        d.next()
+        self.assertEqual(d.names(), ["info"])
+
+    def test_names_must_be_safe_for_tmux(self):
+        t, d = self.dock()
+        self.assertFalse(d.add("#{evil}", "%top", 60))
+        self.assertFalse(d.add("info", "%top", 60))                     # once each
+        self.assertEqual(d.names(), ["info"])
+
+    def test_without_colour_the_active_tab_is_reversed(self):
+        t = FakeTmux(**{"%conv": "@0", "%info": "@0", "%slurm": "@5"})
+        d = Dock.Dock(t, "%conv", environ={"NO_COLOR": "1"})
+        d.add("info", "%info", 42, select=False)
+        d.add("slurm", "%slurm", 60)
+        self.assertIn("#[reverse] slurm #[default]", t.opts["%slurm"])
+        self.assertNotIn("fg=", t.opts["%slurm"])
 
 
 class TestPalette(unittest.TestCase):
@@ -2617,28 +2712,68 @@ class TestHoplonTui(TmuxCase):
             self.assertIn("You are hoplon", slurp(seen))
             self.assertEqual([n for n in os.listdir(self.runtime_state()) if n.startswith("raw-")], [])
 
+    def slurm_home(self, api):
+        """A config with the Slurm plugin on, blessed, over fake sinfo, squeue and scontrol."""
+        home = self.config(api)
+        fake = os.path.join(self.tmp, "slurm-bin")
+        os.mkdir(fake, 0o755)
+        nodes = "c001|batch*|idle|0/32/0/32|192000|none\nc002|batch*|drained|0/0/32/32|192000|bad DIMM\n"
+        for prog, body in (("sinfo", f'case "$*" in *-N*) printf "{nodes}";; *-s*) echo "batch*|up|1:00:00|2|0/1/1/2|0/32/32/64";; esac'),
+                           ("squeue", 'echo "7|batch|train|alice|RUNNING|1:00|1|c001"'),
+                           ("scontrol", 'echo "NodeName=$3 State=DRAIN Reason=bad_DIMM"')):
+            with open(os.path.join(fake, prog), "w") as f:
+                f.write("#!/bin/sh\n" + body + "\n")
+            os.chmod(os.path.join(fake, prog), 0o755)
+        pdir = os.path.join(home, "plugins", "slurm")
+        shutil.copytree(os.path.join(REPO, "plugins", "slurm"), pdir)
+        with open(os.path.join(pdir, "plugin.json")) as f:
+            manifest = json.load(f)
+        manifest["search"] = [fake]
+        with open(os.path.join(pdir, "plugin.json"), "w") as f:
+            json.dump(manifest, f)
+        G.Config(home).set_blessed(pdir, {"kind": "plugin", "name": "slurm", "hash": G.hash_skill(pdir)[0]})
+        G.write_private(os.path.join(home, "config.json"), json.dumps(dict(G.STARTER_CONFIG, default_plugins=["slurm"])))
+        return home
+
+    def test_plugin_panes_are_tabs_in_the_right_column(self):
+        with FakeAPI([reply("ok")]) as api:
+            self.home = self.slurm_home(api)
+            self.start(api, args="-e test", keep_home=True)
+            self.wait_beside("info")
+            self.type("/plugins slurm pane")
+            self.wait_beside("slurm")
+            self.wait_beside("info", shown=False)                      # it gave the slurm pane its place
+            strip = self.tmux("show", "-pv", "-t", self.panes()["slurm"], "@hoplon_tabs")
+            self.assertIn(" info ", strip)
+            self.assertIn(" slurm ", strip)
+            self.type("/tab")                                           # the next one, round to the first
+            self.wait_beside("info")
+            self.wait_beside("slurm", shown=False)
+            env = dict(os.environ, HOPLON_TUI_STATE=self.runtime_state())
+            subprocess.run([sys.executable, os.path.join(REPO, "tui", "request.py"), "tab", "1"], env=env, check=True)
+            self.wait_beside("slurm")                                   # the tab menu's second item
+            self.wait_for("bad DIMM", pane="slurm", timeout=15)         # it kept running while parked
+            self.type("/panel")
+            self.wait_beside("slurm", shown=False)
+            self.type("/panel")
+            self.wait_beside("slurm")                                   # back with the tab that was on screen
+            self.type("/plugins slurm pane")                            # on screen: it leaves the column
+            self.wait_beside("info")
+            self.assertNotIn("@hoplon_tabs", self.tmux("show", "-p", "-t", self.panes()["info"]))
+            self.type("/plugins slurm pane")
+            self.wait_beside("slurm")
+            left, top = self.tmux("display", "-p", "-t", self.panes()["slurm"], "#{pane_left} #{pane_top}").split()
+            x, y = int(left) + 5, int(top) + 1                          # 1-based: its top border, under the header
+            self.at_terminal(f"\x1b[<0;{x};{y}M")
+            time.sleep(0.2)
+            self.at_terminal(f"\x1b[<0;{x};{y}m")
+            time.sleep(0.8)
+            self.at_terminal("1")                                       # the menu's first tab
+            self.wait_beside("info")
+
     def test_the_slurm_console_runs_its_commands_through_hoplon(self):
         with FakeAPI([reply("ok")]) as api:
-            home = self.config(api)
-            fake = os.path.join(self.tmp, "slurm-bin")
-            os.mkdir(fake, 0o755)
-            nodes = "c001|batch*|idle|0/32/0/32|192000|none\nc002|batch*|drained|0/0/32/32|192000|bad DIMM\n"
-            for prog, body in (("sinfo", f'case "$*" in *-N*) printf "{nodes}";; *-s*) echo "batch*|up|1:00:00|2|0/1/1/2|0/32/32/64";; esac'),
-                               ("squeue", 'echo "7|batch|train|alice|RUNNING|1:00|1|c001"'),
-                               ("scontrol", 'echo "NodeName=$3 State=DRAIN Reason=bad_DIMM"')):
-                with open(os.path.join(fake, prog), "w") as f:
-                    f.write("#!/bin/sh\n" + body + "\n")
-                os.chmod(os.path.join(fake, prog), 0o755)
-            pdir = os.path.join(home, "plugins", "slurm")
-            shutil.copytree(os.path.join(REPO, "plugins", "slurm"), pdir)
-            with open(os.path.join(pdir, "plugin.json")) as f:
-                manifest = json.load(f)
-            manifest["search"] = [fake]
-            with open(os.path.join(pdir, "plugin.json"), "w") as f:
-                json.dump(manifest, f)
-            G.Config(home).set_blessed(pdir, {"kind": "plugin", "name": "slurm", "hash": G.hash_skill(pdir)[0]})
-            G.write_private(os.path.join(home, "config.json"), json.dumps(dict(G.STARTER_CONFIG, default_plugins=["slurm"])))
-            self.home = home
+            self.home = self.slurm_home(api)
             self.start(api, args="-e test --no-panel", keep_home=True)
             self.type("/plugins slurm pane")
             end = time.time() + 15

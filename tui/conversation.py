@@ -29,6 +29,7 @@ import unicodedata
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import palette  # noqa: E402
+from dock import Dock  # noqa: E402
 from features import disabled_names, load as load_features, tui_setting  # noqa: E402
 from ipc import Hub  # noqa: E402
 from recorder import Recorder, ago, fifo_path, label, trim  # noqa: E402
@@ -54,7 +55,8 @@ COMMANDS = {
     "/commands": "list the commands run in the shell pane, numbered for /share N (also in the info panel)",
     "/mark": "shell context starts at the shell's current prompt (or right-click a line in the shell)",
     "/shell": "show the shell and move there (Ctrl-` hides it again)",
-    "/panel": "show or hide the info panel on the right",
+    "/panel": "show or hide the right column (the info panel and any plugin panes, as tabs)",
+    "/tab": "[NAME]: the next tab in the right column, or the one named",
     "/plan": "[clear]: show the approved plan, or drop it so everything asks again",
     "/stop": "stop the sandboxed run going on now, or hoplon's turn (Ctrl-C on an empty input does the same)",
     "/compact": "shrink the conversation when the context is getting full",
@@ -1042,6 +1044,8 @@ class Model:
             self.actions.append(("focus_shell",))
         elif cmd == "/panel":
             self.actions.append(("panel",))
+        elif cmd == "/tab":
+            self.actions.append(("tab", arg.strip()))
         elif cmd == "/stop":
             self.stop()
         elif cmd == "/plan":
@@ -1118,6 +1122,10 @@ class Model:
             self.actions.append(("share_cmd", msg["n"]))
         elif t == "mark" and isinstance(msg.get("on"), bool) and self.shell:
             self.actions.append(("mark_line",) if msg["on"] else ("unmark",))
+        elif t == "tabs" and self.shell:
+            self.actions.append(("panel",) if msg.get("hide") else ("tab_menu",))
+        elif t == "tab" and type(msg.get("n")) is int and self.shell:
+            self.actions.append(("tab", msg["n"]))
         else:
             for f in self.features:
                 if t in f.requests and (role is None or role in f.requests[t]):
@@ -1708,6 +1716,9 @@ class App:
         self.panel = os.environ.get("HOPLON_TUI_PANEL") if shell else None
         self.files = os.environ.get("HOPLON_TUI_FILES") if shell else None
         self.prompt = os.environ.get("HOPLON_TUI_PROMPT") if shell else None   # input happens in that pane
+        self.dock = Dock(shell.tmux, os.environ.get("TMUX_PANE", "")) if shell else None   # the right column's tabs
+        if self.dock and self.panel:
+            self.dock.add("info", self.panel, self.PANEL_WIDTH, select=False)
         # the other panes connect here; a feature that is off has no requests, so the Hub refuses them
         self.hub = Hub(self.state_dir, feature_requests(on)) if self.state_dir else None
         if self.hub:
@@ -2083,10 +2094,42 @@ class App:
             return False
         return True
 
-    PANEL_JOIN, FILES_JOIN = ["-l", "42"], ["-b", "-l", "34"]
+    PANEL_WIDTH, FILES_JOIN = 42, ["-b", "-l", "34"]
 
     def toggle_panel(self):
-        self.toggle_pane(self.panel, "panel", self.PANEL_JOIN, "info panel")
+        if not self.dock or not self.dock.tabs:
+            self.m.note("there is no right column in this session", R)
+            return
+        self.dock.toggle()
+
+    def switch_tab(self, which):
+        """/tab (the next tab), /tab NAME, or the tab menu's position."""
+        if not self.dock or not self.dock.tabs:
+            self.m.note("there is no right column in this session", R)
+            return
+        self.dock.prune()
+        names = self.dock.names()
+        if which == "":
+            self.dock.next()
+        elif type(which) is int:
+            if 0 <= which < len(names):
+                self.dock.select(names[which])
+        elif which in names:
+            self.dock.select(which)
+        else:
+            self.m.note(f"no tab {clean(which)[:40]}: the tabs are {', '.join(names)}", R)
+
+    def tab_menu(self):
+        """tmux's menu of the tabs, under the right column's border (a click on it opens this)."""
+        if not self.dock:
+            return
+        self.dock.prune()
+        items = []
+        for i, name in enumerate(self.dock.names()):          # names are checked: [a-z][a-z0-9-]*
+            items += [("• " if name == self.dock.active else "  ") + name, str(i + 1) if i < 9 else "",
+                      menu_item("tab", str(i))]
+        items += ["", "Hide the column", "h", menu_item("tabs", "hide"), "", "Cancel", "q", ""]
+        self.shell.popup_menu("-x", "R", "-y", "S", "-T", " tabs · ↑↓ Enter ", *items)
 
     def toggle_pane(self, pane, name, join, what, want=None):
         """Show a side pane beside this one, or break it out to a window of its own again; want: True to show
@@ -2113,8 +2156,11 @@ class App:
         if "files" in want and self.files:
             self.toggle_pane(self.files, "files", self.FILES_JOIN, "file tree", want["files"])
         wide = self.shell.tmux("display", "-p", "#{window_width}").strip()
-        if "panel" in want and self.panel and (not want["panel"] or (wide.isdigit() and int(wide) >= 100)):
-            self.toggle_pane(self.panel, "panel", self.PANEL_JOIN, "info panel", want["panel"])
+        if "panel" in want and self.dock and self.dock.tab("info"):
+            if not want["panel"]:
+                self.dock.hide()
+            elif wide.isdigit() and int(wide) >= 100:
+                self.dock.select("info")
         if "shell" in want:
             toggle = os.environ.get("HOPLON_TUI_TOGGLE")
             if toggle:
@@ -2586,7 +2632,7 @@ class App:
                 self.m.request(msg, role)
             elif role.startswith("plugin:") and self.m.feature("plugins"):
                 self.m.feature("plugins").request(self.m, role, msg)
-            elif role == "menu" and (msg.get("type") in ("share", "mark") or self.m.takes(role, msg.get("type"))):
+            elif role == "menu" and (msg.get("type") in ("share", "mark", "tabs", "tab") or self.m.takes(role, msg.get("type"))):
                 self.m.request(msg, role)
             elif role == "menu" and msg.get("type") == "menu" and msg.get("action") == "open":
                 self.open_menu(msg.get("key"))
@@ -2615,6 +2661,10 @@ class App:
                 self.shell.focus()
             elif action[0] == "panel":
                 self.toggle_panel()
+            elif action[0] == "tab":
+                self.switch_tab(action[1])
+            elif action[0] == "tab_menu":
+                self.tab_menu()
             elif action[0] == "interrupt":
                 if not self.child.interrupt():
                     self.m.note("hoplon couldn't be sent Ctrl-C", R)

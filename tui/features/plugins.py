@@ -21,6 +21,7 @@ import sys
 from . import Feature
 
 MAX_TEXT = 65536           # characters a pane may insert or offer to attach
+PANE_WIDTH = 60            # a plugin's pane, as a tab in the right column
 PANE_NAME = re.compile(r"[A-Za-z0-9._-]+")
 
 
@@ -177,15 +178,20 @@ class Plugins(Feature):
             app.m.note("plugin panes need hoplon-tui", self.core.R)
             return
         pid = self.panes.get(name)
-        if pid and app.shell.tmux("display", "-p", "-t", pid, "#{pane_id}").strip() == pid:
-            app.toggle_pane(pid, f"plugin {name}", ["-l", "60"], f"{name} pane")
+        dock = app.dock
+        if pid and dock.alive(pid):            # a tab in the right column: on screen, it leaves; otherwise it comes
+            if dock.tab(name) and dock.active == name and dock.shown():
+                dock.remove(name)               # still running, parked: the same command brings it back
+            elif dock.tab(name):
+                dock.select(name)
+            else:
+                dock.add(name, pid, PANE_WIDTH)
             return
         run = (f"{shlex.quote(sys.executable)} {shlex.quote(path)}" if path.endswith(".py") else shlex.quote(path))
         cmd = (f"{run}; rc=$?; if [ $rc -ne 0 ]; then echo; echo \"the {name} pane ended with code $rc. "
                f"Press Enter.\"; read -r _; fi")
         tui = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        me = os.environ.get("TMUX_PANE", "")
-        pid = app.shell.tmux("split-window", "-d", "-h", "-f", "-l", "60", "-t", me,
+        pid = app.shell.tmux("new-window", "-d", "-n", f"tab {name}",            # parked, until the dock shows it
                              "-e", f"HOPLON_TUI_STATE={app.state_dir}", "-e", f"HOPLON_TUI_PLUGIN={name}",
                              "-e", f"PYTHONPATH={tui}", "-c", os.path.dirname(path), "-P", "-F", "#{pane_id}",
                              cmd).strip()
@@ -194,6 +200,7 @@ class Plugins(Feature):
             return
         self.panes[name] = pid
         app.shell.tmux("set", "-p", "-t", pid, "@hoplon_title", f"{name} · /plugins {name} pane hides it")
+        dock.add(name, pid, PANE_WIDTH)
 
 
 FEATURE = Plugins

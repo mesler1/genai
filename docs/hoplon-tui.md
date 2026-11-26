@@ -72,8 +72,8 @@ endpoint's headers, and sends the request on through the endpoint's own TLS and 
 the forward and the ssh connection are closed; detaching tmux keeps the launcher running to hold them, so Ctrl-C there
 ends the session.
 
-You can see where it runs: the banner and the info panel say `hoplon runs ON host AS user in dir` (red as root), the
-status line names the host, and the banner gives the audit log's path on the host (`hello`'s `audit`). The sessions,
+You can see where it runs: the banner says `hoplon runs ON host AS user in dir` and the info panel's WHERE section
+says `ON host AS user in dir` (both red as root), the header names the host, and the banner gives the audit log's path on the host (`hello`'s `audit`). The sessions,
 audit log and `~/.config/hoplon` that hoplon uses are those of the user it runs as on the host; its endpoint is not
 blessed there, because the blessing happened here. Test it against a SLES container with `tests/remote_sshd.sh test`, or against a real host of yours with
 `HOPLON_TEST_REMOTE_HOST=me@devbox python3 -m unittest tests.test_remote.TestRealHost` (a turn, then a sandboxed run and a
@@ -91,6 +91,14 @@ like `token = token.strip()` can look like a password), answer `a` (not secrets)
 remembers that exact text in `~/.config/hoplon/not-secret.json` and won't ask about it again, skip
 it in searches or hide it from sandboxed runs, until the file changes. A file holding the endpoint's
 key always asks. Remove an entry from that file, or the file, to be asked again.
+
+## The right column
+
+The info panel sits on the right, and `/panel` shows or hides that column. A plugin's pane (`/plugins NAME pane`)
+opens there too, as a tab: with two or more, the column's top border shows them, the one on screen in bronze. `/tab`
+goes to the next tab, `/tab NAME` to that one, and a click on the border opens a menu of them. A tab that isn't on
+screen keeps running, with its scrollback. `/plugins NAME pane` on the tab that is on screen takes it out of the
+column (it keeps running; the same command brings it back).
 
 ## File tree
 

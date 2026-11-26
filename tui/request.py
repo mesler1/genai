@@ -7,6 +7,8 @@ Usage: request.py share mark|all|last
        request.py system
        request.py model N             (the Nth model in the /model drop-down)
        request.py models              (open the /model drop-down: a click on the header's model)
+       request.py tabs [hide]         (the right column's tab menu: a click on its border; or hide the column)
+       request.py tab N               (the Nth tab in that menu)
        request.py copy N
        request.py menu run|edit|prompt|copy|decline ID
        request.py menu open N          (Alt+N: the menu of the command proposal showing Alt+N)
@@ -29,6 +31,10 @@ def main(argv):
         msg = {"type": "model", "n": int(argv[1])}
     elif len(argv) == 2 and argv[0] == "copy" and re.fullmatch(r"[0-9]{1,9}", argv[1]):
         msg = {"type": "copy", "turn": int(argv[1])}
+    elif argv in (["tabs"], ["tabs", "hide"]):
+        msg = {"type": "tabs", "hide": len(argv) == 2}
+    elif len(argv) == 2 and argv[0] == "tab" and re.fullmatch(r"[0-9]{1,2}", argv[1]):
+        msg = {"type": "tab", "n": int(argv[1])}
     elif argv == ["models"]:
         msg = {"type": "models"}
     elif argv == ["system"]:
