@@ -331,8 +331,10 @@ class TestOptions(unittest.TestCase):
     """conversation.py --check is what the launcher runs, in your terminal, before tmux starts."""
 
     def check(self, *args):
+        home = tempfile.mkdtemp(prefix="hoplon-test-")
+        self.addCleanup(shutil.rmtree, home, True)
         r = subprocess.run([sys.executable, os.path.join(REPO, "tui", "conversation.py"), "--check", *args],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, env=dict(os.environ, XDG_CONFIG_HOME=home))
         return r.returncode, r.stdout, r.stderr
 
     def test_remote_options_are_printed_for_the_launcher(self):
@@ -342,8 +344,11 @@ class TestOptions(unittest.TestCase):
         self.assertEqual(out.splitlines(), ["dest=me@host", "as=svc", "dir=/srv/x", "profile=coder", "endpoint=",
                                             "ssh=-J", "ssh=bastion", "ssh=-p", "ssh=2222"])
 
-    def test_without_remote_nothing_is_printed(self):
-        self.assertEqual(self.check("--coding"), (0, "", ""))
+    def test_without_remote_only_the_session_is_printed(self):
+        rc, out, err = self.check("--coding")
+        self.assertEqual((rc, err), (0, ""))
+        self.assertEqual([ln.split("=", 1)[0] for ln in out.splitlines()], ["new_session", "session_file"])
+        self.assertEqual(self.check("--coding", "--no-save"), (0, "", ""))
 
     def test_mistakes_are_refused(self):
         for args, why in ((["--dir", "/x"], "--dir needs --remote"), (["--as", "u"], "--as needs --remote"),
