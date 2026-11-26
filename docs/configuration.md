@@ -33,6 +33,14 @@ hoplon --bless /path/to/hoplon/profiles/coder.json
 hoplon --bless /path/to/hoplon/skills/bash-scripts
 ```
 
+### Skill names
+
+A skill's name is its directory's: letters, digits, `.`, `_` and `-`, starting with a letter or digit,
+at most 48 characters. A skill with any other name is listed as `bad name` (escaped and cut short)
+and can't be blessed or switched on. Every listing (`--list-skills`, hoplon-tui's skills, the
+`skills` message) escapes names and descriptions and cuts descriptions to 160 characters, so what a
+skill's files say can't fake or break the list.
+
 ### Skills the model can suggest
 
 The model sees one line for each blessed skill: its name and description (the first line of its

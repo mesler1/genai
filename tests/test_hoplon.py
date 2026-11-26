@@ -588,15 +588,39 @@ class TestFirstRun(Tmp):
     def test_list_skills_shows_the_path_to_bless(self):
         self.run_hoplon("--list-skills")
         home = self.path("xdg", "hoplon")
-        for name in ("slurm", "my notes"):
+        for name in ("slurm", "my-notes"):
             os.makedirs(os.path.join(home, "skills", name))
             with open(os.path.join(home, "skills", name, "SKILL.md"), "w") as f:
                 f.write(f"# {name} help\n")
         bless_path(home, os.path.join(home, "skills", "slurm"))
         lines = self.run_hoplon("--list-skills").stdout.splitlines()
-        self.assertEqual(lines[1], "    to bless: hoplon --bless " + shlex.quote(os.path.join(home, "skills", "my notes")))
+        self.assertEqual(lines[1], "    to bless: hoplon --bless " + shlex.quote(os.path.join(home, "skills", "my-notes")))
         self.assertEqual(lines[3], "    " + os.path.join(home, "skills", "slurm"))
-        self.assertTrue(lines[0].startswith("my notes ") and lines[2].startswith("slurm "))
+        self.assertTrue(lines[0].startswith("my-notes ") and lines[2].startswith("slurm "))
+
+    def test_a_skill_with_a_bad_name_or_a_lying_description_cant_fake_the_listing(self):
+        self.run_hoplon("--list-skills")
+        home = self.path("xdg", "hoplon")
+        evil = "ok\x1b[2K\rslurm               blessed"
+        long_name = "a" * 80
+        for name, text in {evil: "# fine\n", long_name: "# long\n",
+                           "plain": "# " + "x" * 400 + "\x1b[31m red\n"}.items():
+            os.makedirs(os.path.join(home, "skills", name))
+            with open(os.path.join(home, "skills", name, "SKILL.md"), "w") as f:
+                f.write(text)
+        out = self.run_hoplon("--list-skills").stdout
+        self.assertNotIn("\x1b", out)
+        self.assertNotIn("\r", out)
+        rows = {r["name"]: r for r in G.skill_rows(G.Config(home))}
+        self.assertEqual(rows["ok\\x1b[2K\\rslurm               blessed"]["status"], "bad name")
+        self.assertEqual(rows["a" * 48 + "…"]["status"], "bad name")
+        desc = rows["plain"]["description"]
+        self.assertEqual(len(desc), G.SKILL_DESC_MAX + 1)          # capped, with an ellipsis
+        self.assertNotIn("\x1b", desc)
+        self.assertIn("rename the directory to use it", out)
+        with self.assertRaises(G.HoplonError) as cm:
+            G.bless(G.Config(home), os.path.join(home, "skills", long_name), lambda q: True)
+        self.assertIn("a skill's name (its directory's) must be", str(cm.exception))
 
     def test_second_run_is_quiet_and_keeps_existing(self):
         self.run_hoplon("--list-skills")

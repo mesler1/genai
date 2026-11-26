@@ -49,7 +49,8 @@ SNAPSHOT_CAP = 8 * WRITE_CAP   # maximum existing file size for an approved over
 ATTACH_CAP = 256 * 1024        # bytes per -f file
 OUTPUT_CAP = 32 * 1024         # chars of command output before head/tail cut
 REPLY_CAP = 8 * 1024 * 1024    # bytes of one endpoint reply (and of one streamed line)
-SKILL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,47}")    # a skill the model may be told of
+SKILL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,47}")    # a usable skill's name; others are refused
+SKILL_NAME_RULE = "letters, digits, . _ and -, starting with a letter or digit, at most 48"
 SKILL_DESC_MAX = 160        # characters of a skill's description in the model's list
 SKILL_SUGGEST_MAX = 5       # skills in one suggestion
 PROGRESS_EVERY = 0.5        # seconds between progress reports while a reply streams
@@ -1497,13 +1498,30 @@ def skill_status(cfg, skill):
     return bless_status(cfg, "skill", skill.path, skill.hash)
 
 
+def shown_name(name):
+    """A skill's name as listings show it: as it is when it is a usable name, else escaped and cut short."""
+    if SKILL_NAME.fullmatch(name):
+        return name
+    text = one_line(name)[0]
+    return text[:48] + ("…" if len(text) > 48 else "")
+
+
+def shown_description(skill):
+    """A skill's description as listings show it: one line, escaped, at most SKILL_DESC_MAX characters."""
+    text = one_line(skill.description())[0]
+    return text[:SKILL_DESC_MAX] + ("…" if len(text) > SKILL_DESC_MAX else "")
+
+
 def skill_rows(cfg, active=None, found=None):
     """Every skill found, for listings. active: names in use, marked when given. found: the skills your own machine
-    sent (remote mode), which are the only ones there, and blessed by being sent."""
+    sent (remote mode), which are the only ones there, and blessed by being sent. A skill whose name isn't usable
+    is listed as "bad name", escaped; it can't be blessed or switched on. Every name and description here is escaped
+    and capped, so a listing can't be faked or broken by what a skill's files say."""
     rows = []
     for n, s in sorted((find_skills(cfg) if found is None else found).items()):
-        row = {"name": n, "path": s.path, "description": s.description(),
-               "status": skill_status(cfg, s) if found is None else "blessed"}
+        bad = not SKILL_NAME.fullmatch(n)
+        row = {"name": shown_name(n), "path": s.path, "description": shown_description(s),
+               "status": "bad name" if bad else skill_status(cfg, s) if found is None else "blessed"}
         if active is not None:
             row["active"] = n in active
         rows.append(row)
@@ -1518,6 +1536,9 @@ def skill_lines(rows, mark=False):
         lead = ("* " if r.get("active") else "  ") if mark else ""
         out.append(f"{lead}{one_line(r['name'])[0]:20} {r['status']:10} {one_line(r['description'])[0]}")
         path = one_line(shlex.quote(r["path"]))[0]
+        if r["status"] == "bad name":
+            out.append(f"{' ' * len(lead)}    {path}: rename the directory to use it ({SKILL_NAME_RULE})")
+            continue
         out.append(f"{' ' * len(lead)}    " + (path if r["status"] == "blessed" else f"to bless: hoplon --bless {path}"))
     return out
 
@@ -1526,9 +1547,9 @@ def load_skills(cfg, names, notice):
     """Return the usable skills among names; skip and report the rest."""
     found, out = find_skills(cfg), []
     for n in names:
-        s = found.get(n)
+        s = found.get(n) if SKILL_NAME.fullmatch(n) else None
         if not s:
-            notice(f"skill '{n}' not found; skipped")
+            notice(f"skill '{shown_name(n)}' not found; skipped")
             continue
         st = skill_status(cfg, s)
         if st != "blessed":
@@ -2290,8 +2311,10 @@ def remote_items(raw, kind, bad):
         if not isinstance(item, dict) or set(item) != {"name", "hash", "files"}:
             raise bad(f"each {kind} must have exactly 'name', 'hash' and 'files'")
         name, files = item["name"], item["files"]
-        if not isinstance(name, str) or not NAME_RE.fullmatch(name) or name in out:
-            raise bad(f"{kind} names must be distinct names (letters, digits, . _ -)")
+        if (not isinstance(name, str) or not NAME_RE.fullmatch(name) or name in out
+                or (kind == "skill" and not SKILL_NAME.fullmatch(name))):
+            raise bad(f"{kind} names must be distinct names (letters, digits, . _ -)"
+                      + (f"; a skill's: {SKILL_NAME_RULE}" if kind == "skill" else ""))
         if not isinstance(files, dict) or not files:
             raise bad(f"{kind} '{name}': 'files' must be an object of relative paths")
         data, size = {}, 0
@@ -2456,6 +2479,9 @@ def bless(cfg, path, ask):
             raise HoplonError(f"{path}: {plugin.error}")
         if not plugin and "SKILL.md" not in files:
             raise HoplonError(f"{path}: a skill needs a SKILL.md, and a plugin a plugin.json")
+        if not plugin and not SKILL_NAME.fullmatch(os.path.basename(path)):
+            raise HoplonError(f"{one_line(path)[0]}: a skill's name (its directory's) must be {SKILL_NAME_RULE}; "
+                             "rename it, then bless it", EXIT_USAGE, "bad_name")
         h = hash_snapshot(files)
         print(f"{'Plugin' if plugin else 'Skill'} {one_line(os.path.basename(path))[0]} at {one_line(path)[0]}")
         for f in sorted(files):
@@ -3786,7 +3812,7 @@ class Engine:
         else:
             self.skills = load_skills(self.cfg, self.session.skills, self.ui.notice)
             found = {n: s for n, s in find_skills(self.cfg).items() if skill_status(self.cfg, s) == "blessed"}
-        self.skill_index = [(n, one_line(s.description())[0][:SKILL_DESC_MAX]) for n, s in sorted(found.items())
+        self.skill_index = [(n, shown_description(s)) for n, s in sorted(found.items())
                             if SKILL_NAME.fullmatch(n)]
         self.blessed_skills = found
 
@@ -3839,8 +3865,10 @@ class Engine:
         prompt; one switched off has its text taken out of the conversation too."""
         if on:
             s = (find_skills(self.cfg) if self.offered is None else self.offered["skills"]).get(name)
-            if not s:
-                raise HoplonError(f"skill '{name}' not found", EXIT_USAGE, "unknown_skill")
+            if not s or not SKILL_NAME.fullmatch(name):
+                raise HoplonError(f"skill '{shown_name(name)}' not found" if not s else
+                                 f"skill '{shown_name(name)}' can't be used: its name must be {SKILL_NAME_RULE}",
+                                 EXIT_USAGE, "unknown_skill")
             st = skill_status(self.cfg, s) if self.offered is None else "blessed"
             if st != "blessed":
                 raise HoplonError(f"skill '{name}' is {st}; read it, then: hoplon --bless {s.path}", EXIT_USAGE,

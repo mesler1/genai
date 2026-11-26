@@ -28,7 +28,7 @@ lustre/
 ## How to work
 
 1. Ask what the skill is for and what the user wants the model to know, one question at a time. Ask for real examples: commands they run, error messages they see, paths.
-2. Draft `NAME/SKILL.md` with `write_file`, in the working directory. Your file tools can't reach `~/.config/hoplon/`, and that is by design. Use a short lowercase name with letters, digits and `-`.
+2. Draft `NAME/SKILL.md` with `write_file`, in the working directory. Your file tools can't reach `~/.config/hoplon/`, and that is by design. Use a short lowercase name with letters, digits and `-` (hoplon refuses a skill whose name has anything but letters, digits, `.`, `_` and `-`, or is longer than 48 characters).
 3. Tell the user the next steps, which only they can do:
    - Read it over. Blessing is their "I have read this" checkpoint.
    - Move it into a skills directory: `~/.config/hoplon/skills/NAME/`, or a directory listed under `"skill_dirs"` in `~/.config/hoplon/config.json` (for example a team share).
