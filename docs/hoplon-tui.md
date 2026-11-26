@@ -98,5 +98,9 @@ or set `HOPLON_TUI_DISABLE=copy,model` for one run. Names are `model`, `copy`, `
 refuses its requests. Without `ssh`, a hoplon-ssh session isn't followed. No file means
 everything is on; a file that can't be read is ignored, with a note in the conversation.
 
+When something waits for your decision, hoplon-tui rings the terminal bell once and tmux's status
+line shows `⏸ waiting for you` until you answer, so you notice from another window. Most terminals
+turn the bell into an alert or a highlighted window.
+
 hoplon-tui shows a splash while tmux starts, for about a second, on a terminal of at least 60×24.
 `HOPLON_TUI_SPLASH=0` or `NO_COLOR` turns it off.

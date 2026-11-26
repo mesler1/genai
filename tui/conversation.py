@@ -781,10 +781,14 @@ class Model:
             self.actions.append(("interrupt",))
 
     def tmux_status(self):
-        """The sandbox part of tmux's status-right. It is a tmux format, so only fixed words, a checked proposal id
-        and a number go in."""
+        """The sandbox part of tmux's status-right, after a "waiting for you" while a card waits for a decision. It
+        is a tmux format, so only fixed words, a checked proposal id and a number go in."""
         if self.hello is None:
             return ""
+        wait = " #[fg=black,bg=yellow,bold] ⏸ waiting for you #[default] │" if self.pending else ""
+        return wait + self.sandbox_status()
+
+    def sandbox_status(self):
         card = self.running_card()
         if card and PROPOSAL_ID.fullmatch(card.id):
             return f" #[fg=yellow,bold]⏵ sandbox {card.id} {card.elapsed()}s#[default] │"
@@ -1626,6 +1630,7 @@ class App:
         self.last_total = 0
         self.ctrl_c = 0.0
         self.status = None         # the sandbox part of tmux's status line, as last set
+        self.rung = set()          # cards the terminal bell has rung for: once each, as it starts to wait
         self.paste = None          # text of a bracketed paste in progress
         curses.curs_set(1)
         curses.use_default_colors()
@@ -2493,6 +2498,13 @@ class App:
         card = self.m.running_card()
         if card and card.shown_secs != card.elapsed():
             card.changed()                             # its elapsed time, once a second
+        fresh = {c.id for c in self.m.pending} - self.rung
+        if fresh:                                      # a decision is waiting: ring, so you hear it from elsewhere
+            self.rung |= fresh
+            try:
+                curses.beep()
+            except curses.error:
+                pass
         if self.shell:
             status = self.m.tmux_status()
             if status != self.status:

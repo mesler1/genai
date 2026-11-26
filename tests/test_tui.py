@@ -579,6 +579,13 @@ class TestSandboxStatus(unittest.TestCase):
         self.assertIn("⊡ model's runs sandboxed", self.model().tmux_status())
         self.assertIn("▲ no sandbox", self.model(runner=None).tmux_status())
         self.assertIn("⊡ sandbox", self.model(sandbox={"name": "podman"}).tmux_status())
+        waiting = self.model(runner=None)
+        waiting.submit("go")
+        waiting.handle({"type": "proposal", "id": "p1", "kind": "write", "path": "a", "content": "x", "reason": "r",
+                        "digest": "d"})
+        self.assertTrue(waiting.tmux_status().startswith(" #[fg=black,bg=yellow,bold] ⏸ waiting for you"))
+        waiting.decide(False)                                   # answered: no longer waiting
+        self.assertNotIn("waiting for you", waiting.tmux_status())
         m = self.model()
         card = self.start(m)
         card.started -= 5
@@ -2238,6 +2245,10 @@ class TestHoplonTui(TmuxCase):
             self.key("a")
             self.wait_for("Allow p3: edit a.txt?")                     # the read didn't ask; the edit does
             self.assertIn("step 2 of the plan", self.screen())
+            end = time.time() + 5                                       # tmux's status line says so too
+            while "waiting for you" not in self.tmux("show", "-gv", "@hoplon_sandbox") and time.time() < end:
+                time.sleep(0.1)
+            self.assertIn("⏸ waiting for you", self.tmux("show", "-gv", "@hoplon_sandbox"))
             self.key("y")
             self.wait_for("p4 finished (exit 0). Share the output")    # run without another question
             self.assertIn("planned-new", self.screen("shell"))
