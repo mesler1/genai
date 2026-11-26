@@ -65,8 +65,8 @@ def setup_home():
         json.dump({"name": PERSONA, "endpoint": NAME, "skills": [], "params": {"temperature": 0},
                    "persona": "Begin every reply with the word PINEAPPLE in capital letters, then answer."}, f)
     cfg.set_blessed(persona, {"kind": "profile", "name": PERSONA, "hash": G.hash_file(persona)})
-    skill = os.path.join(REPO, "skills", "bash-scripts")
-    cfg.set_blessed(skill, {"kind": "skill", "name": "bash-scripts", "hash": G.hash_skill(skill)[0]})
+    skill = os.path.join(REPO, "skills", "bash")
+    cfg.set_blessed(skill, {"kind": "skill", "name": "bash", "hash": G.hash_skill(skill)[0]})
     return base, home
 
 
@@ -90,7 +90,7 @@ def test_cli_script(env, work):
     out = os.path.join(work, "rotate-logs.sh")
     prompt = ("Write a bash script that deletes *.log files older than 7 days in a directory given as the "
               "first argument (default ./logs), with a --dry-run flag. Output only the script.")
-    cmd = f"python3 {SCRIPT} -e {NAME} -k bash-scripts {json.dumps(prompt)} > {out}"
+    cmd = f"python3 {SCRIPT} -e {NAME} -k bash {json.dumps(prompt)} > {out}"
     before = set(os.listdir(work))
     t = time.time()
     r = subprocess.run(["sh", "-c", cmd], cwd=work, env=env, stdin=subprocess.DEVNULL,

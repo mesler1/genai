@@ -363,9 +363,9 @@ class TestOptions(unittest.TestCase):
             self.assertIn(why, err, args)
 
     def test_skills_go_to_the_launcher_not_to_the_remote_hoplon(self):
-        rc, out, _ = self.check("--remote", "h", "-k", "hpc", "-k", "bash-scripts")
+        rc, out, _ = self.check("--remote", "h", "-k", "hpc", "-k", "bash")
         self.assertEqual(rc, 0)
-        self.assertEqual([x for x in out.splitlines() if x.startswith("skill=")], ["skill=hpc", "skill=bash-scripts"])
+        self.assertEqual([x for x in out.splitlines() if x.startswith("skill=")], ["skill=hpc", "skill=bash"])
         self.assertEqual(C.hoplon_args(C.parse_args(["--remote", "h", "-k", "hpc"])), [])
         self.assertEqual(C.hoplon_args(C.parse_args(["-k", "hpc"])), ["-k", "hpc"])
 

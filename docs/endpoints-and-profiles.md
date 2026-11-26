@@ -12,7 +12,7 @@ model, default skills, sampling settings and coding mode:
   "description": "Careful senior engineer: small diffs, tests first",
   "endpoint": "work-llm",
   "persona": "You are a careful senior software engineer pairing with the user. ...",
-  "skills": ["bash-scripts"],
+  "skills": ["bash"],
   "coding": true
 }
 ```

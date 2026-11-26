@@ -12,7 +12,7 @@ One JSON file:
   "description": "Careful senior engineer: small diffs, tests first",
   "endpoint": "work-llm",
   "persona": "You are a careful senior software engineer. Prefer small, reviewable changes. Read the code before proposing edits. Say what you would test and how.",
-  "skills": ["bash-scripts"],
+  "skills": ["bash"],
   "params": {"temperature": 0.2},
   "coding": true
 }

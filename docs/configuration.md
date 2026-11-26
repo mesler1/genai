@@ -30,7 +30,7 @@ repo's files in place. For example, to use the coder persona by default and the 
 
 ```bash
 hoplon --bless /path/to/hoplon/profiles/coder.json
-hoplon --bless /path/to/hoplon/skills/bash-scripts
+hoplon --bless /path/to/hoplon/skills/bash
 ```
 
 ### Skill names
@@ -73,9 +73,15 @@ profiles/coder.json        example persona with coding mode
 skills/hoplon-endpoint/     helps you write an endpoint
 skills/hoplon-profile/      helps you write a profile (persona)
 skills/hoplon-skill/        helps you write a skill
-skills/bash-scripts/       conventions for small, safe bash scripts
-skills/hpc/                a shared cluster: login nodes, modules, file systems (any scheduler)
-skills/slurm/              generic Slurm: srun/sbatch, batch scripts, job arrays, failed jobs
+skills/bash/                Bash: house rules for scripts, and the gotchas that bite
+skills/c/                   C: house rules and gotchas
+skills/csh/                 C shell: csh and tcsh syntax, not Bash's
+skills/multi-user/          being safe and fair on a machine others share
+skills/parallel-fs/         Lustre, GPFS and the like: metadata, small files, striping
+skills/rust/                Rust: house rules and gotchas
+skills/security-review/     a checklist the model applies to its own proposals
+skills/hpc/                 a shared cluster: login nodes, modules, file systems (any scheduler)
+skills/slurm/               generic Slurm: srun/sbatch, batch scripts, job arrays, failed jobs
 plugins/slurm/             trusted read-only Slurm commands: sinfo, squeue, scontrol show, sacct
 sandbox/run                podman sandbox for running hoplon and its tests, on this machine's OS
 sandbox/hooks/modules.sh   sandbox hook: makes loaded environment modules work inside the sandbox

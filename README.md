@@ -57,7 +57,7 @@ then bless both and start it in a project directory (coding mode is refused in y
 
 ```bash
 hoplon --bless profiles/coder.json           # a persona: shows its text, endpoint, skills, coding grant
-hoplon --bless skills/bash-scripts           # the skill it uses
+hoplon --bless skills/bash                   # the skill it uses
 cd ~/src/some-project
 hoplon -e work-llm -p coder                  # REPL: a line with only '..' sends; :help for commands
 hoplon-tui -e work-llm -p coder              # the same in tmux panes, beside your shell (needs tmux)
