@@ -198,7 +198,8 @@ class TestRunColours(unittest.TestCase):
         p = G.Proposal("c1", "command", "tc1", command="ls", reason="r")
         bufs = []
         eng = types.SimpleNamespace(commands=[p], sandbox=None, audit=G.Audit(os.path.join(tmp, "audit.log")),
-                                    secrets=lambda: [], share=lambda *a: None, user_turn=lambda *a: None)
+                                    secrets=lambda: [], share=lambda *a: None, user_turn=lambda *a: None,
+                                    ui=G.PlainUI())
 
         def edit(text, title, what, cancel):
             bufs.append(text)

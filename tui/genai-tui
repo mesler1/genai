@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # genai-tui: genai in tmux, as one coding agent. The conversation, the prompt you type into below
-# it, and an info panel on the right. Your own shell runs hidden: `` on an empty line shows it above
-# the conversation, or hides it again. /run types a proposed command into that shell, /share sends
+# it, and an info panel on the right. Your own shell runs hidden: Ctrl-` shows it above the
+# conversation, or hides it again. /run types a proposed command into that shell, /share sends
 # what it printed, and right-clicking the shell marks where shell context starts. Clicking a proposed
 # command, or Alt+1..Alt+9 (Alt+1 the newest), opens its menu: run it, edit it, paste it or copy it.
 # In the shell, genai-ssh [ssh options] HOST connects to another host in a way genai-tui can follow.
@@ -199,9 +199,9 @@ t set -g status-style 'bg=default,fg=default'
 t set -g status-left ' genai │ '
 t set -g status-left-length 20
 if [ -n "$remote" ]; then       # the host that matters is the one genai runs on
-  t set -g status-right "#{@genai_sandbox} genai on ${remote//#/##} │ \`\` shows the shell │ Ctrl-b o: other pane │ Ctrl-b d: detach "
+  t set -g status-right "#{@genai_sandbox} genai on ${remote//#/##} │ Ctrl-\` shell │ Ctrl-b o: other pane │ Ctrl-b d: detach "
 else
-  t set -g status-right '#{@genai_sandbox} #H │ `` shows the shell │ Ctrl-b o: other pane │ Ctrl-b d: detach '
+  t set -g status-right '#{@genai_sandbox} #H │ Ctrl-` shell │ Ctrl-b o: other pane │ Ctrl-b d: detach '
 fi
 t set -g window-status-format ''          # hidden panes live in other windows; don't list them
 t set -g window-status-current-format ''
@@ -210,7 +210,7 @@ t set -g @genai_prompt_pane "$prompt"
 t set -g @genai_shell_pane "$shell"
 t set -g @genai_conv_pane "$conv"
 t set -p -t "$conv" @genai_title 'genai'
-t set -p -t "$shell" @genai_title 'shell · `` hides it · right-click: shell context'
+t set -p -t "$shell" @genai_title 'shell · Ctrl-` hides it · right-click: shell context'
 t set -p -t "$prompt" @genai_title 'you'
 t set -p -t "$side" @genai_title 'info · /panel hides it'
 t set -p -t "$tree" @genai_title 'files · /files hides it'
@@ -242,6 +242,9 @@ done >> "$state/menu.conf"
 t set-environment -g GENAI_TUI_STATE "$state"
 t source-file "$state/menu.conf"
 t set-environment -g GENAI_TUI_TOGGLE "$here/shell-toggle"
+# Ctrl-` shows the shell, or hides it, from any pane. Most terminals send it as NUL, the same byte as
+# Ctrl-Space, which tmux names C-Space; a terminal that reports keys in full sends C-`.
+for k in C-Space C-\`; do t bind -n "$k" run-shell "$(q "$here/shell-toggle") toggle --focus"; done
 t run-shell "$(q "$here/shell-toggle") hide"
 t select-pane -t "$prompt"
 # The shell pane runs genai-ssh to the host at once, as a command, so it is followed like any genai-ssh session.

@@ -86,7 +86,8 @@ advice is to remove one of the three, or put a human in front of it.
   same masking; files that look like secrets are hidden from it.
 
 What remains: the endpoint receives every prompt, attachment and file the model reads. In
-coding mode the model reads non-hidden files in the working directory without asking (a file
+coding mode the model reads non-hidden files in the working directory without asking (hidden: a
+name starting with `.`, or one the sandbox hides as a secret, such as `id_rsa` or `*.key`; a file
 that looks like it holds secrets still asks), so treat the directory as shared with the
 endpoint.
 
@@ -231,28 +232,71 @@ in between.
 
 - **Work sessions** (`:work`, or the JSON `work` message) let the model edit, test and commit
   without asking, so the boundary moves from each edit to the branch you review at the end:
-  - The model works in a git worktree outside your project, on a branch of its own. Your own
-    files and branch are never written; you merge the branch yourself, with git.
-  - The copy's `.git` file and the repository's hooks could make git run a program. genai runs
-    every git command itself, on the host, with `GIT_DIR` set to the git directory it recorded
-    when it made the copy (before the model could write anything), with all `GIT_*` variables
-    from the environment dropped, and with `core.hooksPath=/dev/null`, `core.fsmonitor=false`,
-    signing, external diff and textconv off. No file tool may write under `.git`, and the
-    sandbox still runs on a throwaway overlay of the copy, so a test can't leave anything behind.
-  - Hidden and secret-looking files still ask, and the sandbox still hides secrets and runs
-    offline: a session can't start with the network on.
+  - The model works in a copy outside your project: a new git repository (`git init`) holding
+    your last commit and nothing else, fetched with depth 1, so neither the model nor the sandbox
+    can read your history, other branches or tags, including a secret that was committed once and
+    removed. Your own files and branch are never written; you merge the branch yourself, with git.
+  - genai reads your repository at the start: `git status`, in your own checkout with your own
+    config, as you would run it, and read-only lookups of your last commit and branch names (and
+    the fetch of that commit into the copy reads it too). It writes it in one place only: `git
+    fetch` of each commit made in the copy into `refs/heads/genai/work-N`, without recursing into
+    submodules or running maintenance. That fetch only adds to the branch: a branch moved or
+    deleted meanwhile is an error, never overwritten, and so is one found changed at the end when
+    nothing new is left to add; a name taken meanwhile moves to the next free one, and a branch
+    named `genai` refuses the session. SIGTERM and SIGHUP wait for the fetch, so git is never
+    killed halfway with a lock file left, and one that finished just as a signal came counts as
+    done.
+  - The copy's config is only what `git init` writes, so your repository's own config (filters,
+    hooks, includes) never applies there; your global and system config does, so a filter driver
+    set there still runs. A repository with Git LFS files is refused: the copy can't reach the
+    LFS store. genai runs every git command itself, on the host, with `GIT_DIR` set to the
+    copy's git directory, all `GIT_*` variables from the environment dropped, and
+    `core.hooksPath=/dev/null`, `core.fsmonitor=false`, signing, external diff and textconv, and
+    bare-repository discovery off. No file tool may write under `.git`, and the sandbox still runs
+    on a throwaway overlay of the copy, so a test can't leave anything behind. The copy's git
+    directory is beside its files, not among them, and the sandbox mounts only the files: the
+    git directory holds every file of the commit, the ones the sandbox hides as secrets too.
+  - Edits and writes apply without asking only while an item of an approved plan is worked on;
+    before approval, and while the planner reviews an item, they ask, whatever the edits mode:
+    files you approved with `approved-files` count only outside the session. Hidden and
+    secret-looking files always ask, and so does a `pyvenv.cfg` or anything under a directory of
+    that name, as the sandbox's secret scan treats a virtual environment differently (it skips
+    only its package directories, never the whole directory, and only for a real
+    `pyvenv.cfg` file).
+  - The sandbox still hides secrets and runs offline: a session can't start with the network on,
+    the network can't be turned on during one, and a finish test checks again before it runs.
+  - Only the tools offered at that point can be called: a call to any other is refused.
+  - The session's state is its own: coding mode, if the session turned it on, and approved files
+    go back to what they were when it ends, or when starting fails (`:edits reset` or `:edits ask`
+    during it forgets the set-aside ones too). While it is on, the saved session keeps a copy of the
+    conversation and coding mode from before it, so one resumed after a crash doesn't carry the
+    session's. A planner on another endpoint starts from the task alone, without the earlier
+    conversation or attachments queued in genai-tui or the REPL; every read question while it plans
+    names the endpoint the file would go to; and when an item's context replaces the plan, the
+    planner keeps its own context and is only told the new plan. `/clear` drops the planner's
+    waiting context as well, and the saved conversation from before the session.
+  - The user can stop the turn at any time (`stop`, Ctrl-C, `/stop`), including while the model
+    writes tool calls or rollover notes, and end the session mid-turn (`work_end`), even while it
+    is starting; quitting the front end, SIGTERM and SIGHUP end it too, committing what is there
+    and removing the copy. If git fails while ending, or a file the model wrote is not in its
+    commits (git ignores it, or it is inside a submodule's directory), the copy is not deleted;
+    what is committed still goes to the branch. A genai killed outright (SIGKILL, a
+    crash) leaves its copy in `~/.local/state/genai/work/`; your repository has whatever reached
+    the branch. Once a plan, finish or retry takes effect, the rest of
+    that reply's calls are not run: they were decided for the state before it.
   - A profile can plan with another model (`work.planner`). On the same endpoint, nothing new
     is trusted. A second endpoint must be blessed like any other, the profile's summary says it
     sees the project, and its key is masked in output too. It reads files, so whatever the
     profile's endpoint may see, it may see.
-  - Each plan item has a step budget and the session a time limit without you. A stuck item goes
-    back to the planning context once; after that, or at the time limit, it pauses. Every step,
+  - Each plan item has a step budget and the session a time limit without you, which also cuts
+    off a sandboxed run or test that would outlast it. A stuck item goes back to the planning
+    context once; after that, or at the time limit, it pauses. Every step,
     edit, test, commit and context swap is in the audit log.
   - What remains: the branch contains whatever the model wrote, including test files and build
     configuration, and nothing in it has been reviewed until you review it. Running its tests or
-    build on your machine before reading the diff runs the model's code as you. Git still
-    applies `.gitattributes` filters you have configured globally (such as Git LFS) when it
-    checks out and commits the copy.
+    build on your machine before reading the diff runs the model's code as you. Filter drivers
+    from your global and system config still run when git checks out and commits the copy, and
+    the model's `.gitattributes` can choose which files they get.
 
 What remains: the indicator is display only. A command you approve outside a sandbox can do
 anything you can. Inside `sandbox/run genai` the network is open, because genai has to reach

@@ -64,6 +64,9 @@ class Feature:
     def run_started(self, m, card):
         """A command card was typed into the shell pane to run."""
 
+    def exited(self, m):
+        """genai has exited."""
+
     def snapshot(self, m, view):
         """May add to or adjust the info panel's view dict before it is sent."""
 

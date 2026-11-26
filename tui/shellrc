@@ -73,18 +73,6 @@ __genai_prompt() {
 }
 PROMPT_COMMAND="__genai_prompt${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
 
-# `` on an empty command line hides this shell again (it keeps running) and goes back to the prompt.
-# Anywhere else `` is typed as it is, and a single ` types after a moment (readline's keyseq-timeout).
-__genai_hide() {
-  if [ -n "$READLINE_LINE" ] || [ -z "${TMUX:-}" ] || [ -z "${GENAI_TUI_TOGGLE:-}" ]; then
-    READLINE_LINE="${READLINE_LINE:0:READLINE_POINT}\`\`${READLINE_LINE:READLINE_POINT}"
-    READLINE_POINT=$((READLINE_POINT + 2))
-    return
-  fi
-  "$GENAI_TUI_TOGGLE" hide
-}
-bind -x '"``": __genai_hide' 2>/dev/null
-
 # genai-ssh [ssh options] [user@]host: ssh to a shell genai-tui can follow, as it follows this one. Nothing is
 # installed there and no key is on the command line: see tui/recorder.py. Only here, in genai-tui's shell pane.
 if [ -n "${__genai_rc:-}" ]; then

@@ -235,7 +235,7 @@ class TestProposalDisplay(Tmp):
         with open(target, "wb") as f:
             f.write(b"\x7fELF\x00\x01")
         os.chmod(target, 0o755)
-        eng = types.SimpleNamespace(counter=0, wd=G.Workdir(wd))
+        eng = types.SimpleNamespace(counter=0, wd=G.Workdir(wd), tools=lambda: G.TOOLS)
         tc = {"id": "t1", "function": {"name": "write_file", "arguments": json.dumps(
             {"path": "tool", "content": "#!/bin/sh\necho pwned\n", "reason": "r"})}}
         p = G.Engine.make_proposal(eng, tc)

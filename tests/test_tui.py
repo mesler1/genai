@@ -825,6 +825,132 @@ class TestWorkFeature(unittest.TestCase):
         self.assertEqual(m.outbox, [])
         self.assertIn("this genai can't run work sessions", self.shown(m, 1))
 
+    def test_work_end_and_stop_reach_a_busy_genai_that_can_halt(self):
+        m = self.model(features=("work", "stop", "halt"))
+        m.submit("/work t")
+        m.handle({"type": "work", "state": "started", "branch": "genai/work-1", "base": "abc", "items": []})
+        self.assertTrue(m.busy)
+        m.stop()
+        self.assertEqual(m.outbox[-1], {"type": "stop"})
+        self.assertIn("stopping genai's turn", self.shown(m, 1))
+        m.submit("/work end")
+        self.assertEqual(m.outbox[-1], {"type": "work_end"})
+        m.handle({"type": "work", "state": "ended", "why": "ended", "branch": "genai/work-1", "path": "/s/copy",
+                  "problems": ["what was left could not be committed: git add failed"], "commits": "not a list"})
+        text = self.shown(m)
+        self.assertIn("could not be committed", text)
+        self.assertIn("the copy is still at /s/copy", text)
+
+    def test_a_finish_test_runs_with_a_clock_and_stops(self):
+        m = self.model(features=("work", "stop"))
+        m.handle({"type": "proposal", "id": "p1", "kind": "finish", "n": 1, "summary": "s", "test": "make test",
+                  "auto": True})
+        self.assertIs(m.running_card(), m.cards["p1"])
+        m.stop()
+        self.assertEqual(m.outbox[-1], {"type": "stop"})
+
+    def test_odd_event_fields_are_shown_safely(self):
+        m = self.model()
+        m.handle({"type": "work", "state": "started", "branch": "b\nFAKE", "items": "nope", "time_limit": "x"})
+        m.handle({"type": "work", "state": "plan", "current": "1", "role": "item",
+                  "items": [{"n": 1, "title": "one\n✓  2. fake", "status": "todo"}, "junk", 3]})
+        panel = self.panel(m)
+        self.assertIn("one⏎✓  2. fake", panel)
+        self.assertIn("b⏎FAKE", panel)
+        self.assertNotIn("\n✓  2. fake", panel)
+        m.handle({"type": "work", "state": "item", "current": 1, "items": [{"n": "1", "status": "done"}]})
+        self.assertIn("✓  ?. ", self.panel(m))
+        m.handle({"type": "proposal", "id": "p1", "kind": "work_plan", "goal": "g", "items": ["a\nb"], "digest": "d"})
+        self.assertIn(" 1. a⏎b", text_of(m.cards["p1"], 100))
+
+
+    def test_a_path_with_a_line_break_stays_on_one_row(self):
+        m = self.model()
+        m.handle({"type": "proposal", "id": "p1", "kind": "write", "path": "a\nb.py", "content": "x", "auto": True,
+                  "work": True})
+        self.assertEqual(m.cards["p1"].title(), "create a⏎b.py")
+        m.handle({"type": "proposal", "id": "p2", "kind": ["odd"], "items": 3, "digest": "d"})
+        self.assertEqual(m.cards["p2"].title(), "['odd']")
+
+    def test_a_stopped_turn_leaves_nothing_waiting_or_running(self):
+        m = self.model(features=("work", "halt", "stop"))
+        m.busy = True
+        m.handle({"type": "proposal", "id": "p1", "kind": "work_plan", "goal": "g", "reason": "g",
+                  "items": ["a"], "digest": "d"})
+        m.handle({"type": "proposal", "id": "p2", "kind": "finish", "n": 1, "summary": "s", "auto": True,
+                  "test": "make test"})
+        self.assertTrue(m.pending and m.running_card())
+        m.handle({"type": "done", "reason": "stopped"})
+        self.assertEqual(m.pending, [])
+        self.assertIsNone(m.running_card())
+        self.assertEqual((m.cards["p1"].state, m.cards["p2"].state), ("stopped", "stopped"))
+        m.handle({"type": "proposal", "id": "p3", "kind": "write", "path": "x", "content": "x", "auto": True})
+        m.handle({"type": "result", "id": "p3", "status": "skipped", "detail": "not run"})
+        self.assertEqual(m.cards["p3"].state, "stopped")
+
+    def test_odd_work_fields_dont_break_the_panel(self):
+        m = self.model()
+        m.handle({"type": "work", "state": "started", "branch": "b", "items": [], "role": "plan"})
+        m.handle({"type": "work", "state": "context", "role": ["item"], "item": 1, "why": "w"})
+        m.handle({"type": "work", "state": "item", "items": [{"n": 1, "title": "t", "status": ["done"]}],
+                  "current": 1})
+        self.assertIn("WORK", self.panel(m))
+        m.submit("/work")
+        self.assertIn("1. t", self.shown(m))
+
+    def test_how_a_session_ended_is_told_apart(self):
+        m = self.model()
+        m.handle({"type": "work", "state": "started", "branch": "genai/work-1", "base": "abc", "items": []})
+        m.handle({"type": "work", "state": "ended", "why": "ended", "branch": None, "path": "/s/copy/tree",
+                  "problems": ["1 file the model wrote is not in its commits"], "commits": ["abc one"]})
+        text = self.shown(m)
+        self.assertIn("the work is not on a branch; it is in the copy at /s/copy/tree", text)
+        self.assertNotIn("nothing was changed", text)
+        m.submit("/work")
+        self.assertIn("the work is in the copy at /s/copy/tree", self.shown(m, 1))
+        m.handle({"type": "work", "state": "started", "branch": "genai/work-2", "base": "abc", "items": []})
+        m.handle({"type": "work", "state": "ended", "why": ["odd"], "branch": None, "path": None})
+        self.assertIn("nothing was changed, so no branch was made", self.shown(m, 1))
+
+    def test_work_end_reaches_a_session_still_starting(self):
+        m = self.model(features=("work", "stop", "halt"))
+        m.submit("/work t")
+        m.submit("/work end")                           # genai hasn't said started yet
+        self.assertEqual(m.outbox[-1], {"type": "work_end"})
+        m.handle({"type": "error", "code": "not_running", "message": "no work session is on"})
+        self.assertIn("no work session is on", self.shown(m, 1))
+        self.assertNotIn("sandbox", self.shown(m, 1))
+
+    def test_genai_exiting_mid_session_says_where_the_work_is(self):
+        m = self.model()
+        m.handle({"type": "work", "state": "started", "branch": "genai/work-1", "base": "abc", "path": "/s/c/tree",
+                  "items": []})
+        m.exit(1)
+        self.assertIn("the copy is at /s/c/tree", self.shown(m))
+        self.assertNotIn("WORK", self.panel(m))
+        m.submit("/work end")
+        self.assertIn("no work session is on", self.shown(m, 1))
+
+    def test_a_failed_finish_test_shows_its_output(self):
+        m = self.model()
+        m.handle({"type": "proposal", "id": "p1", "kind": "finish", "n": 1, "summary": "s", "test": "make test",
+                  "auto": True})
+        m.handle({"type": "result", "id": "p1", "status": "error", "detail": "the test command failed (exit 1)",
+                  "output": "FAILED test_core"})
+        self.assertIn("FAILED test_core", text_of(m.cards["p1"], 100))
+
+    def test_ctrl_c_in_the_prompt_pane_stops_a_turn_even_during_a_question(self):
+        p = C_PROMPT.Prompt.__new__(C_PROMPT.Prompt)
+        sent = []
+        p.send = lambda msg: sent.append(msg) or True
+        p.view, p.ctrl_c, p.paste, p.asked_at = {"mode": "approval", "halt": True}, 0.0, None, 0.0
+        p.ed = C.Editor()
+        p.key("\x03")
+        p.view = {"mode": "input", "busy": True, "halt": True}
+        p.key("\x03")
+        p.key("\x03")
+        self.assertEqual(sent, [{"type": "stop"}, {"type": "stop"}, {"type": "quit"}])
+
 
 class TestPluginsFeature(unittest.TestCase):
     ROWS = [{"name": "slurm", "description": "cluster", "enabled": True, "blessed": True, "status": "blessed",
@@ -2177,35 +2303,28 @@ class TestGenaiTui(TmuxCase):
         return [r[3] for r in rows if r[1] == 0], next(r[3] for r in rows if r[2] == "1")
 
     def show_shell(self):
-        self.type("`", enter=False)
-        self.type("`", enter=False)
+        self.at_terminal("\x00")             # Ctrl-` as most terminals send it
         time.sleep(0.6)
 
-    def test_shell_hidden_until_backticks(self):
+    def test_ctrl_backtick_shows_and_hides_the_shell_from_any_pane(self):
         with FakeAPI([reply("hello")]) as api:
             self.start(api)
             self.assertEqual(self.window(), (["genai", "you"], "you"))          # the shell starts hidden
             self.type("hi")
             self.wait_for("● hello")
-            self.type("`", enter=False)
-            time.sleep(0.8)                                                   # however slowly it is typed
-            self.type("`", enter=False)
+            self.type("a `` b", enter=False)                                  # backticks are only text now
+            self.at_terminal("\x00")                                          # Ctrl-`, sent as NUL
             time.sleep(0.6)
             self.assertEqual(self.window(), (["shell", "genai", "you"], "shell"))   # above the conversation
-            self.tmux("send-keys", "-t", self.panes()["shell"], "-l", "``")
-            time.sleep(1)
-            self.assertEqual(self.window(), (["genai", "you"], "you"))
-            self.assertNotIn("`", self.screen("you").splitlines()[0])           # the taps didn't stay in the input
-            self.type("a ``code`` b", enter=False)                             # not on an empty input: just text
-            time.sleep(0.3)
-            self.assertEqual(self.window()[0], ["genai", "you"])
-            self.assertIn("a ``code`` b", self.screen("you"))
-            self.tmux("send-keys", "-t", self.panes()["you"], "C-u")
-            self.show_shell()
-            self.tmux("send-keys", "-t", self.panes()["shell"], "-l", "echo ``x")   # mid-command: typed as is
-            time.sleep(1)
-            self.assertEqual(self.window()[0], ["shell", "genai", "you"])
+            self.shell("echo ``x")
             self.assertIn("echo ``x", self.screen("shell"))
+            self.at_terminal("\x00")                                          # from the shell: hides it
+            time.sleep(0.6)
+            self.assertEqual(self.window(), (["genai", "you"], "you"))
+            self.assertIn("a `` b", self.screen("you"))                        # the input is untouched
+            self.at_terminal("\x1b[96;5u")                                    # Ctrl-` reported in full
+            time.sleep(0.6)
+            self.assertEqual(self.window()[0], ["shell", "genai", "you"])
 
     def test_an_answer_must_name_the_question_showing(self):
         with FakeAPI([call("write_file", path="x.txt", content="x\n", reason="r"), reply("done")]) as api:
