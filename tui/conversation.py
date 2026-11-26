@@ -477,6 +477,8 @@ class Card(Block):
                 "write": f"{'overwrite' if ev.get('exists') else 'create'} {path}",
                 "command": "command", "external": f"tool {row(ev.get('tool', ''))}",
                 "samples": "samples requested",
+                "skills": "switch on skills: " + ", ".join(row(n) for n in (ev.get("names") or [])[:5]
+                                                           if isinstance(ev.get("names"), list)),
                 "sandbox": f"sandbox · {'ONLINE' if ev.get('network') else 'offline'}",
                 "trusted": f"{row(ev.get('plugin', '?'))} · {row(ev.get('command', '?'))}"
                            + (" · read-only" if ev.get("read_only") else ""),
@@ -503,6 +505,13 @@ class Card(Block):
             out.append(("this file looks like it contains secrets", R))
         if ev.get("flagged"):
             out.append(("hidden or control characters are shown as \\x.. or \\u.... escapes", R))
+        if k == "skills":
+            names = ev.get("names") if isinstance(ev.get("names"), list) else []
+            about = ev.get("about") if isinstance(ev.get("about"), list) else []
+            for i, n in enumerate(names[:5]):
+                d = about[i] if i < len(about) and isinstance(about[i], str) else ""
+                out.append((f"{one_row(str(n))[:48]}" + (f": {one_row(d)[:160]}" if d else ""), ""))
+            out += [("Yes: the model gets their text from now on.", Q), ("Only you switch skills on or off.", Q)]
         if k == "samples":
             out += [(ln, "") for ln in clean(str(ev.get("what", ""))).split("\n")]
             files = ev.get("files") if isinstance(ev.get("files"), list) else []

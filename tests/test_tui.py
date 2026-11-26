@@ -1592,6 +1592,19 @@ class TestSamplesAndLeftovers(unittest.TestCase):
         self.assertIn("▲→⊡", body)
         self.assertIn("/fixtures add", body)
 
+    def test_a_skill_suggestion_asks_like_any_proposal(self):
+        m = self.model()
+        m.submit("plan a job")
+        m.handle({"type": "proposal", "id": "p1", "kind": "skills", "names": ["slurm", "c\x1b[2Jsh"],
+                  "about": ["Generic Slurm", "C shell\nrules"], "reason": "a batch job", "digest": "d"})
+        card = m.cards["p1"]
+        self.assertEqual(m.pending, [card])
+        self.assertIn("switch on skills: slurm, c\\x1b[2Jsh", card.title())
+        body = text_of(card)
+        self.assertIn("slurm: Generic Slurm", body)
+        self.assertIn("Only you switch skills on or off", body)
+        self.assertNotIn("\x1b", body)
+
     def test_leftovers_clean_asks_then_sends_the_listed_ids(self):
         m = self.model()
         m.submit("/leftovers clean")

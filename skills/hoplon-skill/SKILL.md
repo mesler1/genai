@@ -12,7 +12,7 @@ lustre/
   notes.txt       # optional; covered by the blessing hash, not sent to the model
 ```
 
-- The **first non-blank line** of `SKILL.md` is the skill's description, shown by `hoplon --list-skills`. Make it a heading that says what the skill is for, e.g. `# Lustre quotas and striping on the hpc2 cluster`.
+- The **first non-blank line** of `SKILL.md` is the skill's description, shown by `hoplon --list-skills` and, once blessed, in the one-line list the model reads to decide whether to suggest the skill. Make it a heading that says what the skill is for, e.g. `# Lustre quotas and striping on the hpc2 cluster`.
 - Only `SKILL.md` is sent to the model. Other files are covered by the hash, so a blessing covers them too, but they are not read into the prompt.
 - **No symlinks** anywhere in the directory, and only regular files. hoplon rejects the skill otherwise, because the hash couldn't notice a link's target changing.
 - A skill is **prompt text only**. It can't run code, add tools, or turn on coding mode. Don't write instructions that pretend otherwise.

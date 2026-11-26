@@ -33,6 +33,19 @@ hoplon --bless /path/to/hoplon/profiles/coder.json
 hoplon --bless /path/to/hoplon/skills/bash-scripts
 ```
 
+### Skills the model can suggest
+
+The model sees one line for each blessed skill: its name and description (the first line of its
+`SKILL.md`). Unblessed skills are never named to it. Before it plans, or when a request clearly needs a
+skill that is off, it may ask to switch some on (`suggest_skills`); you answer yes or no, as with any
+proposal. Only you switch skills on, and the model can't switch one off. If you decline, it may not
+suggest those skills again in that run unless you ask.
+
+A skill switched on after the conversation has begun, at the model's suggestion or with `:skill NAME
+on` (`/skills` in hoplon-tui), comes into the conversation where it was switched on: with the
+suggestion's answer, or with your next message. The system prompt stays the same, so the server can
+keep using what it has cached. Switching a skill off takes its text out of the conversation again.
+
 `not-secret.json`, next to `config.json`, holds the files you said hold no secrets though they look
 as if they do (the sha256 of each text, and where it was); remove an entry to be asked again.
 

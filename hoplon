@@ -49,6 +49,9 @@ SNAPSHOT_CAP = 8 * WRITE_CAP   # maximum existing file size for an approved over
 ATTACH_CAP = 256 * 1024        # bytes per -f file
 OUTPUT_CAP = 32 * 1024         # chars of command output before head/tail cut
 REPLY_CAP = 8 * 1024 * 1024    # bytes of one endpoint reply (and of one streamed line)
+SKILL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,47}")    # a skill the model may be told of
+SKILL_DESC_MAX = 160        # characters of a skill's description in the model's list
+SKILL_SUGGEST_MAX = 5       # skills in one suggestion
 PROGRESS_EVERY = 0.5        # seconds between progress reports while a reply streams
 PATH_ARG = re.compile(r'"path"\s*:\s*"((?:[^"\\]|\\.){1,240})"')
 
@@ -96,7 +99,8 @@ EXIT_OK, EXIT_ERROR, EXIT_USAGE, EXIT_PROFILE, EXIT_API, EXIT_CONTEXT = 0, 1, 2,
 EXIT_INTERRUPT = 130
 
 INTRINSICS = ("propose_command", "read_file", "list_dir", "write_file", "edit_file", "propose_plan", "run_in_sandbox",
-              "search_files", "propose_work_plan", "finish_item", "retry_item", "request_samples")
+              "search_files", "propose_work_plan", "finish_item", "retry_item", "request_samples",
+              "suggest_skills")
 PLAN_STEPS = 30                # steps one plan may have
 ENDPOINT_KEYS = {"name", "base_url", "model", "key_env", "key_file", "context_limit", "timeout",
                  "ca_bundle", "headers", "params", "allow_http", "proxy", "description"}
@@ -3054,6 +3058,13 @@ SAMPLES_TOOL = _tool("request_samples", "Ask the user for real samples your test
                                   "them, such as tail -n 200 /var/log/app.log > app.log."},
                       "reason": _REASON}, ["what", "files", "reason"])
 
+SKILLS_TOOL = _tool("suggest_skills", "Ask the user to switch on skills from the list under 'Skills you can "
+                    "suggest'. They answer yes or no; on yes, each skill's text comes back in this call's result. "
+                    "You can't switch a skill off, and you can't switch one on without asking.",
+                    {"names": {"type": "array", "items": {"type": "string"},
+                               "description": "The skills to switch on, by name, from the list."},
+                     "reason": _REASON}, ["names", "reason"])
+
 # Offered only in a work session, in place of propose_plan and propose_command.
 WORK_PLAN_TOOL = _tool("propose_work_plan", "Propose the plan for this work session: the items, in order, each a "
                        "piece of the task you can finish and commit on its own. The user approves it before you start. "
@@ -3121,6 +3132,14 @@ WHERE_STANDINS_WORK = ("If a test needs data or a service that isn't in the copy
                        "session waits for the user.")
 
 # Added to the system prompt while a plugin's trusted commands are offered.
+SKILL_RULES = """
+
+# Skills you can suggest
+Skills are instructions the user wrote or chose and blessed: house rules and know-how for a tool, a language or a site. A skill that is on appears in full under a "# Skill: NAME" heading, in this prompt or later in the conversation. These are the blessed skills; some may be on already:
+{index}
+
+Before you propose a plan or a work plan, and when a request clearly needs one, check this list against the request. If a skill that is not on looks needed, call suggest_skills first and wait for the answer; then plan. Don't ask when the skills that are on already look right, and never suggest a skill the user declined unless they ask for it."""
+
 TRUSTED_RULES = """
 
 # Trusted commands
@@ -3575,6 +3594,7 @@ class Kind:
 PROPOSAL_KINDS = {k.name: k for k in (       # every kind of proposal there is; a call for any other tool is invalid
     Kind("command", "propose_command", "build_command", "perform_command", shown=True),
     Kind("samples", "request_samples", "build_samples", "perform_samples", shown=True),
+    Kind("skills", "suggest_skills", "build_skills", "perform_skills"),
     Kind("sandbox", "run_in_sandbox", "build_sandbox", "run_sandboxed", bulk=True),
     Kind("search", "search_files", "search_proposal", "perform_file", bulk=True),
     Kind("read", "read_file", "build_read", "perform_file", bulk=True),
@@ -3628,7 +3648,9 @@ UNOFFERED = {"search_files": "is only available in coding mode",
              "finish_item": "is only available in a work session",
              "retry_item": "is only for reviewing an item that used its steps",
              "propose_command": "is not available in a work session: run_in_sandbox runs commands there",
-             "propose_plan": "is not available in a work session: propose_work_plan plans one"}
+             "propose_plan": "is not available in a work session: propose_work_plan plans one",
+             "suggest_skills": "is not available now: no skill is left to suggest (each one is on, or the user "
+                               "declined it), or nobody is there to answer"}
 
 
 class Halted(Exception):
@@ -3663,6 +3685,9 @@ class Engine:
         self.commands = []       # command proposals shown in this process, newest last
         self.offered = offered
         self.skills = []
+        self.skill_index = []    # [(name, description)] of every blessed skill, for the model's list
+        self.queued_skills = []  # switched on mid-conversation: their text goes with the next user message
+        self.declined_skills = set()     # suggestions the user said no to; the model may not ask again
         self.reload_skills()
         self.plugins = []        # enabled plugins; never saved with the session
         self.trusted = {}        # tool name -> TrustedCommand, for the enabled plugins
@@ -3757,8 +3782,28 @@ class Engine:
     def reload_skills(self):
         if self.offered is not None:
             self.skills = [self.offered["skills"][n] for n in self.session.skills if n in self.offered["skills"]]
-            return
-        self.skills = load_skills(self.cfg, self.session.skills, self.ui.notice)
+            found = {n: s for n, s in self.offered["skills"].items()}
+        else:
+            self.skills = load_skills(self.cfg, self.session.skills, self.ui.notice)
+            found = {n: s for n, s in find_skills(self.cfg).items() if skill_status(self.cfg, s) == "blessed"}
+        self.skill_index = [(n, one_line(s.description())[0][:SKILL_DESC_MAX]) for n, s in sorted(found.items())
+                            if SKILL_NAME.fullmatch(n)]
+        self.blessed_skills = found
+
+    def carried_skills(self):
+        """Skills whose text the conversation itself carries: switched on after it began, so the system prompt
+        stays as it was (and the server's cache with it). Pruned or summarized away, a skill is carried no more and
+        the system prompt has it again."""
+        return {n for m in self.session.messages if not m.get("_pruned") for n in (m.get("_skills") or {})}
+
+    def skill_block(self, s, why):
+        return (f"\n\n[skill {s.name}: {why}; its text follows]\n# Skill: {s.name}\n\n{s.text().rstrip()}\n"
+                f"[end of skill {s.name}]")
+
+    def skills_open(self):
+        """Blessed skills that are off and not declined: what suggest_skills may name."""
+        on = {s.name for s in self.skills}
+        return [n for n, _ in self.skill_index if n not in on and n not in self.declined_skills]
 
     def skill_rows(self):
         found = self.offered["skills"] if self.offered is not None else None
@@ -3788,8 +3833,10 @@ class Engine:
         self.coding_from = source if on else None
         self.audit.log("coding", on=on, source=source, cwd=os.getcwd(), override=self.coding_override)
 
-    def set_skill(self, name, on):
-        """Use a skill from the next request on, or stop using it. Only a blessed skill can be turned on."""
+    def set_skill(self, name, on, source="user", carry=True):
+        """Use a skill from the next request on, or stop using it. Only a blessed skill can be turned on. Once the
+        conversation has begun, a skill switched on goes with the next user message (carry), not into the system
+        prompt; one switched off has its text taken out of the conversation too."""
         if on:
             s = (find_skills(self.cfg) if self.offered is None else self.offered["skills"]).get(name)
             if not s:
@@ -3800,11 +3847,21 @@ class Engine:
                                  "not_blessed")
             if name not in self.session.skills:
                 self.session.skills.append(name)
-        elif name in self.session.skills:
-            self.session.skills.remove(name)
+                if carry and self.session.messages and name not in self.queued_skills:
+                    self.queued_skills.append(name)
+        else:
+            if name in self.session.skills:
+                self.session.skills.remove(name)
+            if name in self.queued_skills:
+                self.queued_skills.remove(name)
+            for m in self.session.messages:
+                block = (m.get("_skills") or {}).pop(name, None)
+                if block is not None and isinstance(m.get("content"), str):
+                    m["content"] = m["content"].replace(block, f"\n\n[skill {name}: switched off by the user; "
+                                                               "its text was removed]")
         self.reload_skills()
         self.session.usage = None   # the system prompt changed, so the last measured size no longer holds
-        self.audit.log("skill", name=name, on=on)
+        self.audit.log("skill", name=name, on=on, source=source)
 
     def set_plugin(self, name, on):
         """Offer a plugin's trusted commands to the model and the user from the next request on, or stop. Only a
@@ -4192,8 +4249,16 @@ class Engine:
                     + ([RETRY_TOOL] if self.work.role == "review" else []))
         return (TOOLS + ([SEARCH_TOOL] if self.can_search() else [])
                 + ([RUN_TOOL, SAMPLES_TOOL] if self.can_run() else [])
+                + ([SKILLS_TOOL] if self.can_suggest_skills() else [])
                 + [c.schema(host) for c in self.trusted_tools().values()]
                 + list(self.external.values()))
+
+    def can_suggest_skills(self, index_only=False):
+        """Someone is there to answer, outside a work session, and there are blessed skills to list (index_only)
+        or ones left to suggest."""
+        if not self.ui.performs or self.work or not self.skill_index:
+            return False
+        return index_only or bool(self.skills_open())
 
     def where(self):
         """The system prompt's "Where things are": what the model's tools reach, as it is now."""
@@ -4240,8 +4305,13 @@ class Engine:
             parts.append(TRUSTED_RULES)
         if self.ui.performs:
             parts.append(self.where())
+        if self.can_suggest_skills(index_only=True):
+            parts.append(SKILL_RULES.replace("{index}", "\n".join(f"- {n}: {d}" if d else f"- {n}"
+                                                                   for n, d in self.skill_index)))
+        later = self.carried_skills() | set(self.queued_skills)
         for s in self.skills:
-            parts.append(f"\n\n# Skill: {s.name}\n\n{s.text()}")
+            if s.name not in later:
+                parts.append(f"\n\n# Skill: {s.name}\n\n{s.text()}")
         if self.plan:
             parts.append("\n\n# The plan the user approved\n\n" + plan_text(self.plan))
         if self.work and self.work.items:
@@ -4307,12 +4377,20 @@ class Engine:
         msg = {"role": "user", "content": content}
         if attachments:
             msg["_bulk"] = True
+        carry = {}
+        for s in self.skills:
+            if s.name in self.queued_skills:
+                carry[s.name] = self.skill_block(s, "switched on by the user")
+        if carry:
+            msg["content"] += "".join(carry.values())
+            msg["_skills"] = carry
         self.session.add(msg)
         try:
             self.check_budget()
         except HoplonError:
             self.session.drop_last()
             raise
+        self.queued_skills = [n for n in self.queued_skills if n not in carry]
         try:
             ended = self.loop(checked=True)
             if self.work and self.work.done() and ended == "reply":
@@ -4392,6 +4470,8 @@ class Engine:
                             and mark != (self.work.current, self.work.swap, len(self.work.reports))):
                         moved = PROPOSAL_KINDS[p.kind].tool
                 tool_msg = {"role": "tool", "tool_call_id": p.call_id, "content": result}
+                if getattr(p, "carry", None):
+                    tool_msg["_skills"] = p.carry
                 kind = PROPOSAL_KINDS.get(p.kind)
                 if kind and kind.bulk and p.decision == "accept":
                     tool_msg["_bulk"] = True
@@ -4473,6 +4553,25 @@ class Engine:
         fx = self.fixtures_store()
         return Proposal(pid, "samples", call_id, what=what, files=files[:20], suggest=suggest or "", reason=reason,
                         folder=fx.dir)
+
+    def build_skills(self, pid, call_id, args, reason, name):
+        names = args.get("names")
+        if not self.can_suggest_skills(index_only=True):
+            raise ValueError("suggest_skills is not available now")
+        if not isinstance(names, list) or not names or not all(isinstance(n, str) for n in names):
+            raise ValueError("names must list skills from 'Skills you can suggest'")
+        names = list(dict.fromkeys(names))
+        if len(names) > SKILL_SUGGEST_MAX:
+            raise ValueError(f"suggest at most {SKILL_SUGGEST_MAX} skills at a time")
+        on, index = {s.name for s in self.skills}, dict(self.skill_index)
+        for n in names:
+            if n not in index:
+                raise ValueError(f"'{one_line(n)[0][:40]}' is not in the list of skills you can suggest")
+            if n in on:
+                raise ValueError(f"skill {n} is on already")
+            if n in self.declined_skills:
+                raise ValueError(f"the user declined skill {n}; don't suggest it again unless they ask")
+        return Proposal(pid, "skills", call_id, names=names, about=[index[n] for n in names], reason=reason)
 
     def build_sandbox(self, pid, call_id, args, reason, name):
         cmd = args.get("command")
@@ -4798,6 +4897,8 @@ class Engine:
             if p.kind != "external":    # the wrapper's answer (ok, declined, error) is its result, not a decision
                 p.decision = p.decision if p.decision in ("accept", "decline") else "decline"
                 self.audit.log("decision", id=p.id, decision=p.decision)
+                if p.kind == "skills" and p.decision != "accept":
+                    self.declined_skills.update(p.fields["names"])     # the model may not suggest them again
             if p.kind in ("edit", "write") and self.edits == "approved-files":
                 key = self.file_key(p.fields.get("path"))
                 if p.decision == "accept" and key and key not in self.approved_files:
@@ -4902,6 +5003,23 @@ class Engine:
 
     def perform_command(self, p):
         return "shown to the user, not run. If they run it, they may send you the output."
+
+    def perform_skills(self, p):
+        """Switch them on, carried by this call's result. A skill that can't be (its blessing changed since) is
+        reported, and the others still go on."""
+        p.carry, failed = {}, []
+        for n in p.fields["names"]:
+            try:
+                self.set_skill(n, True, source="suggestion", carry=False)
+            except HoplonError as e:
+                failed.append(f"{n} ({e})")
+                continue
+            s = next(s for s in self.skills if s.name == n)
+            p.carry[n] = self.skill_block(s, "switched on by the user at your suggestion")
+        self.ui.skills_changed(self.skill_rows())
+        head = (f"switched on: {', '.join(p.carry)}." if p.carry else "none was switched on.") + \
+            (f" Not switched on: {'; '.join(failed)}." if failed else "")
+        return head + "".join(p.carry.values())
 
     def perform_samples(self, p):
         return ("shown to the user, not run: nothing runs for a sample request. Wait for them: once they have put the samples in the folder and approved them, "
@@ -5346,6 +5464,10 @@ class PlainUI:
     def generated(self, stats):
         pass
 
+    def skills_changed(self, rows):
+        on = [one_line(r["name"])[0] for r in rows if r.get("active")]
+        self.notice(f"skills on: {', '.join(on) or 'none'}")
+
     def context(self, used, limit):
         pass
 
@@ -5502,6 +5624,10 @@ class TtyUI(PlainUI):
                 self.out.flush()
                 p.decision = "accept" if ask_yes(f"Approve {p.id} and start?") else "decline"
                 continue
+            elif p.kind == "skills":
+                rows = "\n".join(f"{one_line(n)[0]}: {one_line(d)[0]}" if d else one_line(n)[0]
+                                 for n, d in zip(f["names"], f["about"]))
+                head = f"Switch on these skills?\n{margin(rows)}"
             else:
                 head = f"Call {p.kind}?"
             self.out.write(f"\n\033[1m[{p.id}] {tagged(p.kind, f)}{p.kind}\033[0m — {one_line(f.get('reason', ''))[0]}\n"
@@ -5636,6 +5762,9 @@ class JsonUI:
 
     def progress(self, report):
         self.emit(dict(report, type="progress"))
+
+    def skills_changed(self, rows):
+        self.emit({"type": "skills", "skills": rows})
 
     def generated(self, stats):
         self.emit({"type": "generated", "tokens": stats["tokens"], "estimated": stats["estimated"],
