@@ -127,7 +127,7 @@ desktop notification, a sound, a message to your phone.
 
 - **Input:** one line of JSON on standard input, then end of input:
   `{"event": "approval", "count": 2, "kinds": ["edit", "write"], "session": "nightly",
-  "cwd": "/home/you/project", "endpoint": "work-llm", "sandbox": null, "version": "1.0.0"}`.
+  "cwd": "/home/you/project", "endpoint": "work-llm", "sandbox": null, "version": "1.1.0"}`.
 - **What it never gets:** file contents, proposal paths, command text, model text, or the key. The
   endpoint's key variable is removed from the hook's environment.
 - **Output:** thrown away. A hook cannot write to your terminal through hoplon, and it has no
