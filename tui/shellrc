@@ -121,3 +121,9 @@ if [ -n "${__hoplon_rc:-}" ]; then
     }
   fi
 fi
+
+# hoplon-share: output from here to the conversation, to go with your next message (tui/share.py). Only in this
+# pane on this machine: a hoplon-ssh session on another host has no way back to hoplon-tui's socket yet.
+if [ -n "${HOPLON_TUI_SHARE:-}" ]; then
+  hoplon-share() { "${HOPLON_TUI_PY:-python3}" "$HOPLON_TUI_SHARE" "$@"; }
+fi

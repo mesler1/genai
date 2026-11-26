@@ -29,6 +29,7 @@ ROLES = {
     "panel": {"coding", "skill", "skills", "command"},
     "menu": {"share", "menu", "mark"},
     "files": set(),          # the files feature adds what this pane may ask for
+    "pipe": set(),           # hoplon-share in the shell pane; the shared feature adds what it may send
 }
 # A plugin's pane connects as "plugin:NAME". It may run its own plugin's read-only commands, put text in the input box
 # and offer text to attach after the user reviews it; the plugins feature checks each request (tui/features/plugins.py).

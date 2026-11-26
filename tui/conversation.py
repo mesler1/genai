@@ -2514,7 +2514,7 @@ class App:
                 self.sent.pop(msg, None)                  # a pane (re)connected: send it everything
             elif role == "prompt":
                 self.from_prompt(msg)
-            elif role in ("panel", "files"):
+            elif role in ("panel", "files", "pipe"):        # the Hub let through only what the role may send
                 self.m.request(msg, role)
             elif role.startswith("plugin:") and self.m.feature("plugins"):
                 self.m.feature("plugins").request(self.m, role, msg)

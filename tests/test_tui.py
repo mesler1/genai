@@ -1336,7 +1336,7 @@ class TestSamplesAndLeftovers(unittest.TestCase):
     def model(self):
         m = C.Model()
         m.handle({"type": "hello", "version": "1", "endpoint": {"name": "e", "model": "m", "base_url": "u"},
-                  "sandbox": None, "features": ["fixtures", "leftovers", "alerts"]})
+                  "sandbox": None, "features": ["fixtures", "leftovers", "alerts", "shared"]})
         m.outbox.clear()
         return m
 
@@ -1438,6 +1438,105 @@ class TestSessionName(unittest.TestCase):
         self.assertEqual(C.fresh_session(where, lambda: next(tries)), "tui-bbbbbb")
 
 
+class TestShared(unittest.TestCase):
+    """hoplon-share in the shell pane queues output for your next message; /shared lists and takes it back."""
+
+    def model(self):
+        m = C.Model([f for f in F.load(core=C.CORE) if f.name == "shared"])
+        m.sent = []
+        m.send = m.sent.append
+        return m
+
+    def test_shares_wait_for_the_next_message_with_their_notes(self):
+        m = self.model()
+        m.request({"type": "piped", "note": "the flaky one", "command": "make test", "rc": 2, "text": "FAIL x\n",
+                   "cwd": "/w"}, "pipe")
+        m.request({"type": "piped", "note": "", "command": None, "rc": None, "text": "a\nb\n"}, "pipe")
+        m.request({"type": "piped", "text": 5}, "pipe")                      # malformed: ignored
+        self.assertEqual(len(m.next_attachments), 2)
+        self.assertIn("2 waiting", text_of(m.blocks[-1]))
+        self.assertEqual(m.sent, [])                                         # nothing starts a turn
+        self.assertEqual(m.next_attachments[0]["label"],
+                         "shared from the shell pane: the flaky one — `make test` (exit 2) in /w")
+        self.assertIn("exit code unknown", m.next_attachments[1]["label"])
+        m.submit("/shared")
+        self.assertIn("the flaky one", "\n".join(text_of(b) for b in m.blocks[-4:]))
+        m.submit("/shared drop 2")
+        self.assertEqual(len(m.next_attachments), 1)
+        m.submit("/shared drop 9")
+        self.assertIn("usage", text_of(m.blocks[-1]))
+        m.hello = {"type": "hello"}
+        m.submit("what do you make of this?")
+        self.assertEqual([x["type"] for x in m.sent], ["attach", "user"])
+        self.assertEqual(m.sent[0]["text"], "FAIL x")
+        self.assertEqual(m.next_attachments, [])
+
+    def test_clear_and_the_panel_count(self):
+        m = self.model()
+        m.request({"type": "piped", "text": "x"}, "pipe")
+        view = {}
+        m.features[0].snapshot(m, view)
+        self.assertEqual(view["shared"], 1)
+        m.submit("/shared clear")
+        self.assertEqual(m.next_attachments, [])
+
+    def test_only_the_pipe_role_may_send_it(self):
+        hub_roles = C.feature_requests([f for f in F.load(core=C.CORE) if f.name == "shared"])
+        self.assertEqual(hub_roles, {"pipe": {"piped"}})
+
+
+class TestShareClient(unittest.TestCase):
+    """tui/share.py against a real socket: what it passes through, and what it sends."""
+
+    def setUp(self):
+        self.state = tempfile.mkdtemp(prefix="hs-", dir="/tmp")
+        self.addCleanup(shutil.rmtree, self.state, True)
+        self.hub = IPC.Hub(self.state, {"pipe": {"piped"}})
+        self.addCleanup(self.hub.close)
+
+    def run_share(self, args, stdin=None):
+        env = dict(os.environ, HOPLON_TUI_STATE=self.state)
+        r = subprocess.run([sys.executable, os.path.join(REPO, "tui", "share.py"), *args], input=stdin, env=env,
+                           capture_output=True, timeout=20)
+        msgs = []
+        while True:
+            try:
+                role, msg = self.hub.inbox.get(timeout=2)
+            except queue.Empty:
+                break
+            if role == "pipe":
+                msgs.append(msg)
+                break
+        return r, msgs
+
+    def test_piped_output_passes_through_and_is_sent_without_escapes(self):
+        r, msgs = self.run_share(["--note", "colours"], stdin=b"\x1b[31mred\x1b[0m line\nnext\n")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout, b"\x1b[31mred\x1b[0m line\nnext\n")            # your screen: unchanged
+        self.assertIn(b"2 lines queued for your next message", r.stderr)
+        self.assertEqual(msgs[0]["text"], "red line\nnext\n")
+        self.assertEqual((msgs[0]["note"], msgs[0]["command"], msgs[0]["rc"]), ("colours", None, None))
+
+    def test_a_command_is_run_and_its_exit_code_kept(self):
+        r, msgs = self.run_share(["--note", "n", "sh", "-c", "echo out; echo err >&2; exit 3"])
+        self.assertEqual(r.returncode, 3)
+        self.assertEqual(msgs[0]["rc"], 3)
+        self.assertEqual(sorted(msgs[0]["text"].split()), ["err", "out"])
+        self.assertEqual(msgs[0]["command"], "sh -c echo out; echo err >&2; exit 3")
+
+    def test_outside_hoplon_tui_it_says_so(self):
+        r = subprocess.run([sys.executable, os.path.join(REPO, "tui", "share.py")], input=b"x",
+                           env={k: v for k, v in os.environ.items() if k != "HOPLON_TUI_STATE"},
+                           capture_output=True, timeout=20)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn(b"only in hoplon-tui's shell pane", r.stderr)
+
+    def test_a_missing_command_is_127(self):
+        r, msgs = self.run_share(["no-such-command-zq91"])
+        self.assertEqual(r.returncode, 127)
+        self.assertEqual(msgs, [])
+
+
 class TestAlerts(unittest.TestCase):
     def setUp(self):
         self.home = tempfile.mkdtemp(prefix="hoplon-test-")
@@ -1501,17 +1600,17 @@ class TestFeatures(unittest.TestCase):
 
     def test_all_built_in_features_load(self):
         on = F.load(core=C.CORE)
-        self.assertEqual([f.name for f in on], ["model", "copy", "decline", "raw", "ssh", "files", "sandbox", "edits", "plugins", "work", "fixtures", "leftovers", "alerts"])
+        self.assertEqual([f.name for f in on], ["model", "copy", "decline", "raw", "ssh", "files", "sandbox", "edits", "plugins", "work", "fixtures", "leftovers", "alerts", "shared"])
         m = C.Model()
         self.assertEqual([f.name for f in m.features], [f.name for f in on])
-        self.assertEqual(list(m.commands())[-13:], ["/model", "/copy", "/decline", "/raw", "/system", "/files", "/sandbox", "/edits", "/plugins", "/work", "/fixtures", "/leftovers", "/alerts"])
+        self.assertEqual(list(m.commands())[-14:], ["/model", "/copy", "/decline", "/raw", "/system", "/files", "/sandbox", "/edits", "/plugins", "/work", "/fixtures", "/leftovers", "/alerts", "/shared"])
         self.assertEqual(C.feature_requests(on), {"panel": {"models"}, "menu": {"model", "copy", "raw", "system"},
-                          "files": {"list", "view", "attach", "insert"}})
+                          "files": {"list", "view", "attach", "insert"}, "pipe": {"piped"}})
 
     def test_environment_disables_a_feature(self):
         m, warning = self.model(self.environ(HOPLON_TUI_DISABLE="copy, model"))
         self.assertIsNone(warning)
-        self.assertEqual([f.name for f in m.features], ["decline", "raw", "ssh", "files", "sandbox", "edits", "plugins", "work", "fixtures", "leftovers", "alerts"])
+        self.assertEqual([f.name for f in m.features], ["decline", "raw", "ssh", "files", "sandbox", "edits", "plugins", "work", "fixtures", "leftovers", "alerts", "shared"])
         m.submit("/copy")
         self.assertIn("unknown command /copy (/help lists them)", text_of(m.blocks[-1]))
         m.submit("/help")
@@ -1527,7 +1626,7 @@ class TestFeatures(unittest.TestCase):
         self.write_config('{"disable": ["decline", "raw"]}')
         m, warning = self.model(self.environ())
         self.assertIsNone(warning)
-        self.assertEqual([f.name for f in m.features], ["model", "copy", "ssh", "files", "sandbox", "edits", "plugins", "work", "fixtures", "leftovers", "alerts"])
+        self.assertEqual([f.name for f in m.features], ["model", "copy", "ssh", "files", "sandbox", "edits", "plugins", "work", "fixtures", "leftovers", "alerts", "shared"])
         m.submit("/decline")
         self.assertIn("unknown command /decline", text_of(m.blocks[-1]))
 
@@ -1539,7 +1638,7 @@ class TestFeatures(unittest.TestCase):
         for text in ("{not json", '{"disable": "copy"}', '["copy"]', '{"disable": [1]}'):
             self.write_config(text)
             m, warning = self.model(self.environ())
-            self.assertEqual(len(m.features), 13, text)
+            self.assertEqual(len(m.features), 14, text)
             self.assertIn("was ignored, so every feature is on", warning)
 
     def test_the_hub_refuses_the_requests_of_a_disabled_feature(self):
@@ -2005,6 +2104,20 @@ class TestHoplonTui(TmuxCase):
 
     def sent(self, api):
         return [m for m in api.requests[-1]["body"]["messages"] if m["role"] == "user"][-1]["content"]
+
+    def test_hoplon_share_queues_output_for_the_next_message(self):
+        with FakeAPI([reply("looked at both")]) as api:
+            self.start(api)
+            self.shell("printf 'first-zq91\\n' | hoplon-share --note 'the first'")
+            self.wait_for("the first")
+            self.shell("hoplon-share --note 'the second' sh -c 'echo second-zq91; exit 4'")
+            self.wait_for("2 waiting")
+            self.assertEqual(api.requests, [])                     # nothing started a turn
+            self.type("what do you make of these?")
+            self.wait_for("looked at both")
+        body = json.dumps(api.requests[-1]["body"]["messages"])
+        for seen in ("first-zq91", "second-zq91", "the first", "the second", "(exit 4)"):
+            self.assertIn(seen, body)
 
     def test_a_conversation_is_kept_in_a_session_and_the_way_back_is_shown(self):
         out = open(os.path.join(self.tmp, "launcher.out"), "w+")

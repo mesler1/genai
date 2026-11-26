@@ -432,6 +432,11 @@ shared filesystem; never an abstract socket, which has no permissions).
 - An answer names the question it answers. One meant for a question that has gone, or not yet
   appeared, is ignored, and keys typed within 0.3 s of a question appearing count as typing.
 - Messages are size-limited; a line that is too long or not JSON ends the connection.
+- `hoplon-share` in the shell pane connects as `pipe` and can only queue output for your next
+  message. It starts no turn and answers nothing: each share shows as a line in the conversation
+  and in `/shared`, where you can take it back, and it reaches the model fenced as data, masked.
+  The shell pane is told where the socket is (`HOPLON_TUI_STATE`), so a program you run there
+  can queue a share too, which it could already do by finding the socket (see below).
 - The file tree pane can only ask the conversation pane to list, view, attach or insert the path of a file.
   Listings and views go through hoplon's checks, and nothing goes to the model except an attachment you
   reviewed in your editor first.

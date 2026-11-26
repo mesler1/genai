@@ -108,6 +108,9 @@ def view(st, w, sel):
     head("CONTEXT")
     ctx = st.get("context") or [None, None]
     add(bar(ctx[0] or 0, ctx[1], w) if ctx[0] is not None else [("not measured yet", Q)])
+    if st.get("shared"):
+        n = st["shared"]
+        add([(fit(f"{n} shared, sent with your next message · /shared", w), D)])
     if st.get("busy"):
         add([("… hoplon is replying", W)])
     plan = st.get("plan")

@@ -100,6 +100,23 @@ what you save goes with your next message, and nothing does if you save an empty
 closes it, the arrows, PgUp/PgDn and the wheel scroll, `/` searches and `n`/`N` move between matches. To use
 another, set `HOPLON_TUI_PAGER` (for example `HOPLON_TUI_PAGER=less`).
 
+## Sending output from the shell pane
+
+`hoplon-share` sends output from the shell pane to the conversation, to go with your next message.
+Pipe into it, or give it a command to run so the exit code goes too:
+
+```bash
+make test 2>&1 | hoplon-share --note "the flaky one"
+hoplon-share --note "before the fix" make test
+```
+
+You still see the output as it runs. Nothing starts a turn: each share waits, with its note, so you
+can collect several and then ask about them all ("what do these have in common?"). `/shared` lists
+what is waiting, `/shared drop N` takes one back and `/shared clear` takes them all back; the info
+panel shows how many are waiting. `-r` opens the output in your editor before it is sent. Long output
+is cut to its start and end, and hoplon masks the secrets it recognises, as for `/share`. Not yet in
+remote mode, where the shell pane is on the other host.
+
 ## Features
 
 hoplon-tui's `/model`, `/copy`, `/decline`, `/raw`, `/system`, `/files`, `/sandbox`, `/edits`, `/plugins` and `/work`, and the `hoplon-ssh` handshake, are
@@ -111,7 +128,7 @@ features, each in its own module under `tui/features/`. To switch some off, list
 ```
 
 or set `HOPLON_TUI_DISABLE=copy,model` for one run. Names are `model`, `copy`, `decline`, `raw`,
-`ssh`, `files`, `sandbox`, `edits`, `plugins` (without it, no plugin pane can connect), `work`, `fixtures`, `leftovers` and `alerts` (without it, no bell). A disabled feature has no command, help line or menu item, and hoplon-tui's socket
+`ssh`, `files`, `sandbox`, `edits`, `plugins` (without it, no plugin pane can connect), `work`, `fixtures`, `leftovers`, `alerts` (without it, no bell) and `shared` (without it, hoplon-share sends nothing). A disabled feature has no command, help line or menu item, and hoplon-tui's socket
 refuses its requests. Without `ssh`, a hoplon-ssh session isn't followed. No file means
 everything is on; a file that can't be read is ignored, with a note in the conversation.
 

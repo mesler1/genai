@@ -170,7 +170,8 @@ shell_env=()
 # blanks. It has to be set before the first pane starts, so the server starts first.
 t -f /dev/null start-server \; set -g default-terminal screen-256color \; \
   new-session -d -s hoplon -n hoplon -x "$cols" -y "${rows:-40}" -c "$PWD" \
-  -e "HOPLON_TUI_TOGGLE=$here/shell-toggle" ${shell_env[@]+"${shell_env[@]}"} "bash --rcfile $(q "$here/shellrc") -i"
+  -e "HOPLON_TUI_TOGGLE=$here/shell-toggle" -e "HOPLON_TUI_STATE=$state" -e "HOPLON_TUI_PY=$py" \
+  -e "HOPLON_TUI_SHARE=$here/share.py" ${shell_env[@]+"${shell_env[@]}"} "bash --rcfile $(q "$here/shellrc") -i"
 started=1
 shell=$(t display -p -t hoplon '#{pane_id}')
 # tmux copies what the shell prints into a FIFO the conversation pane reads, in memory, to know each
