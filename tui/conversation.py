@@ -531,7 +531,7 @@ class Card(Block):
         """Where approving this acts: ▲ live, ⊡ isolated, an arrow where it crosses from the model to your side."""
         k = self.ev.get("kind")
         if k in ("edit", "write"):
-            return "⊡ the copy" if self.ev.get("work") else "⊡→▲ your files"
+            return "⊡ the copy" if self.ev.get("work") or self.ev.get("in_copy") else "⊡→▲ your files"
         return {"command": "⊡→▲ your shell", "trusted": "▲ runs live", "sandbox": "⊡ a throwaway run",
                 "samples": "▲→⊡ from your side"}.get(k if isinstance(k, str) else None, "")
 

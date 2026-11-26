@@ -214,6 +214,7 @@ class WorkTest(FakePodman):
                 p = g.until("proposal")
             self.assertEqual(p["path"], ".env")                 # .git never became a proposal
             self.assertIsNone(p.get("auto"))                    # a hidden file asks
+            self.assertTrue(p.get("in_copy"))                   # and its card says it lands in the copy
             g.send({"type": "decision", "id": p["id"], "digest": p["digest"], "decision": "decline"})
             g.until("done")
             g.close()

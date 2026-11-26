@@ -613,7 +613,8 @@ class TestSandboxStatus(unittest.TestCase):
                               ("p2", {"kind": "edit", "path": "a.py", "work": True}, "⊡ the copy · edit a.py"),
                               ("p3", {"kind": "command", "command": "ls"}, "⊡→▲ your shell · command"),
                               ("p4", {"kind": "trusted", "plugin": "slurm", "command": "jobs"}, "▲ runs live · slurm"),
-                              ("p5", {"kind": "read", "path": "a.py"}, "─ p5 · read a.py")):
+                              ("p5", {"kind": "read", "path": "a.py"}, "─ p5 · read a.py"),
+                              ("p6", {"kind": "write", "path": "b.py", "in_copy": True}, "⊡ the copy · create b.py")):
             m.handle(dict(ev, type="proposal", id=pid, reason="r"))
             head = "".join(t for t, _ in m.cards[pid].lines(80)[1])
             self.assertIn(want, head)

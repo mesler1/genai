@@ -239,6 +239,7 @@ class TestPlace(unittest.TestCase):
     def test_proposals_say_where_they_act(self):
         self.assertEqual(G.place("edit", {}), "⊡→▲ your files")
         self.assertEqual(G.place("write", {"work": True}), "⊡ the copy")
+        self.assertEqual(G.place("write", {"in_copy": True}), "⊡ the copy")     # a work-session write that asks
         self.assertEqual(G.place("command", {}), "⊡→▲ your shell")
         self.assertEqual(G.place("trusted", {}), "▲ runs live")
         self.assertEqual(G.tagged("read", {}), "")

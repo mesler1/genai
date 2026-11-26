@@ -4660,6 +4660,8 @@ class Engine:
             self.audit.log("proposal", **rec)
         live = [p for p in props if not p.error]
         for p in live:
+            if p.kind in ("edit", "write") and self.work:
+                p.fields["in_copy"] = True      # it lands in the copy, asked or not: the card says so
             if p.kind in ("edit", "write") and not p.auto and self.work_edit(p):
                 p.auto, p.fields["work"] = True, True
                 self.audit.log("auto_edit", id=p.id, kind=p.kind, path=p.fields["path"], work=True)
@@ -5267,7 +5269,7 @@ def place(kind, fields):
     """Where a proposal acts, as hoplon-tui's cards say it: ▲ live, ⊡ isolated, an arrow where it crosses to the
     user's side."""
     if kind in ("edit", "write"):
-        return "⊡ the copy" if fields.get("work") else "⊡→▲ your files"
+        return "⊡ the copy" if fields.get("work") or fields.get("in_copy") else "⊡→▲ your files"
     return {"command": "⊡→▲ your shell", "trusted": "▲ runs live", "sandbox": "⊡ a throwaway run"}.get(kind, "")
 
 
