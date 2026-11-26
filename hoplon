@@ -42,7 +42,7 @@ import urllib.request
 
 VERSION = "1.0.0"
 PROTOCOL = 1
-STEP_LIMIT = 10
+STEP_LIMIT = 50                # model steps in a row nobody decides anything in (max_steps)
 READ_CAP = 256 * 1024          # bytes per read_file
 WRITE_CAP = 1024 * 1024        # bytes per write_file / edit result
 SNAPSHOT_CAP = 8 * WRITE_CAP   # maximum existing file size for an approved overwrite
@@ -1238,6 +1238,8 @@ STARTER_CONFIG = {
              "endpoint_dirs, profile_dirs, skill_dirs, plugin_dirs: extra directories to search, after the ones here. "
              "fixtures_dir: where /fixtures keeps real samples for the model's test runs (default: "
              "~/.local/state/hoplon/fixtures); outside any project. "
+             "max_steps: model steps in a row that run without you deciding anything before the turn pauses "
+             "(default 50; a step where you approve or decline something starts the count again). "
              "alerts: false keeps the notify hook quiet (:alerts on|off switches it for a session). "
              "Endpoints, profiles, skills and plugins must be blessed: hoplon --bless PATH",
     "default_profile": None,
@@ -1249,6 +1251,7 @@ STARTER_CONFIG = {
     "skill_dirs": [],
     "plugin_dirs": [],
     "fixtures_dir": None,
+    "max_steps": STEP_LIMIT,
     "alerts": True,
 }
 
@@ -1278,6 +1281,10 @@ class Config:
         if not isinstance(data.get("alerts", True), bool):
             raise HoplonError("config.json: alerts must be true or false")
         self.alerts = data.get("alerts", True)
+        steps = data.get("max_steps", STEP_LIMIT)
+        if type(steps) is not int or not 1 <= steps <= 1000:
+            raise HoplonError("config.json: max_steps must be a whole number from 1 to 1000")
+        self.max_steps = steps
         self.default_profile = data.get("default_profile")
         self.default_endpoint = data.get("default_endpoint")
         self.default_skills = list(data.get("default_skills", []))
@@ -4236,8 +4243,9 @@ class Engine:
                     self.ui.notice(f"work session paused: {why}. Send a message to go on with a fresh budget, "
                                    "or end the session")
                     return "work_limit"
-            elif step >= STEP_LIMIT:
-                self.ui.notice(f"step limit ({STEP_LIMIT}) reached; send a message to continue")
+            elif step >= self.cfg.max_steps:
+                self.ui.notice(f"{step} steps in a row ran without you deciding anything (max_steps in "
+                               "config.json); send a message to continue")
                 return "step_limit"
             if self.work:
                 try:
@@ -4264,6 +4272,8 @@ class Engine:
                 return "reply"
             props = [self.make_proposal(tc) for tc in calls]
             self.decide(props)
+            if any(not p.auto and not p.error for p in props):
+                step = 0                # you decided something: you are the brake, so the count starts again
             ended = stopped = False
             moved = None        # a plan, finish or retry that took effect: what follows it was decided for before
             for p in props:

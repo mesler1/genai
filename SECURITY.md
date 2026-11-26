@@ -111,8 +111,10 @@ much permission and too much autonomy.
   other file there. The model can't make one, and Linux normally lets you hard-link only
   your own files, so only a hard link you made yourself does this. Files that look like
   secrets still ask, wherever they are linked from.
-- **Autonomy.** A turn ends when a command is proposed. A turn is capped at 10 model steps,
-  which also caps how many sandboxed runs one turn makes.
+- **Autonomy.** A turn ends when a command is proposed. A turn pauses after 50 model steps in a
+  row in which nobody decided anything (`max_steps` in config.json, 1 to 1000), which also caps
+  how many automatic sandboxed runs one turn makes. A step where you approve or decline something
+  starts the count again: you are the brake then.
   Reads are capped at 256 KiB, writes at 1 MiB, overwrite snapshots at 8 MiB, and directory scans at 500 entries plus a truncation check. Without a terminal and
   outside JSON mode, nothing is performed at all.
 

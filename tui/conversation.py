@@ -722,7 +722,8 @@ class Model:
             self.retire("the turn ended before you answered")
             self.context = ((ev.get("context") or {}).get("used"), (ev.get("context") or {}).get("limit"))
             if ev.get("reason") == "step_limit":
-                self.note("hoplon stopped after its step limit; send a message to continue", W)
+                self.note("hoplon paused: many steps in a row ran without you deciding anything (max_steps); "
+                          "send a message to continue", W)
             elif ev.get("reason") == "work_limit":
                 self.note("the work session paused at a limit: send a message to go on, or /work end", W)
             self.next_queued()
