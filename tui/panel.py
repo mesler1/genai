@@ -47,21 +47,7 @@ def view(st, w, sel):
     if not st:
         add([("waiting for the conversation…", Q)])
         return lines, acts
-    h = st.get("session") or {}
-    head("SESSION")
-    for label, value, role in (("endpoint", h.get("endpoint"), ""), ("model", h.get("model"), ""),
-                               ("profile", h.get("profile") or "none", "" if h.get("profile") else Q),
-                               ("session", h.get("session") or "not saved", "" if h.get("session") else Q)):
-        if label == "model":                             # a click opens the /model drop-down
-            add([(f"{label:9}", Q), (fit(clean(value or "?"), w - 11), role), (" ▾", A)], "model")
-            continue
-        add([(f"{label:9}", Q), (fit(clean(value or "?"), w - 9), role)])
-    gw = h.get("hoplon_where")
-    if gw:
-        add([("hoplon    ", Q), (fit(clean(gw[0].removeprefix("hoplon runs ")), w - 9), R if gw[1] == R else W)])
-    coding = st.get("coding")
-    add([("coding   ", Q), ("[on] " if coding else "[off]", W if coding else ""),
-         (fit("  c switches" if not coding else "  reads without asking", w - 14), Q)], "coding")
+    h = st.get("session") or {}        # endpoint, model, profile, session and coding are in the header
     head("WHERE")
     # What is live and what is isolated: each line names one thing and marks it, ⊡ isolated or ▲ live.
     L, V = 14, w - 14
@@ -88,7 +74,10 @@ def view(st, w, sel):
     else:
         text = "this host, no sandbox" if where == "OUTSIDE any sandbox, directly on this host" else clean(where)
         add([("your commands ", Q), (fit("▲ " + text, V), W)])
-    if h.get("sandbox"):
+    gw = h.get("hoplon_where")
+    if gw:                                   # remote mode: ON host AS user in dir, red as root
+        add([("hoplon itself ", Q), (fit("▲ " + clean(gw[0].removeprefix("hoplon runs ")), V), R if gw[1] == R else W)])
+    elif h.get("sandbox"):
         add([("hoplon itself ", Q), (fit(f"⊡ in the {clean(h['sandbox'])} sandbox", V), D)])
     else:
         add([("hoplon itself ", Q), (fit("▲ this host", V), "")])      # the usual way to run it: not a fault
@@ -250,8 +239,6 @@ class Panel:
         st = self.st or {}
         if what == "coding":
             ok = self.request({"type": "coding", "on": not st.get("coding")})
-        elif what == "model":
-            ok = self.request({"type": "models"})
         elif isinstance(what, tuple) and what[0] == "cmd" and type(what[1]) is int:
             ok = self.request({"type": "command", "n": what[1]})
         elif isinstance(what, int) and what < len(self.skills()):

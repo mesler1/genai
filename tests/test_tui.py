@@ -668,7 +668,7 @@ class TestSandboxStatus(unittest.TestCase):
 
     def test_project_files_say_whose_they_are(self):
         text = self.panel(self.model())
-        self.assertTrue(text.startswith("SESSION") and "\nWHERE\n" in text)
+        self.assertTrue(text.startswith("WHERE\n"))                 # the session's details are in the header
         self.assertIn("project files ▲ yours, edits ask", text)
         PANEL = load("panel", os.path.join(REPO, "tui", "panel.py"))
         for extra, want in (({"work": {"branch": "hoplon/work-3", "status": "s"}}, "project files ⊡ copy hoplon/work-3"),
@@ -1689,7 +1689,7 @@ class TestFeatures(unittest.TestCase):
         m = C.Model()
         self.assertEqual([f.name for f in m.features], [f.name for f in on])
         self.assertEqual(list(m.commands())[-14:], ["/model", "/copy", "/decline", "/raw", "/system", "/files", "/sandbox", "/edits", "/plugins", "/work", "/fixtures", "/leftovers", "/alerts", "/shared"])
-        self.assertEqual(C.feature_requests(on), {"panel": {"models"}, "menu": {"model", "copy", "raw", "system"},
+        self.assertEqual(C.feature_requests(on), {"menu": {"model", "copy", "raw", "system"},
                           "files": {"list", "view", "attach", "insert"}, "pipe": {"piped"}})
 
     def test_environment_disables_a_feature(self):
@@ -2374,7 +2374,10 @@ class TestHoplonTui(TmuxCase):
             self.assertIn("▲ this host, no sandbox" if not G.sandbox_info() else "⊡ inside", self.screen("info"))
             self.tmux("send-keys", "-t", self.panes()["info"], "c")
             self.wait_for("coding mode is on")
-            self.wait_for("[on]", pane="info")
+            end = time.time() + 5                                       # the header says so
+            while "◆ coding" not in self.tmux("show", "-gv", "@hoplon_header") and time.time() < end:
+                time.sleep(0.1)
+            self.assertIn("◆ coding", self.tmux("show", "-gv", "@hoplon_header"))
             self.tmux("send-keys", "-t", self.panes()["info"], " ")
             self.wait_for("[x] slurm", pane="info")
             self.type("/panel")
@@ -2408,7 +2411,10 @@ class TestHoplonTui(TmuxCase):
             env = dict(os.environ, HOPLON_TUI_STATE=self.runtime_state())
             subprocess.run([sys.executable, os.path.join(REPO, "tui", "request.py"), "model", "1"], env=env, check=True)
             self.wait_for("model: coder-model from your next message")
-            self.wait_for("coder-model ▾", pane="info")
+            end = time.time() + 5                                       # the header names it
+            while "coder-model" not in self.tmux("show", "-gv", "@hoplon_header") and time.time() < end:
+                time.sleep(0.1)
+            self.assertIn("coder-model", self.tmux("show", "-gv", "@hoplon_header"))
             self.type("and now?")
             self.wait_for("from coder")
             self.assertEqual([r["body"]["model"] for r in api.requests if r.get("body")], ["fake-model", "coder-model"])

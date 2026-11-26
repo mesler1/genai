@@ -17,7 +17,7 @@ class ModelPicker(Feature):
     needs = "models"
     cant = "list or switch models"
     events = ("models", "model")
-    requests = {"models": ("panel",), "model": ("menu",)}
+    requests = {"model": ("menu",)}
     actions = ("model_menu",)
 
     def __init__(self):
@@ -56,9 +56,7 @@ class ModelPicker(Feature):
             m.note(f"model: {clean(str((ep or {}).get('model', '?')))} from your next message", self.core.D)
 
     def request(self, m, role, msg):
-        if msg.get("type") == "models":
-            m.command("/model")
-        elif type(msg.get("n")) is int and 0 <= msg["n"] < len(self.models):
+        if type(msg.get("n")) is int and 0 <= msg["n"] < len(self.models):
             m.command(f"/model {self.models[msg['n']]}")      # the menu sent a position; the name is ours
 
     def action(self, app, action):
