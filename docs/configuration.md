@@ -49,6 +49,9 @@ skill isn't on, it tells the model to say its general knowledge may not match th
 switching that skill on. hoplon never loads one skill because of another. The `hoplon-skill`
 authoring skill has a template for a site skill.
 
+On a shared cluster, `multi-user` and `parallel-fs` are worth having on all the time: bless them
+and add them to `default_skills`. hoplon doesn't switch any skill on by itself.
+
 ### Skills the model can suggest
 
 The model sees one line for each blessed skill: its name and description (the first line of its
