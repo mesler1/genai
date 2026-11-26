@@ -33,6 +33,9 @@ hoplon --bless /path/to/hoplon/profiles/coder.json
 hoplon --bless /path/to/hoplon/skills/bash-scripts
 ```
 
+`not-secret.json`, next to `config.json`, holds the files you said hold no secrets though they look
+as if they do (the sha256 of each text, and where it was); remove an entry to be asked again.
+
 ## Files
 
 ```

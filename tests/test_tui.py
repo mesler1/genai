@@ -318,6 +318,17 @@ class TestModel(unittest.TestCase):
         self.assertEqual(m.outbox[-1], {"type": "user", "text": "two"})
         self.assertTrue(m.busy)
 
+    def test_a_secret_looking_read_can_be_allowed_as_not_secret(self):
+        m = C.Model()
+        m.submit("go")
+        m.handle({"type": "proposal", "id": "p1", "kind": "read", "path": "ptop", "secret": True, "digest": "d1"})
+        m.handle({"type": "proposal", "id": "p2", "kind": "read", "path": "b", "digest": "d2"})
+        m.decide(True, not_secret=True)
+        m.decide(True, not_secret=True)                  # only a secret-looking read takes it
+        self.assertEqual(m.outbox[1:], [{"type": "decision", "id": "p1", "decision": "accept", "digest": "d1",
+                                         "not_secret": True},
+                                        {"type": "decision", "id": "p2", "decision": "accept", "digest": "d2"}])
+
     def test_approvals_go_in_order_and_cards_follow_results(self):
         m = C.Model()
         m.submit("go")

@@ -154,6 +154,14 @@ class TestMasks(FakePodman):
         root = self.project({".git/config": '[remote "o"]\n\turl = https://me:ghp_abcdefghijklmnopqrstuvwxyz0123456789@x/r\n'})
         self.assertEqual(G.Sandbox(conf(), root, print).masks(), ([".git/config"], []))
 
+    def test_contents_you_said_hold_no_secrets_are_not_hidden(self):
+        text = "password = hunter2hunter2\n"
+        root = self.project({"conf/settings.ini": text, ".env": "X=1\n"})
+        box = G.Sandbox(conf(), root, print)
+        self.assertEqual(box.masks(), ([".env", "conf/settings.ini"], []))
+        box.excused = lambda: {G.text_digest(text): {}}
+        self.assertEqual(box.masks(), ([".env"], []))              # a secret name still hides
+
     def test_the_endpoint_key_is_a_secret_too(self):
         root = self.project({"notes.txt": "the key is abcdef0123456789xyz\n"})
         box = G.Sandbox(conf(), root, print)

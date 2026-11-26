@@ -93,7 +93,10 @@ What remains: the endpoint receives every prompt, attachment and file the model 
 coding mode the model reads non-hidden files in the working directory without asking (hidden: a
 name starting with `.`, or one the sandbox hides as a secret, such as `id_rsa` or `*.key`; a file
 that looks like it holds secrets still asks), so treat the directory as shared with the
-endpoint.
+endpoint. When you allow such a read and say the file holds no secrets after all, hoplon
+remembers the sha256 of that text (`not-secret.json`, and a `not_secret` event in the audit log):
+that text no longer asks, is searched and is not hidden in the sandbox; any change asks again. A
+file holding the endpoint key is never excused.
 
 ### 3. Excessive agency and tool misuse
 

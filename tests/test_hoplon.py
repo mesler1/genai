@@ -1127,6 +1127,51 @@ class TestEndToEnd(Tmp):
             g.until("done")
             g.close()
 
+    def test_a_file_you_say_holds_no_secrets_reads_without_asking_until_it_changes(self):
+        read = call("read_file", path="notes.txt", reason="r")
+        with FakeAPI([read, reply("a"), read, reply("b"), read, reply("c"), call("search_files", pattern="xyz", reason="r"),
+                      reply("d")]) as api:
+            g = self.start(api, "--coding")
+            path = os.path.join(self.wd, "notes.txt")
+            with open(path, "w") as f:
+                f.write("password = hunter2xyz\n")
+            g.send({"type": "user", "text": "1"})
+            p = g.until("proposal")
+            self.assertTrue(p.get("secret"))
+            g.send({"type": "decision", "id": p["id"], "digest": p["digest"], "decision": "accept", "not_secret": True})
+            g.until("done")
+            g.send({"type": "user", "text": "2"})
+            self.assertTrue(g.until("proposal").get("auto"))       # the same text: no question
+            g.until("done")
+            with open(path, "a") as f:
+                f.write("more\n")
+            g.send({"type": "user", "text": "3"})
+            p = g.until("proposal")
+            self.assertFalse(p.get("auto"))                         # changed: it asks again
+            g.send({"type": "decision", "id": p["id"], "digest": p["digest"], "decision": "decline"})
+            g.until("done")
+            with open(path, "w") as f:
+                f.write("password = hunter2xyz\n")
+            g.send({"type": "user", "text": "4"})
+            g.until("proposal")
+            g.until("done")
+            g.close()
+        found = api.requests[-1]["body"]["messages"][-1]["content"]
+        self.assertIn("notes.txt:1", found)                         # the search no longer skips it
+        self.assertNotIn("looking like secrets", found)
+        with open(os.path.join(self.home, "not-secret.json")) as f:
+            saved = json.load(f)
+        self.assertEqual([v["path"] for v in saved.values()], [path])
+        self.assertEqual([a["path"] for a in self.audit() if a["event"] == "not_secret"], [path])
+
+    def test_the_endpoint_key_is_never_excused(self):
+        e = types.SimpleNamespace(secrets=lambda: ["KEY12345678"], cfg=types.SimpleNamespace(not_secret=dict))
+        text = "x = KEY12345678\n"
+        excused = {G.text_digest(text): {}}
+        self.assertTrue(G.Engine.secret_text(e, text, excused))
+        self.assertFalse(G.Engine.secret_text(e, "password = hunter2xyz\n", {G.text_digest("password = hunter2xyz\n"): {}}))
+        self.assertTrue(G.Engine.secret_text(e, "password = hunter2xyz\n", {}))
+
     def test_repl_picks_plan_steps(self):
         p = types.SimpleNamespace(id="p1")
         steps = [{"n": 1}, {"n": 2}, {"n": 3}]

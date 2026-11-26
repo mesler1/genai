@@ -1112,7 +1112,9 @@ class Model:
             msg["edits"] = {str(n): c for n, c in edits.items()}
         self.send(msg)
 
-    def decide(self, accept):
+    def decide(self, accept, not_secret=False):
+        """not_secret: you allowed a secret-looking read and said it holds none, so hoplon won't ask about it again
+        until the file changes."""
         if not self.pending:
             return
         card = self.pending.pop(0)
@@ -1121,7 +1123,8 @@ class Model:
         else:
             card.state = "accepted" if accept else "declined"
         card.changed()
-        self.send(answer(card, "decision", decision="accept" if accept else "decline"))
+        extra = {"not_secret": True} if accept and not_secret and card.ev.get("secret") else {}
+        self.send(answer(card, "decision", decision="accept" if accept else "decline", **extra))
 
 
 def answer(card, kind, **fields):
@@ -1787,6 +1790,10 @@ class App:
                 ep = (self.m.hello or {}).get("endpoint") or {}
                 to = c.ev.get("to") if isinstance(c.ev.get("to"), str) else ep.get("base_url", "the endpoint")
                 lines.append([(f"It looks like it holds secrets; allowing sends it to {clean(str(to))}", R)])
+                lines.append([("  y", A), (" yes   ", ""), ("a", A), (" yes, it holds none: don't ask until it changes   ",
+                                                                           ""), ("n", A), (" no   ", ""),
+                              ("v", A), (" view it all", "")])
+                return lines, None, "y allow · a allow, not secrets · n or Esc decline · v view in full"
             elif isinstance(c.ev.get("to"), str):
                 lines.append([(f"  Allowing sends it to the planner, at {one_row(c.ev['to'])}", W)])
             lines.append([("  y", A), (" yes   ", ""), ("n", A), (" no   ", ""), ("v", A), (" view it all", "")])
@@ -1903,6 +1910,8 @@ class App:
         if m.pending:
             if k in ("y", "Y"):
                 m.decide(True)
+            elif k in ("a", "A") and m.pending[0].ev.get("secret"):
+                m.decide(True, not_secret=True)
             elif k in ("n", "N"):
                 m.decide(False)
             elif k in ("v", "V"):

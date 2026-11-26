@@ -385,6 +385,11 @@ def looks_secret(text):
     return bool(redact(text)[1])
 
 
+def text_digest(text):
+    """The sha256 of a file's text, as remembered in not-secret.json."""
+    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
+
+
 def clip(text, cap=OUTPUT_CAP):
     """Keep the first and last parts of long output, with a marker between."""
     if len(text) <= cap:
@@ -666,7 +671,8 @@ class Sandbox:
         self.podman = shutil.which("podman")
         self.network = conf["network"]      # the switch; starts as the profile says, never saved with a session
         self.limits = True                  # False once the host refused memory and process limits
-        self.cache = {}                     # (path, identity) -> looks secret
+        self.cache = {}                     # (path, identity) -> (looks secret, digest, holds a value)
+        self.excused = dict                 # -> the not-secret digests (Config.not_secret), set by the Engine
         self.counter = 0
 
     def problem(self):
@@ -732,8 +738,9 @@ class Sandbox:
             if key not in self.cache:
                 with open(path, "rb") as f:
                     text = f.read(READ_CAP).decode("utf-8", "replace")
-                self.cache[key] = looks_secret(text) or any(v and v in text for v in values)
-            return self.cache[key]
+                self.cache[key] = (looks_secret(text), text_digest(text), any(v and v in text for v in values))
+            looks, digest, holds = self.cache[key]
+            return holds or (looks and digest not in self.excused())
         except OSError:
             return False
 
@@ -1309,6 +1316,7 @@ class Config:
         self.endpoint_dirs, self.profile_dirs, self.skill_dirs = dirs("endpoints"), dirs("profiles"), dirs("skills")
         self.plugin_dirs = dirs("plugins")
         self.blessed_path = os.path.join(self.home, "blessed.json")
+        self.not_secret_path = os.path.join(self.home, "not-secret.json")
         self.sessions = os.path.join(self.home, "sessions")
         state_directory(self.sessions)
         if os.path.islink(self.sessions):
@@ -1348,6 +1356,17 @@ class Config:
         b = self.blessed()
         b[path] = entry
         write_private(self.blessed_path, json.dumps(b, indent=2, sort_keys=True) + "\n")
+
+    def not_secret(self):
+        """Contents you said hold no secrets though they look as if they do: sha256 of the text -> where you saw it.
+        Only that exact text is excused; the endpoint key always counts."""
+        n = read_state_json(self.not_secret_path, {}) or {}
+        return n if isinstance(n, dict) else {}
+
+    def set_not_secret(self, digest, path):
+        n = self.not_secret()
+        n[digest] = {"path": path, "when": datetime.datetime.now().isoformat(timespec="seconds")}
+        write_private(self.not_secret_path, json.dumps(n, indent=2, sort_keys=True) + "\n")
 
 
 def _hash_bytes(h, label, data):
@@ -3585,6 +3604,8 @@ class Engine:
         self.warned = False
         self.sandbox = sandbox_info()
         self.box = Sandbox(profile.sandbox, os.getcwd(), ui.notice) if profile and profile.sandbox else None
+        if self.box:
+            self.box.excused = cfg.not_secret
         self.notifier = None     # the notify hook, set by main() when a person is at the terminal
         self.alerts = cfg.alerts  # False: the notify hook stays quiet (:alerts); it never runs under --json
         self.commands = []       # command proposals shown in this process, newest last
@@ -3829,8 +3850,8 @@ class Engine:
             old = self.wd.read(f["path"])
         except (ValueError, OSError):
             return False
-        secrets_ = [k for k in self.secrets() if k]
-        return not any(looks_secret(t) or any(k in t for k in secrets_) for t in (old, new or ""))
+        excused = self.cfg.not_secret()
+        return not any(self.secret_text(t, excused) for t in (old, new or ""))
 
     def work_edit(self, p):
         """Does this edit or write apply without asking, in a work session? Yes, in the copy, while an item of the
@@ -3852,8 +3873,8 @@ class Engine:
                 texts.append(self.wd.read(p.fields["path"]))
             except (ValueError, OSError):
                 return False
-        keys = [k for k in self.secrets() if k]
-        return not any(looks_secret(t) or any(k in t for k in keys) for t in texts)
+        excused = self.cfg.not_secret()
+        return not any(self.secret_text(t, excused) for t in texts)
 
     # -- work sessions
 
@@ -4564,7 +4585,7 @@ class Engine:
         """Run an automatic search_files: (what the model gets, a note for the user)."""
         f = p.fields
         fold = (lambda t: t.casefold()) if f.get("ignore_case") else (lambda t: t)
-        needle, keys = fold(f["pattern"]), self.secrets()
+        needle, excused = fold(f["pattern"]), self.cfg.not_secret()
         hits, files, skipped, stopped = [], 0, {}, None
         deadline = time.monotonic() + SEARCH_SECONDS
         for rel in self.wd.walk(f["path"]):
@@ -4584,7 +4605,7 @@ class Engine:
                 continue
             if needle not in fold(text):
                 continue
-            if looks_secret(text) or any(k and k in text for k in keys):
+            if self.secret_text(text, excused):
                 skipped["looking like secrets"] = skipped.get("looking like secrets", 0) + 1
                 continue
             for n, line in enumerate(text.split("\n"), 1):
@@ -4598,7 +4619,7 @@ class Engine:
                         break
             if stopped:
                 break
-        out, counts = redact("\n".join(hits), keys)
+        out, counts = redact("\n".join(hits), self.secrets())
         tail = [f"(stopped {stopped}; narrow it with path or glob)"] if stopped else []
         tail += [f"(skipped {n} file{'' if n == 1 else 's'} {why})" for why, n in sorted(skipped.items())]
         result = "\n".join(([out] if out else ["(no matches)"]) + tail)
@@ -4611,12 +4632,13 @@ class Engine:
         parts = split_rel(path) if path not in ("", ".", "./") else []
         rows = []
         entries, truncated = self.wd.list(path)
+        excused = self.cfg.not_secret()
         for name, kind, size in entries:
             sub = parts + [name]
             row = {"name": name, "kind": kind, "size": size, "hidden": is_hidden(sub)}
             if kind == "file":
                 try:
-                    row["secret"] = looks_secret(self.wd.read("/".join(sub)))
+                    row["secret"] = self.secret_text(self.wd.read("/".join(sub)), excused)
                 except (ValueError, OSError):
                     row["secret"] = None
                 row["asks"] = not self.read_allowed(sub) or row["secret"] is not False
@@ -4627,7 +4649,7 @@ class Engine:
         """A file for the user's viewer: read through the same checks as the model's reads, with the endpoint key
         masked. It goes to the wrapper only, never into the session. Returns (text, size, secret, redacted)."""
         text = self.wd.read(path)
-        secret = looks_secret(text) or any(key and key in text for key in self.secrets())
+        secret = self.secret_text(text)
         shown, counts = redact(text, self.secrets())
         self.audit.log("user_read", path=path, chars=len(text), secret=secret)
         return shown, len(text.encode()), secret, counts
@@ -4642,7 +4664,7 @@ class Engine:
             proposal.fields["_read_error"] = e
             proposal.auto = True
             return
-        if looks_secret(text) or any(key and key in text for key in self.secrets()):
+        if self.secret_text(text):
             proposal.fields["secret"] = True
             proposal.fields["to"] = to = self.active()[0].base_url     # where it goes: a planner may be elsewhere
             self.ui.notice(f"{path} looks like it contains secrets, so reading it needs your OK; allowing sends it "
@@ -4650,6 +4672,18 @@ class Engine:
             return
         proposal.fields["_read_text"] = text
         proposal.auto = True
+
+    def remember_not_secret(self, path, text):
+        """You said this file holds no secrets: don't ask about this exact text again. Not when it holds the endpoint
+        key, which always counts."""
+        if any(k and k in text for k in self.secrets()):
+            self.ui.notice(f"{path} holds the endpoint's key, so it will still ask")
+            return
+        digest = text_digest(text)
+        where = os.path.join(self.wd.root, path)
+        self.cfg.set_not_secret(digest, where)
+        self.audit.log("not_secret", path=where, sha256=digest)
+        self.ui.notice(f"{path}: you said it holds no secrets, so it won't ask again until the file changes")
 
     def read_allowed(self, parts):
         """Would reading this path be allowed without asking? (coding mode, not hidden)"""
@@ -4959,7 +4993,9 @@ class Engine:
                 text = p.fields["_read_text"] if p.auto else self.wd.read(p.fields["path"])
                 result = text
                 note = f"read {len(text)} characters"
-                if looks_secret(text):
+                if p.fields.get("_not_secret") and not p.auto:
+                    self.remember_not_secret(p.fields["path"], text)
+                if self.secret_text(text):
                     self.ui.notice(f"warning: {p.fields['path']} looks like it contains secrets; it was sent as is")
             elif p.kind == "search":
                 result, note = self.search(p)
@@ -5132,6 +5168,15 @@ class Engine:
         """Record that reviewed output is being sent to the model."""
         self.audit.log("shared", source=source, ref=ref, chars=len(text),
                        sha256=hashlib.sha256(text.encode("utf-8", "replace")).hexdigest())
+
+    def secret_text(self, text, excused=None):
+        """Does this text look like it holds secrets? The endpoint key always counts; the patterns don't for text you
+        said holds none (not-secret.json, matched by its sha256, so any change asks again)."""
+        if any(k and k in text for k in self.secrets()):
+            return True
+        if not looks_secret(text):
+            return False
+        return text_digest(text) not in (self.cfg.not_secret() if excused is None else excused)
 
     def secrets(self):
         """Exact values to mask in text bound for the model: the endpoint keys."""
@@ -5398,6 +5443,9 @@ class TtyUI(PlainUI):
                            f"{head}\n")
             self.out.flush()
             p.decision = "accept" if ask_yes(f"Accept {p.id}?") else "decline"
+            if p.decision == "accept" and f.get("secret") and ask_yes(
+                    "Does it hold no secrets after all? (it won't ask again until the file changes)"):
+                f["_not_secret"] = True
 
     def work(self, ev):
         state = ev["state"]
@@ -5592,6 +5640,8 @@ class JsonUI:
             elif t == "decision" and pid in waiting and waiting[pid].kind != "external":
                 p = waiting.pop(pid)
                 p.decision = msg.get("decision") if msg.get("decision") in ("accept", "decline") else "decline"
+                if p.decision == "accept" and msg.get("not_secret") is True and p.fields.get("secret"):
+                    p.fields["_not_secret"] = True
                 if p.kind == "plan" and p.decision == "accept" and not plan_choice(p, msg):
                     p.decision = "decline"
                     self.error(f"{pid}: approve must list step numbers, and edits map a command step's number to "

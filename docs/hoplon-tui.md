@@ -84,6 +84,14 @@ Limits: the host's login shell must be POSIX-like, its sshd must allow TCP forwa
 `python3`, `python3.13` ... `python3.10` is searched in that order for 3.10 or newer (SLES: `zypper install python311`).
 Another user of that host can reach the forwarded port, which is why the token matters (SECURITY.md).
 
+## Files that look like secrets
+
+In coding mode, reading a file that looks like it holds secrets asks first. If it doesn't (code
+like `token = token.strip()` can look like a password), answer `a` instead of `y`: hoplon
+remembers that exact text in `~/.config/hoplon/not-secret.json` and won't ask about it again, skip
+it in searches or hide it from sandboxed runs, until the file changes. A file holding the endpoint's
+key always asks. Remove an entry from that file, or the file, to be asked again.
+
 ## File tree
 
 `/files` shows or hides a file tree of the working directory on the left (`hoplon-tui --files` starts
