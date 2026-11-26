@@ -616,7 +616,7 @@ class TestRunning(PluginBase):
             ui.show_auto(p)
             ui.result(p, "ok", "exit 0 in 5 ms", output="line\x1b[2J\n", exit=0)
         text = err.getvalue()
-        self.assertIn("↳ [p1] fake.queue(user=alice, fmt=long): fakeq -u alice --fmt=long", text)
+        self.assertIn("↳ [p1] ▲ runs live · fake.queue(user=alice, fmt=long): fakeq -u alice --fmt=long", text)
         self.assertIn("\\x1b[2J", text)
         self.assertNotIn("\x1b", text)
 

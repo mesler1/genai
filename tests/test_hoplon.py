@@ -226,6 +226,19 @@ class TestSharedBlock(unittest.TestCase):
         self.assertNotEqual(G.shared_block(1, "x", body), block)  # a new tag each time
 
 
+class TestPlace(unittest.TestCase):
+    def test_proposals_say_where_they_act(self):
+        self.assertEqual(G.place("edit", {}), "⊡→▲ your files")
+        self.assertEqual(G.place("write", {"work": True}), "⊡ the copy")
+        self.assertEqual(G.place("command", {}), "⊡→▲ your shell")
+        self.assertEqual(G.place("trusted", {}), "▲ runs live")
+        self.assertEqual(G.tagged("read", {}), "")
+        out = io.StringIO()
+        G.TtyUI(out).show_command(types.SimpleNamespace(id="p1", kind="command",
+                                                         fields={"command": "ls", "reason": "look"}))
+        self.assertIn("⊡→▲ your shell · Proposed command [p1]", out.getvalue())
+
+
 class TestExactAndRedact(unittest.TestCase):
     def test_exact_flags_controls_and_bidi(self):
         disp, flagged = G.exact("ls\x1b[2J ‮gnp.exe")

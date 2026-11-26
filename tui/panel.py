@@ -61,8 +61,8 @@ def view(st, w, sel):
     coding = st.get("coding")
     add([("coding   ", Q), ("[on] " if coding else "[off]", W if coding else ""),
          (fit("  c switches" if not coding else "  reads without asking", w - 14), Q)], "coding")
-    head("SANDBOX")
-    # Three different things run in different places; each line names which, and marks it: ⊡ sandboxed, ▲ not.
+    head("WHERE")
+    # What is live and what is isolated: each line names one thing and marks it, ⊡ isolated or ▲ live.
     L, V = 14, w - 14
     run, going = st.get("runner"), st.get("running")
     if going:
@@ -91,6 +91,13 @@ def view(st, w, sel):
         add([("hoplon itself ", Q), (fit(f"⊡ in the {clean(h['sandbox'])} sandbox", V), D)])
     else:
         add([("hoplon itself ", Q), (fit("▲ this host", V), "")])      # the usual way to run it: not a fault
+    work, edits = st.get("work"), st.get("edits") or {}
+    if work:
+        add([("project files ", Q), ("⊡ ", D), (fit("copy " + one_row(work.get("branch", "")), V - 2), D)])
+    elif edits.get("mode") == "approved-files":
+        add([("project files ", Q), (fit("▲ yours, some edits don't ask", V), W)])
+    else:
+        add([("project files ", Q), (fit("▲ yours, edits ask", V), "")])
     add([(fit("/sandbox shows the details", w), Q)])
     head("CONTEXT")
     ctx = st.get("context") or [None, None]

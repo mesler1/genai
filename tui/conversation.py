@@ -19,6 +19,7 @@ import queue
 import re
 import shlex
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -516,6 +517,14 @@ class Card(Block):
     def full_text(self):
         return "\n".join(t for t, _ in self.body(full=True))
 
+    def place(self):
+        """Where approving this acts: ▲ live, ⊡ isolated, an arrow where it crosses from the model to your side."""
+        k = self.ev.get("kind")
+        if k in ("edit", "write"):
+            return "⊡ the copy" if self.ev.get("work") else "⊡→▲ your files"
+        return {"command": "⊡→▲ your shell", "trusted": "▲ runs live", "sandbox": "⊡ a throwaway run"}.get(
+            k if isinstance(k, str) else None, "")
+
     def lines(self, w):
         if self.state == "auto":
             why = "work session" if self.ev.get("work") or self.ev.get("kind") in ("finish", "retry") else \
@@ -523,7 +532,8 @@ class Card(Block):
             return [[("  ↳ ", Q), (fit(f"{self.title()}  ({why})", w - 4), Q)]]
         role = self.STATE_ROLE.get(self.state, Q)
         inner = max(w - 4, 8)
-        head = f"─ {self.id} · {self.title()}{f' · Alt+{self.key}' if self.key else ''} "
+        place = self.place()
+        head = f"─ {self.id} · {f'{place} · ' if place else ''}{self.title()}{f' · Alt+{self.key}' if self.key else ''} "
         tail = f" {STATE_MARK.get(self.state, '·')} {self.state} ─"
         head = fit(head, w - 2 - width(tail) - 1)
         fill = max(w - 2 - width(head) - width(tail), 1)
@@ -787,6 +797,22 @@ class Model:
             return ""
         wait = " #[fg=black,bg=yellow,bold] ⏸ waiting for you #[default] │" if self.pending else ""
         return wait + self.sandbox_status()
+
+    def shell_title(self):
+        """The shell pane's title: whether what you type there is live. A tmux format, so the host is reduced to
+        the characters a host name has."""
+        hints = " · Ctrl-` hides it · right-click: shell context"
+        where = self.shell_where or ""
+        if where.startswith("inside"):
+            return f"#[fg=#6ed6c0,bold]⊡ your shell, {where}#[default]{hints}"
+        if where.startswith("ON ANOTHER HOST"):
+            host, how = (self.hello or {}).get("host"), ", over ssh"
+        elif where.startswith("OUTSIDE"):
+            host, how = socket.gethostname(), ""
+        else:
+            return f"your shell, isolation unverified{hints}"
+        host = re.sub(r"[^A-Za-z0-9._@-]", "", str(host or "")) or "?"
+        return f"#[fg=#d6b26e,bold]▲ LIVE: your shell on {host}{how}#[default]{hints}"
 
     def sandbox_status(self):
         card = self.running_card()
@@ -1630,6 +1656,7 @@ class App:
         self.last_total = 0
         self.ctrl_c = 0.0
         self.status = None         # the sandbox part of tmux's status line, as last set
+        self.shell_title = None    # the shell pane's title, as last set
         self.rung = set()          # cards the terminal bell has rung for: once each, as it starts to wait
         self.paste = None          # text of a bracketed paste in progress
         curses.curs_set(1)
@@ -2510,6 +2537,10 @@ class App:
             if status != self.status:
                 self.status = status
                 self.shell.tmux("set", "-g", "@hoplon_sandbox", status)
+            title = self.m.shell_title()
+            if title != self.shell_title:
+                self.shell_title = title
+                self.shell.tmux("set", "-p", "-t", self.shell.pane, "@hoplon_title", title)
         self.publish()
 
 

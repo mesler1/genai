@@ -4966,6 +4966,19 @@ class PlainUI:
         pass
 
 
+def place(kind, fields):
+    """Where a proposal acts, as hoplon-tui's cards say it: ▲ live, ⊡ isolated, an arrow where it crosses to the
+    user's side."""
+    if kind in ("edit", "write"):
+        return "⊡ the copy" if fields.get("work") else "⊡→▲ your files"
+    return {"command": "⊡→▲ your shell", "trusted": "▲ runs live", "sandbox": "⊡ a throwaway run"}.get(kind, "")
+
+
+def tagged(kind, fields):
+    t = place(kind, fields)
+    return f"{t} · " if t else ""
+
+
 def margin(text):
     """Escape a multi-line body and put a margin on every line, so it can't pass for hoplon's own prompts."""
     return "\n".join("    | " + ln for ln in show_exact(text).splitlines() or [""])
@@ -4981,7 +4994,7 @@ class TtyUI(PlainUI):
     def show_command(self, p):
         cmd = show_exact(p.fields["command"])
         note = non_ascii_line(p.fields["command"])
-        self.out.write(f"\n\033[1mProposed command [{p.id}]\033[0m: {one_line(p.fields['reason'])[0]}\n\n    {cmd}\n"
+        self.out.write(f"\n\033[1m{tagged(p.kind, p.fields)}Proposed command [{p.id}]\033[0m: {one_line(p.fields['reason'])[0]}\n\n    {cmd}\n"
                        + (note + "\n" if note else "") +
                        "\nPaste it into your shell, or type :run to review and run it.\n")
         self.out.flush()
@@ -4990,10 +5003,10 @@ class TtyUI(PlainUI):
         if p.kind == "trusted":
             f = p.fields
             args = ", ".join(f"{k}={v}" for k, v in f["params"].items())
-            eprint(f"  \u21b3 [{p.id}] {one_line(f['plugin'])[0]}.{one_line(f['command'])[0]}({show_exact(args)}): "
+            eprint(f"  \u21b3 [{p.id}] {tagged(p.kind, f)}{one_line(f['plugin'])[0]}.{one_line(f['command'])[0]}({show_exact(args)}): "
                    f"{show_exact(f['argv'])}")
         elif p.kind == "sandbox":
-            eprint(f"  [{p.id}] sandbox, offline: {one_line(p.fields['reason'])[0]}\n    $ {show_exact(p.fields['command'])}")
+            eprint(f"  [{p.id}] {tagged(p.kind, p.fields)}sandbox, offline: {one_line(p.fields['reason'])[0]}\n    $ {show_exact(p.fields['command'])}")
         elif p.kind == "search":
             eprint(f"  (coding mode) search {show_exact(p.fields['pattern'])} in {one_line(p.fields['path'])[0]}")
         elif p.kind == "finish":
@@ -5002,10 +5015,11 @@ class TtyUI(PlainUI):
             eprint(f"  [{p.id}] try item {p.fields['n']} again: {one_line(p.fields['hint'])[0]}")
         elif p.fields.get("work"):
             what = "edit" if p.kind == "edit" else "write"
-            eprint(f"  [{p.id}] (work session) {what} {one_line(p.fields['path'])[0]}")
+            eprint(f"  [{p.id}] {tagged(p.kind, p.fields)}(work session) {what} {one_line(p.fields['path'])[0]}")
         elif p.fields.get("approved_file"):
             what = "Edit" if p.kind == "edit" else "Overwrite"
-            self.out.write(f"\n\033[1m[{p.id}] {p.kind}\033[0m — {one_line(p.fields.get('reason', ''))[0]}\n"
+            self.out.write(f"\n\033[1m[{p.id}] {tagged(p.kind, p.fields)}{p.kind}\033[0m — "
+                           f"{one_line(p.fields.get('reason', ''))[0]}\n"
                            f"{what} {one_line(p.fields['path'])[0]} (without asking: you approved an edit to it "
                            f"earlier; :edits ask stops that):\n{margin(p.fields.get('diff') or '(no changes)')}\n")
             self.out.flush()
@@ -5057,7 +5071,8 @@ class TtyUI(PlainUI):
                 continue
             else:
                 head = f"Call {p.kind}?"
-            self.out.write(f"\n\033[1m[{p.id}] {p.kind}\033[0m — {one_line(f.get('reason', ''))[0]}\n{head}\n")
+            self.out.write(f"\n\033[1m[{p.id}] {tagged(p.kind, f)}{p.kind}\033[0m — {one_line(f.get('reason', ''))[0]}\n"
+                           f"{head}\n")
             self.out.flush()
             p.decision = "accept" if ask_yes(f"Accept {p.id}?") else "decline"
 

@@ -92,8 +92,8 @@ project, invented data, a fake server the test starts on `127.0.0.1`, or a stub 
 work session it is told the live system is out of reach for the whole session. This guides the
 model; it enforces nothing, and the limits above hold whatever it is told.
 
-**Seeing it in hoplon-tui.** The info panel's SANDBOX section has a line for each of the three things
-that run, marked ⊡ (green) where it is sandboxed and ▲ where it isn't:
+**Seeing it in hoplon-tui.** The info panel's WHERE section has a line for each thing that runs or
+changes, marked ⊡ (green) where it is isolated and ▲ where it is live:
 
 - `model's runs`: the model's own builds and tests. `⊡ sandboxed · offline` (or `ONLINE`) with its
   image, `⊡ RUNNING p3 · 12s` during a run, `can't run: …`, or `none` when the profile has no sandbox
@@ -101,6 +101,16 @@ that run, marked ⊡ (green) where it is sandboxed and ▲ where it isn't:
 - `your commands`: the commands you approve, which run in your shell. Usually `▲ this host, no sandbox`.
 - `hoplon itself`: `▲ this host`, the usual way to run it, or `⊡ in the podman sandbox` under
   `sandbox/run`.
+- `project files`: `▲ yours, edits ask`; `▲ yours, some edits don't ask` once you have let edits to
+  some files apply without asking; or `⊡ copy hoplon/work-3` during a work session, which changes a
+  copy on its own branch.
+
+The shell pane's title says the same about your shell: `▲ LIVE: your shell on HOST` (`, over ssh`
+in remote mode), or `⊡ your shell, inside the podman sandbox`.
+A card names where approving it acts: `⊡→▲ your files` for an edit or write (`⊡ the copy` in a work
+session), `⊡→▲ your shell` for a command, `▲ runs live` for a trusted command and `⊡ a throwaway run`
+for a sandboxed one. The arrow marks a crossing from what the model sees to your side. The REPL puts
+the same tags before each proposal.
 
 tmux's status line says `⊡ sandbox` when hoplon itself is sandboxed, `⊡ model's runs sandboxed` when
 only the model's runs are, `▲ no sandbox` otherwise, and `⏵ sandbox p3 12s` during a run. A running card counts its seconds. Ctrl-C on an

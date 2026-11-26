@@ -203,7 +203,7 @@ class TestModel(unittest.TestCase):
         m.submit("/decline")                                   # the latest
         self.assertEqual((m.cards["p2"].state, m.cards["p1"].state), ("declined", "shown"))
         self.assertEqual((m.cards["p2"].key, m.keyed(1).id), (None, "p1"))   # Alt+1 moves to what's still open
-        self.assertIn("p2 · command", text_of(m.cards["p2"]))
+        self.assertIn("p2 · ⊡→▲ your shell · command", text_of(m.cards["p2"]))
         self.assertNotIn("/run p2", text_of(m.cards["p2"]))
         m.submit("/decline p2")
         self.assertIn("p2 is declined", text_of(m.blocks[-1]))
@@ -248,7 +248,7 @@ class TestModel(unittest.TestCase):
         self.assertIsNone(m.cards["p2"].key)
         self.assertIsNone(m.keyed(10))
         head = text_of(m.cards["p11"])
-        self.assertIn("p11 · command · Alt+1", head)
+        self.assertIn("p11 · ⊡→▲ your shell · command · Alt+1", head)
         self.assertIn("click it, press Alt+1, or /run p11", head)
 
     def test_model_picker(self):
@@ -303,7 +303,7 @@ class TestModel(unittest.TestCase):
         self.assertEqual(card.state, "running")
         m.handle({"type": "result", "id": "p1", "status": "ok", "output": "cn042|down*\x1b[2J", "exit": 0})
         text = text_of(card, 80)
-        self.assertIn("p1 · slurm · down_nodes · read-only", text)
+        self.assertIn("p1 · ▲ runs live · slurm · down_nodes · read-only", text)
         self.assertIn("$ sinfo -R -h", text)
         self.assertIn("│ cn042|down*\\x1b[2J", text)                     # output escaped, as everywhere
 
@@ -534,8 +534,15 @@ class TestSandboxRuns(unittest.TestCase):
         self.assertNotEqual(m.outbox[-1], {"type": "network", "on": False})   # waits until the reply ends
 
 
+def pane_name(title):
+    """A pane's name from its title: the first word, or "shell" for the shell pane, whose title says whether it is
+    live."""
+    return "shell" if "your shell" in title or title.startswith("shell") else title.split(" ")[0]
+
+
 class TestSandboxStatus(unittest.TestCase):
-    """The SANDBOX panel section, tmux's status line, a running card's clock, and stopping a run."""
+    """The WHERE panel section, the shell pane's title, tmux's status line, a running card's clock, and stopping
+    a run."""
     RUNNER = TestSandboxRuns.RUNNER
 
     def model(self, sandbox=None, runner=RUNNER, features=("interrupt",), remote=False):
@@ -573,6 +580,41 @@ class TestSandboxStatus(unittest.TestCase):
         self.assertIn("Ctrl-C or /stop stops it", text)
         m.handle({"type": "result", "id": "p3", "status": "ok", "detail": "exit 0"})
         self.assertIn("model's runs  ⊡ sandboxed", self.panel(m))
+
+    def test_project_files_say_whose_they_are(self):
+        text = self.panel(self.model())
+        self.assertTrue(text.startswith("SESSION") and "\nWHERE\n" in text)
+        self.assertIn("project files ▲ yours, edits ask", text)
+        PANEL = load("panel", os.path.join(REPO, "tui", "panel.py"))
+        for extra, want in (({"work": {"branch": "hoplon/work-3", "status": "s"}}, "project files ⊡ copy hoplon/work-3"),
+                            ({"edits": {"mode": "approved-files", "files": []}}, "project files ▲ yours, some edits")):
+            st = dict(self.model().snapshot(), **extra)
+            lines, _ = PANEL.view(st, 42, None)
+            self.assertIn(want, "\n".join("".join(t for t, _ in ln) for ln in lines))
+
+    def test_the_shell_title_says_whether_it_is_live(self):
+        m = self.model()
+        m.shell_where = "OUTSIDE any sandbox, directly on this host"
+        self.assertIn(f"▲ LIVE: your shell on {socket.gethostname()}#[default] · Ctrl-`", m.shell_title())
+        m.shell_where = "inside the podman sandbox"
+        self.assertIn("⊡ your shell, inside the podman sandbox", m.shell_title())
+        m = self.model(remote=True)
+        m.hello["host"] = "#[fg=red]evil#{host}"
+        m.shell_where = C.remote_where("x")
+        self.assertIn("▲ LIVE: your shell on fgredevilhost, over ssh", m.shell_title())   # no tmux format gets in
+        m.shell_where = "with unverified isolation"
+        self.assertTrue(m.shell_title().startswith("your shell, isolation unverified"))
+
+    def test_cards_name_where_they_act(self):
+        m = self.model()
+        for pid, ev, want in (("p1", {"kind": "edit", "path": "a.py"}, "⊡→▲ your files · edit a.py"),
+                              ("p2", {"kind": "edit", "path": "a.py", "work": True}, "⊡ the copy · edit a.py"),
+                              ("p3", {"kind": "command", "command": "ls"}, "⊡→▲ your shell · command"),
+                              ("p4", {"kind": "trusted", "plugin": "slurm", "command": "jobs"}, "▲ runs live · slurm"),
+                              ("p5", {"kind": "read", "path": "a.py"}, "─ p5 · read a.py")):
+            m.handle(dict(ev, type="proposal", id=pid, reason="r"))
+            head = "".join(t for t, _ in m.cards[pid].lines(80)[1])
+            self.assertIn(want, head)
 
     def test_tmux_status_holds_only_fixed_words_and_a_checked_id(self):
         self.assertEqual(C.Model().tmux_status(), "")
@@ -1769,7 +1811,7 @@ class TestHoplonTui(TmuxCase):
 
     def panes(self):
         out = self.tmux("list-panes", "-a", "-F", "#{pane_id} #{@hoplon_title}")
-        return {t.split(" ")[0]: p for p, _, t in (ln.partition(" ") for ln in out.splitlines())}
+        return {pane_name(t): p for p, _, t in (ln.partition(" ") for ln in out.splitlines())}
 
     def screen(self, pane=None):
         """One pane, or the conversation and the prompt pane together."""
@@ -2312,7 +2354,7 @@ class TestHoplonTui(TmuxCase):
     def window(self):
         """Titles of the visible panes, top to bottom, and which one is active."""
         rows = self.tmux("list-panes", "-t", "hoplon:0", "-F", "#{pane_top} #{pane_left} #{pane_active} #{@hoplon_title}")
-        rows = sorted((int(t), int(lf), a, title.split(" ")[0]) for t, lf, a, title in
+        rows = sorted((int(t), int(lf), a, pane_name(title)) for t, lf, a, title in
                       (ln.split(" ", 3) for ln in rows.splitlines()))
         return [r[3] for r in rows if r[1] == 0], next(r[3] for r in rows if r[2] == "1")
 
