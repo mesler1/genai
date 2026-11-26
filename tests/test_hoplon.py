@@ -700,6 +700,20 @@ class TestEndToEnd(Tmp):
             self.assertEqual(api.requests[0]["path"], "/v1/chat/completions")
             self.assertEqual(api.requests[0]["body"]["model"], "fake-model")
 
+    def test_context_is_reported_before_each_model_request(self):
+        turns = [call("read_file", path="a.txt", reason="r"), reply("ok")]
+        with FakeAPI(turns) as api:
+            g = self.start(api, "--coding")
+            with open(os.path.join(self.wd, "a.txt"), "w") as f:
+                f.write("a\n")
+            g.send({"type": "user", "text": "read it"})
+            g.until("done")
+            g.close()
+        ctx = [e for e in g.events if e["type"] == "context"]
+        self.assertEqual(len(ctx), 2)                     # one per request, mid-turn included
+        self.assertTrue(all(isinstance(e["used"], int) and e["limit"] > 0 for e in ctx))
+        self.assertLess(ctx[0]["used"], ctx[1]["used"])
+
     def test_write_accept_then_edit_decline(self):
         turns = [call("write_file", path="rotate.sh", content="echo one\n", reason="make script"),
                  call("edit_file", path="rotate.sh", old_text="one", new_text="two", reason="fix"),

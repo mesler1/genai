@@ -5511,8 +5511,8 @@ class JsonUI:
         self.emit({"type": "notice", "message": msg})
 
     def context(self, used, limit):
-        if used >= WARN_FRACTION * limit:
-            self.emit({"type": "context", "used": used, "limit": limit})
+        """Before each model request, so a front end's gauge keeps up during a long turn or a work session."""
+        self.emit({"type": "context", "used": used, "limit": limit})
 
     def show_samples(self, p):
         self.emit(p.event())
