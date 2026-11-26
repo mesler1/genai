@@ -1689,7 +1689,7 @@ class TestFeatures(unittest.TestCase):
         m = C.Model()
         self.assertEqual([f.name for f in m.features], [f.name for f in on])
         self.assertEqual(list(m.commands())[-14:], ["/model", "/copy", "/decline", "/raw", "/system", "/files", "/sandbox", "/edits", "/plugins", "/work", "/fixtures", "/leftovers", "/alerts", "/shared"])
-        self.assertEqual(C.feature_requests(on), {"menu": {"model", "copy", "raw", "system"},
+        self.assertEqual(C.feature_requests(on), {"menu": {"model", "models", "copy", "raw", "system"},
                           "files": {"list", "view", "attach", "insert"}, "pipe": {"piped"}})
 
     def test_environment_disables_a_feature(self):
@@ -2399,6 +2399,25 @@ class TestHoplonTui(TmuxCase):
             self.key("y")
             self.wait_for("got it")
             self.assertIn("```\necho first-out\n```\nOutput:\n```\nfirst-out\n```", self.sent(api))
+
+    def test_a_click_on_the_headers_model_opens_the_drop_down(self):
+        with FakeAPI([reply("hi")], models=[{"id": "fake-model"}, {"id": "coder-model"}]) as api:
+            self.start(api)
+            end = time.time() + 5
+            while "fake-model" not in self.tmux("show", "-gv", "@hoplon_header") and time.time() < end:
+                time.sleep(0.1)
+            left = re.sub(r"#\[[^]]*\]", "", self.tmux("display", "-p", "#{T:status-left}"))
+            col = left.index("fake-model") + 2                      # 1-based, a character into the name
+            asked = lambda: [r for r in api.requests if r["path"].endswith("/models")]
+            before = len(asked())
+            self.at_terminal(f"\x1b[<0;{col};1M")
+            time.sleep(0.2)
+            self.at_terminal(f"\x1b[<0;{col};1m")
+            end = time.time() + 5
+            while len(asked()) == before and time.time() < end:
+                time.sleep(0.1)
+            self.assertGreater(len(asked()), before)                # /model asked hoplon for the server's list
+            self.at_terminal("q")
 
     def test_switch_model_from_the_drop_down(self):
         with FakeAPI([reply("from fake"), reply("from coder")],

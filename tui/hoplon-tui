@@ -264,6 +264,9 @@ bind -n MouseDown3Pane {
   }
 }
 EOF
+# A click on the model in the header (its range, "model") opens the /model drop-down; elsewhere on the
+# status line a click does what tmux's does.
+echo "bind -n MouseDown1Status if -F \"#{==:#{mouse_status_range},model}\" { run-shell -b \"$req models\" } { switch-client -t= }" >> "$state/menu.conf"
 # Alt+1 .. Alt+9: the menu of a command proposal, from the keyboard. In the shell pane they stay the shell's.
 for n in 1 2 3 4 5 6 7 8 9; do
   echo "bind -n M-$n if -F \"#{==:#{pane_id},$shell}\" { send-keys M-$n } { run-shell -b \"$req menu open $n\" }"

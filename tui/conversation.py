@@ -837,8 +837,9 @@ class Model:
             return re.sub(r"[^A-Za-z0-9._:@/+=-]", "", str(v or ""))[:n]
         ep, prof = self.hello.get("endpoint") or {}, self.hello.get("profile") or {}
         dim = T("dim")
-        parts = [f"{dim}{safe(ep.get('name')) or '?'}·#[fg=default]{T(bold=True)}{safe(ep.get('model'), 40) or '?'}"
-                 f"#[nobold]"]
+        # The model is a range of its own: a click on it opens the /model drop-down (hoplon-tui binds it).
+        parts = [f"{dim}{safe(ep.get('name')) or '?'}·#[fg=default]#[range=user|model]{T(bold=True)}"
+                 f"{safe(ep.get('model'), 40) or '?'} ▾#[nobold]#[norange]"]
         if prof.get("name"):
             parts.append(f"{T('bronze')}{safe(prof['name'])}#[fg=default]")
         if self.hello.get("session"):

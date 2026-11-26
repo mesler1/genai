@@ -6,6 +6,7 @@ Usage: request.py share mark|all|last
        request.py raw N|last|all
        request.py system
        request.py model N             (the Nth model in the /model drop-down)
+       request.py models              (open the /model drop-down: a click on the header's model)
        request.py copy N
        request.py menu run|edit|prompt|copy|decline ID
        request.py menu open N          (Alt+N: the menu of the command proposal showing Alt+N)
@@ -28,6 +29,8 @@ def main(argv):
         msg = {"type": "model", "n": int(argv[1])}
     elif len(argv) == 2 and argv[0] == "copy" and re.fullmatch(r"[0-9]{1,9}", argv[1]):
         msg = {"type": "copy", "turn": int(argv[1])}
+    elif argv == ["models"]:
+        msg = {"type": "models"}
     elif argv == ["system"]:
         msg = {"type": "system"}
     elif len(argv) == 1 and argv[0] in ("mark", "unmark"):
