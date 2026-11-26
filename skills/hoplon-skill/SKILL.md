@@ -1,6 +1,6 @@
-# Help the user write a genai skill
+# Help the user write a hoplon skill
 
-You are helping the user create a skill for genai, the command-line client they are using right now. A skill is saved prompt text that genai adds to the system prompt when the user runs `genai -k NAME`. It teaches you site-specific knowledge: the local Slurm setup, a team's conventions, how a service is laid out.
+You are helping the user create a skill for hoplon, the command-line client they are using right now. A skill is saved prompt text that hoplon adds to the system prompt when the user runs `hoplon -k NAME`. It teaches you site-specific knowledge: the local Slurm setup, a team's conventions, how a service is laid out.
 
 ## What a skill is
 
@@ -12,9 +12,9 @@ lustre/
   notes.txt       # optional; covered by the blessing hash, not sent to the model
 ```
 
-- The **first non-blank line** of `SKILL.md` is the skill's description, shown by `genai --list-skills`. Make it a heading that says what the skill is for, e.g. `# Lustre quotas and striping on the hpc2 cluster`.
+- The **first non-blank line** of `SKILL.md` is the skill's description, shown by `hoplon --list-skills`. Make it a heading that says what the skill is for, e.g. `# Lustre quotas and striping on the hpc2 cluster`.
 - Only `SKILL.md` is sent to the model. Other files are covered by the hash, so a blessing covers them too, but they are not read into the prompt.
-- **No symlinks** anywhere in the directory, and only regular files. genai rejects the skill otherwise, because the hash couldn't notice a link's target changing.
+- **No symlinks** anywhere in the directory, and only regular files. hoplon rejects the skill otherwise, because the hash couldn't notice a link's target changing.
 - A skill is **prompt text only**. It can't run code, add tools, or turn on coding mode. Don't write instructions that pretend otherwise.
 
 ## What makes a good skill
@@ -28,10 +28,10 @@ lustre/
 ## How to work
 
 1. Ask what the skill is for and what the user wants the model to know, one question at a time. Ask for real examples: commands they run, error messages they see, paths.
-2. Draft `NAME/SKILL.md` with `write_file`, in the working directory. Your file tools can't reach `~/.config/genai/`, and that is by design. Use a short lowercase name with letters, digits and `-`.
+2. Draft `NAME/SKILL.md` with `write_file`, in the working directory. Your file tools can't reach `~/.config/hoplon/`, and that is by design. Use a short lowercase name with letters, digits and `-`.
 3. Tell the user the next steps, which only they can do:
    - Read it over. Blessing is their "I have read this" checkpoint.
-   - Move it into a skills directory: `~/.config/genai/skills/NAME/`, or a directory listed under `"skill_dirs"` in `~/.config/genai/config.json` (for example a team share).
-   - Bless it where it now lives: `genai --bless ~/.config/genai/skills/NAME`.
-   - Use it: `genai -k NAME`. An unblessed or changed skill is skipped with a notice.
-4. To share it, a colleague copies the directory and blesses it themselves. Any later change makes genai skip it until they look again.
+   - Move it into a skills directory: `~/.config/hoplon/skills/NAME/`, or a directory listed under `"skill_dirs"` in `~/.config/hoplon/config.json` (for example a team share).
+   - Bless it where it now lives: `hoplon --bless ~/.config/hoplon/skills/NAME`.
+   - Use it: `hoplon -k NAME`. An unblessed or changed skill is skipped with a notice.
+4. To share it, a colleague copies the directory and blesses it themselves. Any later change makes hoplon skip it until they look again.

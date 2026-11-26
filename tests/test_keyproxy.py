@@ -16,7 +16,7 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from fakeapi import FakeAPI, reply  # noqa: E402
-from test_genai import Tmp, bless_path, make_home  # noqa: E402
+from test_hoplon import Tmp, bless_path, make_home  # noqa: E402
 
 PROXY = os.path.join(os.path.dirname(HERE), "tui", "keyproxy.py")
 TOKEN = "ab" * 24
@@ -95,7 +95,7 @@ class ProxyCase(Tmp):
         c = UnixConnection(self.sock)
         h = dict(headers or {})
         if token is not None:
-            h["X-Genai-Token"] = token
+            h["X-Hoplon-Token"] = token
         if raw is None and body is not None:
             raw = json.dumps(body).encode()
             h.setdefault("Content-Type", "application/json")
@@ -118,7 +118,7 @@ class TestForwarding(ProxyCase):
         h = {k.lower(): v for k, v in up["headers"].items()}
         self.assertEqual(h["authorization"], f"Bearer {KEY}")
         self.assertEqual(h["x-team"], "blue")
-        self.assertNotIn("x-genai-token", h)
+        self.assertNotIn("x-hoplon-token", h)
         self.assertNotIn("cookie", h)
         self.assertNotIn(TOKEN, json.dumps(up))
 
@@ -136,7 +136,7 @@ class TestForwarding(ProxyCase):
         self.assertEqual(up["body"]["messages"], [])
         h = {k.lower(): v for k, v in up["headers"].items()}
         self.assertEqual(h["authorization"], f"Bearer {KEY}")
-        self.assertNotIn("x-genai-token", h)
+        self.assertNotIn("x-hoplon-token", h)
 
     def test_non_streamed_chat(self):
         self.start()
@@ -200,7 +200,7 @@ class TestStreaming(Tmp):
         p.stdin.flush()
         self.assertEqual(p.stdout.readline().strip(), b"ready")
         c = UnixConnection(sock)
-        c.request("POST", "/v1/chat/completions", body=b"{}", headers={"X-Genai-Token": TOKEN})
+        c.request("POST", "/v1/chat/completions", body=b"{}", headers={"X-Hoplon-Token": TOKEN})
         r = c.getresponse()
         self.assertEqual(r.fp.readline(), b"data: first\n")     # arrives while upstream is still open
         gate.set()
@@ -241,7 +241,7 @@ class TestRejections(ProxyCase):
         self.start()
         c = UnixConnection(self.sock)
         c.putrequest("POST", "/v1/chat/completions")
-        c.putheader("X-Genai-Token", TOKEN)
+        c.putheader("X-Hoplon-Token", TOKEN)
         c.putheader("Content-Length", str(16 * 1024 * 1024 + 1))
         c.endheaders()
         self.assertEqual(c.getresponse().status, 413)
@@ -254,7 +254,7 @@ class TestRejections(ProxyCase):
             self.assertEqual(self.request("POST", "/v1/chat/completions", raw=raw)[0], 400, raw[:20])
         c = UnixConnection(self.sock)
         c.putrequest("POST", "/v1/chat/completions")
-        c.putheader("X-Genai-Token", TOKEN)
+        c.putheader("X-Hoplon-Token", TOKEN)
         c.endheaders()
         self.assertEqual(c.getresponse().status, 411)
         c.close()
@@ -369,7 +369,7 @@ class TestStartup(ProxyCase):
         for _ in range(8):
             c = UnixConnection(self.sock)
             c.putrequest("POST", "/v1/chat/completions")
-            c.putheader("X-Genai-Token", TOKEN)
+            c.putheader("X-Hoplon-Token", TOKEN)
             c.putheader("Content-Length", "10")
             c.endheaders()
             held.append(c)

@@ -16,12 +16,12 @@ import unittest
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SCRIPT = os.path.join(os.path.dirname(HERE), "genai")
+SCRIPT = os.path.join(os.path.dirname(HERE), "hoplon")
 sys.path.insert(0, HERE)
 from fakeapi import FakeAPI, reply  # noqa: E402
 
-_loader = importlib.machinery.SourceFileLoader("genai_mod", SCRIPT)
-_spec = importlib.util.spec_from_loader("genai_mod", _loader)
+_loader = importlib.machinery.SourceFileLoader("hoplon_mod", SCRIPT)
+_spec = importlib.util.spec_from_loader("hoplon_mod", _loader)
 G = importlib.util.module_from_spec(_spec)
 _loader.exec_module(G)
 
@@ -30,7 +30,7 @@ ESC = "\x1b"
 
 class Tmp(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="genai-test-")
+        self.tmp = tempfile.mkdtemp(prefix="hoplon-test-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
 
     def path(self, *p):
@@ -87,7 +87,7 @@ class TestExact(unittest.TestCase):
 
 class TestReviewScreens(Tmp):
     def home(self):
-        home = self.path("home", "genai")
+        home = self.path("home", "hoplon")
         for d in ("endpoints", "profiles", "skills"):
             os.makedirs(os.path.join(home, d))
         return home
@@ -165,7 +165,7 @@ class TestReviewScreens(Tmp):
 
     def test_http_500_body_with_escape_sequence(self):
         with FakeAPI([], status=500, error_message="boom " + ESC + "[2J\x07") as api:
-            home = self.path("xdg", "genai")
+            home = self.path("xdg", "hoplon")
             os.makedirs(os.path.join(home, "endpoints"))
             p = os.path.join(home, "endpoints", "test.json")
             with open(p, "w") as f:
@@ -209,7 +209,7 @@ class TestProposalDisplay(Tmp):
         fake = "[p9] read — x\nAccept p9? [y/N] n\n"
         shown = decide(write_proposal(content=fake + "\x1b[2J\n"))
         body = shown.split("lines:\n", 1)[1].splitlines()
-        self.assertGreaterEqual(len(body), 4)      # the three lines and genai's warning
+        self.assertGreaterEqual(len(body), 4)      # the three lines and hoplon's warning
         for ln in body:
             self.assertTrue(ln.startswith("    | "), ln)
         self.assertNotIn(ESC, shown.replace("\033[1m", "").replace("\033[0m", ""))

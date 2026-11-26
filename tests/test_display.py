@@ -1,4 +1,4 @@
-"""Offline tests for what genai shows and shares: escaped model text, the :run share buffer, audit hashes.
+"""Offline tests for what hoplon shows and shares: escaped model text, the :run share buffer, audit hashes.
 Run: python3 -m unittest discover -s tests"""
 
 import contextlib
@@ -16,10 +16,10 @@ import unittest
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SCRIPT = os.path.join(os.path.dirname(HERE), "genai")
+SCRIPT = os.path.join(os.path.dirname(HERE), "hoplon")
 
-_loader = importlib.machinery.SourceFileLoader("genai_mod", SCRIPT)
-_spec = importlib.util.spec_from_loader("genai_mod", _loader)
+_loader = importlib.machinery.SourceFileLoader("hoplon_mod", SCRIPT)
+_spec = importlib.util.spec_from_loader("hoplon_mod", _loader)
 G = importlib.util.module_from_spec(_spec)
 _loader.exec_module(G)
 
@@ -61,7 +61,7 @@ class TestEscapedModelText(unittest.TestCase):
         for ui_class in (G.PlainUI, G.TtyUI):
             out = io.StringIO()
             ui_class(out).show_command(p)
-            shown = out.getvalue().replace("\033[1m", "").replace("\033[0m", "")   # genai's own bold
+            shown = out.getvalue().replace("\033[1m", "").replace("\033[0m", "")   # hoplon's own bold
             self.assertNotIn("\x1b", shown)
             self.assertNotIn("‮", shown)
             self.assertIn("\\x1b[2K", shown)
@@ -79,7 +79,7 @@ class TestEscapedModelText(unittest.TestCase):
 
 class TestRunShare(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="genai-test-")
+        self.tmp = tempfile.mkdtemp(prefix="hoplon-test-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.audit_path = os.path.join(self.tmp, "audit.log")
         self.saved = os.path.join(self.tmp, "saved.txt")

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""genai-tui conversation pane: a coding-agent front end for `genai --json`.
+"""hoplon-tui conversation pane: a coding-agent front end for `hoplon --json`.
 
 One scrolling conversation with the model's reply streaming in, an input box at the bottom,
-slash commands, and approval prompts that take the input box's place while genai waits.
-genai decides what needs approval and enforces every rule; this program shows proposals and
+slash commands, and approval prompts that take the input box's place while hoplon waits.
+hoplon decides what needs approval and enforces every rule; this program shows proposals and
 returns the user's answers, nothing more.
 
-Usage: conversation.py [genai options such as -p PROFILE -e ENDPOINT -S SESSION]
+Usage: conversation.py [hoplon options such as -p PROFILE -e ENDPOINT -S SESSION]
 Standard library only; Python 3.10 or newer.
 """
 
@@ -32,8 +32,8 @@ from ipc import Hub  # noqa: E402
 from recorder import Recorder, ago, fifo_path, label, trim  # noqa: E402
 import remote  # noqa: E402
 
-GENAI = os.environ.get("GENAI_BIN") or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                                    "genai")
+HOPLON = os.environ.get("HOPLON_BIN") or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                                    "hoplon")
 CARD_BODY_LINES = 12
 OUTPUT_LINES = 8               # last lines of a sandboxed run's output shown in its card
 INPUT_MAX_LINES = 8
@@ -54,14 +54,14 @@ COMMANDS = {
     "/shell": "show the shell and move there (Ctrl-` hides it again)",
     "/panel": "show or hide the info panel on the right",
     "/plan": "[clear]: show the approved plan, or drop it so everything asks again",
-    "/stop": "stop the sandboxed run going on now, or genai's turn (Ctrl-C on an empty input does the same)",
+    "/stop": "stop the sandboxed run going on now, or hoplon's turn (Ctrl-C on an empty input does the same)",
     "/compact": "shrink the conversation when the context is getting full",
     "/context": "show how full the context is",
     "/clear": "start over: the model forgets this conversation, and the screen clears (the saved session keeps it)",
     "/quit": "leave (also Ctrl-D on an empty input)",
 }
-# The commands of the features are in tui/features. Of the core's own, these wait while genai is replying:
-TO_GENAI = ("/coding", "/skills", "/skill", "/compact", "/network", "/clear")
+# The commands of the features are in tui/features. Of the core's own, these wait while hoplon is replying:
+TO_HOPLON = ("/coding", "/skills", "/skill", "/compact", "/network", "/clear")
 
 # --------------------------------------------------------------------------
 # Text: what is safe to draw, and how wide it is
@@ -301,12 +301,12 @@ class Reply(Block):
         return [[]] + [[("● " if i == 0 else "  ", D)] + ln for i, ln in enumerate(body)]
 
 
-def genai_where(h):
-    """Where genai itself runs, from its hello, when that is another host: (text, role), red for root. Else None."""
+def hoplon_where(h):
+    """Where hoplon itself runs, from its hello, when that is another host: (text, role), red for root. Else None."""
     if not h.get("remote"):
         return None
     user, root = clean(str(h.get("user", "?"))), h.get("uid") == 0 or h.get("user") == "root"
-    return (f"genai runs ON {clean(str(h.get('host', '?')))} AS {user} in {clean(str(h.get('cwd', '?')))}"
+    return (f"hoplon runs ON {clean(str(h.get('host', '?')))} AS {user} in {clean(str(h.get('cwd', '?')))}"
             + (" (root)" if root else ""), R if root else W)
 
 
@@ -317,9 +317,9 @@ class Banner(Block):
 
     def lines(self, w):
         h, ep = self.h, self.h.get("endpoint") or {}
-        rows = [(f"◆ genai {h.get('version', '?')}", A),
+        rows = [(f"◆ hoplon {h.get('version', '?')}", A),
                 (f"{ep.get('name', '?')}: {ep.get('model', '?')} at {ep.get('base_url', '?')}", "")]
-        where = genai_where(h)
+        where = hoplon_where(h)
         if where:
             rows.append(where)
             rows.append((f"it keeps its audit log there: {h.get('audit') or '?'}", ""))
@@ -398,7 +398,7 @@ MARK = {R: "✗", W: "⚠", D: "✓"}      # notes: the symbol before one in tha
 RUNS = ("sandbox", "finish")     # kinds of card that run something in the sandbox: a clock, and /stop stops them
 STATE_MARK = {"waiting": "◆", "shown": "▸", "running": "…", "accepted": "✓", "done": "✓", "ran": "✓",
               "declined": "⊘", "cancelled": "⊘", "error": "✗", "auto": "↳", "stopped": "■"}
-# A proposal id, as it may go into a tmux format (the status line): genai's are p1, p2 ...
+# A proposal id, as it may go into a tmux format (the status line): hoplon's are p1, p2 ...
 PROPOSAL_ID = re.compile(r"[a-z]{1,4}[0-9]{1,6}")
 
 
@@ -413,7 +413,7 @@ class Card(Block):
         self.output = None         # a sandboxed run's output, as the model got it
         self.key = None            # N when Alt+N opens this command's menu
         self.started = None        # time.monotonic() when a sandboxed run started
-        self.stoppable = True      # /stop can stop it (in remote mode, only a genai that takes the stop message)
+        self.stoppable = True      # /stop can stop it (in remote mode, only a hoplon that takes the stop message)
         self.shown_secs = None     # the elapsed seconds last drawn
 
     def start(self, stoppable=True):
@@ -467,7 +467,7 @@ class Card(Block):
         if k in ("command", "sandbox"):
             for i, ln in enumerate(command_text(ev.get("command", "")).split("\n")):
                 out.append((("$ " if i == 0 else "  ") + ln, ""))
-        elif k == "trusted":                             # a plugin's trusted command: what runs, as genai shows it
+        elif k == "trusted":                             # a plugin's trusted command: what runs, as hoplon shows it
             out.append(("$ " + command_text(str(ev.get("argv", ""))).replace("\n", " "), ""))
         if k in RUNS and self.state == "running":
             self.shown_secs = self.elapsed()
@@ -499,7 +499,7 @@ class Card(Block):
         elif k == "external":
             out.append((clean(json.dumps(ev.get("args", {}), ensure_ascii=False)), ""))
         elif k == "work_plan":
-            if ev.get("goal") != ev.get("reason"):              # genai sends the goal as the reason too
+            if ev.get("goal") != ev.get("reason"):              # hoplon sends the goal as the reason too
                 out.append((clean(str(ev.get("goal", ""))), A))
             items = ev.get("items") if isinstance(ev.get("items"), list) else []
             out += [(f"{n:>2}. {one_row(it)}", "") for n, it in enumerate(items, 1)]
@@ -535,7 +535,7 @@ class Card(Block):
             rows.append((f"… {len(body) - len(shown)} more lines (v views it all)", Q))
         if self.ev.get("kind") == "command" and self.state == "shown":
             how = f"click it, press Alt+{self.key}," if self.key else "click it,"
-            rows.append((f"{how} or /run {self.id}, to send it to your shell; genai never runs it", A))
+            rows.append((f"{how} or /run {self.id}, to send it to your shell; hoplon never runs it", A))
         if self.detail:
             rows.append((fit(clean(self.detail), inner), R if self.state == "error" else Q))
         for t, r in rows:
@@ -545,7 +545,7 @@ class Card(Block):
 
 
 # --------------------------------------------------------------------------
-# State: genai's events in, the user's messages out. No curses here, so it can be tested.
+# State: hoplon's events in, the user's messages out. No curses here, so it can be tested.
 
 class Model:
     def __init__(self, features=None):
@@ -556,25 +556,25 @@ class Model:
         self.reply = None          # the reply being streamed
         self.busy = False          # a turn is running
         self.queued = []           # messages typed while busy
-        self.outbox = []           # messages for genai
+        self.outbox = []           # messages for hoplon
         self.next_attachments = [] # reviewed shell context for the next prompt the user submits
         self.hello = None
         self.coding = False
         self.runner = None         # the profile's sandbox, from hello and network events
         self.context = None        # (used, limit)
-        self.exited = None         # genai's exit code once it has gone
+        self.exited = None         # hoplon's exit code once it has gone
         self.quit = False
-        self.shell = False         # a shell pane is there (inside genai-tui)
+        self.shell = False         # a shell pane is there (inside hoplon-tui)
         self.shell_where = None
-        self.skills = None         # genai's skill list, once asked for
+        self.skills = None         # hoplon's skill list, once asked for
         self.show_skills = False   # print the next skill list in the conversation (the user typed /skills)
         self.ask = None            # a question of ours in place of the input box: run or share
         self.actions = []          # things for the screen to do: ("share", "last"), ("focus_shell",)
         self.panes = []            # messages for the other panes: (role, message)
         self.recent = []           # the shell pane's latest commands, for the info panel
-        self.turn = 0              # turns sent to genai so far
+        self.turn = 0              # turns sent to hoplon so far
         self.exchanges = {}        # turn: [first, last] exchange with the endpoint, for /raw
-        self.plan = None           # the approved plan, as genai last reported it
+        self.plan = None           # the approved plan, as hoplon last reported it
         self.plan_cmds = {}        # (plan id, step number) -> approved command, consumed before execution
         self.plan_context = None   # execution pane and directory reviewed for automatic runs
         self.plan_auto = False     # run those commands as they come, without asking again
@@ -621,7 +621,7 @@ class Model:
         for f in self.features:
             f.run_started(self, card)
 
-    # -- from genai
+    # -- from hoplon
 
     def handle(self, ev):
         t = ev.get("type")
@@ -630,7 +630,7 @@ class Model:
         if t == "hello":
             self.hello, self.coding, self.runner = ev, bool(ev.get("coding")), ev.get("runner")
             if ev.get("remote") and isinstance(ev.get("host"), str):
-                self.shell_where = remote_where(clean(ev["host"]))   # the shell pane follows genai to that host
+                self.shell_where = remote_where(clean(ev["host"]))   # the shell pane follows hoplon to that host
             self.add(Banner(ev, self.shell_where))
             if "skills" in (ev.get("features") or []):
                 self.send({"type": "skills"})          # for the info panel; not printed
@@ -686,7 +686,7 @@ class Model:
             self.retire("the turn ended before you answered")
             self.context = ((ev.get("context") or {}).get("used"), (ev.get("context") or {}).get("limit"))
             if ev.get("reason") == "step_limit":
-                self.note("genai stopped after its step limit; send a message to continue", W)
+                self.note("hoplon stopped after its step limit; send a message to continue", W)
             elif ev.get("reason") == "work_limit":
                 self.note("the work session paused at a limit: send a message to go on, or /work end", W)
             self.next_queued()
@@ -719,12 +719,12 @@ class Model:
                 return
             self.show_skills = False
             if not rows:
-                self.note("no skills found (genai --list-skills shows where they are looked for)")
+                self.note("no skills found (hoplon --list-skills shows where they are looked for)")
             for r in rows:
                 self.note(f"{'*' if r.get('active') else ' '} {clean(r.get('name', '')):20} {r.get('status', ''):10} "
                           f"{clean(r.get('description', ''))}", "" if r.get("active") else Q)
             if any(r.get("status") != "blessed" for r in rows):
-                self.note("genai --list-skills shows the command that blesses each one")
+                self.note("hoplon --list-skills shows the command that blesses each one")
         elif t == "compacted":
             self.note(f"compacted: {ev.get('before')} → {ev.get('after')} tokens", D)
         elif t == "cleared":
@@ -736,7 +736,7 @@ class Model:
         elif t == "attached":
             masked = ev.get("redacted") or {}
             if masked:
-                self.note("genai masked " + ", ".join(f"{n} {clean(k)}" for k, n in masked.items())
+                self.note("hoplon masked " + ", ".join(f"{n} {clean(k)}" for k, n in masked.items())
                           + " in what you shared", W)
         else:
             for f in self.features:
@@ -756,15 +756,15 @@ class Model:
         return "stop" in features or ("interrupt" in features and not self.remote())
 
     def can_halt(self):
-        """genai stops a whole turn on the stop message, not only a sandboxed run."""
+        """hoplon stops a whole turn on the stop message, not only a sandboxed run."""
         return "halt" in ((self.hello or {}).get("features") or [])
 
     def stop(self):
-        """/stop and Ctrl-C: ask genai to stop the sandboxed run: the stop message, which works over ssh too, or
-        from an older genai here, a SIGINT to the genai child. A genai that can halt stops the whole turn."""
+        """/stop and Ctrl-C: ask hoplon to stop the sandboxed run: the stop message, which works over ssh too, or
+        from an older hoplon here, a SIGINT to the hoplon child. A hoplon that can halt stops the whole turn."""
         card = self.running_card()
         if not card and self.busy and self.can_halt() and self.exited is None:
-            self.note("stopping genai's turn: its reply ends at the next words, and what is waiting is declined…", W)
+            self.note("stopping hoplon's turn: its reply ends at the next words, and what is waiting is declined…", W)
             self.send({"type": "stop"})
         elif not card:
             self.note("nothing is running in the sandbox. A command in the shell pane stops with Ctrl-C there "
@@ -775,7 +775,7 @@ class Model:
         elif self.remote():
             self.note("stopping a sandboxed run isn't available in remote mode yet; it ends at its time limit", W)
         elif "interrupt" not in ((self.hello or {}).get("features") or []):
-            self.note("this genai can't stop a sandboxed run; it ends at its time limit", R)
+            self.note("this hoplon can't stop a sandboxed run; it ends at its time limit", R)
         else:
             self.note(f"stopping the sandboxed run {clean(card.id)}…", W)
             self.actions.append(("interrupt",))
@@ -804,7 +804,7 @@ class Model:
                 + ("" if self.coding else " (the sandbox is used in coding mode)") + " · /network on|off")
 
     def retire(self, why):
-        """The turn is over (it was stopped, or genai has gone): nothing still waits for an answer, and nothing
+        """The turn is over (it was stopped, or hoplon has gone): nothing still waits for an answer, and nothing
         still runs, so no card asks or keeps its clock going, and Ctrl-C quits again."""
         for card in self.pending:
             card.state, card.detail = "stopped", why
@@ -819,14 +819,14 @@ class Model:
         self.exited, self.busy = code, False
         for card in self.cards.values():
             if card.ev.get("kind") in RUNS and card.state == "running":
-                card.state, card.detail = "error", "genai exited before it finished"
+                card.state, card.detail = "error", "hoplon exited before it finished"
                 card.changed()
-        self.retire("genai exited")
+        self.retire("hoplon exited")
         for f in self.features:
             f.exited(self)
         for ln in err.strip().splitlines()[-5:]:
             self.note(clean(ln), R)
-        self.note(f"genai exited (code {code}). /quit or Ctrl-D to leave.", R)
+        self.note(f"hoplon exited (code {code}). /quit or Ctrl-D to leave.", R)
 
     # -- from the user
 
@@ -843,7 +843,7 @@ class Model:
 
     def say(self, text, attachments=()):
         if self.exited is not None:
-            self.note("genai is not running", R)
+            self.note("hoplon is not running", R)
         elif self.busy:
             self.queued.append(self.add(UserMsg(text, queued=True, attachments=attachments)))
         else:
@@ -851,7 +851,7 @@ class Model:
             self.send_turn(self.add(UserMsg(text, attachments=attachments)))
 
     def share(self, label, text, message):
-        """Send reviewed output: as an attachment, so genai masks secrets in it, then a message about it."""
+        """Send reviewed output: as an attachment, so hoplon masks secrets in it, then a message about it."""
         self.say(message, attachments=[{"type": "attach", "label": label, "text": text}])
 
     def next_queued(self):
@@ -874,15 +874,15 @@ class Model:
         cmd, _, arg = line.partition(" ")
         arg = arg.strip()
         feature = next((f for f in self.features if cmd in f.commands), None)
-        to_genai = cmd in TO_GENAI or (feature is not None and cmd in feature.to_genai)
-        if to_genai and (self.busy or self.exited is not None):
-            self.note(f"{cmd} has to wait until genai finishes this reply", W)
+        to_hoplon = cmd in TO_HOPLON or (feature is not None and cmd in feature.to_hoplon)
+        if to_hoplon and (self.busy or self.exited is not None):
+            self.note(f"{cmd} has to wait until hoplon finishes this reply", W)
         elif cmd == "/help":
             for c, d in self.commands().items():
                 self.note(f"{c:9} {d}")
             self.note("Enter sends · Alt+Enter or \\ then Enter adds a line · ↑↓ earlier messages · "
                       "PgUp/PgDn scroll · // starts a message with /")
-            self.note("In the shell pane, genai-ssh [ssh options] HOST connects so commands on that host can be "
+            self.note("In the shell pane, hoplon-ssh [ssh options] HOST connects so commands on that host can be "
                       "followed and /run can send them there (plain ssh can't be)")
             self.note("Alt+1 … Alt+9 open the menu of a command proposal, Alt+1 the newest (as its card says); "
                       "↑↓ and Enter, or the letter shown, choose")
@@ -911,13 +911,13 @@ class Model:
                 self.note(f"skill {clean(name)}: {state} from your next message", Q)
                 self.send({"type": "skill", "name": name, "on": state == "on"})
         elif feature and feature.needs and feature.needs not in ((self.hello or {}).get("features") or []):
-            self.note(f"this genai can't {feature.cant}", R)
+            self.note(f"this hoplon can't {feature.cant}", R)
         elif feature:
             feature.command(self, cmd, arg)
         elif cmd == "/compact":
             self.send({"type": "compact"})
         elif cmd in ("/run", "/share", "/shell", "/mark", "/commands") and not self.shell:
-            self.note(f"{cmd} needs the shell pane: start genai with genai-tui", R)
+            self.note(f"{cmd} needs the shell pane: start hoplon with hoplon-tui", R)
         elif cmd == "/run":
             cards = [c for c in self.cards.values() if c.ev.get("kind") == "command"]
             card = self.cards.get(arg) if arg else (cards[-1] if cards else None)
@@ -944,7 +944,7 @@ class Model:
             self.stop()
         elif cmd == "/plan":
             if arg == "clear" and self.busy:
-                self.note("/plan clear has to wait until genai finishes this reply", W)
+                self.note("/plan clear has to wait until hoplon finishes this reply", W)
             elif arg == "clear":
                 self.plan_cmds, self.plan_auto, self.plan_context = {}, False, None
                 self.send({"type": "plan", "clear": True})
@@ -968,7 +968,7 @@ class Model:
                 self.send({"type": "clear"})
             else:
                 self.blocks = []
-                self.note("this genai can't clear its context; only the screen was cleared", W)
+                self.note("this hoplon can't clear its context; only the screen was cleared", W)
         elif cmd in ("/quit", "/exit"):
             self.quit = True
         else:
@@ -982,7 +982,7 @@ class Model:
         view = {
             "session": {"endpoint": ep.get("name"), "model": ep.get("model"), "profile": prof.get("name"),
                         "session": h.get("session"), "sandbox": sb.get("name") if sb else None,
-                        "shell_where": self.shell_where, "genai_where": genai_where(h)},
+                        "shell_where": self.shell_where, "hoplon_where": hoplon_where(h)},
             "coding": self.coding, "busy": self.busy, "context": list(self.context or (None, None)),
             "runner": self.runner and {"network": bool(self.runner.get("network")), "problem": self.runner.get("problem"),
                                        "image": self.runner.get("image")},
@@ -1058,7 +1058,7 @@ class Model:
             return
         card = self.pending.pop(0)
         if accept and card.ev.get("kind") == "sandbox":
-            card.start(self.can_stop())            # genai runs it as soon as it has the answer
+            card.start(self.can_stop())            # hoplon runs it as soon as it has the answer
         else:
             card.state = "accepted" if accept else "declined"
         card.changed()
@@ -1066,7 +1066,7 @@ class Model:
 
 
 def answer(card, kind, **fields):
-    """A decision or result for genai, echoing the digest of the proposal the card shows (genai refuses an answer
+    """A decision or result for hoplon, echoing the digest of the proposal the card shows (hoplon refuses an answer
     whose digest is missing or different)."""
     msg = {"type": kind, "id": card.id, **fields}
     if card.ev.get("digest"):
@@ -1099,7 +1099,7 @@ def command_list(features):
 
 
 def configured_features():
-    """The features that are on, as the config file and GENAI_TUI_DISABLE say, and a warning if the file was no good."""
+    """The features that are on, as the config file and HOPLON_TUI_DISABLE say, and a warning if the file was no good."""
     disabled, warning = disabled_names()
     return load_features(disabled, CORE), warning
 
@@ -1246,16 +1246,16 @@ EDITOR_HEADER_TOP = EDITOR_HEADER.replace("# Lines starting with '#' are removed
 
 
 def pager_argv(path):
-    """How to show a text file genai-tui wrote: its own pager (tui/pager.py: Esc or q closes it), or the program in
-    GENAI_TUI_PAGER (for example less) if you set one."""
-    mine = os.environ.get("GENAI_TUI_PAGER", "").strip()
+    """How to show a text file hoplon-tui wrote: its own pager (tui/pager.py: Esc or q closes it), or the program in
+    HOPLON_TUI_PAGER (for example less) if you set one."""
+    mine = os.environ.get("HOPLON_TUI_PAGER", "").strip()
     if mine:
         return shlex.split(mine) + [path]
     return [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "pager.py"), path]
 
 
 def editor_argv(path):
-    """The user's editor, with swap, backup and history files off for vim, as genai does: the text may hold secrets."""
+    """The user's editor, with swap, backup and history files off for vim, as hoplon does: the text may hold secrets."""
     argv = shlex.split(os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi")
     base = os.path.basename(argv[0])
     if base in ("vim", "nvim", "gvim"):
@@ -1280,7 +1280,7 @@ def remote_where(host):
 
 
 def review_buffer(command, rc, where, output):
-    """What /run and /share open for review: the same layout as genai's own :run."""
+    """What /run and /share open for review: the same layout as hoplon's own :run."""
     return ("# EVERYTHING below is sent to the model as saved, the command included.\n"
             "# Remove anything you don't want it to see, such as a secret in the command.\n"
             f"I ran this command {where} (exit {rc}):\n```\n{command}\n```\nOutput:\n```\n{output}\n```\n")
@@ -1322,18 +1322,18 @@ def menu_item(*args):
 
 
 class Shell:
-    """The shell pane genai-tui opened beside the conversation. What each command printed comes from the
+    """The shell pane hoplon-tui opened beside the conversation. What each command printed comes from the
     recorder (tui/recorder.py); this reads the screen and its history only for shell context, by logical line:
     a line wrapped onto several rows counts once, so resizing the pane doesn't move a mark."""
 
     def __init__(self, pane):
         self.pane = pane
         self.primary_prompt = None
-        self.remote_prompt = None      # (host, directory) while a genai-ssh shell is at its prompt, from the recorder
+        self.remote_prompt = None      # (host, directory) while a hoplon-ssh shell is at its prompt, from the recorder
 
     @classmethod
     def from_env(cls):
-        pane = os.environ.get("GENAI_TUI_SHELL")
+        pane = os.environ.get("HOPLON_TUI_SHELL")
         return cls(pane) if pane and os.environ.get("TMUX") else None
 
     def tmux(self, *args, data=None, check=False):
@@ -1357,7 +1357,7 @@ class Shell:
         return (pid, cwd), (command, mode, paste)
 
     def execution_where(self, pid=None):
-        """Describe the shell pane itself, independently of the genai child."""
+        """Describe the shell pane itself, independently of the hoplon child."""
         if pid is None:
             try:
                 (pid, _), _ = self.context()
@@ -1376,14 +1376,14 @@ class Shell:
             raise Busy("it is in copy mode; press q there")
         remote = self.remote_prompt() if self.remote_prompt else None
         if remote:
-            # A genai-ssh session's shell, at its prompt: its markers carry the key only it was given (recorder.py),
+            # A hoplon-ssh session's shell, at its prompt: its markers carry the key only it was given (recorder.py),
             # so that is the proof, whatever runs ssh here (ssh itself, or a wrapper).
             if paste == "0":
                 raise Busy("the shell on the other host has bracketed input turned off")
             return context[0], f"{remote[0]}:{remote[1]}"
         if command == "ssh":
-            raise Busy("ssh is running, and genai-tui can't follow it; to send commands to another host, connect "
-                       "with genai-ssh [ssh options] HOST instead")
+            raise Busy("ssh is running, and hoplon-tui can't follow it; to send commands to another host, connect "
+                       "with hoplon-ssh [ssh options] HOST instead")
         if command != "bash":
             raise Busy(f"{command or 'something'} is running")
         # tmux before 3.4 can't report bracketed paste (an empty format). Our shellrc turns it on, and the recorder's
@@ -1400,11 +1400,11 @@ class Shell:
         context = self.ready()
         if expected is not None and context != expected:
             raise Busy("the shell or working directory changed since review")
-        self.tmux("load-buffer", "-b", "genai-run", "-", data=command, check=True)
+        self.tmux("load-buffer", "-b", "hoplon-run", "-", data=command, check=True)
         if self.ready() != context:
             raise Busy("the shell changed before paste")
         self.tmux("send-keys", "-t", self.pane, "C-e", "C-u", check=True)
-        self.tmux("paste-buffer", "-p", "-d", "-b", "genai-run", "-t", self.pane, check=True)
+        self.tmux("paste-buffer", "-p", "-d", "-b", "hoplon-run", "-t", self.pane, check=True)
         if enter:
             if self.ready() != context:
                 raise Busy("the shell changed before Enter")
@@ -1423,7 +1423,7 @@ class Shell:
 
     def show(self, focus=False):
         """Bring the shell pane into view above the conversation (it runs hidden), and go there if asked."""
-        toggle = os.environ.get("GENAI_TUI_TOGGLE")
+        toggle = os.environ.get("HOPLON_TUI_TOGGLE")
         if toggle:
             subprocess.run([toggle, "show"] + (["--focus"] if focus else []), capture_output=True, timeout=5)
         elif focus:
@@ -1434,7 +1434,7 @@ class Shell:
 
     def copy(self, text):
         """To tmux's buffer and, through the terminal (OSC 52), the system clipboard where the terminal allows it."""
-        self.tmux("set-buffer", "-w", "-b", "genai-copy", "--", text)
+        self.tmux("set-buffer", "-w", "-b", "hoplon-copy", "--", text)
 
     def popup_menu(self, *args):
         """tmux's display-menu in this pane, without waiting for it to close. Titles, names and commands are tmux
@@ -1481,20 +1481,20 @@ class Shell:
                         *items, *([""] if items else []), "Cancel", "q", "")
 
     def title(self, text):
-        self.tmux("set", "-p", "-t", os.environ.get("TMUX_PANE", ""), "@genai_title", text)
+        self.tmux("set", "-p", "-t", os.environ.get("TMUX_PANE", ""), "@hoplon_title", text)
 
 
 # --------------------------------------------------------------------------
-# genai as a child process
+# hoplon as a child process
 
 class Child:
     def __init__(self, args, remote_info=None):
-        """genai --json ARGS, here, or (remote_info is remote.json) on the remote host over the ssh master. Remote,
-        what genai reads first is its own source, then the config line, then the protocol (see remote.py); a
+        """hoplon --json ARGS, here, or (remote_info is remote.json) on the remote host over the ssh master. Remote,
+        what hoplon reads first is its own source, then the config line, then the protocol (see remote.py); a
         thread writes it all so a slow or dead ssh can't freeze the screen."""
         self.writes = None
         if remote_info:
-            with open(GENAI, "rb") as f:
+            with open(HOPLON, "rb") as f:
                 source = f.read()
             cmd = remote_info["ssh"] + [remote.bootstrap_command(remote_info, len(source), args)]
             args = []
@@ -1502,7 +1502,7 @@ class Child:
             self.writes.put(source)
             self.writes.put(json.dumps(remote_info["config"]).encode() + b"\n")
         else:
-            cmd = ([GENAI] if os.environ.get("GENAI_BIN") else [sys.executable, GENAI]) + ["--json"]
+            cmd = ([HOPLON] if os.environ.get("HOPLON_BIN") else [sys.executable, HOPLON]) + ["--json"]
         self.p = subprocess.Popen(cmd + args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", bufsize=1)
         self.events = queue.Queue()
@@ -1534,7 +1534,7 @@ class Child:
             try:
                 ev = json.loads(line)
             except ValueError:
-                ev = {"type": "error", "message": f"not JSON from genai: {line.strip()[:200]}"}
+                ev = {"type": "error", "message": f"not JSON from hoplon: {line.strip()[:200]}"}
             self.events.put(ev)
         self.events.put({"type": "_exit", "code": self.p.wait(), "err": "\n".join(self.err)})
 
@@ -1553,7 +1553,7 @@ class Child:
             pass
 
     def interrupt(self):
-        """Ctrl-C for genai: a SIGINT, which stops a sandboxed run (genai ignores it otherwise). Only when genai is
+        """Ctrl-C for hoplon: a SIGINT, which stops a sandboxed run (hoplon ignores it otherwise). Only when hoplon is
         our own child here; over ssh there is no way to send it one yet."""
         if self.writes or self.p.poll() is not None:
             return False
@@ -1572,7 +1572,7 @@ class Child:
                 self.p.stdin.close()
             self.p.wait(5)
         except (OSError, subprocess.TimeoutExpired):
-            try:            # still busy: SIGTERM lets genai end a work session, committing it, before it exits
+            try:            # still busy: SIGTERM lets hoplon end a work session, committing it, before it exits
                 self.p.terminate()
                 self.p.wait(30)
             except (OSError, subprocess.TimeoutExpired):
@@ -1597,10 +1597,10 @@ class App:
         self.plan_review = None
         self.running = None        # a /run command in the shell pane: card, command, commands done before it
         self.rows = []             # the block drawn on each screen row of the conversation
-        self.state_dir = os.environ.get("GENAI_TUI_STATE") if shell else None
-        self.panel = os.environ.get("GENAI_TUI_PANEL") if shell else None
-        self.files = os.environ.get("GENAI_TUI_FILES") if shell else None
-        self.prompt = os.environ.get("GENAI_TUI_PROMPT") if shell else None   # input happens in that pane
+        self.state_dir = os.environ.get("HOPLON_TUI_STATE") if shell else None
+        self.panel = os.environ.get("HOPLON_TUI_PANEL") if shell else None
+        self.files = os.environ.get("HOPLON_TUI_FILES") if shell else None
+        self.prompt = os.environ.get("HOPLON_TUI_PROMPT") if shell else None   # input happens in that pane
         # the other panes connect here; a feature that is off has no requests, so the Hub refuses them
         self.hub = Hub(self.state_dir, feature_requests(on)) if self.state_dir else None
         if self.hub:
@@ -1733,7 +1733,7 @@ class App:
             rows, cur = rows[top:top + INPUT_MAX_LINES], (cur[0] - top, cur[1])
         lines = [[(r[:2], A), (r[2:], "")] for r in rows]
         if self.m.exited is not None:
-            hints = "genai has exited · /quit or Ctrl-D to leave"
+            hints = "hoplon has exited · /quit or Ctrl-D to leave"
         elif self.m.busy:
             hints = f"{SPIN[int(time.time() * 10) % len(SPIN)]} working · type ahead, Enter queues it"
         else:
@@ -1870,7 +1870,7 @@ class App:
             elif now - self.ctrl_c < 2:
                 m.quit = True
             else:
-                m.note("Ctrl-C again (or Ctrl-D) to quit" + (". genai's reply can't be interrupted yet." if m.busy else ""))
+                m.note("Ctrl-C again (or Ctrl-D) to quit" + (". hoplon's reply can't be interrupted yet." if m.busy else ""))
             self.ctrl_c = now
         elif k == "\t":
             ed.text = complete(ed.text, self.m.commands())
@@ -1900,7 +1900,7 @@ class App:
         return seq
 
     def prompt_view(self):
-        """What the prompt pane shows: the input box, or our question or genai's approval, with hints."""
+        """What the prompt pane shows: the input box, or our question or hoplon's approval, with hints."""
         lines, cur, hints = self.bottom(200)
         status = []
         if self.m.coding:
@@ -2013,7 +2013,7 @@ class App:
             card = self.rows[y]
             if isinstance(card, Card) and card.ev.get("kind") == "command":
                 if not self.shell:
-                    self.m.note(f"{card.id}: start genai with genai-tui to send commands to a shell pane", R)
+                    self.m.note(f"{card.id}: start hoplon with hoplon-tui to send commands to a shell pane", R)
                     return
                 self.shell.menu(card.id, self.where(), extra=self.card_items(card))
 
@@ -2026,7 +2026,7 @@ class App:
         if not card:
             self.m.note(f"no command proposal has Alt+{n}", Q)
         elif not self.shell:
-            self.m.note(f"{card.id}: start genai with genai-tui to send commands to a shell pane", R)
+            self.m.note(f"{card.id}: start hoplon with hoplon-tui to send commands to a shell pane", R)
         else:
             self.shell.menu(card.id, self.where(), at="C", extra=self.card_items(card))
 
@@ -2056,7 +2056,7 @@ class App:
                     f.card_action(self, what, card)
 
     def where(self):
-        """Where a command typed into the shell pane now runs: here, or on the host of a genai-ssh session."""
+        """Where a command typed into the shell pane now runs: here, or on the host of a hoplon-ssh session."""
         host = self.rec.remote_host() if self.shell else None
         return remote_where(host) if host else self.m.shell_where or "OUTSIDE any sandbox, directly on this host"
 
@@ -2162,7 +2162,7 @@ class App:
                     text = review_buffer(ask["command"], ask["rc"], ask.get("where") or self.where(), ask["output"])
                 if k == "s":                                # the same text, without the editor's # lines on top
                     kept = text.split("\n", 1 if ask.get("context") else 2)[-1].strip("\n")
-                    m.note(f"{ask['label']}: sent without review (genai still masks the secrets it recognises)", Q)
+                    m.note(f"{ask['label']}: sent without review (hoplon still masks the secrets it recognises)", Q)
                 else:
                     kept = self.edit(text, ask["label"], "sent to the model exactly as saved; nothing is added",
                                      "send nothing", top_only=True)
@@ -2288,18 +2288,18 @@ class App:
         """The right-click menu marked a line: turn its row number into a logical line now, before a resize could
         move it."""
         try:
-            raw = self.shell.opt("@genai_ctx_mark")
+            raw = self.shell.opt("@hoplon_ctx_mark")
             if not raw.isdigit():
                 return
             self.ctx_line = len(self.shell.lines(upto=int(raw))) - 1
-            self.shell.tmux("display-message", "-t", self.shell.pane, "genai: shell context starts at this line")
+            self.shell.tmux("display-message", "-t", self.shell.pane, "hoplon: shell context starts at this line")
         except (OSError, subprocess.SubprocessError) as e:
             self.m.note(f"tmux failed ({e})", R)
 
     def edit(self, text, title, what, cancel, top_only=False):
         """Open text in the user's editor; what they save, without # lines (with top_only, only those on top, so
         a shared file or output keeps its own). None if the editor failed."""
-        fd, path = tempfile.mkstemp(prefix="genai-tui-", suffix=".txt")
+        fd, path = tempfile.mkstemp(prefix="hoplon-tui-", suffix=".txt")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 header = EDITOR_HEADER_TOP if top_only else EDITOR_HEADER
@@ -2344,7 +2344,7 @@ class App:
             self.m.decide_plan(approve=None if keep == set(steps) else sorted(keep), edits=edits)
 
     def plan_cmd(self, card):
-        """genai marked a command as one the user approved in the plan, and our own record agrees."""
+        """hoplon marked a command as one the user approved in the plan, and our own record agrees."""
         if self.m.ask or self.m.pending or self.running or not self.m.command_authorized(card):
             return                                          # it stays a card: click it or /run it
         if self.m.plan_auto and self.m.plan_context:
@@ -2373,7 +2373,7 @@ class App:
         return self.view_text(f"{card.id}: {card.title()}\n\n{card.full_text()}\n")
 
     def view_text(self, text):
-        fd, path = tempfile.mkstemp(prefix="genai-preview-", suffix=".txt", dir=self.state_dir)
+        fd, path = tempfile.mkstemp(prefix="hoplon-preview-", suffix=".txt", dir=self.state_dir)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
         curses.endwin()
@@ -2458,7 +2458,7 @@ class App:
                 self.toggle_panel()
             elif action[0] == "interrupt":
                 if not self.child.interrupt():
-                    self.m.note("genai couldn't be sent Ctrl-C", R)
+                    self.m.note("hoplon couldn't be sent Ctrl-C", R)
             else:
                 for f in self.m.features:
                     if action[0] in f.actions:
@@ -2475,7 +2475,7 @@ class App:
                 self.m.handle(ev)
                 if ev.get("type") == "hello" and self.shell:
                     epn = (ev.get("endpoint") or {})
-                    self.shell.title(f"genai · {epn.get('name', '?')}: {epn.get('model', '?')}")
+                    self.shell.title(f"hoplon · {epn.get('name', '?')}: {epn.get('model', '?')}")
         for msg in self.m.outbox:
             self.child.send(msg)
         self.m.outbox = []
@@ -2495,13 +2495,13 @@ class App:
             status = self.m.tmux_status()
             if status != self.status:
                 self.status = status
-                self.shell.tmux("set", "-g", "@genai_sandbox", status)
+                self.shell.tmux("set", "-g", "@hoplon_sandbox", status)
         self.publish()
 
 
 def parse_args(argv):
     ap = argparse.ArgumentParser(
-        prog="genai-tui", description="genai as a coding agent in tmux: the conversation, your shell below it and "
+        prog="hoplon-tui", description="hoplon as a coding agent in tmux: the conversation, your shell below it and "
         "an info panel beside it. The model only proposes; you approve, and you run commands in your own shell.")
     ap.add_argument("-p", "--profile", help="profile (persona) name")
     ap.add_argument("-e", "--endpoint", help="endpoint name (overrides the profile's)")
@@ -2511,15 +2511,15 @@ def parse_args(argv):
                     help="allow sending saved context to a changed or unrecorded destination")
     ap.add_argument("--coding", action="store_true", help="let the model read and list files here without asking")
     ap.add_argument("--coding-anywhere", action="store_true",
-                    help="--coding, also where it is normally refused; genai says what that exposes")
+                    help="--coding, also where it is normally refused; hoplon says what that exposes")
     ap.add_argument("--no-panel", action="store_true", help="start without the info panel (/panel shows it)")
     ap.add_argument("--files", action="store_true", help="start with the file tree shown (/files shows or hides it)")
     ap.add_argument("--remote", metavar="[USER@]HOST",
-                    help="run genai on that host over ssh, keeping this screen and the API key here. Options for ssh "
+                    help="run hoplon on that host over ssh, keeping this screen and the API key here. Options for ssh "
                          "go after a lone --, such as: -- -J bastion")
     ap.add_argument("--dir", metavar="PATH", help="with --remote: the directory on that host to work in")
     ap.add_argument("--as", dest="as_user", metavar="USER",
-                    help="with --remote: run genai and the shell there as USER, through sudo -n (no password)")
+                    help="with --remote: run hoplon and the shell there as USER, through sudo -n (no password)")
     ap.add_argument("--check", action="store_true", help=argparse.SUPPRESS)
     argv, ssh_opts = (argv[:argv.index("--")], argv[argv.index("--") + 1:]) if "--" in argv else (argv, [])
     args = ap.parse_args(argv)
@@ -2529,7 +2529,7 @@ def parse_args(argv):
             ap.error(f"{name} needs --remote")
     if args.remote:
         if args.session:
-            ap.error("--remote can't use -S yet: a saved session would stay on the host genai runs on")
+            ap.error("--remote can't use -S yet: a saved session would stay on the host hoplon runs on")
         if any(not k or re.search(r"[\x00-\x1f\x7f]", k) for k in args.skill):
             ap.error("-k needs a skill name without control characters")
         why = remote.check_destination(args.remote, args.as_user, args.dir)
@@ -2538,8 +2538,8 @@ def parse_args(argv):
     return args
 
 
-def genai_args(a):
-    """The options genai itself gets; everything else is the TUI's. Remote, the endpoint and profile travel in
+def hoplon_args(a):
+    """The options hoplon itself gets; everything else is the TUI's. Remote, the endpoint and profile travel in
     the config line instead (the launcher resolved them here, with -e and -p)."""
     out = []
     for flag, value in (("-p", a.profile), ("-e", a.endpoint), ("-S", a.session)):
@@ -2573,12 +2573,12 @@ def main(argv):
     info = None
     if args.remote:
         try:
-            info = remote.load(os.environ.get("GENAI_TUI_REMOTE", ""))
+            info = remote.load(os.environ.get("HOPLON_TUI_REMOTE", ""))
         except (OSError, ValueError) as e:
-            print(f"genai-tui: --remote needs the launcher (genai-tui) to set up the connection first: {e}",
+            print(f"hoplon-tui: --remote needs the launcher (hoplon-tui) to set up the connection first: {e}",
                   file=sys.stderr)
             return 2
-    child = Child(genai_args(args), info)
+    child = Child(hoplon_args(args), info)
     try:
         curses.wrapper(lambda scr: App(scr, child, Shell.from_env()).run())
     finally:

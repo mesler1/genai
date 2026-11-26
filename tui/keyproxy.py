@@ -1,31 +1,31 @@
 #!/usr/bin/env python3
-"""keyproxy: lets a remote genai use your endpoint without the API key ever leaving this machine.
+"""keyproxy: lets a remote hoplon use your endpoint without the API key ever leaving this machine.
 
-genai-tui's remote mode runs genai on an internal host over ssh. The endpoint's key must not go there, so
-genai-tui starts this program locally. It listens on a Unix socket in genai-tui's private (0700) state
-directory, and `ssh -R 127.0.0.1:0:SOCKET` forwards a port on the remote host to it. The remote genai sends
+hoplon-tui's remote mode runs hoplon on an internal host over ssh. The endpoint's key must not go there, so
+hoplon-tui starts this program locally. It listens on a Unix socket in hoplon-tui's private (0700) state
+directory, and `ssh -R 127.0.0.1:0:SOCKET` forwards a port on the remote host to it. The remote hoplon sends
 plain-HTTP model requests to http://127.0.0.1:PORT/v1; this program checks the token, adds the key and the
 endpoint's own headers, and forwards the request over the endpoint's normal TLS and proxy settings (the same
-opener genai itself builds), streaming the reply back as it arrives.
+opener hoplon itself builds), streaming the reply back as it arrives.
 
     keyproxy.py ENDPOINT SOCKET        the token is the first line of stdin (32-128 hex characters)
 
-ENDPOINT is resolved and blessing-checked exactly like `genai -e ENDPOINT`: an unblessed or changed endpoint
+ENDPOINT is resolved and blessing-checked exactly like `hoplon -e ENDPOINT`: an unblessed or changed endpoint
 is refused (exit 3). After one line `ready` on stdout it serves until stdin closes or SIGTERM, then removes
 the socket and exits 0. The token comes on stdin so it never shows in `ps`.
 
 Allowed, and nothing else (anything else is 404 and is never forwarded):
     GET  /v1/models            ->  BASE_URL/models
     POST /v1/chat/completions  ->  BASE_URL/chat/completions    (JSON object body, at most 16 MiB)
-Every request needs the right X-Genai-Token (401 otherwise). Of the client's headers only Content-Type and
+Every request needs the right X-Hoplon-Token (401 otherwise). Of the client's headers only Content-Type and
 Accept are forwarded; Authorization, Cookie, Proxy-*, Host and the token itself are dropped.
 
 What a root user on the remote host can do: use the token while the tunnel is up, so send chat and model-list
 requests to your endpoint and spend your quota, through this fixed allowlist. What they cannot do: read the
 key (it is only in this process), reach any other URL or path on the endpoint, change its headers, or use the
-proxy once genai-tui exits. The reply size is capped like genai's own.
+proxy once hoplon-tui exits. The reply size is capped like hoplon's own.
 
-Requests are logged to genai's local audit log as `proxy_request` (method, path, status, bytes, ms); the key
+Requests are logged to hoplon's local audit log as `proxy_request` (method, path, status, bytes, ms); the key
 and token are never logged. Standard library only.
 """
 
@@ -53,11 +53,11 @@ ROUTES = {("GET", "/v1/models"): "/models", ("POST", "/v1/chat/completions"): "/
 EXIT_OK, EXIT_USAGE, EXIT_PROFILE = 0, 2, 3
 
 
-def load_genai():
-    """Import the genai script (no .py suffix) that sits at the repository root."""
-    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "genai")
-    loader = importlib.machinery.SourceFileLoader("genai_mod", path)
-    spec = importlib.util.spec_from_loader("genai_mod", loader)
+def load_hoplon():
+    """Import the hoplon script (no .py suffix) that sits at the repository root."""
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hoplon")
+    loader = importlib.machinery.SourceFileLoader("hoplon_mod", path)
+    spec = importlib.util.spec_from_loader("hoplon_mod", loader)
     mod = importlib.util.module_from_spec(spec)
     loader.exec_module(mod)
     return mod
@@ -73,8 +73,8 @@ class Proxy(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     daemon_threads = True
     request_queue_size = 32
 
-    def __init__(self, path, genai, client, token, audit):
-        self.genai, self.client, self.token, self.audit = genai, client, token.encode(), audit
+    def __init__(self, path, hoplon, client, token, audit):
+        self.hoplon, self.client, self.token, self.audit = hoplon, client, token.encode(), audit
         self.base = client.p.base_url
         self.slots = threading.BoundedSemaphore(MAX_CONCURRENT)
         super().__init__(path, Handler)
@@ -132,7 +132,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                   bytes=self.bytes_out, ms=ms)
 
     def handle_request(self, method, path):
-        got = self.headers.get("X-Genai-Token", "")
+        got = self.headers.get("X-Hoplon-Token", "")
         if not hmac.compare_digest(got.encode("utf-8", "replace"), self.server.token):
             return self.fail(401, "missing or wrong token")
         target = ROUTES.get((method, path))
@@ -168,9 +168,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def forward(self, method, target, body):
         srv = self.server
-        g = srv.genai
+        g = srv.hoplon
         headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream",
-                   "User-Agent": f"genai/{g.VERSION}"}
+                   "User-Agent": f"hoplon/{g.VERSION}"}
         for name in ("Content-Type", "Accept"):
             v = self.headers.get(name)
             if v and v.isprintable() and len(v) <= 200:
@@ -185,7 +185,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except urllib.error.HTTPError as e:
             data = e.read(MAX_ERROR)
             return self.relay(e.code, e.headers.get("Content-Type"), [data])
-        except g.GenaiError:
+        except g.HoplonError:
             return self.fail(502, "the endpoint answered with a redirect, which is not followed")
         except (urllib.error.URLError, OSError, ValueError):
             return self.fail(502, "cannot reach the endpoint")
@@ -193,8 +193,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.relay(r.status, r.headers.get("Content-Type"), self.chunks(r))
 
     def chunks(self, r):
-        """The upstream body as it arrives, cut off at genai's reply cap."""
-        left = self.server.genai.REPLY_CAP
+        """The upstream body as it arrives, cut off at hoplon's reply cap."""
+        left = self.server.hoplon.REPLY_CAP
         try:
             while left > 0:
                 data = r.read1(min(CHUNK, left))
@@ -244,12 +244,12 @@ def start(argv):
     if len(argv) != 2 or argv[0].startswith("-"):
         raise Failure("usage: keyproxy.py ENDPOINT SOCKET   (the token is the first line of stdin)")
     name, path = argv
-    g = load_genai()
+    g = load_hoplon()
     try:
         cfg = g.Config()
         endpoint = g.select_endpoint(cfg, name)
         client = g.Client(endpoint)
-    except g.GenaiError as e:
+    except g.HoplonError as e:
         raise Failure(str(e).splitlines()[0], EXIT_PROFILE)
     token = read_token()
     check_socket_path(path)

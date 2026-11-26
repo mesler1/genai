@@ -1,4 +1,4 @@
-"""Tests for genai-tui's pager (tui/pager.py): wrapping, search, and that Esc or q closes it at once.
+"""Tests for hoplon-tui's pager (tui/pager.py): wrapping, search, and that Esc or q closes it at once.
 Run: python3 -m unittest discover -s tests"""
 
 import importlib.machinery
@@ -44,11 +44,11 @@ class TestText(unittest.TestCase):
     def test_pager_is_ours_unless_one_is_set(self):
         argv = C.pager_argv("/tmp/x.txt")
         self.assertEqual((argv[0], os.path.basename(argv[1]), argv[2]), (sys.executable, "pager.py", "/tmp/x.txt"))
-        os.environ["GENAI_TUI_PAGER"] = "less -R"
+        os.environ["HOPLON_TUI_PAGER"] = "less -R"
         try:
             self.assertEqual(C.pager_argv("/tmp/x.txt"), ["less", "-R", "/tmp/x.txt"])
         finally:
-            del os.environ["GENAI_TUI_PAGER"]
+            del os.environ["HOPLON_TUI_PAGER"]
 
 
 @unittest.skipUnless(shutil.which("tmux"), "needs tmux")
@@ -56,9 +56,9 @@ class TestInTmux(unittest.TestCase):
     """The pager for real, in a private tmux server."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="genai-pager-test-")
+        self.tmp = tempfile.mkdtemp(prefix="hoplon-pager-test-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
-        self.sock = f"genai-pager-test-{os.getpid()}"
+        self.sock = f"hoplon-pager-test-{os.getpid()}"
         self.addCleanup(self.tmux, "kill-server")
         self.file = os.path.join(self.tmp, "view.txt")
         with open(self.file, "w") as f:

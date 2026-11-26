@@ -1,13 +1,13 @@
-"""genai-tui's features: each in a module of its own, registered here.
+"""hoplon-tui's features: each in a module of its own, registered here.
 
 The conversation pane (conversation.py) is the core: the conversation, the cards, the approval and run flows. What it
 can do without is a Feature, so it can be changed, or switched off, in one place. A feature gets the Model (to add
-notes, send messages to genai, queue actions) or the App (to do something on screen) and nothing more, and the same
+notes, send messages to hoplon, queue actions) or the App (to do something on screen) and nothing more, and the same
 checks as everywhere apply: it can't answer a question or approve anything.
 
-Switching one off: {"disable": ["copy", "model"]} in $XDG_CONFIG_HOME/genai/tui.json (default
-~/.config/genai/tui.json), or GENAI_TUI_DISABLE=copy,model in the environment. A disabled feature has no command, no
-help line and no menu item, its genai events are ignored, and the socket refuses the requests it would have taken.
+Switching one off: {"disable": ["copy", "model"]} in $XDG_CONFIG_HOME/hoplon/tui.json (default
+~/.config/hoplon/tui.json), or HOPLON_TUI_DISABLE=copy,model in the environment. A disabled feature has no command, no
+help line and no menu item, its hoplon events are ignored, and the socket refuses the requests it would have taken.
 """
 
 import importlib
@@ -25,10 +25,10 @@ class Feature:
 
     name = ""          # how config refers to it
     commands = {}      # "/cmd": "help text" for /help, in order; the core's come first
-    to_genai = ()      # of those, the commands that must wait while genai is replying (like the core's to_genai)
-    needs = None       # a feature genai must list in hello["features"], or the command says "this genai can't ..."
-    cant = ""          # what completes "this genai can't ..." when needs is missing
-    events = ()        # genai event types it handles
+    to_hoplon = ()      # of those, the commands that must wait while hoplon is replying (like the core's to_hoplon)
+    needs = None       # a feature hoplon must list in hello["features"], or the command says "this hoplon can't ..."
+    cant = ""          # what completes "this hoplon can't ..." when needs is missing
+    events = ()        # hoplon event types it handles
     requests = {}      # socket request types it handles -> the roles that may send them, e.g. {"copy": ("menu",)}
     actions = ()       # kinds of Model.actions tuples (action[0]) it performs in the App
     card_actions = ()  # words of `menu ACTION ID` (a command card's tmux menu) it handles
@@ -38,14 +38,14 @@ class Feature:
         """One of its commands, as typed (a menu sends the command a user would have typed). m is the Model."""
 
     def event(self, m, ev):
-        """A genai event of one of its types."""
+        """A hoplon event of one of its types."""
 
     def request(self, m, role, msg):
         """A socket request of one of its types, from a pane in one of the roles it allows (None where the Model is
         driven directly). msg is untrusted: check it, then act as the user's command would."""
 
     def error(self, m, ev):
-        """A genai error event. Return True only for the failure of one of its own requests, which it has then dealt
+        """A hoplon error event. Return True only for the failure of one of its own requests, which it has then dealt
         with; any other is left to the core."""
         return False
 
@@ -59,13 +59,13 @@ class Feature:
         """More /help lines, after the commands."""
 
     def poll(self, app):
-        """Once per App loop iteration, for things that have to be watched (such as genai-ssh's handshake)."""
+        """Once per App loop iteration, for things that have to be watched (such as hoplon-ssh's handshake)."""
 
     def run_started(self, m, card):
         """A command card was typed into the shell pane to run."""
 
     def exited(self, m):
-        """genai has exited."""
+        """hoplon has exited."""
 
     def snapshot(self, m, view):
         """May add to or adjust the info panel's view dict before it is sent."""
@@ -86,7 +86,7 @@ def disabled_names(environ=None):
     malformed one is ignored (every feature stays on), so a typo can't stop the program."""
     env = os.environ if environ is None else environ
     base = env.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
-    path = os.path.join(base, "genai", "tui.json")
+    path = os.path.join(base, "hoplon", "tui.json")
     names, warning = set(), None
     try:
         with open(path, encoding="utf-8") as f:
@@ -99,7 +99,7 @@ def disabled_names(environ=None):
         pass
     except (OSError, ValueError) as e:
         warning = f"{path} was ignored, so every feature is on: {e}"
-    names.update(n.strip() for n in (env.get("GENAI_TUI_DISABLE") or "").split(",") if n.strip())
+    names.update(n.strip() for n in (env.get("HOPLON_TUI_DISABLE") or "").split(",") if n.strip())
     return names, warning
 
 

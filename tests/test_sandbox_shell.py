@@ -15,9 +15,9 @@ class ShellCase(SandboxCase):
     def run_shell(self, *args, env=None, tty=True):
         """Run sandbox/run shell with a pty for stdin and stdout (or /dev/null and pipes when tty is false)."""
         e = dict(os.environ, PATH=self.bin + os.pathsep + os.environ["PATH"], HOME=self.home,
-                 GENAI_SANDBOX_STATE=self.state, GENAI_SANDBOX_WORK=self.p("work"), FAKE_LOG=self.log,
+                 HOPLON_SANDBOX_STATE=self.state, HOPLON_SANDBOX_WORK=self.p("work"), FAKE_LOG=self.log,
                  FAKE_LOG_VARS="")
-        for k in ("GENAI_SANDBOX_HOOKS", "GENAI_SANDBOX_RO", "GENAI_KEY_ENV"):
+        for k in ("HOPLON_SANDBOX_HOOKS", "HOPLON_SANDBOX_RO", "HOPLON_KEY_ENV"):
             e.pop(k, None)
         e.update(env or {})
         cmd = ["bash", RUN, "shell", *args]
@@ -34,14 +34,14 @@ class ShellCase(SandboxCase):
 
 class TestShellMode(ShellCase):
     def test_default_has_no_network_and_a_terminal(self):
-        r = self.run_shell(env={"K_ENV": "secret", "GENAI_KEY_ENV": "K_ENV"})
+        r = self.run_shell(env={"K_ENV": "secret", "HOPLON_KEY_ENV": "K_ENV"})
         args, _ = self.ok(r)
         self.assertIn("--network=none", args)
         self.assertIn("-it", args)
         self.assertIn("network off", r.stderr)
-        self.assertIn(f"GENAI_SANDBOX_WORK_HOST={self.p('work')}", args)
-        self.assertIn("GENAI_SANDBOX_NET=off", args)
-        self.assertIn("GENAI_SANDBOX=podman", args)
+        self.assertIn(f"HOPLON_SANDBOX_WORK_HOST={self.p('work')}", args)
+        self.assertIn("HOPLON_SANDBOX_NET=off", args)
+        self.assertIn("HOPLON_SANDBOX=podman", args)
         self.assertIn(f"{self.p('work')}:/work", args)
         self.assertIn("--read-only", args)           # the same hardened flags as every mode
         self.assertIn("--cap-drop=ALL", args)
@@ -53,15 +53,15 @@ class TestShellMode(ShellCase):
         r = self.run_shell("--net")
         args, _ = self.ok(r)
         self.assertFalse([a for a in args if a.startswith("--network")])
-        self.assertIn("GENAI_SANDBOX_NET=on", args)
+        self.assertIn("HOPLON_SANDBOX_NET=on", args)
         self.assertIn("network on", r.stderr)
 
     def test_bash_runs_with_the_rc_file(self):
         args, _ = self.ok(self.run_shell())
         i = args.index("--noprofile")
         self.assertTrue(args[i - 1].endswith("/bash"))
-        self.assertEqual(args[i:], ["--noprofile", "--rcfile", "/opt/genai/sandbox/shellrc", "-i"])
-        self.assertIn(f"{ROOT}:/opt/genai:ro", args)
+        self.assertEqual(args[i:], ["--noprofile", "--rcfile", "/opt/hoplon/sandbox/shellrc", "-i"])
+        self.assertIn(f"{ROOT}:/opt/hoplon:ro", args)
         self.assertTrue(os.path.isfile(RC))
 
     def test_hooks_run_with_mode_shell(self):
@@ -94,10 +94,10 @@ class TestShellMode(ShellCase):
         self.assertIn("sandbox/run shell [--net]", r.stderr)
         self.assertEqual(self.podman_runs(), [])
 
-    def test_genai_mode_passes_the_host_work_path(self):
-        r = self.run_sandbox(mode="genai", env={"GENAI_SANDBOX_WORK": self.p("work")})
+    def test_hoplon_mode_passes_the_host_work_path(self):
+        r = self.run_sandbox(mode="hoplon", env={"HOPLON_SANDBOX_WORK": self.p("work")})
         args, _ = self.ok(r)
-        self.assertIn(f"GENAI_SANDBOX_WORK_HOST={self.p('work')}", args)
+        self.assertIn(f"HOPLON_SANDBOX_WORK_HOST={self.p('work')}", args)
 
 
 class TestShellRc(unittest.TestCase):
@@ -108,7 +108,7 @@ class TestShellRc(unittest.TestCase):
         return subprocess.run([BASH, "-c", f". {RC}; {tail}"], env=e, capture_output=True, text=True)
 
     def test_prompt_history_and_banner(self):
-        r = self.source({"GENAI_SANDBOX_WORK_HOST": "/host/w"}, 'printf "%s\\n%s\\n" "$PS1" "$HISTFILE"')
+        r = self.source({"HOPLON_SANDBOX_WORK_HOST": "/host/w"}, 'printf "%s\\n%s\\n" "$PS1" "$HISTFILE"')
         self.assertIn("[sandbox:podman /work]", r.stdout)
         self.assertIn("\\[\\e[7m\\]", r.stdout)            # escapes sit inside \[ \]
         self.assertIn("/tmp/.bash_history", r.stdout)
@@ -116,7 +116,7 @@ class TestShellRc(unittest.TestCase):
         self.assertIn("network: off (sandbox/run shell --net to allow)", r.stdout)
 
     def test_banner_says_network_on(self):
-        self.assertIn("network: on (--net)", self.source({"GENAI_SANDBOX_NET": "on"}).stdout)
+        self.assertIn("network: on (--net)", self.source({"HOPLON_SANDBOX_NET": "on"}).stdout)
 
 
 if __name__ == "__main__":

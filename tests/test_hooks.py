@@ -15,18 +15,18 @@ from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import test_genai as T  # noqa: E402
+import test_hoplon as T  # noqa: E402
 from fakeapi import FakeAPI, call, calls, reply  # noqa: E402
 
 G, SCRIPT = T.G, T.SCRIPT
-KEY_VAR = "GENAI_TEST_KEY"
+KEY_VAR = "HOPLON_TEST_KEY"
 KEY_VALUE = "key-value-r7x2"
 
 # What a test hook does: append what it saw (one tab-separated line) to $HOOK_OUT, then make noise.
 RECORDER = """#!/bin/sh
 line=$(cat)
 if [ -t 1 ]; then t=tty; else t=notty; fi
-printf '%s\\t%s\\t%s\\t%s\\n' "$line" "${GENAI_TEST_KEY-unset}" "${OTHER_VAR-unset}" "$t" >> "$HOOK_OUT"
+printf '%s\\t%s\\t%s\\t%s\\n' "$line" "${HOPLON_TEST_KEY-unset}" "${OTHER_VAR-unset}" "$t" >> "$HOOK_OUT"
 echo HOOKNOISE-q7
 echo HOOKNOISE-q7 >&2
 """
@@ -104,7 +104,7 @@ class HookCase(T.Tmp):
     def env(self, **extra):
         e = dict(os.environ, XDG_CONFIG_HOME=os.path.dirname(self.home), HOME=self.tmp, TERM="dumb",
                  HOOK_OUT=self.out, OTHER_VAR="ordinary", **{KEY_VAR: KEY_VALUE})
-        e.pop("GENAI_SANDBOX", None)
+        e.pop("HOPLON_SANDBOX", None)
         e.update(extra)
         return e
 
@@ -172,7 +172,7 @@ class TestBlessHook(HookCase):
         self.assertTrue(ok)
         self.assertEqual(len(asked), 1)
         self.assertIn(self.hook, out)
-        self.assertIn("a hook: a program genai will run as you when it is waiting for you", out)
+        self.assertIn("a hook: a program hoplon will run as you when it is waiting for you", out)
         self.assertIn(f"{len(RECORDER.encode())} bytes", out)
         self.assertIn("    | #!/bin/sh", out)
         self.assertNotIn("not executable", out)
@@ -194,24 +194,24 @@ class TestBlessHook(HookCase):
             f.write(RECORDER)
         os.chmod(real, 0o700)
         os.symlink(real, self.hook)
-        with self.assertRaisesRegex(G.GenaiError, "regular file"):
+        with self.assertRaisesRegex(G.HoplonError, "regular file"):
             self.run_bless()
         os.unlink(self.hook)
         self.install(mode=0o770, bless=False)
-        with self.assertRaisesRegex(G.GenaiError, "writable by group or others"):
+        with self.assertRaisesRegex(G.HoplonError, "writable by group or others"):
             self.run_bless()
         os.chmod(self.hook, 0o702)
-        with self.assertRaisesRegex(G.GenaiError, "writable by group or others"):
+        with self.assertRaisesRegex(G.HoplonError, "writable by group or others"):
             self.run_bless()
         with open(self.hook, "wb") as f:
             f.write(b"#!/bin/sh\n\xff\xfe\n")
         os.chmod(self.hook, 0o700)
-        with self.assertRaisesRegex(G.GenaiError, "UTF-8"):
+        with self.assertRaisesRegex(G.HoplonError, "UTF-8"):
             self.run_bless()
         self.assertNotIn(self.hook, self.cfg.blessed())
 
     def test_missing_file_is_refused(self):
-        with self.assertRaises(G.GenaiError):
+        with self.assertRaises(G.HoplonError):
             self.run_bless()
 
     def test_not_executable_is_blessed_with_a_note(self):
@@ -286,7 +286,7 @@ class TestNotifierChecks(HookCase):
         self.assertIsNone(G.Notifier.start(eng))
         self.assertEqual(len(eng.notices), 1)
         self.assertIn("is not blessed", eng.notices[0])
-        self.assertIn(f"genai --bless {self.hook}", eng.notices[0])
+        self.assertIn(f"hoplon --bless {self.hook}", eng.notices[0])
         self.settle()
         self.assertEqual(self.records(), [])
 
@@ -405,7 +405,7 @@ class TestNotifierRuns(HookCase):
         with mock.patch.object(G, "HOOK_TIMEOUT", 1):
             t0 = time.time()
             G.Notifier.start(eng).fire("reply")
-            self.assertLess(time.time() - t0, 0.9)            # genai did not wait for it
+            self.assertLess(time.time() - t0, 0.9)            # hoplon did not wait for it
             end = time.time() + 5
             while time.time() < end and not (os.path.exists(child) and len(open(child).read().split()) == 2):
                 time.sleep(0.05)
@@ -498,7 +498,7 @@ class TestCli(HookCase):
         out, rc = self.pty_run([], [("> ", "hi\n..\n"), ("MODELTEXT-zq91", ":quit\n")])
         self.assertEqual(rc, 0, out)
         short = self.hook.replace(self.tmp, "~")      # HOME is the temp dir
-        self.assertIn(f"  hook: notify (runs {short} when genai waits for you)", out)
+        self.assertIn(f"  hook: notify (runs {short} when hoplon waits for you)", out)
         self.assertEqual(out.count("hook: notify"), 1)
         self.wait_records(1)
         self.assertEqual([r[0]["event"] for r in self.records()], ["reply"])
@@ -518,7 +518,7 @@ class TestCli(HookCase):
         out, rc = self.pty_run(["go"], [("Accept p1?", "n\n")])
         self.assertEqual(rc, 0, out)
         self.assertEqual(out.count("is not blessed"), 1)
-        self.assertIn(f"genai --bless {self.hook}", out)
+        self.assertIn(f"hoplon --bless {self.hook}", out)
         self.assertNotIn("hook: notify", out)
         self.settle()
         self.assertEqual(self.records(), [])
@@ -534,7 +534,7 @@ class TestCli(HookCase):
         self.settle()
         self.assertEqual(self.records(), [])
 
-    def test_a_slow_hook_does_not_delay_genai(self):
+    def test_a_slow_hook_does_not_delay_hoplon(self):
         pidfile = self.path("slow.pid")
         self.install(f"#!/bin/sh\necho $$ > '{pidfile}'\nexec sleep 30\n")
         self.api.turns[:] = [reply("ok")]

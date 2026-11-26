@@ -14,7 +14,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fakeapi import FakeAPI, call, calls, reply, slow  # noqa: E402
-from test_genai import G, SCRIPT, Proc, bless_path, make_home, write_json  # noqa: E402
+from test_hoplon import G, SCRIPT, Proc, bless_path, make_home, write_json  # noqa: E402
 from test_sandbox_runner import FakePodman  # noqa: E402
 
 GIT_ENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
@@ -82,7 +82,7 @@ class WorkTest(FakePodman):
             g.send({"type": "work", "task": "fix a"})
             started = g.until("work")
             self.assertEqual((started["state"], started["branch"], started["test"]),
-                             ("started", "genai/work-1", "test -f a.txt"))
+                             ("started", "hoplon/work-1", "test -f a.txt"))
             self.approve(g)
             edit = g.until("proposal")
             self.assertEqual((edit["kind"], edit.get("auto"), edit.get("work")), ("edit", True, True))
@@ -96,16 +96,16 @@ class WorkTest(FakePodman):
             self.assertEqual(g.until("done")["reason"], "reply")
             g.close()
         self.assertEqual(ended["why"], "done")
-        self.assertEqual(ended["branch"], "genai/work-1")
+        self.assertEqual(ended["branch"], "hoplon/work-1")
         self.assertEqual([c.split(" ", 1)[1] for c in ended["commits"]], ["1. a.txt says fixed", "2. add b.txt"])
-        self.assertIn("git merge genai/work-1", ended["commands"])
+        self.assertIn("git merge hoplon/work-1", ended["commands"])
         with open(os.path.join(root, "a.txt")) as f:
             self.assertEqual(f.read(), "hi\n")                       # your own files are untouched
         self.assertFalse(os.path.exists(os.path.join(root, "b.txt")))
-        self.assertEqual(git(root, "show", "genai/work-1:a.txt"), "fixed\n")
-        self.assertEqual(git(root, "show", "genai/work-1:b.txt"), "new\n")
+        self.assertEqual(git(root, "show", "hoplon/work-1:a.txt"), "fixed\n")
+        self.assertEqual(git(root, "show", "hoplon/work-1:b.txt"), "new\n")
         self.assertEqual(git(root, "rev-parse", "--abbrev-ref", "HEAD").strip(), "main")
-        self.assertEqual(os.listdir(self.path("state", "genai", "work")), [])     # the copy is gone
+        self.assertEqual(os.listdir(self.path("state", "hoplon", "work")), [])     # the copy is gone
         mounts = [a for c in self.podman_calls() for a in c if a.endswith(":/work:O")]
         self.assertTrue(mounts and all(self.path("state") in m for m in mounts))  # the copy, as an overlay
         events = [e["event"] for e in self.audit()]
@@ -146,7 +146,7 @@ class WorkTest(FakePodman):
             g.close()
         self.assertIn("no files changed", api.requests[2]["body"]["messages"][-1]["content"])
         self.assertEqual((ended["state"], ended["branch"]), ("ended", None))      # no commits: the branch is gone
-        self.assertNotIn("genai/work-1", git(self.path("wd"), "branch"))
+        self.assertNotIn("hoplon/work-1", git(self.path("wd"), "branch"))
 
     def test_the_step_budget_pauses_and_a_message_renews_it(self):
         reads = [call("read_file", path="a.txt", reason="r")] * 5
@@ -245,8 +245,8 @@ class WorkTest(FakePodman):
             self.approve(g)
             g.until("done")
             g.close()
-        self.assertEqual(git(root, "show", "genai/work-1:b.txt"), "x\n")
-        self.assertEqual(os.listdir(self.path("state", "genai", "work")), [])
+        self.assertEqual(git(root, "show", "hoplon/work-1:b.txt"), "x\n")
+        self.assertEqual(os.listdir(self.path("state", "hoplon", "work")), [])
 
     def test_each_item_starts_in_a_fresh_context_with_the_notes(self):
         turns = [call("propose_work_plan", goal="g", items=["make b", "make c"]),
@@ -275,7 +275,7 @@ class WorkTest(FakePodman):
         self.assertEqual([m["role"] for m in item2], ["system", "user"])
         self.assertIn("item 2 of 2: make c", item2[1]["content"])
         self.assertIn("c.txt should match", item2[1]["content"])              # the handoff
-        log = git(root, "log", "--format=%s%n%b", "-1", "genai/work-1~1")
+        log = git(root, "log", "--format=%s%n%b", "-1", "hoplon/work-1~1")
         title = log.splitlines()[0]
         self.assertTrue(title.startswith("1. Add b.txt") and title.endswith("\u2026") and len(title) <= 67, title)
         self.assertIn("Plan item: make b", log)
@@ -433,7 +433,7 @@ class WorkTest(FakePodman):
         self.assertTrue(ended["problems"] and "could not be committed" in ended["problems"][0])
         self.assertEqual((ended["branch"], ended["path"], ended["removed"]), (None, started["path"], False))
         self.assertTrue(os.path.exists(os.path.join(started["path"], "b.txt")))     # the work is still there
-        self.assertNotIn("genai/work", git(root, "branch"))                       # nothing was committed
+        self.assertNotIn("hoplon/work", git(root, "branch"))                       # nothing was committed
 
     def test_the_repositorys_own_filter_drivers_never_run_in_the_copy_but_global_ones_do(self):
         turns = [call("propose_work_plan", goal="g", items=["one"]),
@@ -453,7 +453,7 @@ class WorkTest(FakePodman):
         marks["ob"], text = driver("ob")    # included only on a work branch, so only the copy would see it
         with open(self.path("ob.cfg"), "w") as f:
             f.write(text)
-        git(root, "config", "includeIf.onbranch:genai/**.path", self.path("ob.cfg"))
+        git(root, "config", "includeIf.onbranch:hoplon/**.path", self.path("ob.cfg"))
         with FakeAPI(turns) as api:
             g = self.start(api)
             marks["glob"], text = driver("glob")    # your global config: XDG_CONFIG_HOME/git/config
@@ -472,8 +472,8 @@ class WorkTest(FakePodman):
                 return f.read().split()
         self.assertEqual(len(ended["commits"]), 1)
         for name in ("evil", "x=y", "ob"):
-            self.assertFalse([d for d in where(name) if "genai/work" in d], name)   # never in the copy
-        self.assertTrue([d for d in where("glob") if "genai/work" in d])          # yours runs there too
+            self.assertFalse([d for d in where(name) if "hoplon/work" in d], name)   # never in the copy
+        self.assertTrue([d for d in where("glob") if "hoplon/work" in d])          # yours runs there too
 
     def test_writes_ask_until_the_plan_is_approved(self):
         turns = [call("write_file", path="b.txt", content="x\n", reason="early"), reply("ok")]
@@ -656,7 +656,7 @@ class WorkTest(FakePodman):
         self.assertIn("each item must be one line", self.tool_replies(api)[0])
         self.assertEqual((p["goal"], p["items"]), ("g", ["one"]))
         self.assertEqual(len(ended["commits"]), 1)
-        self.assertIn("b?c", git(root, "log", "-1", "--format=%s", "genai/work-1"))
+        self.assertIn("b?c", git(root, "log", "-1", "--format=%s", "hoplon/work-1"))
 
     def test_a_new_plan_drops_the_old_plans_reports(self):
         turns = [call("propose_work_plan", goal="g", items=["a", "b"]),
@@ -695,7 +695,7 @@ class WorkTest(FakePodman):
             g.send({"type": "stop"})
             self.assertEqual(g.until("done")["reason"], "stopped")
             self.assertLess(time.monotonic() - t, 20)
-            g.send({"type": "work"})            # a bad message: genai is listening again
+            g.send({"type": "work"})            # a bad message: hoplon is listening again
             g.until("error")
             g.close()
         self.assertEqual(len(api.requests), 2)      # never asked the model again
@@ -717,9 +717,9 @@ class WorkTest(FakePodman):
             self.assertEqual(g.until("done")["reason"], "stopped")
             ended = self.ended(g)
             g.close()
-        self.assertEqual((ended["why"], ended["branch"]), ("ended", "genai/work-1"))
-        self.assertEqual(git(root, "show", "genai/work-1:b.txt"), "x\n")    # committed as unfinished
-        self.assertEqual(os.listdir(self.path("state", "genai", "work")), [])
+        self.assertEqual((ended["why"], ended["branch"]), ("ended", "hoplon/work-1"))
+        self.assertEqual(git(root, "show", "hoplon/work-1:b.txt"), "x\n")    # committed as unfinished
+        self.assertEqual(os.listdir(self.path("state", "hoplon", "work")), [])
 
     def test_sigterm_mid_turn_commits_the_work_and_removes_the_copy(self):
         turns = [call("propose_work_plan", goal="g", items=["one"]),
@@ -736,8 +736,8 @@ class WorkTest(FakePodman):
             g.p.send_signal(signal.SIGTERM)
             rc = g.close()
         self.assertEqual(rc, 128 + signal.SIGTERM)
-        self.assertEqual(git(root, "show", "genai/work-1:b.txt"), "x\n")
-        self.assertEqual(os.listdir(self.path("state", "genai", "work")), [])
+        self.assertEqual(git(root, "show", "hoplon/work-1:b.txt"), "x\n")
+        self.assertEqual(os.listdir(self.path("state", "hoplon", "work")), [])
 
 
     # -- what the second audit found
@@ -945,7 +945,7 @@ class WorkTest(FakePodman):
             ended = self.ended(g)
             g.close()
         self.assertEqual((ended["why"], ended["unfinished"]), ("done", None))
-        self.assertNotIn("late.txt", git(root, "ls-tree", "-r", "--name-only", "genai/work-1"))
+        self.assertNotIn("late.txt", git(root, "ls-tree", "-r", "--name-only", "hoplon/work-1"))
         skipped = [e for e in g.events if e["type"] == "result" and e["status"] == "skipped"]
         self.assertEqual(len(skipped), 1)
         self.assertTrue(any("came after finish_item" in t for t in self.tool_replies(api)))
@@ -1019,7 +1019,7 @@ class WorkTest(FakePodman):
                                                capture_output=True).returncode, 0)
             local = git(root, "--git-dir", gitdir, "config", "--local", "--list", "--name-only").split()
             self.assertFalse([k for k in local if not k.startswith("core.")])   # no remote, no filters: none of yours
-            self.assertNotIn("genai/work", git(root, "branch"))     # nothing is on a branch until an item is done
+            self.assertNotIn("hoplon/work", git(root, "branch"))     # nothing is on a branch until an item is done
             g.close()
 
     def test_a_branch_moved_outside_the_session_is_not_overwritten(self):
@@ -1034,12 +1034,12 @@ class WorkTest(FakePodman):
             g.send({"type": "work", "task": "t"})
             self.approve(g)
             g.until("done")
-            self.assertEqual(git(root, "show", "genai/work-1:b.txt"), "b\n")     # on the branch already
-            git(root, "update-ref", "refs/heads/genai/work-1", base)
+            self.assertEqual(git(root, "show", "hoplon/work-1:b.txt"), "b\n")     # on the branch already
+            git(root, "update-ref", "refs/heads/hoplon/work-1", base)
             g.send({"type": "work_end"})
             ended = self.ended(g)
             g.close()
-        self.assertEqual(git(root, "rev-parse", "genai/work-1").strip(), base)
+        self.assertEqual(git(root, "rev-parse", "hoplon/work-1").strip(), base)
         self.assertIn("was moved or deleted outside the session", ended["problems"][0])
         self.assertFalse(ended["removed"])
         self.assertTrue(os.path.exists(os.path.join(ended["path"], "c.txt")))
@@ -1051,16 +1051,16 @@ class WorkTest(FakePodman):
         with FakeAPI(turns) as api:
             g = self.start(api)
             g.send({"type": "work", "task": "t"})
-            self.assertEqual(g.until("work")["branch"], "genai/work-1")
+            self.assertEqual(g.until("work")["branch"], "hoplon/work-1")
             self.approve(g)
             g.until("done")
-            git(root, "branch", "genai/work-1")
+            git(root, "branch", "hoplon/work-1")
             g.send({"type": "work_end"})
             ended = self.ended(g)
             g.close()
-        self.assertEqual(ended["branch"], "genai/work-2")
-        self.assertEqual(git(root, "show", "genai/work-2:b.txt"), "b\n")
-        self.assertEqual(git(root, "rev-parse", "genai/work-1").strip(), git(root, "rev-parse", "main").strip())
+        self.assertEqual(ended["branch"], "hoplon/work-2")
+        self.assertEqual(git(root, "show", "hoplon/work-2:b.txt"), "b\n")
+        self.assertEqual(git(root, "rev-parse", "hoplon/work-1").strip(), git(root, "rev-parse", "main").strip())
 
 
     # -- what the third audit found
@@ -1091,8 +1091,8 @@ class WorkTest(FakePodman):
             g.send({"type": "work_end"})
             ended = self.ended(g)
             g.close()
-        self.assertEqual((ended["branch"], ended["removed"]), ("genai/work-1", False))    # the copy has gen.txt
-        self.assertEqual(git(root, "show", "genai/work-1:b.txt"), "b\n")
+        self.assertEqual((ended["branch"], ended["removed"]), ("hoplon/work-1", False))    # the copy has gen.txt
+        self.assertEqual(git(root, "show", "hoplon/work-1:b.txt"), "b\n")
         self.assertTrue(ended["commands"])
 
     def test_a_file_written_inside_a_submodule_keeps_the_copy(self):
@@ -1125,7 +1125,7 @@ class WorkTest(FakePodman):
             g.send({"type": "work", "task": "t"})
             self.approve(g)
             g.until("done")
-            git(root, "branch", "-D", "genai/work-1")
+            git(root, "branch", "-D", "hoplon/work-1")
             g.send({"type": "work_end"})
             ended = self.ended(g)
             g.close()
@@ -1217,8 +1217,8 @@ class TestCopy(unittest.TestCase):
         self.item(c, "b")
         git(root, "fetch", "-q", c.gitdir, f"{c.head()}:refs/heads/{c.branch}")   # done, but not yet recorded
         c.publish()
-        self.assertEqual((c.branch, c.published), ("genai/work-1", c.head()))
-        self.assertNotIn("genai/work-2", git(root, "branch"))
+        self.assertEqual((c.branch, c.published), ("hoplon/work-1", c.head()))
+        self.assertNotIn("hoplon/work-2", git(root, "branch"))
         self.item(c, "c")
         git(root, "fetch", "-q", c.gitdir, f"{c.head()}:refs/heads/{c.branch}")
         c.publish()                                                         # no false "moved or deleted"
@@ -1226,13 +1226,13 @@ class TestCopy(unittest.TestCase):
 
     def test_branch_names_in_the_way(self):
         root = self.repo()
-        git(root, "branch", "genai/work-1/x")
+        git(root, "branch", "hoplon/work-1/x")
         c, _ = G.Copy.create(root)
         self.addCleanup(c.remove)
-        self.assertEqual(c.branch, "genai/work-2")      # genai/work-1 can't be made beside genai/work-1/x
-        git(root, "branch", "-D", "genai/work-1/x")
-        git(root, "branch", "genai")
-        with self.assertRaisesRegex(G.GenaiError, "a branch named genai"):
+        self.assertEqual(c.branch, "hoplon/work-2")      # hoplon/work-1 can't be made beside hoplon/work-1/x
+        git(root, "branch", "-D", "hoplon/work-1/x")
+        git(root, "branch", "hoplon")
+        with self.assertRaisesRegex(G.HoplonError, "a branch named hoplon"):
             G.Copy.create(root)
 
     def test_a_repository_with_git_lfs_files_is_refused(self):
@@ -1243,11 +1243,11 @@ class TestCopy(unittest.TestCase):
             f.write("version https://git-lfs.github.com/spec/v1\n")
         git(root, "add", "-A")
         git(root, "commit", "-qm", "lfs")
-        with self.assertRaisesRegex(G.GenaiError, "don't support Git LFS yet, and 1 file here is stored with it "
+        with self.assertRaisesRegex(G.HoplonError, "don't support Git LFS yet, and 1 file here is stored with it "
                                                   r"\(big.bin\)"):
             G.Copy.create(root)
-        self.assertEqual(os.listdir(os.path.join(self.tmp, "state", "genai", "work")) if os.path.exists(
-            os.path.join(self.tmp, "state", "genai", "work")) else [], [])
+        self.assertEqual(os.listdir(os.path.join(self.tmp, "state", "hoplon", "work")) if os.path.exists(
+            os.path.join(self.tmp, "state", "hoplon", "work")) else [], [])
 
     def test_a_sha256_repository(self):
         root = self.repo("--object-format=sha256")
@@ -1271,7 +1271,7 @@ class TestCopy(unittest.TestCase):
     def test_a_copy_that_cant_be_made_is_a_refusal(self):
         root = self.repo()
         with mock.patch("tempfile.mkdtemp", side_effect=OSError(28, "No space left on device")):
-            with self.assertRaisesRegex(G.GenaiError, "can't make the copy under .*No space left") as cm:
+            with self.assertRaisesRegex(G.HoplonError, "can't make the copy under .*No space left") as cm:
                 G.Copy.create(root)
         self.assertEqual(cm.exception.kind, "work_refused")
 
@@ -1361,7 +1361,7 @@ class TestWorkParts(unittest.TestCase):
         self.assertEqual(G.git_line("/p/ends in space \n"), "/p/ends in space ")
 
     def test_git_refuses_a_nul_without_crashing(self):
-        with self.assertRaisesRegex(G.GenaiError, "could not run"):
+        with self.assertRaisesRegex(G.HoplonError, "could not run"):
             G.run_git(["log", "a\x00b"], os.getcwd())
 
     def test_a_directory_with_nothing_committed_is_refused(self):
@@ -1372,7 +1372,7 @@ class TestWorkParts(unittest.TestCase):
             git(root, "add", "a")
             git(root, "commit", "-qm", "a")
             os.makedirs(os.path.join(root, "new"))
-            with self.assertRaisesRegex(G.GenaiError, "nothing in this directory is committed"):
+            with self.assertRaisesRegex(G.HoplonError, "nothing in this directory is committed"):
                 G.Copy.create(os.path.join(root, "new"))
 
     def test_a_pyvenv_cfg_doesnt_hide_a_secret_from_the_scan(self):
@@ -1447,18 +1447,18 @@ class TestWorkParts(unittest.TestCase):
 
 class TestWorkProfile(unittest.TestCase):
     def test_work_needs_a_sandbox_and_checks_its_fields(self):
-        with self.assertRaisesRegex(G.GenaiError, "needs a 'sandbox'"):
+        with self.assertRaisesRegex(G.HoplonError, "needs a 'sandbox'"):
             G.Profile({"name": "p", "work": {}}, "p.json")
-        with self.assertRaisesRegex(G.GenaiError, "steps per item"):
+        with self.assertRaisesRegex(G.HoplonError, "steps per item"):
             G.Profile({"name": "p", "sandbox": {"image": "i:1"}, "work": {"steps_per_item": 0}}, "p.json")
-        with self.assertRaisesRegex(G.GenaiError, "unknown work fields"):
+        with self.assertRaisesRegex(G.HoplonError, "unknown work fields"):
             G.Profile({"name": "p", "sandbox": {"image": "i:1"}, "work": {"steps": 3}}, "p.json")
         p = G.Profile({"name": "p", "sandbox": {"image": "i:1"}, "work": {"test": "make test"}}, "p.json")
         self.assertEqual(p.work, {"test": "make test", "steps_per_item": 20, "time_limit": 7200, "planner": None})
         self.assertIn("20 steps per plan item", p.summary()[0])
         box = {"image": "i:1"}
         for bad in ("big", {}, {"endpoint": "../x"}, {"model": "a b"}, {"model": "m", "key": "k"}):
-            with self.subTest(planner=bad), self.assertRaisesRegex(G.GenaiError, "planner"):
+            with self.subTest(planner=bad), self.assertRaisesRegex(G.HoplonError, "planner"):
                 G.Profile({"name": "p", "sandbox": box, "work": {"planner": bad}}, "p.json")
         p = G.Profile({"name": "p", "sandbox": box, "work": {"planner": {"endpoint": "big"}}}, "p.json")
         self.assertIn("plans with endpoint big, which also sees the project", p.summary()[0])

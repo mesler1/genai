@@ -13,7 +13,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fakeapi import FakeAPI, call, reply  # noqa: E402
-from test_genai import G, Proc, Tmp, bless_path, make_home, write_json  # noqa: E402
+from test_hoplon import G, Proc, Tmp, bless_path, make_home, write_json  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -264,24 +264,24 @@ class TestBinary(PluginBase):
         self.assertNotIn("x", pl.commands)
         self.assertIn("queue", pl.commands)
         self.manifest["commands"] = {"x": {"argv": ["nothere"]}}
-        with self.assertRaises(G.GenaiError) as cm:
+        with self.assertRaises(G.HoplonError) as cm:
             self.load().resolve()
         self.assertIn("none of its programs", str(cm.exception))
 
     def test_group_writable_directory_is_refused(self):
         os.chmod(self.bin, 0o775)
-        with self.assertRaises(G.GenaiError) as cm:
+        with self.assertRaises(G.HoplonError) as cm:
             self.load().resolve()
         self.assertIn("writable by group or others", str(cm.exception))
 
     def test_writable_program_is_refused(self):
         os.chmod(os.path.join(self.bin, "fakeq"), 0o775)
-        with self.assertRaises(G.GenaiError):
+        with self.assertRaises(G.HoplonError):
             self.load().resolve()
 
     def test_not_executable_is_refused(self):
         os.chmod(os.path.join(self.bin, "fakeq"), 0o644)
-        with self.assertRaises(G.GenaiError) as cm:
+        with self.assertRaises(G.HoplonError) as cm:
             self.load().resolve()
         self.assertIn("not an executable", str(cm.exception))
 
@@ -359,11 +359,11 @@ class TestBlessing(PluginBase):
         bless_plugin(self.home, self.dir)
         eng, _ = self.engine(())
         eng.register([{"name": "fake__queue", "description": "mine"}])
-        with self.assertRaises(G.GenaiError) as cm:
+        with self.assertRaises(G.HoplonError) as cm:
             eng.set_plugin("fake", True)
         self.assertIn("already has the name fake__queue", str(cm.exception))
         eng2, _ = self.engine()
-        with self.assertRaises(G.GenaiError):
+        with self.assertRaises(G.HoplonError):
             eng2.register([{"name": "fake__queue", "description": "mine"}])
         self.assertEqual(eng2.register([{"name": "other", "description": "x"}]), ["other"])
 
@@ -376,7 +376,7 @@ class TestBlessing(PluginBase):
         prof = G.Profile({"name": "p", "plugins": ["fake"]}, "p.json")
         self.assertEqual(prof.plugins, ["fake"])
         self.assertIn("plugins:  fake", prof.summary()[0])
-        with self.assertRaises(G.GenaiError):
+        with self.assertRaises(G.HoplonError):
             G.Profile({"name": "p", "plugins": "fake"}, "p.json")
         rows = G.plugin_rows(self.cfg, ["fake"])
         self.assertEqual((rows[0]["name"], rows[0]["status"], rows[0]["enabled"], rows[0]["blessed"]),
@@ -399,7 +399,7 @@ class TestBlessing(PluginBase):
     def test_bless_refuses_a_bad_manifest(self):
         self.manifest["commands"]["queue"]["argv"] = ["fakeq", "{nope}"]
         write_json(os.path.join(self.dir, "plugin.json"), self.manifest)
-        with self.assertRaises(G.GenaiError) as cm:
+        with self.assertRaises(G.HoplonError) as cm:
             G.bless(self.cfg, self.dir, lambda q: True)
         self.assertIn("undeclared", str(cm.exception))
 
@@ -575,7 +575,7 @@ class TestRunning(PluginBase):
     def test_the_endpoint_key_is_masked(self):
         self.eng.client = mock.Mock(_key="supersecretendpointkey")
         program(os.path.join(self.bin, "leakq"), "echo 'key is supersecretendpointkey'\n")
-        # the program changed since genai started, so it is refused; a fresh engine reads the new identity
+        # the program changed since hoplon started, so it is refused; a fresh engine reads the new identity
         ep = G.Endpoint({"name": "t", "base_url": "http://127.0.0.1:1/v1", "model": "m"}, "t.json")
         eng = G.Engine(self.cfg, ep, G.Session(self.cfg), self.ui, client=mock.Mock(_key="supersecretendpointkey"),
                        plugins=["fake"])
@@ -586,7 +586,7 @@ class TestRunning(PluginBase):
         time.sleep(0.01)
         program(os.path.join(self.bin, "fakeq"), "echo changed\n")
         r = self.eng.run_user("fake", "job", {"id": 2})
-        self.assertEqual(r["error"], "the program changed since genai started; restart genai")
+        self.assertEqual(r["error"], "the program changed since hoplon started; restart hoplon")
         self.assertEqual(len(self.calls()), 1)
         p, told = self.model("fake__job", id=3)
         self.assertIn("error: not run: the program changed", told)
@@ -597,14 +597,14 @@ class TestRunning(PluginBase):
         r = self.eng.run_user("fake", "kill", {"id": 7})          # not read-only: the user decided by clicking
         self.assertEqual((r["exit"], self.calls()[0]["args"]), (3, ["kill", "7"]))
         self.assertEqual(self.audit()[0]["source"], "user")
-        with self.assertRaises(G.GenaiError) as cm:
+        with self.assertRaises(G.HoplonError) as cm:
             self.eng.run_user("fake", "job", {"id": "1;ls"})
         self.assertEqual(cm.exception.kind, "bad_params")
-        with self.assertRaises(G.GenaiError) as cm:
+        with self.assertRaises(G.HoplonError) as cm:
             self.eng.run_user("fake", "nope", {})
         self.assertEqual(cm.exception.kind, "unknown_command")
         self.eng.set_plugin("fake", False)
-        with self.assertRaises(G.GenaiError):
+        with self.assertRaises(G.HoplonError):
             self.eng.run_user("fake", "job", {"id": 1})
 
     def test_tty_shows_what_ran(self):

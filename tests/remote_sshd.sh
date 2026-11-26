@@ -1,26 +1,26 @@
 #!/usr/bin/env bash
-# A SLES 15 SP6 sshd in a container, for the real-ssh test of genai-tui's remote mode (tests/test_remote.py,
+# A SLES 15 SP6 sshd in a container, for the real-ssh test of hoplon-tui's remote mode (tests/test_remote.py,
 # TestRealSsh). Users in it: `me`, who logs in with a key made here, and `svc`, whom `me` may become with
 # `sudo -n -u svc` without a password. It has python3.11 only (SLES 15's python3 is 3.6), like the real hosts.
 #
-#   tests/remote_sshd.sh up      build the image (localhost/genai-sshd-test) if needed, start it on 127.0.0.1:2222
+#   tests/remote_sshd.sh up      build the image (localhost/hoplon-sshd-test) if needed, start it on 127.0.0.1:2222
 #   tests/remote_sshd.sh down    stop it
 #   tests/remote_sshd.sh test    up, run the real-ssh test against it, down
 #
 # Nothing is built by the normal test suite: TestRealSsh is skipped unless podman, the image and the running
-# container are all there. State (the login key) is in $GENAI_TEST_SSH_DIR, default $XDG_RUNTIME_DIR/genai-sshd-test.
-# Usage for a manual try: genai-tui --remote me@127.0.0.1 --as svc --dir /tmp -- -p 2222 -i KEY -o StrictHostKeyChecking=no
+# container are all there. State (the login key) is in $HOPLON_TEST_SSH_DIR, default $XDG_RUNTIME_DIR/hoplon-sshd-test.
+# Usage for a manual try: hoplon-tui --remote me@127.0.0.1 --as svc --dir /tmp -- -p 2222 -i KEY -o StrictHostKeyChecking=no
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
-dir=${GENAI_TEST_SSH_DIR:-${XDG_RUNTIME_DIR:-/tmp}/genai-sshd-test}
-port=${GENAI_TEST_SSH_PORT:-2222}
-image=localhost/genai-sshd-test
-name=genai-sshd-test
+dir=${HOPLON_TEST_SSH_DIR:-${XDG_RUNTIME_DIR:-/tmp}/hoplon-sshd-test}
+port=${HOPLON_TEST_SSH_PORT:-2222}
+image=localhost/hoplon-sshd-test
+name=hoplon-sshd-test
 
 up() {
   mkdir -p "$dir"
   chmod 700 "$dir"
-  [ -f "$dir/key" ] || ssh-keygen -q -t ed25519 -N '' -C genai-sshd-test -f "$dir/key"
+  [ -f "$dir/key" ] || ssh-keygen -q -t ed25519 -N '' -C hoplon-sshd-test -f "$dir/key"
   if ! podman image exists "$image"; then
     cp "$dir/key.pub" "$dir/authorized_keys"
     cat > "$dir/Containerfile" <<'EOF'
@@ -33,7 +33,7 @@ RUN zypper -n install --no-recommends openssh-server python311 sudo shadow && zy
  && mkdir -p /home/me/.ssh && chmod 700 /home/me/.ssh
 COPY authorized_keys /home/me/.ssh/authorized_keys
 RUN chown -R me:users /home/me/.ssh && chmod 600 /home/me/.ssh/authorized_keys \
- && printf 'PasswordAuthentication no\nAllowTcpForwarding yes\n' > /etc/ssh/sshd_config.d/genai.conf
+ && printf 'PasswordAuthentication no\nAllowTcpForwarding yes\n' > /etc/ssh/sshd_config.d/hoplon.conf
 EXPOSE 22
 CMD ["/usr/sbin/sshd", "-D", "-e"]
 EOF
@@ -60,7 +60,7 @@ case ${1:-} in
   test)
     up
     trap down EXIT
-    GENAI_TEST_SSH_PORT=$port GENAI_TEST_SSH_KEY=$dir/key python3 -m unittest -v tests.test_remote.TestRealSsh
+    HOPLON_TEST_SSH_PORT=$port HOPLON_TEST_SSH_KEY=$dir/key python3 -m unittest -v tests.test_remote.TestRealSsh
     ;;
   *) echo "usage: $0 up|down|test" >&2; exit 2 ;;
 esac

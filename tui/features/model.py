@@ -5,7 +5,7 @@ import re
 from . import Feature
 
 MODEL_MENU = 20               # models in the /model drop-down; the rest by name
-# A model name from the server, as genai accepts it. Checked again here before one goes into a tmux menu, whose
+# A model name from the server, as hoplon accepts it. Checked again here before one goes into a tmux menu, whose
 # item names are formats: no '#', ',', '}', quotes or spaces can get through.
 MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+=-]{0,199}")
 
@@ -13,7 +13,7 @@ MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+=-]{0,199}")
 class ModelPicker(Feature):
     name = "model"
     commands = {"/model": "[NAME]: pick the model from those the server offers (a drop-down), or switch to NAME"}
-    to_genai = ("/model",)
+    to_hoplon = ("/model",)
     needs = "models"
     cant = "list or switch models"
     events = ("models", "model")
@@ -21,7 +21,7 @@ class ModelPicker(Feature):
     actions = ("model_menu",)
 
     def __init__(self):
-        self.models = []           # the server's models, as genai last listed them
+        self.models = []           # the server's models, as hoplon last listed them
         self.picking = False       # /model asked for that list, to show it as a drop-down
 
     def command(self, m, cmd, arg):
@@ -38,7 +38,7 @@ class ModelPicker(Feature):
                            if isinstance(x, dict) and isinstance(x.get("id"), str) and MODEL_ID.fullmatch(x["id"])]
             current = (m.hello or {}).get("endpoint", {}).get("model")
             if not self.models:
-                m.note("the server lists no models genai can use", self.core.R)
+                m.note("the server lists no models hoplon can use", self.core.R)
             elif self.picking and m.shell:
                 m.actions.append(("model_menu",))
             else:
