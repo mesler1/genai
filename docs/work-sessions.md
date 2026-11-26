@@ -21,7 +21,7 @@ and merge what you want, with git.
    every edit and write asks.
 3. **It works through the items without asking.** Reads, searches, edits and writes in the copy
    apply at once (you see each one), except to hidden or secret-looking files and `pyvenv.cfg`,
-   which still ask, and edits while the planner reviews a stuck item, which ask too. The sandbox's
+   which still ask. While the planner reviews a stuck item, its edits apply without asking too. The sandbox's
    network stays off for the whole session.
    Offline sandbox runs work on a throwaway overlay of the copy, as usual: they see the model's
    edits, and their own changes are discarded.

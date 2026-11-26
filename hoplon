@@ -3573,12 +3573,12 @@ class Engine:
 
     def work_edit(self, p):
         """Does this edit or write apply without asking, in a work session? Yes, in the copy, while an item of the
-        approved plan is being worked on, unless the file is hidden, or it or the new content looks secret. Before the
-        plan is approved, and while the planner reviews an item, every edit asks. So does a pyvenv.cfg, or anything
+        approved plan is being worked on or the planner reviews it (both are held to the steps and the time limit),
+        unless the file is hidden, or it or the new content looks secret. Before the plan is approved, every edit asks. So does a pyvenv.cfg, or anything
         under a directory of that name, which would change what the sandbox's secret scan looks at. In a work
         session these rules are the only ones: edits "approved-files" doesn't apply in the copy."""
         w = self.work
-        if not w or not self.ui.performs or not w.items or not w.current or w.role != "item":
+        if not w or not self.ui.performs or not w.items or not w.current or w.role not in ("item", "review"):
             return False
         key = self.file_key(p.fields.get("path"))
         if (key is None or is_hidden(key.split("/")) or p.fields.get("undiffable")

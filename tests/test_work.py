@@ -309,6 +309,30 @@ class WorkTest(FakePodman):
         self.assertIn("work_retry", events)
         self.assertIn("work_item", events)
 
+    def test_the_planner_edits_without_asking_while_it_reviews_a_stuck_item(self):
+        turns = [call("propose_work_plan", goal="g", items=["one"]),
+                 call("write_file", path="b.txt", content="x\n", reason="r"),
+                 call("read_file", path="b.txt", reason="polish"),
+                 call("write_file", path="b.txt", content="y\n", reason="the planner fixes it"),
+                 call("finish_item", n=1, summary="b"),
+                 reply("done")]
+        self.repo()
+        with FakeAPI(turns) as api:
+            g = self.start(api, {"steps_per_item": 2})
+            g.send({"type": "work", "task": "t"})
+            self.approve(g)
+            try:
+                for reason in ("r", "the planner fixes it"):          # the item's write, then the planner's
+                    p = g.until("proposal")
+                    while p["kind"] == "read":
+                        p = g.until("proposal")
+                    self.assertEqual((p["kind"], p.get("reason")), ("write", reason))
+                    self.assertTrue(p.get("auto"), p)                   # applied without asking
+                self.assertEqual(g.until("done")["reason"], "reply")
+            finally:
+                g.close()
+        self.assertIn("used its budget of 2 model steps", api.requests[3]["body"]["messages"][-1]["content"])
+
     def test_old_output_is_dropped_as_the_context_fills(self):
         big = "x" * 4000 + "\n"
         turns = ([call("propose_work_plan", goal="g", items=["one"])]

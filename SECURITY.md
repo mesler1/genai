@@ -256,8 +256,9 @@ in between.
     on a throwaway overlay of the copy, so a test can't leave anything behind. The copy's git
     directory is beside its files, not among them, and the sandbox mounts only the files: the
     git directory holds every file of the commit, the ones the sandbox hides as secrets too.
-  - Edits and writes apply without asking only while an item of an approved plan is worked on;
-    before approval, and while the planner reviews an item, they ask, whatever the edits mode:
+  - Edits and writes apply without asking only while an item of an approved plan is worked on, or
+    the planner reviews a stuck item (held to the same step budget and time limit); before
+    approval they ask, whatever the edits mode:
     files you approved with `approved-files` count only outside the session. Hidden and
     secret-looking files always ask, and so does a `pyvenv.cfg` or anything under a directory of
     that name, as the sandbox's secret scan treats a virtual environment differently (it skips
