@@ -58,33 +58,39 @@ def view(st, w, sel):
     gw = h.get("hoplon_where")
     if gw:
         add([("hoplon    ", Q), (fit(clean(gw[0].removeprefix("hoplon runs ")), w - 9), R if gw[1] == R else W)])
-    where = h.get("shell_where")
-    if where:
-        add([("commands ", Q), (fit("run " + clean(where), w - 9), D if where.startswith("inside") else W)])
-    else:
-        add([("commands ", Q), ("shown for manual execution", Q)])
     coding = st.get("coding")
     add([("coding   ", Q), ("[on] " if coding else "[off]", W if coding else ""),
          (fit("  c switches" if not coding else "  reads without asking", w - 14), Q)], "coding")
     head("SANDBOX")
-    if h.get("sandbox"):
-        add([("hoplon    ", Q), (fit(f"in the {clean(h['sandbox'])} sandbox", w - 9), D)])
-    else:
-        add([("hoplon    ", Q), (fit("not sandboxed", w - 9), "")])      # the usual way to run it: not a fault
+    # Three different things run in different places; each line names which, and marks it: ⊡ sandboxed, ▲ not.
+    L, V = 14, w - 14
     run, going = st.get("runner"), st.get("running")
     if going:
-        add([("model's  ", Q), (fit(f"RUNNING {clean(going.get('id', '?'))} · {going.get('secs', 0)}s", w - 9), W)])
-        add([(fit("  Ctrl-C or /stop stops it" if going.get("stoppable") else "  can't be stopped in remote mode yet",
-                  w), Q)])
+        add([("model's runs  ", Q), ("⊡ ", D),
+             (fit(f"RUNNING {clean(going.get('id', '?'))} · {going.get('secs', 0)}s", V - 2), W)])
+        add([(" " * L, ""), (fit("Ctrl-C or /stop stops it" if going.get("stoppable")
+                                 else "can't be stopped in remote mode yet", V), Q)])
     elif run and run.get("problem"):
-        add([("model's  ", Q), (fit(f"can't run: {clean(run['problem'])}", w - 9), R)])
+        add([("model's runs  ", Q), (fit(f"can't run: {clean(run['problem'])}", V), R)])
     elif run:
-        add([("model's  ", Q), ("ready · ", D), ("ONLINE" if run.get("network") else "offline",
-                                                 W if run.get("network") else D),
-             (fit(f" · {clean(run.get('image') or '?')}", max(w - 24, 4)), Q)])
-        add([(fit("  each run asks · /network" if run.get("network") else "  /network switches", w), Q)])
+        add([("model's runs  ", Q), ("⊡ sandboxed · ", D),
+             (fit("ONLINE" if run.get("network") else "offline", V - 14), W if run.get("network") else D)])
+        add([(" " * L, ""), (fit(clean(run.get("image") or "?"), V), Q)])
+        add([(" " * L, ""), (fit("each run asks · /network" if run.get("network") else "/network switches", V), Q)])
     else:
-        add([("model's  ", Q), ("none", Q)])
+        add([("model's runs  ", Q), (fit("none: they're only proposed", V), Q)])
+    where = h.get("shell_where")
+    if not where:
+        add([("your commands ", Q), (fit("you run them yourself", V), Q)])
+    elif where.startswith("inside"):
+        add([("your commands ", Q), ("⊡ ", D), (fit(clean(where), V - 2), D)])
+    else:
+        text = "this host, no sandbox" if where == "OUTSIDE any sandbox, directly on this host" else clean(where)
+        add([("your commands ", Q), (fit("▲ " + text, V), W)])
+    if h.get("sandbox"):
+        add([("hoplon itself ", Q), (fit(f"⊡ in the {clean(h['sandbox'])} sandbox", V), D)])
+    else:
+        add([("hoplon itself ", Q), (fit("▲ this host", V), "")])      # the usual way to run it: not a fault
     add([(fit("/sandbox shows the details", w), Q)])
     head("CONTEXT")
     ctx = st.get("context") or [None, None]

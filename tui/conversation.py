@@ -341,7 +341,7 @@ class Banner(Block):
         elif run and run.get("problem"):
             rows.append((f"The profile's sandbox can't run here: {run['problem']}.", R))
         if self.shell_where:
-            rows.append((f"Approved commands run {self.shell_where}.", W))
+            rows.append((f"Commands you approve run {self.shell_where}.", W))
         else:
             rows.append(("Commands are shown for you to run in your own shell.", W))
         if h.get("skills"):
@@ -792,7 +792,9 @@ class Model:
             return f" #[fg=yellow,bold]⏵ sandbox {card.elapsed()}s#[default] │"
         if self.hello.get("sandbox"):
             return " #[fg=green]⊡ sandbox#[default] │"
-        return " not sandboxed │"
+        if self.runner and not self.runner.get("problem"):
+            return " #[fg=green]⊡ model's runs sandboxed#[default] │"
+        return " #[fg=yellow]▲ no sandbox#[default] │"
 
     def network_text(self):
         r = self.runner

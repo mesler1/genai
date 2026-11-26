@@ -290,7 +290,7 @@ class TestModel(unittest.TestCase):
         m.shell_where = "OUTSIDE any sandbox, directly on this host"
         self.hello(m, remote=True, host="login1", user="svc")
         banner = text_of(m.blocks[0], 120)
-        self.assertIn("Approved commands run ON ANOTHER HOST, login1, over ssh", banner)
+        self.assertIn("Commands you approve run ON ANOTHER HOST, login1, over ssh", banner)
         self.assertNotIn("directly on this host", banner)
 
     def test_trusted_command_card_shows_what_ran_and_its_output(self):
@@ -528,7 +528,7 @@ class TestSandboxRuns(unittest.TestCase):
         self.assertEqual(snap["runner"]["network"], True)
         PANEL = load("panel", os.path.join(REPO, "tui", "panel.py"))
         lines, _ = PANEL.view(snap, 42, None)
-        self.assertIn("model's  ready · ONLINE · dev:1", "\n".join("".join(t for t, _ in ln) for ln in lines))
+        self.assertIn("model's runs  ⊡ sandboxed · ONLINE", "\n".join("".join(t for t, _ in ln) for ln in lines))
         m.submit("go")
         m.submit("/network off")
         self.assertNotEqual(m.outbox[-1], {"type": "network", "on": False})   # waits until the reply ends
@@ -558,24 +558,26 @@ class TestSandboxStatus(unittest.TestCase):
         return m.cards[pid]
 
     def test_panel_states(self):
-        self.assertIn("hoplon    in the podman sandbox", self.panel(self.model(sandbox={"name": "podman"})))
+        self.assertIn("hoplon itself ⊡ in the podman sandbox", self.panel(self.model(sandbox={"name": "podman"})))
         text = self.panel(self.model())
-        self.assertIn("hoplon    not sandboxed", text)
-        self.assertIn("model's  ready · offline · dev:1", text)
-        self.assertIn("model's  none", self.panel(self.model(runner=None)))
-        self.assertIn("model's  can't run: no podman", self.panel(self.model(runner=dict(self.RUNNER, problem="no podman"))))
+        self.assertIn("hoplon itself ▲ this host", text)
+        self.assertIn("model's runs  ⊡ sandboxed · offline\n              dev:1", text)
+        self.assertIn("model's runs  none", self.panel(self.model(runner=None)))
+        self.assertIn("model's runs  can't run: no podman",
+                      self.panel(self.model(runner=dict(self.RUNNER, problem="no podman"))))
         m = self.model()
         card = self.start(m)
         card.started -= 12
         text = self.panel(m)
-        self.assertIn("model's  RUNNING p3 · 12s", text)
+        self.assertIn("model's runs  ⊡ RUNNING p3 · 12s", text)
         self.assertIn("Ctrl-C or /stop stops it", text)
         m.handle({"type": "result", "id": "p3", "status": "ok", "detail": "exit 0"})
-        self.assertIn("model's  ready", self.panel(m))
+        self.assertIn("model's runs  ⊡ sandboxed", self.panel(m))
 
     def test_tmux_status_holds_only_fixed_words_and_a_checked_id(self):
         self.assertEqual(C.Model().tmux_status(), "")
-        self.assertIn("not sandboxed", self.model().tmux_status())
+        self.assertIn("⊡ model's runs sandboxed", self.model().tmux_status())
+        self.assertIn("▲ no sandbox", self.model(runner=None).tmux_status())
         self.assertIn("⊡ sandbox", self.model(sandbox={"name": "podman"}).tmux_status())
         m = self.model()
         card = self.start(m)
@@ -1825,7 +1827,7 @@ class TestHoplonTui(TmuxCase):
         turns = [call("run_in_sandbox", command="echo started; sleep 30", reason="t"), reply("it was stopped")]
         with FakeAPI(turns) as api, mock.patch.dict(os.environ, {"FAKE_PODMAN_LOG": log}):
             self.start(api, path=path, args="-p coder")
-            self.assertIn("not sandboxed", self.tmux("show", "-gv", "@hoplon_sandbox"))
+            self.assertIn("⊡ model's runs sandboxed", self.tmux("show", "-gv", "@hoplon_sandbox"))
             self.type("go")
             self.wait_for("Ctrl-C (or /stop) stops it", pane="hoplon")
             self.wait_for("RUNNING p", pane="info")
@@ -1841,7 +1843,7 @@ class TestHoplonTui(TmuxCase):
             self.assertTrue(any("stopped by the user" in str(m.get("content"))
                                 for m in api.requests[-1]["body"]["messages"]))
             self.assertTrue(any("kill" in ln for ln in open(log)))
-            self.assertIn("not sandboxed", self.tmux("show", "-gv", "@hoplon_sandbox"))
+            self.assertIn("⊡ model's runs sandboxed", self.tmux("show", "-gv", "@hoplon_sandbox"))
             self.assertNotIn("hoplon exited", self.screen())
 
     def test_starts_with_no_arguments(self):
@@ -1951,7 +1953,7 @@ class TestHoplonTui(TmuxCase):
             G.Config(home).set_blessed(sk, {"kind": "skill", "name": "slurm", "hash": G.hash_skill(sk)[0]})
             self.tmux("send-keys", "-t", self.panes()["info"], "r")
             self.wait_for("[ ] slurm", pane="info")
-            self.assertIn("run OUTSIDE any sandbox" if not G.sandbox_info() else "run in", self.screen("info"))
+            self.assertIn("▲ this host, no sandbox" if not G.sandbox_info() else "⊡ inside", self.screen("info"))
             self.tmux("send-keys", "-t", self.panes()["info"], "c")
             self.wait_for("coding mode is on")
             self.wait_for("[on]", pane="info")
@@ -2041,7 +2043,7 @@ class TestHoplonTui(TmuxCase):
             self.shell("exit")                                            # back here: commands run here again
             time.sleep(0.5)
             self.type("/run p1")
-            self.wait_for("directly on this host")
+            self.wait_for("It runs OUTSIDE any sandbox")                # here again, not on the other host
             self.key("n")
 
     def test_plain_ssh_is_not_followed_and_says_how(self):

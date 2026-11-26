@@ -82,11 +82,18 @@ The model then has a `run_in_sandbox` tool. Each command runs in a rootless podm
 An offline run needs no approval: you see the command, then its exit code and output, and so does
 the model. Ctrl-C stops it and ends the turn. Every run is in the audit log, by fingerprint.
 
-**Seeing it in hoplon-tui.** The info panel has a SANDBOX section: whether hoplon itself runs in a
-sandbox (`in the podman sandbox`, green, or `not sandboxed`, the usual way to run it, from `hello`'s `sandbox`), and
-the model's sandbox: `none`, `ready · offline` or `ONLINE` with its image, `can't run: …`, or
-`RUNNING p3 · 12s` while a run is going. tmux's status line says `⊡ sandbox` or `not sandboxed`,
-and `⏵ sandbox p3 12s` during a run. A running card counts its seconds. Ctrl-C on an
+**Seeing it in hoplon-tui.** The info panel's SANDBOX section has a line for each of the three things
+that run, marked ⊡ (green) where it is sandboxed and ▲ where it isn't:
+
+- `model's runs`: the model's own builds and tests. `⊡ sandboxed · offline` (or `ONLINE`) with its
+  image, `⊡ RUNNING p3 · 12s` during a run, `can't run: …`, or `none` when the profile has no sandbox
+  and the model's commands are only proposed.
+- `your commands`: the commands you approve, which run in your shell. Usually `▲ this host, no sandbox`.
+- `hoplon itself`: `▲ this host`, the usual way to run it, or `⊡ in the podman sandbox` under
+  `sandbox/run`.
+
+tmux's status line says `⊡ sandbox` when hoplon itself is sandboxed, `⊡ model's runs sandboxed` when
+only the model's runs are, `▲ no sandbox` otherwise, and `⏵ sandbox p3 12s` during a run. A running card counts its seconds. Ctrl-C on an
 empty input, or `/stop`, stops the run: hoplon-tui sends hoplon the `stop` message, which works in
 remote mode too (an older hoplon without it gets a SIGINT here, and in remote mode its run ends at
 its time limit). `/sandbox` prints all of it, with the image, network and limits.
