@@ -1,11 +1,11 @@
-"""/sandbox: where genai runs, where your commands run, and the model's sandbox, in full."""
+"""/sandbox: where hoplon runs, where your commands run, and the model's sandbox, in full."""
 
 from . import Feature
 
 
 class SandboxInfo(Feature):
     name = "sandbox"
-    commands = {"/sandbox": "where genai and your commands run, and the model's sandbox: its image, network, limits, "
+    commands = {"/sandbox": "where hoplon and your commands run, and the model's sandbox: its image, network, limits, "
                             "and the run going on now"}
 
     def command(self, m, cmd, arg):
@@ -13,20 +13,20 @@ class SandboxInfo(Feature):
         clean, note = c.clean, m.note
         h = m.hello
         if h is None:
-            note("genai hasn't said hello yet", c.W)
+            note("hoplon hasn't said hello yet", c.W)
             return
-        where = c.genai_where(h)
+        where = c.hoplon_where(h)
         if where:
             note(where[0], where[1])
         sb = h.get("sandbox")
         if sb:
             name = clean(sb.get("name", "?") if isinstance(sb, dict) else sb)
-            note(f"genai: in the {name} sandbox (it says so in its hello: an indicator, not a guarantee)", c.D)
+            note(f"hoplon: in the {name} sandbox (it says so in its hello: an indicator, not a guarantee)", c.D)
         else:
-            note("genai: not sandboxed: it runs directly on " + ("that host" if m.remote() else "this machine")
+            note("hoplon: not sandboxed: it runs directly on " + ("that host" if m.remote() else "this machine")
                  + ", as you")
             if not m.remote():
-                note("  sandbox/run genai runs it in a podman sandbox; sandbox/run shell opens a shell in that one")
+                note("  sandbox/run hoplon runs it in a podman sandbox; sandbox/run shell opens a shell in that one")
         note("your commands: " + (f"run {clean(m.shell_where)} when you approve them" if m.shell_where
                                   else "shown for you to run in your own shell"))
         r = m.runner

@@ -1,4 +1,4 @@
-# A one-node Slurm cluster for trying genai and its TUI against real squeue/sbatch.
+# A one-node Slurm cluster for trying hoplon and its TUI against real squeue/sbatch.
 # openSUSE Leap 15.6 with SUSE's own SLES 15 packages (a target platform): Slurm 24.11, tmux 3.3a,
 # Python 3.11. Cgroups are disabled so it runs in rootless podman. Not for production.
 FROM registry.opensuse.org/opensuse/leap:15.6
@@ -13,7 +13,7 @@ RUN (getent passwd slurm >/dev/null || useradd -r -M -s /sbin/nologin slurm) \
  && chmod 1777 /run/tmux \
  && chown -R slurm:slurm /var/spool/slurm /var/log/slurm && chown munge:munge /run/munge \
  && ln -sf /usr/bin/python3.11 /usr/local/bin/python3 \
- && echo 'export LANG=C.UTF-8' > /etc/profile.d/genai-utf8.sh
+ && echo 'export LANG=C.UTF-8' > /etc/profile.d/hoplon-utf8.sh
 ENV LANG=C.UTF-8
 COPY slurm.conf cgroup.conf /etc/slurm/
 COPY entrypoint.sh /usr/local/sbin/entrypoint.sh

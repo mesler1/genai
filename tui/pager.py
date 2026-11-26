@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""genai-tui's pager: a text file genai-tui wrote, shown in a popup until you close it.
+"""hoplon-tui's pager: a text file hoplon-tui wrote, shown in a popup until you close it.
 
-genai-tui cleans what it shows before writing it, so the file holds no control characters; this pager draws it
+hoplon-tui cleans what it shows before writing it, so the file holds no control characters; this pager draws it
 as plain text all the same (each line through clean()), never through the terminal raw. Esc or q closes it,
 which less can't do: in less, Esc starts other commands and waits for the next key.
 Keys: ↑↓ j k, PgUp PgDn space b, Home End g G, the mouse wheel; / searches (case-insensitive), n and N find the

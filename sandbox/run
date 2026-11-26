@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Run genai, or its tests, inside a rootless podman sandbox made from this machine's own OS.
+# Run hoplon, or its tests, inside a rootless podman sandbox made from this machine's own OS.
 #
 #   sandbox/run tests            offline test suite, no network
 #   sandbox/run live ENDPOINT.json  live test against a real endpoint (needs its key variable set)
-#   sandbox/run genai [ARGS...]  genai itself, interactive, in ./sandbox-work by default
+#   sandbox/run hoplon [ARGS...]  hoplon itself, interactive, in ./sandbox-work by default
 #   sandbox/run selfcheck        the live test's harness against a fake endpoint, no network
-#   sandbox/run shell [--net]    an interactive bash in the same sandbox as "genai": no network unless --net,
+#   sandbox/run shell [--net]    an interactive bash in the same sandbox as "hoplon": no network unless --net,
 #                                and no key variable (a shell doesn't need the endpoint)
 #
 # There is no image to build or pull. The sandbox's root is an empty directory tree made here, and
@@ -14,22 +14,22 @@
 # Whatever your user can read under /usr and /etc can be read inside it.
 #
 # This is the podman implementation of a small contract, so another sandbox can replace it:
-#   - the repo is mounted read-only at /opt/genai
-#   - one working directory is mounted read-write at /work, and is the only host path genai can write
+#   - the repo is mounted read-only at /opt/hoplon
+#   - one working directory is mounted read-write at /work, and is the only host path hoplon can write
 #     (besides its own config directory, below)
-#   - genai's config lives in a sandbox-only directory, never the user's real ~/.config/genai
-#   - GENAI_SANDBOX=<name> is set, so genai reports that commands run inside a sandbox, and
-#     GENAI_SANDBOX_WORK_HOST=<host path of /work> so it (and the shell) can show where /work really is
+#   - hoplon's config lives in a sandbox-only directory, never the user's real ~/.config/hoplon
+#   - HOPLON_SANDBOX=<name> is set, so hoplon reports that commands run inside a sandbox, and
+#     HOPLON_SANDBOX_WORK_HOST=<host path of /work> so it (and the shell) can show where /work really is
 #   - only the key variable the endpoint names is passed in, by name (its value is never on a command line)
 #
 # Environment:
-#   GENAI_SANDBOX_STATE   host dir for the sandbox's genai config and root tree (default ~/.local/share/genai-sandbox)
-#   GENAI_SANDBOX_WORK    host dir mounted at /work for "genai" and "shell" (default ./sandbox-work)
-#   GENAI_SANDBOX_PYTHON  the Python to run inside (default python3); it must live under a mounted directory
-#   GENAI_SANDBOX_RO      more host directories to mount read-only at the same path, colon-separated
+#   HOPLON_SANDBOX_STATE   host dir for the sandbox's hoplon config and root tree (default ~/.local/share/hoplon-sandbox)
+#   HOPLON_SANDBOX_WORK    host dir mounted at /work for "hoplon" and "shell" (default ./sandbox-work)
+#   HOPLON_SANDBOX_PYTHON  the Python to run inside (default python3); it must live under a mounted directory
+#   HOPLON_SANDBOX_RO      more host directories to mount read-only at the same path, colon-separated
 #                         (for a Python or editor outside /usr, for example /opt/python-3.12)
-#   GENAI_SANDBOX_HOOKS   directory of sandbox hooks (default $GENAI_SANDBOX_STATE/hooks); see below
-#   GENAI_KEY_ENV         key variable to pass through (for "live", default: the endpoint's key_env)
+#   HOPLON_SANDBOX_HOOKS   directory of sandbox hooks (default $HOPLON_SANDBOX_STATE/hooks); see below
+#   HOPLON_KEY_ENV         key variable to pass through (for "live", default: the endpoint's key_env)
 #
 # Hooks: every executable file in the hooks directory is run, in name order, before the sandbox
 # starts, with the mode as its argument. Each prints requests (ro DIR, path NAME, env NAME) to add
@@ -40,8 +40,8 @@ set -euo pipefail
 die() { echo "sandbox/run: $1" >&2; exit "${2:-1}"; }
 
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-state=${GENAI_SANDBOX_STATE:-$HOME/.local/share/genai-sandbox}
-key_env=${GENAI_KEY_ENV:-}
+state=${HOPLON_SANDBOX_STATE:-$HOME/.local/share/hoplon-sandbox}
+key_env=${HOPLON_KEY_ENV:-}
 
 # The key variable name is used in ${!name} below, which bash would evaluate as an expression
 # (array subscripts can run commands). Only a plain identifier is ever looked up.
@@ -51,7 +51,7 @@ check_key_env() {  # $1 = where the name came from
     exit 2
   }
 }
-check_key_env GENAI_KEY_ENV
+check_key_env HOPLON_KEY_ENV
 
 # Absolute paths, so a filtered PATH handed to podman (see hooks below) cannot change which ones run.
 podman=$(command -v podman) || die "podman is required"
@@ -62,7 +62,7 @@ ro_dirs=(/usr /etc)
 inside() { [[ "$1" == "$2" || "$1" == "${2%/}"/* ]]; }   # is path $1 at or under directory $2?
 
 # Can $1 be mounted read-only? Sets ro_dir (resolved when it exists) and, on failure, ro_reason.
-# Used for GENAI_SANDBOX_RO and for hooks' "ro" requests, so the rules are the same.
+# Used for HOPLON_SANDBOX_RO and for hooks' "ro" requests, so the rules are the same.
 ro_dir=
 ro_reason=
 ro_check() {
@@ -78,7 +78,7 @@ ro_check() {
     ro_reason="is or contains your home directory; refusing"
     return 1
   fi
-  for own in /proc /sys /dev /run /tmp /var/tmp /work /opt/genai /opt/genai-live /home/genai /usr /etc; do
+  for own in /proc /sys /dev /run /tmp /var/tmp /work /opt/hoplon /opt/hoplon-live /home/hoplon /usr /etc; do
     if inside "$own" "$d"; then
       ro_reason="would cover the sandbox's own $own; name a deeper directory"
       return 1
@@ -99,10 +99,10 @@ ro_add() {  # add $ro_dir to ro_dirs unless it is already listed
   ro_dirs+=("$ro_dir")
 }
 
-IFS=: read -r -a extra_ro <<<"${GENAI_SANDBOX_RO:-}"
+IFS=: read -r -a extra_ro <<<"${HOPLON_SANDBOX_RO:-}"
 for d in "${extra_ro[@]}"; do
   [[ -n "$d" ]] || continue
-  ro_check "$d" || die "GENAI_SANDBOX_RO: '$ro_dir' $ro_reason" 2
+  ro_check "$d" || die "HOPLON_SANDBOX_RO: '$ro_dir' $ro_reason" 2
   ro_add
 done
 
@@ -126,14 +126,14 @@ hook_name_ok() {  # $1 = variable name from a hook, $2 = request, $3 = hook; die
   local n=$1
   [[ "$n" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "hook $3: '$2' names a variable that is not a plain identifier" 2
   case "$n" in
-    HOME|XDG_CONFIG_HOME|GENAI_SANDBOX) die "hook $3: '$2' names $n, which the sandbox sets itself" 2 ;;
+    HOME|XDG_CONFIG_HOME|HOPLON_SANDBOX) die "hook $3: '$2' names $n, which the sandbox sets itself" 2 ;;
     LD_LIBRARY_PATH) ;;
     LD_*) die "hook $3: '$2' names $n; loader variables are not passed" 2 ;;
   esac
 }
 
 run_hooks() {  # $1 = mode
-  local dir=${GENAI_SANDBOX_HOOKS:-$state/hooks} real f name resolved out rc line idx verb arg
+  local dir=${HOPLON_SANDBOX_HOOKS:-$state/hooks} real f name resolved out rc line idx verb arg
   [[ -e "$dir" ]] || return 0
   real=$(realpath "$dir")
   if ! [[ -d "$real" ]] || ! mine_only "$real"; then
@@ -264,15 +264,15 @@ export_hook_vars() {  # last step before podman run: the values go in podman's e
 }
 
 # The Python that runs inside is the host's, by its real path, so it has to be under a mounted directory.
-py=${GENAI_SANDBOX_PYTHON:-python3}
+py=${HOPLON_SANDBOX_PYTHON:-python3}
 pybin=$(command -v "$py") || die "$py was not found on this machine"
 pybin=$(realpath "$pybin")
 "$pybin" -c 'import sys; raise SystemExit(sys.version_info < (3, 10))' || die "$pybin is older than Python 3.10"
 
 make_root() {  # $1 = directory to hold the sandbox's root: mount points and the host's top-level links, no files
   local root=$1 d
-  mkdir -p "$root"/{proc,sys,dev,run,tmp,var/tmp,work,opt/genai,opt/genai-live,home/genai/.config/genai}
-  : >"$root/opt/genai-live/endpoint.json"
+  mkdir -p "$root"/{proc,sys,dev,run,tmp,var/tmp,work,opt/hoplon,opt/hoplon-live,home/hoplon/.config/hoplon}
+  : >"$root/opt/hoplon-live/endpoint.json"
   for d in /bin /sbin /lib /lib32 /lib64 /libx32; do   # /bin -> usr/bin and friends, as on the host
     if [[ -L "$d" ]]; then
       ln -sfn "$(readlink "$d")" "$root$d"
@@ -288,7 +288,7 @@ make_root() {  # $1 = directory to hold the sandbox's root: mount points and the
   local ok=0
   for d in "${ro_dirs[@]}"; do if inside "$pybin" "$d"; then ok=1; fi; done
   if [[ $ok == 0 ]]; then
-    die "$pybin is outside what the sandbox mounts (${ro_dirs[*]}); set GENAI_SANDBOX_PYTHON to one under /usr, or add its directory to GENAI_SANDBOX_RO"
+    die "$pybin is outside what the sandbox mounts (${ro_dirs[*]}); set HOPLON_SANDBOX_PYTHON to one under /usr, or add its directory to HOPLON_SANDBOX_RO"
   fi
 }
 
@@ -299,10 +299,10 @@ common=(
   --read-only --tmpfs /tmp:rw,mode=1777,size=64m
   --cap-drop=ALL --security-opt=no-new-privileges
   --pids-limit=256 --memory=1g
-  -v "$repo:/opt/genai:ro"
-  -e HOME=/home/genai -e XDG_CONFIG_HOME=/home/genai/.config
+  -v "$repo:/opt/hoplon:ro"
+  -e HOME=/home/hoplon -e XDG_CONFIG_HOME=/home/hoplon/.config
   -e PYTHONDONTWRITEBYTECODE=1
-  -e GENAI_SANDBOX=podman
+  -e HOPLON_SANDBOX=podman
 )
 for v in LANG EDITOR VISUAL; do if [[ -n "${!v:-}" ]]; then common+=(-e "$v"); fi; done
 
@@ -313,23 +313,23 @@ keyflag=()
 set_keyflag() { check_key_env "the key variable name"; keyflag=(); if [[ -n "$key_env" && -n "${!key_env:-}" ]]; then keyflag=(-e "$key_env"); fi; }
 set_keyflag
 
-seed_config() {  # $1 = host config dir mounted at ~/.config/genai
+seed_config() {  # $1 = host config dir mounted at ~/.config/hoplon
   mkdir -p "$1"
   chmod 700 "$1"
   if [[ ! -f "$1/config.json" ]]; then
-    printf '{\n  "default_profile": null,\n  "default_endpoint": null,\n  "default_skills": [],\n  "endpoint_dirs": ["/opt/genai/endpoints"],\n  "profile_dirs": ["/opt/genai/profiles"],\n  "skill_dirs": ["/opt/genai/skills"]\n}\n' >"$1/config.json"
+    printf '{\n  "default_profile": null,\n  "default_endpoint": null,\n  "default_skills": [],\n  "endpoint_dirs": ["/opt/hoplon/endpoints"],\n  "profile_dirs": ["/opt/hoplon/profiles"],\n  "skill_dirs": ["/opt/hoplon/skills"]\n}\n' >"$1/config.json"
   fi
 }
 
 scratch_root() {  # a throwaway root and /work for the test modes
-  scratch=$(mktemp -d "${TMPDIR:-/tmp}/genai-sbx-XXXXXX")
+  scratch=$(mktemp -d "${TMPDIR:-/tmp}/hoplon-sbx-XXXXXX")
   trap '"$rm_bin" -rf "$scratch"' EXIT
   mkdir "$scratch/work"
   make_root "$scratch/root"
   apply_hook_vars
 }
 
-mode=${1:-genai}
+mode=${1:-hoplon}
 shift || true
 
 # A shell needs a terminal; say so before any hook runs.
@@ -337,7 +337,7 @@ if [[ "$mode" == shell && ! ( -t 0 && -t 1 ) ]]; then
   die "shell needs a terminal (stdin and stdout must be a terminal); run it from an interactive session" 2
 fi
 
-case "$mode" in tests|live|selfcheck|genai|shell) run_hooks "$mode"; apply_hook_ro ;; esac
+case "$mode" in tests|live|selfcheck|hoplon|shell) run_hooks "$mode"; apply_hook_ro ;; esac
 
 case "$mode" in
   tests)
@@ -345,7 +345,7 @@ case "$mode" in
     rc=0
     export_hook_vars
     "$podman" run "${common[@]}" "${mounts[@]}" "${hook_flags[@]}" --network=none \
-      -v "$scratch/work:/work" -w /opt/genai \
+      -v "$scratch/work:/work" -w /opt/hoplon \
       --rootfs "$scratch/root" "$pybin" -W ignore::ResourceWarning -m unittest discover -s tests "$@" || rc=$?
     exit "$rc"
     ;;
@@ -358,15 +358,15 @@ case "$mode" in
       key_env=$("$pybin" -c 'import json,sys; print(json.load(open(sys.argv[1])).get("key_env") or "")' "$endpoint")
     fi
     check_key_env "the endpoint's key_env"
-    [[ -n "$key_env" ]] || { echo "sandbox/run: the endpoint has no key_env; set GENAI_KEY_ENV" >&2; exit 2; }
+    [[ -n "$key_env" ]] || { echo "sandbox/run: the endpoint has no key_env; set HOPLON_KEY_ENV" >&2; exit 2; }
     [[ -n "${!key_env:-}" ]] || { echo "sandbox/run: \$$key_env is not set; the live test needs it" >&2; exit 2; }
     set_keyflag
     scratch_root
     rc=0
     export_hook_vars
     "$podman" run "${common[@]}" "${mounts[@]}" "${keyflag[@]}" "${hook_flags[@]}" \
-      -v "$scratch/work:/work" -v "$endpoint:/opt/genai-live/endpoint.json:ro" -w /work \
-      --rootfs "$scratch/root" "$pybin" /opt/genai/tests/live_endpoint.py --endpoint /opt/genai-live/endpoint.json "$@" || rc=$?
+      -v "$scratch/work:/work" -v "$endpoint:/opt/hoplon-live/endpoint.json:ro" -w /work \
+      --rootfs "$scratch/root" "$pybin" /opt/hoplon/tests/live_endpoint.py --endpoint /opt/hoplon-live/endpoint.json "$@" || rc=$?
     exit "$rc"
     ;;
   selfcheck)
@@ -375,25 +375,25 @@ case "$mode" in
     export_hook_vars
     "$podman" run "${common[@]}" "${mounts[@]}" "${hook_flags[@]}" --network=none \
       -v "$scratch/work:/work" -w /work \
-      --rootfs "$scratch/root" "$pybin" /opt/genai/tests/selfcheck_live.py "$@" || rc=$?
+      --rootfs "$scratch/root" "$pybin" /opt/hoplon/tests/selfcheck_live.py "$@" || rc=$?
     exit "$rc"
     ;;
-  genai)
-    work=${GENAI_SANDBOX_WORK:-$PWD/sandbox-work}
+  hoplon)
+    work=${HOPLON_SANDBOX_WORK:-$PWD/sandbox-work}
     mkdir -p "$work"
     work_shown=$(cd "$work" && pwd)
     seed_config "$state/config"
     make_root "$state/root"
     apply_hook_vars
-    echo "sandbox/run: genai in podman on this machine's OS; /work = $work; config = $state/config" >&2
+    echo "sandbox/run: hoplon in podman on this machine's OS; /work = $work; config = $state/config" >&2
     export_hook_vars
     exec "$podman" run "${common[@]}" "${mounts[@]}" "${tty_flags[@]}" "${keyflag[@]}" "${hook_flags[@]}" \
-      -e "GENAI_SANDBOX_WORK_HOST=$work_shown" \
-      -v "$work:/work" -v "$state/config:/home/genai/.config/genai" -w /work \
-      --rootfs "$state/root" "$pybin" /opt/genai/genai "$@"
+      -e "HOPLON_SANDBOX_WORK_HOST=$work_shown" \
+      -v "$work:/work" -v "$state/config:/home/hoplon/.config/hoplon" -w /work \
+      --rootfs "$state/root" "$pybin" /opt/hoplon/hoplon "$@"
     ;;
   shell)
-    # The same sandbox as "genai" (root, /work, config, flags, hooks), with a bash instead of genai. No
+    # The same sandbox as "hoplon" (root, /work, config, flags, hooks), with a bash instead of hoplon. No
     # network unless --net, and no key variable: a shell has no use for the endpoint's key.
     net=none
     for a in "$@"; do
@@ -402,7 +402,7 @@ case "$mode" in
         *) echo "usage: sandbox/run shell [--net]" >&2; exit 2 ;;
       esac
     done
-    work=${GENAI_SANDBOX_WORK:-$PWD/sandbox-work}
+    work=${HOPLON_SANDBOX_WORK:-$PWD/sandbox-work}
     mkdir -p "$work"
     work_shown=$(cd "$work" && pwd)
     seed_config "$state/config"
@@ -415,16 +415,16 @@ case "$mode" in
       for d in "${ro_dirs[@]}"; do if inside "$c" "$d"; then shbin=$c; fi; done
       [[ -z "$shbin" ]] || break
     done
-    [[ -n "$shbin" ]] || die "no bash under a mounted directory (${ro_dirs[*]}); install bash in /usr or add its directory to GENAI_SANDBOX_RO"
+    [[ -n "$shbin" ]] || die "no bash under a mounted directory (${ro_dirs[*]}); install bash in /usr or add its directory to HOPLON_SANDBOX_RO"
     netflags=(--network=none)
     netword=off
     if [[ "$net" == default ]]; then netflags=(); netword=on; fi
     echo "sandbox/run: shell in podman on this machine's OS; /work = $work_shown; config = $state/config; network $netword" >&2
     export_hook_vars
     exec "$podman" run "${common[@]}" "${mounts[@]}" -it "${hook_flags[@]}" "${netflags[@]}" \
-      -e "GENAI_SANDBOX_WORK_HOST=$work_shown" -e "GENAI_SANDBOX_NET=$netword" -e TERM \
-      -v "$work:/work" -v "$state/config:/home/genai/.config/genai" -w /work \
-      --rootfs "$state/root" "$shbin" --noprofile --rcfile /opt/genai/sandbox/shellrc -i
+      -e "HOPLON_SANDBOX_WORK_HOST=$work_shown" -e "HOPLON_SANDBOX_NET=$netword" -e TERM \
+      -v "$work:/work" -v "$state/config:/home/hoplon/.config/hoplon" -w /work \
+      --rootfs "$state/root" "$shbin" --noprofile --rcfile /opt/hoplon/sandbox/shellrc -i
     ;;
   *)
     sed -n '2,9p' "$0" >&2

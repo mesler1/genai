@@ -1,6 +1,6 @@
-"""genai-tui's record of the shell pane: each command, its exit code and exactly what it printed.
+"""hoplon-tui's record of the shell pane: each command, its exit code and exactly what it printed.
 
-tmux copies everything the shell pane prints into a FIFO in genai-tui's private directory (pipe-pane), and
+tmux copies everything the shell pane prints into a FIFO in hoplon-tui's private directory (pipe-pane), and
 this reads it in the conversation pane, in memory only; nothing is written to disk. The shell's prompt hook
 (tui/shellrc) prints invisible markers that tmux shows nothing for: one when a command starts (PS0) and one
 when the next prompt comes (with the exit code and the command line). What lies between the two is that
@@ -14,7 +14,7 @@ a command to the list, by printing markers of its own.
 Full-screen programs (vim, top, less) draw on tmux's alternate screen; what they draw there isn't output and
 is left out.
 
-genai-ssh (a function in tui/shellrc) follows commands on another host the same way, with a key of their own:
+hoplon-ssh (a function in tui/shellrc) follows commands on another host the same way, with a key of their own:
 
 1. The local shell announces the session with a marker carrying its own word, so no program can: X, with a
    random id and the destination you typed. The recorder makes a fresh key for it, here, in memory.
@@ -22,7 +22,7 @@ genai-ssh (a function in tui/shellrc) follows commands on another host the same 
    echo off and asks for the key: R, with the id, and nothing secret. The id came over the command line, which
    other users of that host can see, so it only names the session: an R is accepted once, for the session
    announced, within REMOTE_WAIT seconds.
-3. genai-tui types the key into the pane, through ssh's encrypted connection. Echo is off, so the key isn't
+3. hoplon-tui types the key into the pane, through ssh's encrypted connection. Echo is off, so the key isn't
    shown or recorded, and it is never on a command line, in the environment or in a file. The remote bash
    keeps it in an unexported variable, as the local one keeps its word.
 4. The remote markers carry that key, so a program run there can't fake them, and they bring the remote's
@@ -44,7 +44,7 @@ HEAD = 256 * 1024            # bytes kept from the start of one command's output
 TAIL = 768 * 1024            # and from its end; the middle of a huge output is dropped
 ALT_ON = re.compile(rb"\x1b\[\?(?:1049|1047|47)h")
 ALT_OFF = re.compile(rb"\x1b\[\?(?:1049|1047|47)l")
-REMOTE_WAIT = 20             # seconds from genai-ssh's announcement to the remote shell asking for its key
+REMOTE_WAIT = 20             # seconds from hoplon-ssh's announcement to the remote shell asking for its key
 
 
 class Command:
@@ -55,7 +55,7 @@ class Command:
         self.head, self.tail = bytearray(), bytearray()
         self.size = 0                # bytes printed, including any that were dropped
         self.screen = False          # it used the alternate screen (a full-screen program)
-        self.host = None             # the host a genai-ssh session ran it on; None for this one
+        self.host = None             # the host a hoplon-ssh session ran it on; None for this one
         self._text = None
 
     def add(self, data):
@@ -135,7 +135,7 @@ def render(data):
 
 
 class Remote:
-    """A genai-ssh session, from its announcement until the local prompt comes back."""
+    """A hoplon-ssh session, from its announcement until the local prompt comes back."""
 
     def __init__(self, sid, dest):
         self.id, self.dest = sid, dest
@@ -162,7 +162,7 @@ class Recorder:
         self.alt = False
         self.ps1_lines = 1
         self.primary_prompt = False
-        self.remote = None           # the genai-ssh session: id, key, destination, and once it is up host and cwd
+        self.remote = None           # the hoplon-ssh session: id, key, destination, and once it is up host and cwd
         self.handshake = None        # a key to type now, for the remote shell asking for it
         self.buf = b""
         self.lock = threading.Lock()
@@ -281,7 +281,7 @@ class Recorder:
         return True
 
     def _announced(self, args):
-        """X from the local shell (its word proves it): genai-ssh is about to start a session."""
+        """X from the local shell (its word proves it): hoplon-ssh is about to start a session."""
         if len(args) < 2 or not re.fullmatch(r"[0-9a-f]{32}", args[0]):
             return False
         try:
@@ -340,13 +340,13 @@ class Recorder:
             return key
 
     def remote_prompt(self):
-        """(host, directory) while a genai-ssh session's shell is at its prompt; None otherwise."""
+        """(host, directory) while a hoplon-ssh session's shell is at its prompt; None otherwise."""
         with self.lock:
             r = self.remote
             return (r.name(), r.cwd) if r and r.key and r.prompt else None
 
     def remote_host(self):
-        """The host of a genai-ssh session that is up, or None."""
+        """The host of a hoplon-ssh session that is up, or None."""
         with self.lock:
             r = self.remote
             return r.name() if r and r.key else None

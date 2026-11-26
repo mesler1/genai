@@ -1,5 +1,5 @@
 """/edits: let a further edit to a file you approved apply without asking ("approved-files"), and see or clear the files
-that do. genai keeps the set, per session and never saved; this shows it."""
+that do. hoplon keeps the set, per session and never saved; this shows it."""
 
 from . import Feature
 
@@ -8,13 +8,13 @@ class Edits(Feature):
     name = "edits"
     commands = {"/edits": "[ask|approved-files|reset]: approved-files applies a further edit to a file you approved "
                           "one for without asking; reset forgets those files"}
-    to_genai = ("/edits",)
+    to_hoplon = ("/edits",)
     needs = "edits"
     cant = "apply edits to approved files without asking"
     events = ("edits",)
 
     def __init__(self):
-        self.info = None           # {"mode": ..., "files": [...]}, as genai last said
+        self.info = None           # {"mode": ..., "files": [...]}, as hoplon last said
         self.show = False          # print the next edits event (the user typed /edits)
 
     def current(self, m):

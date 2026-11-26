@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""The Slurm console: genai-tui's pane for the slurm plugin. Nodes by state (down and drained in red, with their
+"""The Slurm console: hoplon-tui's pane for the slurm plugin. Nodes by state (down and drained in red, with their
 reasons), partitions, how many jobs are in each state, and your own jobs.
 
-genai-tui starts it with /plugins slurm pane, in a tmux pane of its own. It runs nothing itself: it asks the
-conversation pane over genai-tui's private socket, in the "plugin:slurm" role, to run the plugin's read-only commands
-through genai (the same checks, cache and rate limits as the model's calls), and shows what comes back. It can also
+hoplon-tui starts it with /plugins slurm pane, in a tmux pane of its own. It runs nothing itself: it asks the
+conversation pane over hoplon-tui's private socket, in the "plugin:slurm" role, to run the plugin's read-only commands
+through hoplon (the same checks, cache and rate limits as the model's calls), and shows what comes back. It can also
 put a job id or node name in the input box, and offer details for your next message, which you review in your editor
 first. Everything it receives is cleaned before it is drawn.
 
 Keys: ↑↓ choose a node or job · Enter (or a click) its details · i insert its name · a attach what is shown ·
 / filter · r refresh · Esc back · q hides nothing (use /plugins slurm pane).
-Standard library only; Python 3.10 or newer. genai-tui puts its own directory on PYTHONPATH.
+Standard library only; Python 3.10 or newer. hoplon-tui puts its own directory on PYTHONPATH.
 """
 
 import curses
@@ -23,7 +23,7 @@ import sys
 from conversation import A, D, Q, R, W, clean, fit, width
 from ipc import Client
 
-STATE = os.environ.get("GENAI_TUI_STATE", "")
+STATE = os.environ.get("HOPLON_TUI_STATE", "")
 ROLE = "plugin:slurm"
 BAD = ("down", "drain", "fail", "not_responding", "unk", "maint", "reboot", "inval")
 HINT = "↑↓ choose · Enter details · i insert · a attach · / filter · r refresh"
@@ -168,7 +168,7 @@ class Console:
             return
         self.st["errors"][purpose] = str(err) if err else None
         if msg.get("cached"):
-            self.msg = f"{purpose}: cached (genai keeps results a while)"
+            self.msg = f"{purpose}: cached (hoplon keeps results a while)"
         if err:
             return
         if purpose == "nodes":
@@ -307,7 +307,7 @@ class Screen:
 
 def main():
     if not STATE:
-        print("slurm.py is started by genai-tui: /plugins slurm pane", file=sys.stderr)
+        print("slurm.py is started by hoplon-tui: /plugins slurm pane", file=sys.stderr)
         return 2
     try:
         link = Client(STATE, ROLE)

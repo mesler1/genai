@@ -1,6 +1,6 @@
-"""genai-tui's private socket: how the prompt pane, the info panel and tmux menus reach the conversation pane.
+"""hoplon-tui's private socket: how the prompt pane, the info panel and tmux menus reach the conversation pane.
 
-The socket lives in a directory only the user can open (genai-tui makes it with mktemp -d, mode 0700, in
+The socket lives in a directory only the user can open (hoplon-tui makes it with mktemp -d, mode 0700, in
 $XDG_RUNTIME_DIR or /tmp; never on a shared filesystem). The conversation pane listens. Every other pane
 connects and first says which role it is; a role may send only its own kinds of message (the panel can
 switch a skill, never answer a question), and a connection from another user is closed at once. Messages

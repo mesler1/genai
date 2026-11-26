@@ -33,14 +33,14 @@ class Raw(Feature):
 
     def command(self, m, cmd, arg):
         if m.busy and not m.pending:
-            m.note(f"{cmd} has to wait until genai finishes this reply", self.core.W)
+            m.note(f"{cmd} has to wait until hoplon finishes this reply", self.core.W)
         elif cmd == "/system":
             m.send({"type": "system"})
         else:
             self.raw(m, arg)
 
     def raw(self, m, arg):
-        """Ask genai for a turn's exchanges with the endpoint: the latest turn that had any, turn N, or all."""
+        """Ask hoplon for a turn's exchanges with the endpoint: the latest turn that had any, turn N, or all."""
         if arg == "all":
             m.send({"type": "trace", "from": 1, "to": 1 << 30})
             return
@@ -70,10 +70,10 @@ class Raw(Feature):
         self.show(app, action[1])
 
     def show(self, app, ev):
-        """A trace or system answer from genai, full screen in a pager. The file holds the whole conversation, so
-        it goes in genai-tui's private directory (or a private one of its own) and is gone when the pager closes."""
+        """A trace or system answer from hoplon, full screen in a pager. The file holds the whole conversation, so
+        it goes in hoplon-tui's private directory (or a private one of its own) and is gone when the pager closes."""
         text = self.render_system(ev) if ev.get("type") == "system" else self.render_trace(ev, app.m.exchanges)
-        where = app.state_dir or tempfile.mkdtemp(prefix="genai-tui-raw-")
+        where = app.state_dir or tempfile.mkdtemp(prefix="hoplon-tui-raw-")
         fd, path = tempfile.mkstemp(prefix="raw-", suffix=".txt", dir=where)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -90,7 +90,7 @@ class Raw(Feature):
         this = [("What was sent and received for this turn", "r", "raw", str(turn))] if turn in m.exchanges else []
         return this + [
             ("What was sent and received last", "l", "raw", "last"),
-            ("Everything genai still has (last 30)", "a", "raw", "all"),
+            ("Everything hoplon still has (last 30)", "a", "raw", "all"),
             ("The system prompt and tools", "s", "system")]
 
     def safe_lines(self, text):
@@ -102,11 +102,11 @@ class Raw(Feature):
         exs = ev.get("exchanges") or []
         named = {n: t for t, (a, b) in turns.items() for n in range(a, b + 1)}
         kept = ev.get("kept")
-        out = ["genai: what was sent to the endpoint, and what came back",
+        out = ["hoplon: what was sent to the endpoint, and what came back",
                "Exactly as sent and received, except your API key and the endpoint's own header values. Request bodies",
                "are indented here for reading; they were sent as compact JSON. q leaves, / searches.", ""]
         if not exs:
-            out.append("genai no longer has these exchanges" + (f" (it keeps the last 30: {kept[0]}–{kept[1]})" if kept
+            out.append("hoplon no longer has these exchanges" + (f" (it keeps the last 30: {kept[0]}–{kept[1]})" if kept
                                                                 else ""))
         for ex in exs:
             n = ex.get("n")
@@ -123,7 +123,7 @@ class Raw(Feature):
             out += [f"── Response: HTTP {ex.get('http', '?')}, {how} " + "─" * 40]
             out += resp if ex.get("stream") else [pretty("".join(resp))]
             if ex.get("message") is not None:
-                out += ["", "── The reply as genai put it together " + "─" * 40,
+                out += ["", "── The reply as hoplon put it together " + "─" * 40,
                         json.dumps(ex["message"], indent=2, ensure_ascii=False)]
             if ex.get("usage"):
                 out += ["", f"usage: {json.dumps(ex['usage'])}"]
@@ -131,7 +131,7 @@ class Raw(Feature):
         return self.safe_lines("\n".join(out))
 
     def render_system(self, ev):
-        out = ["genai: the system prompt and tools sent with every request",
+        out = ["hoplon: the system prompt and tools sent with every request",
                "Your conversation follows the system prompt in each request. q leaves, / searches.", "",
                f"model: {ev.get('model', '?')}", f"params: {json.dumps(ev.get('params') or {})}", "",
                "── System prompt " + "─" * 60, ev.get("system", ""), "",

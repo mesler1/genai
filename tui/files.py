@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""genai-tui files pane: the working directory as a tree, beside the conversation.
+"""hoplon-tui files pane: the working directory as a tree, beside the conversation.
 
 This pane never reads the disk itself. It connects to the conversation pane's private socket (see ipc.py)
 in the "files" role and asks for one directory's entries at a time ("list"). The role may only ask the
 conversation pane to show a file in the pager ("view"), attach a file to your next message once you have
 reviewed it in your editor ("attach"), or put a path in the input box ("insert"): it can never approve
-anything or reach genai directly. Everything it receives is treated as untrusted: entries are validated,
+anything or reach hoplon directly. Everything it receives is treated as untrusted: entries are validated,
 names are cleaned before they are drawn, and at most MAX_ENTRIES are kept per directory.
 Standard library only; Python 3.10 or newer.
 """
@@ -19,7 +19,7 @@ import sys
 from conversation import A, D, Q, R, W, clean, fit, width
 from ipc import Client
 
-STATE = os.environ.get("GENAI_TUI_STATE", "")
+STATE = os.environ.get("HOPLON_TUI_STATE", "")
 MAX_ENTRIES = 2000
 KINDS = ("file", "dir", "symlink", "other")
 HINT = "↑↓ move · →← open/close · Enter view · a attach · i insert path · . hidden · r refresh"
@@ -401,7 +401,7 @@ class Pane:
 
 def main():
     if not STATE:
-        print("files.py is started by genai-tui", file=sys.stderr)
+        print("files.py is started by hoplon-tui", file=sys.stderr)
         return 2
     try:
         link = Client(STATE, "files")

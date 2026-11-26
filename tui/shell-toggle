@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Show genai-tui's shell pane above the conversation, or hide it again (it keeps running hidden).
+# Show hoplon-tui's shell pane above the conversation, or hide it again (it keeps running hidden).
 # Usage: shell-toggle [toggle|show|hide] [--focus]
 set -u
-shell=$(tmux show -gqv @genai_shell_pane)
-conv=$(tmux show -gqv @genai_conv_pane)
-prompt=$(tmux show -gqv @genai_prompt_pane)
+shell=$(tmux show -gqv @hoplon_shell_pane)
+conv=$(tmux show -gqv @hoplon_conv_pane)
+prompt=$(tmux show -gqv @hoplon_prompt_pane)
 [ -n "$shell" ] && [ -n "$conv" ] || exit 1
 shown=0
 [ "$(tmux display -p -t "$shell" '#{window_id}')" = "$(tmux display -p -t "$conv" '#{window_id}')" ] && shown=1

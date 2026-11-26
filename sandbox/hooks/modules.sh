@@ -2,10 +2,10 @@
 # Sandbox hook: make software from environment modules (Lmod, Environment Modules, EasyBuild) work
 # inside the sandbox. Prints requests only: it asks for the package directories behind your search
 # paths (ro), asks for the search paths themselves (path), and passes variables that point into
-# those directories, such as EBROOTGCC (env). GENAI_MODULE_ROOTS is a colon list of whole trees to
+# those directories, such as EBROOTGCC (env). HOPLON_MODULE_ROOTS is a colon list of whole trees to
 # mount, such as /apps.
 #
-# Install: ln -s "$PWD/sandbox/hooks/modules.sh" ~/.local/share/genai-sandbox/hooks/
+# Install: ln -s "$PWD/sandbox/hooks/modules.sh" ~/.local/share/hoplon-sandbox/hooks/
 # Then load your modules and run sandbox/run. See HOOKS.md.
 set -u
 
@@ -46,13 +46,13 @@ package_dir() {  # strip a well-known leaf from $1; otherwise the entry itself
       break
     fi
   done
-  # "/" and a single top-level directory are too broad to ask for unless named in GENAI_MODULE_ROOTS
+  # "/" and a single top-level directory are too broad to ask for unless named in HOPLON_MODULE_ROOTS
   if [[ -z "$p" || "$p" =~ ^/[^/]*$ ]]; then p=$1; fi
   printf '%s\n' "$p"
 }
 
 # Whole trees named by the user.
-IFS=: read -r -a roots <<<"${GENAI_MODULE_ROOTS:-}"
+IFS=: read -r -a roots <<<"${HOPLON_MODULE_ROOTS:-}"
 for r in "${roots[@]}"; do
   [[ "$r" == /* && -d "$r" ]] || continue
   r=$(realpath "$r")
@@ -85,7 +85,7 @@ done
 while IFS= read -r name; do
   [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
   case "$name" in
-    HOME|XDG_CONFIG_HOME|GENAI_SANDBOX|PATH|PYTHONPATH|LD_*|PWD|OLDPWD|_|GENAI_MODULE_ROOTS) continue ;;
+    HOME|XDG_CONFIG_HOME|HOPLON_SANDBOX|PATH|PYTHONPATH|LD_*|PWD|OLDPWD|_|HOPLON_MODULE_ROOTS) continue ;;
   esac
   skip=0
   for v in "${vars[@]}"; do

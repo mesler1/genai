@@ -10,7 +10,7 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from test_genai import G, SCRIPT, Tmp, bless_path, make_home  # noqa: E402
+from test_hoplon import G, SCRIPT, Tmp, bless_path, make_home  # noqa: E402
 
 RUN = os.path.join(os.path.dirname(SCRIPT), "sandbox", "run")
 
@@ -152,7 +152,7 @@ class TestEndpointSingleRead(Tmp):
         finally:
             G.read_regular = real
         self.assertEqual(ep.base_url, "http://127.0.0.1:1/v1")
-        with self.assertRaises(G.GenaiError):          # the next selection sees the change
+        with self.assertRaises(G.HoplonError):          # the next selection sees the change
             G.select_named(cfg, "endpoint", "ep")
 
     def test_profile_snapshot(self):
@@ -181,7 +181,7 @@ class TestEndpointSingleRead(Tmp):
         home, path = make_home(self.tmp, "http://127.0.0.1:1/v1", name="ep")
         link = os.path.join(home, "endpoints", "ln.json")
         os.symlink(path, link)
-        with self.assertRaises(G.GenaiError):
+        with self.assertRaises(G.HoplonError):
             G.hash_file(link)
 
 
@@ -190,9 +190,9 @@ class TestKeyEnvName(Tmp):
         return G.Endpoint({"name": "x", "base_url": "https://llm.example/v1", "model": "m",
                            "key_env": key_env}, "x.json")
 
-    def test_genai_rejects_non_identifier_key_env(self):
+    def test_hoplon_rejects_non_identifier_key_env(self):
         for bad in ("a[$(touch /tmp/x)]", "A-B", "1ABC", "A B", "", "A\n", "$X", 5, ["A"]):
-            with self.assertRaises(G.GenaiError, msg=repr(bad)):
+            with self.assertRaises(G.HoplonError, msg=repr(bad)):
                 self.ep(bad)
         self.assertEqual(self.ep("MY_KEY_2").key_env, "MY_KEY_2")
 
@@ -213,11 +213,11 @@ class TestSandboxRun(Tmp):
 
     def run_sandbox(self, *args, key_env=None):
         env = dict(os.environ, PATH=self.bin + os.pathsep + os.environ["PATH"],
-                   GENAI_SANDBOX_STATE=self.path("state"))   # hooks run in every mode; use none
-        env.pop("GENAI_KEY_ENV", None)
-        env.pop("GENAI_SANDBOX_HOOKS", None)
+                   HOPLON_SANDBOX_STATE=self.path("state"))   # hooks run in every mode; use none
+        env.pop("HOPLON_KEY_ENV", None)
+        env.pop("HOPLON_SANDBOX_HOOKS", None)
         if key_env is not None:
-            env["GENAI_KEY_ENV"] = key_env
+            env["HOPLON_KEY_ENV"] = key_env
         return subprocess.run(["bash", RUN, *args], env=env, capture_output=True, text=True, timeout=60)
 
     def check(self, r):

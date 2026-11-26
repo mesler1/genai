@@ -14,7 +14,7 @@ from fakeapi import FakeAPI, call, reply  # noqa: E402
 
 SCRIPT_TEXT = "#!/usr/bin/env bash\nset -euo pipefail\n# delete old logs\ndir=${1:-./logs}\necho \"$dir\"\n"
 turns = [reply(SCRIPT_TEXT),
-         call("write_file", path="hello.txt", content="hello from genai\n", reason="asked"), reply("Done."),
+         call("write_file", path="hello.txt", content="hello from hoplon\n", reason="asked"), reply("Done."),
          call("propose_command", command="du -sh .", reason="disk usage"),
          reply("PINEAPPLE. 4")]
 

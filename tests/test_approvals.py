@@ -6,7 +6,7 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import test_genai as T  # noqa: E402
+import test_hoplon as T  # noqa: E402
 from fakeapi import FakeAPI, call, calls, reply  # noqa: E402
 
 GENERIC = "declined by the user"

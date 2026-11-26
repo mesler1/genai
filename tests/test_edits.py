@@ -8,7 +8,7 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import test_genai as T  # noqa: E402
+import test_hoplon as T  # noqa: E402
 from fakeapi import FakeAPI, call, reply  # noqa: E402
 from test_approvals import Approvals  # noqa: E402
 
@@ -42,7 +42,7 @@ class Edits(Approvals):
                 g.send({"type": "decision", "id": ev["id"], "digest": ev["digest"], "decision": answers.pop(0)})
 
     def audit(self):
-        home = os.path.join(self.tmp, "home", "genai")
+        home = os.path.join(self.tmp, "home", "hoplon")
         with open(os.path.join(home, "audit.log")) as f:
             return [json.loads(x) for x in f]
 
@@ -148,7 +148,7 @@ class TestApprovedFiles(Edits):
             self.put("a.txt", "one\n")
             self.turn(g, ["accept"])
             g.close()
-            g = T.Proc(os.path.join(self.tmp, "home", "genai"), self.wd, ["-e", "test"])
+            g = T.Proc(os.path.join(self.tmp, "home", "hoplon"), self.wd, ["-e", "test"])
             g.until("hello")
             g.send({"type": "edits", "mode": "approved-files"})
             g.until("edits")
@@ -170,13 +170,13 @@ class TestProfileAndRepl(T.Tmp):
         self.assertEqual(p.edits, "approved-files")
         self.assertIn("edits: approved-files", p.summary()[0])
         self.assertEqual(T.G.Profile({"name": "p"}, "p.json").edits, "ask")
-        with self.assertRaises(T.G.GenaiError):
+        with self.assertRaises(T.G.HoplonError):
             T.G.Profile({"name": "p", "edits": "yes"}, "p.json")
 
     def test_repl_command(self):
         import io
         from unittest import mock
-        cfg = T.G.Config(self.path("home", "genai"))
+        cfg = T.G.Config(self.path("home", "hoplon"))
         cfg.ensure()
         ep = T.G.Endpoint({"name": "t", "base_url": "https://llm.invalid/v1", "model": "m"}, "t.json")
         eng = T.G.Engine(cfg, ep, T.G.Session(cfg), T.G.PlainUI())

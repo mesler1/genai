@@ -57,8 +57,8 @@ class SandboxCase(unittest.TestCase):
 
     def run_sandbox(self, *args, mode="selfcheck", env=None, log_vars=""):
         e = dict(os.environ, PATH=self.bin + os.pathsep + os.environ["PATH"], HOME=self.home,
-                 GENAI_SANDBOX_STATE=self.state, FAKE_LOG=self.log, FAKE_LOG_VARS=log_vars)
-        for k in ("GENAI_SANDBOX_HOOKS", "GENAI_SANDBOX_RO", "GENAI_KEY_ENV"):
+                 HOPLON_SANDBOX_STATE=self.state, FAKE_LOG=self.log, FAKE_LOG_VARS=log_vars)
+        for k in ("HOPLON_SANDBOX_HOOKS", "HOPLON_SANDBOX_RO", "HOPLON_KEY_ENV"):
             e.pop(k, None)
         e.update(env or {})
         return subprocess.run(["bash", RUN, mode, *args], env=e, capture_output=True, text=True, timeout=60)
@@ -117,7 +117,7 @@ class TestHooksDirectory(SandboxCase):
         d = self.tree("mods/a")
         self.hook("a", [f"ro {d}"], directory=other)
         self.hook("ignored", ["ro /nonexistent-ignored"])
-        r = self.run_sandbox(env={"GENAI_SANDBOX_HOOKS": other})
+        r = self.run_sandbox(env={"HOPLON_SANDBOX_HOOKS": other})
         args, _ = self.ok(r)
         self.assertIn(f"{d}:{d}:ro", args)
         self.assertNotIn("ignored", r.stderr)
@@ -249,7 +249,7 @@ class TestRoRequests(SandboxCase):
         os.symlink(d, link)
         self.hook("a", [f"ro {d}", f"ro {link}"])
         self.hook("b", [f"ro {d}"])
-        args, _ = self.ok(self.run_sandbox(env={"GENAI_SANDBOX_RO": d}))
+        args, _ = self.ok(self.run_sandbox(env={"HOPLON_SANDBOX_RO": d}))
         self.assertEqual(args.count(f"{d}:{d}:ro"), 1)
 
     def test_ro_under_an_existing_mount_is_not_repeated(self):
@@ -262,29 +262,29 @@ class TestRoRequests(SandboxCase):
     def test_unsafe_ro_is_skipped_with_a_note(self):
         d = self.tree("mods/gcc")
         self.hook("a", ["ro " + self.home, "ro " + os.path.dirname(self.home), "ro /", "ro /usr",
-                        "ro /opt", "ro /opt/genai", "ro /tmp", "ro /etc", "ro relative/dir",
+                        "ro /opt", "ro /opt/hoplon", "ro /tmp", "ro /etc", "ro relative/dir",
                         "ro " + self.p("missing"), "ro " + d])
         r = self.run_sandbox()
         args, _ = self.ok(r)
         self.assertEqual([a for a in args if a.endswith(":ro") and a.startswith(self.tmp)], [f"{d}:{d}:ro"])
-        for bad in (self.home, "/", "/usr", "/opt", "/opt/genai", "/tmp", "/etc", "relative/dir",
+        for bad in (self.home, "/", "/usr", "/opt", "/opt/hoplon", "/tmp", "/etc", "relative/dir",
                     self.p("missing")):
             self.assertIn(f"skipped ro {bad} (", r.stderr)
         self.assertNotIn(f"{self.home}:{self.home}", " ".join(args))
         self.assertNotIn("-v /:/:ro", " ".join(args))
-        self.assertIn("would cover the sandbox's own /opt/genai", r.stderr)
+        self.assertIn("would cover the sandbox's own /opt/hoplon", r.stderr)
 
-    def test_genai_sandbox_ro_still_refuses(self):
-        r = self.run_sandbox(env={"GENAI_SANDBOX_RO": "/"})
-        self.refused(r, "GENAI_SANDBOX_RO: '/' is or contains your home directory")
-        r = self.run_sandbox(env={"GENAI_SANDBOX_RO": "/opt"})
-        self.refused(r, "would cover the sandbox's own /opt/genai; name a deeper directory")
-        r = self.run_sandbox(env={"GENAI_SANDBOX_RO": self.p("missing")})
+    def test_hoplon_sandbox_ro_still_refuses(self):
+        r = self.run_sandbox(env={"HOPLON_SANDBOX_RO": "/"})
+        self.refused(r, "HOPLON_SANDBOX_RO: '/' is or contains your home directory")
+        r = self.run_sandbox(env={"HOPLON_SANDBOX_RO": "/opt"})
+        self.refused(r, "would cover the sandbox's own /opt/hoplon; name a deeper directory")
+        r = self.run_sandbox(env={"HOPLON_SANDBOX_RO": self.p("missing")})
         self.refused(r, "is not an absolute path to a directory")
 
-    def test_genai_sandbox_ro_adds_a_mount(self):
+    def test_hoplon_sandbox_ro_adds_a_mount(self):
         d = self.tree("mods/gcc")
-        args, _ = self.ok(self.run_sandbox(env={"GENAI_SANDBOX_RO": d}))
+        args, _ = self.ok(self.run_sandbox(env={"HOPLON_SANDBOX_RO": d}))
         self.assertIn(f"{d}:{d}:ro", args)
 
 
@@ -377,8 +377,8 @@ class TestRefusedNames(SandboxCase):
 
     def test_refused_requests(self):
         for line in ("path LD_PRELOAD", "path LD_AUDIT", "env LD_PRELOAD", "env LD_LIBRARY_PATH",
-                     "env PATH", "env HOME", "env PYTHONPATH", "env XDG_CONFIG_HOME", "env GENAI_SANDBOX",
-                     "path HOME", "path XDG_CONFIG_HOME", "path GENAI_SANDBOX",
+                     "env PATH", "env HOME", "env PYTHONPATH", "env XDG_CONFIG_HOME", "env HOPLON_SANDBOX",
+                     "path HOME", "path XDG_CONFIG_HOME", "path HOPLON_SANDBOX",
                      "path 1BAD", "env 1BAD", "path A-B", "env A.B", "path A=B", "env a/b",
                      f"path {self.evil}", f"env {self.evil}", "env a[0]", "path a[0]", "env $HOME",
                      "env `id`"):
@@ -409,10 +409,10 @@ class TestEnvRequests(SandboxCase):
         self.assertIn("env EBROOTGCC MKLROOT", r.stderr)
 
     def test_unset_variable_is_skipped_quietly(self):
-        self.hook("a", ["env GENAI_TEST_NEVER_SET"])     # a name no real environment has
+        self.hook("a", ["env HOPLON_TEST_NEVER_SET"])     # a name no real environment has
         r = self.run_sandbox()
         args, _ = self.ok(r)
-        self.assertNotIn("GENAI_TEST_NEVER_SET", args)
+        self.assertNotIn("HOPLON_TEST_NEVER_SET", args)
         self.assertNotIn("skipped", r.stderr)
 
     def test_hooks_apply_in_every_mode(self):
@@ -421,7 +421,7 @@ class TestEnvRequests(SandboxCase):
         ep = self.p("ep.json")
         write(ep, '{"name": "e", "base_url": "https://x.example/v1", "model": "m", "key_env": "K_ENV"}', 0o644)
         for mode, extra, env in (("tests", [], {}), ("selfcheck", [], {}), ("live", [ep], {"K_ENV": "secret"}),
-                                 ("genai", [], {"GENAI_SANDBOX_WORK": self.p("work")})):
+                                 ("hoplon", [], {"HOPLON_SANDBOX_WORK": self.p("work")})):
             with self.subTest(mode=mode):
                 if os.path.exists(self.log):
                     os.remove(self.log)
@@ -482,7 +482,7 @@ class TestModulesHook(SandboxCase):
 
     def test_module_roots_cover_their_entries(self):
         t = self.t
-        r = self.modules({"GENAI_MODULE_ROOTS": f"{t}/apps:/:{t}/missing:relative"})
+        r = self.modules({"HOPLON_MODULE_ROOTS": f"{t}/apps:/:{t}/missing:relative"})
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout.splitlines(), [
             f"ro {t}/apps",
@@ -492,7 +492,7 @@ class TestModulesHook(SandboxCase):
 
     def test_root_does_not_hide_entries_outside_it(self):
         t = self.t
-        r = self.modules({"GENAI_MODULE_ROOTS": f"{t}/apps/openmpi", "PATH": f"{t}/apps/gcc/13/bin:/usr/bin",
+        r = self.modules({"HOPLON_MODULE_ROOTS": f"{t}/apps/openmpi", "PATH": f"{t}/apps/gcc/13/bin:/usr/bin",
                           "LD_LIBRARY_PATH": "", "MANPATH": "", "PKG_CONFIG_PATH": ""})
         self.assertEqual(r.stdout.splitlines(), [
             f"ro {t}/apps/openmpi", f"ro {t}/apps/gcc/13", "path PATH", "env EBROOTGCC"])
@@ -516,7 +516,7 @@ class TestModulesHook(SandboxCase):
     def test_refused_names_are_never_printed(self):
         t = self.t
         r = self.modules({"LD_PRELOAD": f"{t}/apps/gcc/13/lib64/x", "PYTHONPATH": f"{t}/apps/gcc/13",
-                          "XDG_CONFIG_HOME": f"{t}/apps/gcc/13", "GENAI_SANDBOX": f"{t}/apps/gcc/13",
+                          "XDG_CONFIG_HOME": f"{t}/apps/gcc/13", "HOPLON_SANDBOX": f"{t}/apps/gcc/13",
                           "LD_AUDIT": f"{t}/apps/gcc/13", "bad-name": f"{t}/apps/gcc/13"})
         self.assertEqual(r.stdout.splitlines()[-1], "env EBROOTGCC")
         self.assertNotIn("env LD_", r.stdout)
@@ -556,8 +556,8 @@ class TestTightening(SandboxCase):
             self.assertNotIn(f"{d}:{d}:ro", args)
         self.assertIn("skipped ro /dev/shm (is under /dev", r.stderr)
 
-    def test_genai_sandbox_ro_refuses_them_too(self):
-        r = self.run_sandbox(env={"GENAI_SANDBOX_RO": "/dev/shm"})
+    def test_hoplon_sandbox_ro_refuses_them_too(self):
+        r = self.run_sandbox(env={"HOPLON_SANDBOX_RO": "/dev/shm"})
         self.refused(r, "is under /dev")
 
     def test_the_launchers_own_variables_are_not_passed(self):

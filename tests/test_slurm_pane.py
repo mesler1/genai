@@ -115,7 +115,7 @@ class TestConsole(unittest.TestCase):
 
     def test_errors_and_refusals_are_shown(self):
         self.c.refresh()
-        self.answer("nodes", "", exit=None, error="the program changed since genai started; restart genai")
+        self.answer("nodes", "", exit=None, error="the program changed since hoplon started; restart hoplon")
         self.assertIn("nodes: the program changed", shown(slurm.view(self.c.st, 120, None, "")[0]))
         self.c.handle({"type": "refused", "why": "this plugin is not on"})
         self.assertEqual(self.c.msg, "this plugin is not on")

@@ -1,4 +1,4 @@
-"""Offline tests for genai. Run: python3 -m unittest discover -s tests"""
+"""Offline tests for hoplon. Run: python3 -m unittest discover -s tests"""
 
 import importlib.machinery
 import importlib.util
@@ -20,19 +20,19 @@ import unittest
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SCRIPT = os.path.join(os.path.dirname(HERE), "genai")
+SCRIPT = os.path.join(os.path.dirname(HERE), "hoplon")
 sys.path.insert(0, HERE)
 from fakeapi import FakeAPI, call, calls, reply  # noqa: E402
 
-_loader = importlib.machinery.SourceFileLoader("genai_mod", SCRIPT)
-_spec = importlib.util.spec_from_loader("genai_mod", _loader)
+_loader = importlib.machinery.SourceFileLoader("hoplon_mod", SCRIPT)
+_spec = importlib.util.spec_from_loader("hoplon_mod", _loader)
 G = importlib.util.module_from_spec(_spec)
 _loader.exec_module(G)
 
 
 class Tmp(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="genai-test-")
+        self.tmp = tempfile.mkdtemp(prefix="hoplon-test-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
 
     def path(self, *p):
@@ -107,7 +107,7 @@ class TestWorkdir(Tmp):
         self.assertFalse(truncated)
         names = [n for n, _, _ in entries]
         self.assertEqual(names, ["a.txt", "sub"])
-        self.assertEqual([x for x in os.listdir(self.path("wd", "sub", "deeper")) if x.startswith(".genai")], [])
+        self.assertEqual([x for x in os.listdir(self.path("wd", "sub", "deeper")) if x.startswith(".hoplon")], [])
 
     def test_write_keeps_mode(self):
         p = self.path("wd", "x.sh")
@@ -124,7 +124,7 @@ class TestWorkdir(Tmp):
         fsync = os.fsync
 
         def check_staging(fd):
-            (stage,) = [name for name in os.listdir(self.root) if name.startswith(".genai-tmp-")]
+            (stage,) = [name for name in os.listdir(self.root) if name.startswith(".hoplon-tmp-")]
             self.assertEqual(stat.S_IMODE(os.stat(self.path("wd", stage)).st_mode), 0o700)
             self.assertEqual(stat.S_IMODE(os.fstat(fd).st_mode), 0o600)
             return fsync(fd)
@@ -177,7 +177,7 @@ class TestWorkdir(Tmp):
             with self.assertRaises(G.StaleApproval):
                 self.wd.write("taken.txt", "replacement", expected=None)
         self.assertEqual(self.wd.read("taken.txt"), "someone else's")
-        self.assertEqual([n for n in os.listdir(self.path("wd")) if n.startswith(".genai")], [])
+        self.assertEqual([n for n in os.listdir(self.path("wd")) if n.startswith(".hoplon")], [])
 
     def test_existing_file_snapshot_is_bounded(self):
         with mock.patch.object(G, "SNAPSHOT_CAP", 4):
@@ -243,7 +243,7 @@ class TestExactAndRedact(unittest.TestCase):
 # ---------------------------------------------------------------- endpoints and blessing
 
 def make_home(root, url, name="test", **extra):
-    home = os.path.join(root, "home", "genai")
+    home = os.path.join(root, "home", "hoplon")
     os.makedirs(os.path.join(home, "endpoints"))
     prof = {"name": name, "base_url": url, "model": "fake-model", "context_limit": 100000}
     prof.update(extra)
@@ -269,7 +269,7 @@ class TestStatePermissions(Tmp):
         home, _ = make_home(self.tmp, "https://local.example/v1")
         os.chmod(os.path.dirname(home), 0o770)
         with mock.patch.object(G, "own_group", return_value=False):
-            with self.assertRaisesRegex(G.GenaiError, "other users can write to it. If it is yours: chmod go-w"):
+            with self.assertRaisesRegex(G.HoplonError, "other users can write to it. If it is yours: chmod go-w"):
                 G.Config(home)
         with mock.patch.object(G, "own_group", return_value=True):     # a user-private group, as with umask 002
             G.Config(home)
@@ -280,13 +280,13 @@ class TestStatePermissions(Tmp):
         cfg = G.Config(home)
         os.chmod(cfg.blessed_path, 0o660)
         with mock.patch.object(G, "own_group", return_value=False):
-            with self.assertRaisesRegex(G.GenaiError, "chmod 600"):
+            with self.assertRaisesRegex(G.HoplonError, "chmod 600"):
                 G.select_endpoint(cfg, "test")
         with mock.patch.object(G, "own_group", return_value=True):
             G.select_endpoint(cfg, "test")
         os.chmod(cfg.blessed_path, 0o606)                               # others: never
         with mock.patch.object(G, "own_group", return_value=True):
-            with self.assertRaisesRegex(G.GenaiError, "chmod 600"):
+            with self.assertRaisesRegex(G.HoplonError, "chmod 600"):
                 G.select_endpoint(cfg, "test")
 
     def test_own_group_means_named_after_you_with_no_other_members(self):
@@ -301,7 +301,7 @@ class TestStatePermissions(Tmp):
             self.assertFalse(G.own_group(os.getgid()))
 
     def test_first_run_creates_private_parents_whatever_the_umask(self):
-        home = self.path("fresh", ".config", "genai")
+        home = self.path("fresh", ".config", "hoplon")
         old = os.umask(0o002)
         try:
             with mock.patch.object(G, "own_group", return_value=False):
@@ -318,7 +318,7 @@ class TestStatePermissions(Tmp):
         target = self.path("copied-blessings.json")
         os.rename(cfg.blessed_path, target)
         os.symlink(target, cfg.blessed_path)
-        with self.assertRaisesRegex(G.GenaiError, "cannot read genai state file"):
+        with self.assertRaisesRegex(G.HoplonError, "cannot read hoplon state file"):
             G.select_endpoint(cfg, "test")
 
 
@@ -332,20 +332,20 @@ class TestEndpoints(Tmp):
         self.prof()
         self.prof(base_url="http://127.0.0.1:8000/v1")
         self.prof(base_url="http://localhost/v1")
-        with self.assertRaises(G.GenaiError):
+        with self.assertRaises(G.HoplonError):
             self.prof(base_url="http://llm.example/v1")
         self.prof(base_url="http://llm.example/v1", allow_http=True)
-        with self.assertRaises(G.GenaiError):
+        with self.assertRaises(G.HoplonError):
             self.prof(base_url="https://user:pw@llm.example/v1")
 
     def test_strict_fields(self):
-        with self.assertRaises(G.GenaiError):
+        with self.assertRaises(G.HoplonError):
             self.prof(key_command="pass show x")
-        with self.assertRaises(G.GenaiError):
+        with self.assertRaises(G.HoplonError):
             self.prof(headers={"Authorization": "Bearer x"})
-        with self.assertRaises(G.GenaiError):
+        with self.assertRaises(G.HoplonError):
             self.prof(key_env="A", key_file="/b")
-        with self.assertRaises(G.GenaiError):
+        with self.assertRaises(G.HoplonError):
             self.prof(params={"model": "other"})
 
     def test_key_file_mode(self):
@@ -353,31 +353,31 @@ class TestEndpoints(Tmp):
         with open(kf, "w") as f:
             f.write("k\n")
         os.chmod(kf, 0o644)
-        with self.assertRaises(G.GenaiError):
+        with self.assertRaises(G.HoplonError):
             self.prof(key_file=kf).key()
         os.chmod(kf, 0o600)
         self.assertEqual(self.prof(key_file=kf).key(), "k")
 
     def test_key_env(self):
-        os.environ["GENAI_TEST_KEY"] = "abc"
-        self.addCleanup(os.environ.pop, "GENAI_TEST_KEY", None)
-        self.assertEqual(self.prof(key_env="GENAI_TEST_KEY").key(), "abc")
-        with self.assertRaises(G.GenaiError):
-            self.prof(key_env="GENAI_TEST_KEY_UNSET").key()
+        os.environ["HOPLON_TEST_KEY"] = "abc"
+        self.addCleanup(os.environ.pop, "HOPLON_TEST_KEY", None)
+        self.assertEqual(self.prof(key_env="HOPLON_TEST_KEY").key(), "abc")
+        with self.assertRaises(G.HoplonError):
+            self.prof(key_env="HOPLON_TEST_KEY_UNSET").key()
 
     def test_selection_requires_blessing(self):
         home, path = make_home(self.tmp, "https://llm.example/v1")
         cfg = G.Config(home)
-        with self.assertRaises(G.GenaiError) as e:
+        with self.assertRaises(G.HoplonError) as e:
             G.select_endpoint(cfg, None)
         self.assertEqual(e.exception.code, G.EXIT_PROFILE)
-        with self.assertRaises(G.GenaiError):
+        with self.assertRaises(G.HoplonError):
             G.select_endpoint(cfg, "test")           # unblessed
         bless_path(home, path)
         self.assertEqual(G.select_endpoint(cfg, "test").name, "test")
         with open(path, "a") as f:
             f.write(" ")
-        with self.assertRaises(G.GenaiError):
+        with self.assertRaises(G.HoplonError):
             G.select_endpoint(cfg, "test")           # changed
 
     def test_blessed_shared_endpoint_found_by_name(self):
@@ -397,12 +397,12 @@ class TestEndpoints(Tmp):
         p = self.path("work-llm.json")
         with open(p, "w") as f:
             f.write(text)
-        with self.assertRaisesRegex(G.GenaiError, "base_url must be an http"):     # left as it is, it goes nowhere
+        with self.assertRaisesRegex(G.HoplonError, "base_url must be an http"):     # left as it is, it goes nowhere
             G.Endpoint.load(p)
         with open(p, "w") as f:
             f.write(text.replace("YOUR-SERVER-ADDRESS", "https://llm.internal"))
         e = G.Endpoint.load(p)
-        self.assertEqual((e.name, e.base_url, e.key_env), ("work-llm", "https://llm.internal/v1", "GENAI_API_KEY"))
+        self.assertEqual((e.name, e.base_url, e.key_env), ("work-llm", "https://llm.internal/v1", "HOPLON_API_KEY"))
 
 
 class TestSkills(Tmp):
@@ -416,11 +416,11 @@ class TestSkills(Tmp):
             f.write("x")
         self.assertNotEqual(h1, G.hash_skill(d)[0])
         os.symlink("/etc/hostname", os.path.join(d, "link"))
-        with self.assertRaises(G.GenaiError):
+        with self.assertRaises(G.HoplonError):
             G.hash_skill(d)
 
     def test_unblessed_skill_skipped(self):
-        home = self.path("home", "genai")
+        home = self.path("home", "hoplon")
         d = os.path.join(home, "skills", "slurm")
         os.makedirs(d)
         with open(os.path.join(d, "SKILL.md"), "w") as f:
@@ -454,7 +454,7 @@ class TestSkills(Tmp):
                 text = out.getvalue()
                 self.assertIn("Exchange 2 · turn 2", text)
                 self.assertNotIn("Exchange 1", text)
-                self.assertIn("User-Agent: genai/", text)
+                self.assertIn("User-Agent: hoplon/", text)
                 out.seek(0)
                 out.truncate(0)
                 repl.command(":raw 1")
@@ -480,7 +480,7 @@ class TestSkills(Tmp):
         self.assertEqual(out.getvalue().split("\n")[:2], ["ok", "red \\x1b[31mtext\\u202e"])
 
     def test_repl_skill_command(self):
-        home = self.path("home", "genai")
+        home = self.path("home", "hoplon")
         d = os.path.join(home, "skills", "slurm")
         os.makedirs(d)
         with open(os.path.join(d, "SKILL.md"), "w") as f:
@@ -510,17 +510,17 @@ class TestSkills(Tmp):
 
 
 class TestFirstRun(Tmp):
-    def run_genai(self, *args):
+    def run_hoplon(self, *args):
         env = dict(os.environ, XDG_CONFIG_HOME=self.path("xdg"))
         return subprocess.run([sys.executable, SCRIPT, *args], env=env, stdin=subprocess.DEVNULL,
                               capture_output=True, text=True, timeout=30)
 
     def test_creates_config_tree(self):
-        r = self.run_genai("--list-skills", "--json")
+        r = self.run_hoplon("--list-skills", "--json")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(json.loads(r.stdout)["skills"], [])        # stdout stays clean JSON
-        self.assertIn("genai: created", r.stderr)
-        home = self.path("xdg", "genai")
+        self.assertIn("hoplon: created", r.stderr)
+        home = self.path("xdg", "hoplon")
         for d in ("", "endpoints", "profiles", "skills", "sessions"):
             self.assertEqual(stat.S_IMODE(os.stat(os.path.join(home, d)).st_mode), 0o700, d)
         conf = os.path.join(home, "config.json")
@@ -533,42 +533,42 @@ class TestFirstRun(Tmp):
         self.assertEqual(G.Config(home).default_profile, None)        # the starter file loads cleanly
 
     def test_config_typo_warns_and_bad_type_fails(self):
-        home = self.path("xdg", "genai")
+        home = self.path("xdg", "hoplon")
         os.makedirs(home)
         with open(os.path.join(home, "config.json"), "w") as f:
             json.dump({"default_profle": "x", "_note": "mine"}, f)
-        r = self.run_genai("--list-skills")
+        r = self.run_hoplon("--list-skills")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("unknown setting(s) ignored: default_profle", r.stderr)
         self.assertNotIn("_note", r.stderr)
         with open(os.path.join(home, "config.json"), "w") as f:
             json.dump({"skill_dirs": "/opt/skills"}, f)
-        r = self.run_genai("--list-skills")
+        r = self.run_hoplon("--list-skills")
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("skill_dirs must be a list", r.stderr)
 
     def test_list_skills_shows_the_path_to_bless(self):
-        self.run_genai("--list-skills")
-        home = self.path("xdg", "genai")
+        self.run_hoplon("--list-skills")
+        home = self.path("xdg", "hoplon")
         for name in ("slurm", "my notes"):
             os.makedirs(os.path.join(home, "skills", name))
             with open(os.path.join(home, "skills", name, "SKILL.md"), "w") as f:
                 f.write(f"# {name} help\n")
         bless_path(home, os.path.join(home, "skills", "slurm"))
-        lines = self.run_genai("--list-skills").stdout.splitlines()
-        self.assertEqual(lines[1], "    to bless: genai --bless " + shlex.quote(os.path.join(home, "skills", "my notes")))
+        lines = self.run_hoplon("--list-skills").stdout.splitlines()
+        self.assertEqual(lines[1], "    to bless: hoplon --bless " + shlex.quote(os.path.join(home, "skills", "my notes")))
         self.assertEqual(lines[3], "    " + os.path.join(home, "skills", "slurm"))
         self.assertTrue(lines[0].startswith("my notes ") and lines[2].startswith("slurm "))
 
     def test_second_run_is_quiet_and_keeps_existing(self):
-        self.run_genai("--list-skills")
-        home = self.path("xdg", "genai")
+        self.run_hoplon("--list-skills")
+        home = self.path("xdg", "hoplon")
         os.chmod(os.path.join(home, "skills"), 0o750)
         with open(os.path.join(home, "config.json"), "w") as f:
             json.dump({"default_profile": "mine"}, f)
         shutil.rmtree(os.path.join(home, "sessions"))
-        r = self.run_genai("--list-skills")
-        self.assertNotIn("genai: created", r.stderr)
+        r = self.run_hoplon("--list-skills")
+        self.assertNotIn("hoplon: created", r.stderr)
         self.assertTrue(os.path.isdir(os.path.join(home, "sessions")))      # missing piece restored
         self.assertEqual(stat.S_IMODE(os.stat(os.path.join(home, "skills")).st_mode), 0o750)
         self.assertEqual(json.load(open(os.path.join(home, "config.json"))), {"default_profile": "mine"})
@@ -578,9 +578,9 @@ class TestBundledSkills(unittest.TestCase):
     def test_bundled_skills_are_valid(self):
         root = os.path.join(os.path.dirname(HERE), "skills")
         names = sorted(os.listdir(root))
-        self.assertIn("genai-profile", names)
-        self.assertIn("genai-endpoint", names)
-        self.assertIn("genai-skill", names)
+        self.assertIn("hoplon-profile", names)
+        self.assertIn("hoplon-endpoint", names)
+        self.assertIn("hoplon-skill", names)
         for n in names:
             G.hash_skill(os.path.join(root, n))
             s = G.Skill(n, os.path.join(root, n))
@@ -590,7 +590,7 @@ class TestBundledSkills(unittest.TestCase):
 # ---------------------------------------------------------------- end to end
 
 class Proc:
-    """genai --json as a subprocess, driven line by line."""
+    """hoplon --json as a subprocess, driven line by line."""
 
     def __init__(self, home, cwd, args, env=None):
         env = dict(os.environ, XDG_CONFIG_HOME=os.path.dirname(home), HTTPS_PROXY="http://127.0.0.1:9",
@@ -714,7 +714,7 @@ class TestEndToEnd(Tmp):
             g.close()
             self.assertTrue(os.path.exists(os.path.join(self.wd, "x")))
 
-    def test_a_digest_from_another_genai_never_matches(self):
+    def test_a_digest_from_another_hoplon_never_matches(self):
         ev = {"type": "proposal", "id": "p1", "kind": "write", "path": "x", "content": "y"}
         self.assertEqual(G.digest(ev), G.digest(dict(ev, digest="ignored")))
         with mock.patch.object(G, "DIGEST_NONCE", b"another process"):
@@ -924,16 +924,16 @@ class TestEndToEnd(Tmp):
     def test_wrapper_sees_each_exchange_as_sent_and_received(self):
         turns = [call("write_file", path="x", content="y", reason="r"), reply("all done")]
         with FakeAPI(turns) as api:
-            home, path = make_home(self.tmp, api.url, key_env="GENAI_TRACE_KEY", headers={"X-Team": "hush-hush"})
+            home, path = make_home(self.tmp, api.url, key_env="HOPLON_TRACE_KEY", headers={"X-Team": "hush-hush"})
             bless_path(home, path)
             self.wd = self.path("wd")
             os.makedirs(self.wd)
-            with mock.patch.dict(os.environ, GENAI_TRACE_KEY="sk-very-secret"):
+            with mock.patch.dict(os.environ, HOPLON_TRACE_KEY="sk-very-secret"):
                 g = Proc(home, self.wd, ["-e", "test"])
             self.assertIn("trace", g.until("hello")["features"])
             g.send({"type": "system"})
             sysev = g.until("system")
-            self.assertIn("You are genai", sysev["system"])
+            self.assertIn("You are hoplon", sysev["system"])
             self.assertIn("propose_command", [t["function"]["name"] for t in sysev["tools"]])
             g.send({"type": "user", "text": "make x"})
             p = g.until("proposal")
@@ -1108,7 +1108,7 @@ class TestEndToEnd(Tmp):
             g.send({"type": "skill", "name": "draft", "on": True})
             err = g.until("error")
             self.assertEqual(err["code"], "not_blessed")
-            self.assertIn("genai --bless", err["message"])
+            self.assertIn("hoplon --bless", err["message"])
             self.assertFalse({r["name"]: r["active"] for r in g.until("skills")["skills"]}["draft"])
             g.send({"type": "skill", "name": "slurm"})
             self.assertEqual(g.until("error")["code"], "bad_message")
@@ -1130,7 +1130,7 @@ class TestEndToEnd(Tmp):
 
     def test_read_shows_a_file_to_the_user_only(self):
         with FakeAPI([]) as api:
-            home, path = make_home(self.tmp, api.url, key_env="GENAI_VIEW_KEY")
+            home, path = make_home(self.tmp, api.url, key_env="HOPLON_VIEW_KEY")
             bless_path(home, path)
             self.home = home
             wd = self.wd = self.path("wd")
@@ -1145,7 +1145,7 @@ class TestEndToEnd(Tmp):
             with open(os.path.join(wd, "big.txt"), "w") as f:
                 f.write("x" * (G.READ_CAP + 1))
             os.symlink("/etc/hostname", os.path.join(wd, "link"))
-            g = Proc(home, wd, ["-e", "test"], env={"GENAI_VIEW_KEY": "sk-viewer-key-12345"})
+            g = Proc(home, wd, ["-e", "test"], env={"HOPLON_VIEW_KEY": "sk-viewer-key-12345"})
             self.assertIn("read", g.until("hello")["features"])
 
             g.send({"type": "read", "path": "plain.txt"})
@@ -1408,8 +1408,8 @@ class TestEndToEnd(Tmp):
             self.assertEqual(roles, ["system", "user", "assistant", "tool", "user"])
 
     def test_sandbox_indicator(self):
-        os.environ["GENAI_SANDBOX"] = "testbox"
-        self.addCleanup(os.environ.pop, "GENAI_SANDBOX", None)
+        os.environ["HOPLON_SANDBOX"] = "testbox"
+        self.addCleanup(os.environ.pop, "HOPLON_SANDBOX", None)
         self.assertEqual(G.sandbox_info()["name"], "testbox")
         self.assertIn("inside the testbox sandbox", G.where_runs(G.sandbox_info()))
         self.assertIn("OUTSIDE", G.where_runs(None))
@@ -1430,7 +1430,7 @@ class TestEndToEnd(Tmp):
             os.makedirs(wd, exist_ok=True)
             env = dict(os.environ, XDG_CONFIG_HOME=os.path.dirname(home), EDITOR="true", VISUAL="true",
                        SHELL="/bin/sh", TERM="dumb")
-            env.pop("GENAI_SANDBOX", None)
+            env.pop("HOPLON_SANDBOX", None)
             env.update(sandbox_env)
             master, slave = pty.openpty()
             proc = subprocess.Popen([sys.executable, SCRIPT, "-e", "test"], cwd=wd, env=env,
@@ -1469,7 +1469,7 @@ class TestEndToEnd(Tmp):
             return out.decode(errors="replace"), sent
 
     def test_run_reports_outside_sandbox(self):
-        out, sent = self.repl_run({"GENAI_SANDBOX": "none"})
+        out, sent = self.repl_run({"HOPLON_SANDBOX": "none"})
         if os.path.exists("/run/.containerenv") or os.path.exists("/.dockerenv"):
             self.skipTest("running inside a container; 'outside' can't be shown here")
         self.assertIn("OUTSIDE any sandbox", out)
@@ -1479,11 +1479,11 @@ class TestEndToEnd(Tmp):
         self.assertIn("sandbox-check", sent)
 
     def test_run_reports_inside_sandbox(self):
-        out, sent = self.repl_run({"GENAI_SANDBOX": "testbox"})
+        out, sent = self.repl_run({"HOPLON_SANDBOX": "testbox"})
         self.assertIn("sandbox: commands you :run or :sh execute inside the testbox sandbox", out)
         self.assertIn("ran inside the testbox sandbox", out)
         self.assertIn("inside the testbox sandbox", sent)
-        runs = [a for a in self.audit_at(self.path("home", "genai")) if a["event"] == "run"]
+        runs = [a for a in self.audit_at(self.path("home", "hoplon")) if a["event"] == "run"]
         self.assertEqual(runs[0]["sandbox"]["name"], "testbox")
 
     def audit_at(self, home):
@@ -1529,17 +1529,17 @@ class TestPersonaProfiles(Tmp):
         self.assertIsNone(self.prof().skills)                     # not set: default_skills apply
         for bad in ({"coding": "yes"}, {"params": {"model": "x"}}, {"skills": "a"}, {"endpoint": "../x"},
                     {"persona": 3}, {"temperature": 1}):
-            with self.assertRaises(G.GenaiError, msg=bad):
+            with self.assertRaises(G.HoplonError, msg=bad):
                 self.prof(**bad)
-        with self.assertRaises(G.GenaiError) as e:
+        with self.assertRaises(G.HoplonError) as e:
             self.prof(base_url="https://x/v1")
         self.assertIn("looks like an endpoint", str(e.exception))
-        with self.assertRaises(G.GenaiError) as e:
+        with self.assertRaises(G.HoplonError) as e:
             G.Endpoint({"name": "x", "base_url": "https://x/v1", "model": "m", "persona": "hi"}, "x.json")
         self.assertIn("belong in a profile", str(e.exception))
 
     def test_bless_shows_persona_and_coding(self):
-        home = self.path("home", "genai")
+        home = self.path("home", "hoplon")
         os.makedirs(home)
         path = write_json(self.path("coder.json"), {"name": "coder", "endpoint": "e", "coding": True,
                                                    "persona": "Be terse.\u202e hidden"})
@@ -1559,7 +1559,7 @@ class TestPersonaProfiles(Tmp):
     def setup_home(self, api, profile, config=None):
         home, ep = make_home(self.tmp, api.url, params={"temperature": 0.9, "top_p": 0.5})
         bless_path(home, ep)
-        skill = self.path("home", "genai", "skills", "terse")
+        skill = self.path("home", "hoplon", "skills", "terse")
         os.makedirs(skill)
         with open(os.path.join(skill, "SKILL.md"), "w") as f:
             f.write("# Terse\n\nSKILL-MARKER\n")
@@ -1591,7 +1591,7 @@ class TestPersonaProfiles(Tmp):
             system = body["messages"][0]["content"]
             self.assertIn("PERSONA-MARKER", system)
             self.assertIn("SKILL-MARKER", system)
-            self.assertLess(system.index("You are genai"), system.index("PERSONA-MARKER"))   # core rules first
+            self.assertLess(system.index("You are hoplon"), system.index("PERSONA-MARKER"))   # core rules first
             self.assertEqual((body["temperature"], body["top_p"]), (0.1, 0.5))             # profile over endpoint
 
     def test_endpoint_flag_overrides_profile(self):
@@ -1628,7 +1628,7 @@ class TestPersonaProfiles(Tmp):
             g.close()
             self.assertNotIn("SKILL-MARKER", api.requests[-1]["body"]["messages"][0]["content"])
 
-    def run_genai(self, home, *args, cwd=None, **env):
+    def run_hoplon(self, home, *args, cwd=None, **env):
         return subprocess.run([sys.executable, SCRIPT, *args], cwd=cwd or self.wd,
                               env=dict(os.environ, XDG_CONFIG_HOME=os.path.dirname(home), **env),
                               capture_output=True, text=True, stdin=subprocess.DEVNULL)
@@ -1637,20 +1637,20 @@ class TestPersonaProfiles(Tmp):
         with FakeAPI([]) as api:
             home = self.setup_home(api, None)
             path = write_json(os.path.join(home, "profiles", "coder.json"), {"name": "coder", "endpoint": "test"})
-            r = self.run_genai(home, "-p", "coder", "hi")
+            r = self.run_hoplon(home, "-p", "coder", "hi")
             self.assertEqual(r.returncode, G.EXIT_PROFILE)
             self.assertIn("profile 'coder'", r.stderr)
             self.assertIn("not blessed", r.stderr)
             bless_path(home, path)
             write_json(path, {"name": "coder", "endpoint": "test", "persona": "sneaky"})
-            r = self.run_genai(home, "-p", "coder", "hi")
+            r = self.run_hoplon(home, "-p", "coder", "hi")
             self.assertIn("changed since it was blessed", r.stderr)
             self.assertEqual(api.requests, [])
 
     def test_wrong_kind_hint(self):
         with FakeAPI([]) as api:
             home = self.setup_home(api, None)
-            r = self.run_genai(home, "-p", "test", "hi")
+            r = self.run_hoplon(home, "-p", "test", "hi")
             self.assertEqual(r.returncode, G.EXIT_PROFILE)
             self.assertIn("use -e test", r.stderr)
 
@@ -1659,7 +1659,7 @@ class TestPersonaProfiles(Tmp):
             home = self.setup_home(api, {"name": "coder", "endpoint": "test", "coding": True})
             fake_home = self.path("fakehome")
             os.makedirs(fake_home)
-            r = self.run_genai(home, "--json", "-p", "coder", cwd=fake_home, HOME=fake_home)
+            r = self.run_hoplon(home, "--json", "-p", "coder", cwd=fake_home, HOME=fake_home)
             events = [json.loads(x) for x in r.stdout.splitlines()]
             self.assertEqual(r.returncode, 0, r.stderr)
             hello = next(e for e in events if e["type"] == "hello")
@@ -1670,12 +1670,12 @@ class TestPersonaProfiles(Tmp):
         with FakeAPI([]) as api:
             home = self.setup_home(api, {"name": "coder", "endpoint": "test", "description": "Careful", "coding": True})
             write_json(os.path.join(home, "profiles", "draft.json"), {"name": "draft"})
-            r = self.run_genai(home, "--list-profiles", "--json")
+            r = self.run_hoplon(home, "--list-profiles", "--json")
             rows = {x["name"]: x for x in json.loads(r.stdout)["profiles"]}
             self.assertEqual(rows["coder"]["status"], "blessed")
             self.assertIn("grants coding mode", rows["coder"]["description"])
             self.assertEqual(rows["draft"]["status"], "unblessed")
-            r = self.run_genai(home, "--list-endpoints")
+            r = self.run_hoplon(home, "--list-endpoints")
             self.assertIn("test", r.stdout)
             self.assertIn("blessed", r.stdout)
 
@@ -1686,7 +1686,7 @@ class TestPersonaProfiles(Tmp):
 
 
 class TestRemoteConfig(Tmp):
-    """--config-stdin: genai-tui sends the endpoint, profile and session token as the first line."""
+    """--config-stdin: hoplon-tui sends the endpoint, profile and session token as the first line."""
     TOKEN = "ab12" * 16
 
     def config(self, api, **ep):
@@ -1695,7 +1695,7 @@ class TestRemoteConfig(Tmp):
         return {"type": "config", "endpoint": endpoint, "profile": None, "token": self.TOKEN}
 
     def start(self, msg, args=()):
-        self.home = self.path("home", "genai")           # empty: nothing is configured or blessed here
+        self.home = self.path("home", "hoplon")           # empty: nothing is configured or blessed here
         os.makedirs(os.path.dirname(self.home))
         g = Proc(self.home, self.tmp, ["--config-stdin"] + list(args))
         g.send(msg) if isinstance(msg, dict) else g.p.stdin.write(msg)
@@ -1719,7 +1719,7 @@ class TestRemoteConfig(Tmp):
             self.assertEqual(g.until("done")["reason"], "reply")
             self.assertEqual(g.close(), 0)
             headers = {k.lower(): v for k, v in api.requests[0]["headers"].items()}
-            self.assertEqual(headers["x-genai-token"], self.TOKEN)
+            self.assertEqual(headers["x-hoplon-token"], self.TOKEN)
             self.assertNotIn("authorization", headers)
             remote = [a for a in self.audit() if a["event"] == "remote_config"]
             self.assertEqual((remote[0]["endpoint"], remote[0]["model"]), ("remote", "fake-model"))
@@ -1746,7 +1746,7 @@ class TestRemoteConfig(Tmp):
             g.until("done")
             g.send({"type": "trace"})
             tr = g.until("trace")
-            self.assertEqual(tr["exchanges"][0]["headers"]["X-Genai-Token"], "(set in the endpoint; not shown)")
+            self.assertEqual(tr["exchanges"][0]["headers"]["X-Hoplon-Token"], "(set in the endpoint; not shown)")
             g.close()
             self.assertNotIn(self.TOKEN, json.dumps(g.events))
 
@@ -1829,13 +1829,13 @@ class TestRemoteConfig(Tmp):
             self.assertEqual("every command it proposes would run as root" in out.getvalue(), shown)
 
     def test_repl_sandbox_markers(self):
-        home = self.path("home", "genai")
+        home = self.path("home", "hoplon")
         cfg = G.Config(home)
         cfg.ensure()
         ep = G.Endpoint({"name": "t", "base_url": "https://llm.invalid/v1", "model": "m"}, "t.json")
         for name, inside in (("podman", True), ("", False)):
             with self.subTest(sandbox=inside):
-                env = {"GENAI_SANDBOX": name, "GENAI_SANDBOX_WORK_HOST": "/host/w\x1b[31m"}
+                env = {"HOPLON_SANDBOX": name, "HOPLON_SANDBOX_WORK_HOST": "/host/w\x1b[31m"}
                 with mock.patch.dict(os.environ, env), mock.patch.object(G.os.path, "exists", return_value=False):
                     eng = G.Engine(cfg, ep, G.Session(cfg), G.PlainUI())
                     repl, out = G.Repl(eng), io.StringIO()
@@ -1850,12 +1850,12 @@ class TestRemoteConfig(Tmp):
                 self.assertIn(":sandbox ", text)
                 self.assertEqual("IN THE PODMAN SANDBOX: /work = /host/w" in text, inside)
                 self.assertNotIn("\x1b", text)                          # the host path is escaped
-                self.assertEqual("genai runs inside the podman sandbox" in text, inside)
-                self.assertEqual("genai runs OUTSIDE any sandbox, directly on this host" in text, not inside)
-                self.assertEqual("/opt/genai, read-only" in text, inside)
+                self.assertEqual("hoplon runs inside the podman sandbox" in text, inside)
+                self.assertEqual("hoplon runs OUTSIDE any sandbox, directly on this host" in text, not inside)
+                self.assertEqual("/opt/hoplon, read-only" in text, inside)
                 self.assertEqual("sandbox/run shell opens a shell in it" in text, inside)
                 self.assertEqual("network:" in text, inside)
-                self.assertEqual("sandbox/run genai runs genai in a podman sandbox" in text, not inside)
+                self.assertEqual("sandbox/run hoplon runs hoplon in a podman sandbox" in text, not inside)
 
     def test_model_auto(self):
         with FakeAPI([reply("ok")], models=[{"id": "coder-model"}]) as api:

@@ -6,7 +6,7 @@ from . import Feature
 
 
 def items_of(ev):
-    """The plan's items from an event, keeping only well-formed ones: genai sends a list of objects."""
+    """The plan's items from an event, keeping only well-formed ones: hoplon sends a list of objects."""
     items = ev.get("items")
     return [it for it in items if isinstance(it, dict)] if isinstance(items, list) else []
 
@@ -16,7 +16,7 @@ def number(v):
 
 
 def word(v):
-    """A field genai sends as a short string (a role, a status): anything else counts as none."""
+    """A field hoplon sends as a short string (a role, a status): anything else counts as none."""
     return v if isinstance(v, str) else None
 
 
@@ -29,10 +29,10 @@ class Work(Feature):
     events = ("work",)
 
     def __init__(self):
-        self.info = None           # the session's last state from genai, while one is on
+        self.info = None           # the session's last state from hoplon, while one is on
         self.last = None           # how the last one ended, for /work after it
-        self.starting = False      # /work TASK was sent and genai hasn't said started, or refused, yet
-        self.ending = False        # /work end was sent and genai hasn't answered yet
+        self.starting = False      # /work TASK was sent and hoplon hasn't said started, or refused, yet
+        self.ending = False        # /work end was sent and hoplon hasn't answered yet
 
     def command(self, m, cmd, arg):
         core = self.core
@@ -42,11 +42,11 @@ class Work(Feature):
             m.note("no work session is on", core.Q)
         elif arg == "end" and m.exited is None and (not m.busy or m.can_halt()):
             if m.busy:
-                m.note("ending the work session: genai stops its turn first, then commits what is there", core.W)
+                m.note("ending the work session: hoplon stops its turn first, then commits what is there", core.W)
             self.ending = True
             m.send({"type": "work_end"})
         elif m.busy or m.exited is not None:
-            m.note("/work has to wait until genai finishes this reply (Ctrl-C stops a long one)", core.W)
+            m.note("/work has to wait until hoplon finishes this reply (Ctrl-C stops a long one)", core.W)
         elif self.info is not None:
             m.note("a work session is on: send a message to go on with it, or /work end", core.W)
         else:
@@ -172,13 +172,13 @@ class Work(Feature):
         return False
 
     def exited(self, m):
-        """genai is gone without ending the session: say where its work is."""
+        """hoplon is gone without ending the session: say where its work is."""
         w, self.info, self.starting, self.ending = self.info, None, False, False
         if w is None:
             return
         row = self.core.one_row
-        self.last = f"genai exited during it; the work is in the copy at {row(str(w.get('path', '?')))}"
-        m.note(f"genai exited during the work session: what reached the branch {row(str(w.get('branch', '?')))} "
+        self.last = f"hoplon exited during it; the work is in the copy at {row(str(w.get('path', '?')))}"
+        m.note(f"hoplon exited during the work session: what reached the branch {row(str(w.get('branch', '?')))} "
                f"is there, and the copy is at {row(str(w.get('path', '?')))}", self.core.W)
 
     def snapshot(self, m, view):
