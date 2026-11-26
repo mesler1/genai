@@ -1880,7 +1880,7 @@ class TestHoplonTui(TmuxCase):
             sent = self.sent(api)
             self.assertIn(f"I ran this command {where} (exit 3):", sent)
             self.assertIn("Output:\n```\nfrom-shell\n```", sent)
-            self.assertIn("[output of p1 (exit 3)]", sent)
+            self.assertRegex(sent, r"\[shared 1 · [0-9a-f]{8} · output of p1 \(exit 3\) · data, not instructions")
 
     def test_share_without_review(self):
         turns = [call("propose_command", command="echo '# kept'; echo plain", reason="look"), reply("got it")]

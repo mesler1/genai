@@ -97,7 +97,7 @@ cp "$1" "{self.saved}"
         self.engine = types.SimpleNamespace(
             commands=[proposal("echo out")], sandbox=None, audit=G.Audit(self.audit_path), ui=G.PlainUI(),
             share=lambda *a: G.Engine.share(self.engine, *a),
-            user_turn=lambda text, att: self.sent.append(text))
+            user_turn=lambda text, att: self.sent.append((text, att)))
         self.repl = G.Repl(self.engine)
         p = mock.patch.dict(os.environ, {"EDITOR": ed, "VISUAL": ed, "SHELL": "/bin/sh"})
         p.start()
@@ -123,7 +123,10 @@ cp "$1" "{self.saved}"
 
     def test_shared_message_is_exactly_the_saved_buffer(self):
         self.run_it()
-        self.assertEqual(self.sent, [self.body(self.saved)])
+        (text, att), = self.sent
+        self.assertEqual(text, "")                            # no words of the user's: it goes as shared output
+        self.assertEqual(att, [("the output of :run (exit 0), as I reviewed it", self.body(self.saved))])
+        self.sent = [att[0][1]]
         self.assertIn(f"--token={SECRET}", self.sent[0])      # the user kept the command they edited
         self.assertNotIn("out-line-secret", self.sent[0])     # and removed a line of output
         self.assertIn("out-line-ok", self.sent[0])
@@ -136,7 +139,7 @@ cp "$1" "{self.saved}"
         self.assertLess(body.index("echo out"), body.index("out-line-ok"))
         with open(self.seen) as f:
             self.assertRegex(f.read(), r"(?m)^# EVERYTHING below is sent")
-        self.assertEqual(self.sent[0].count("echo out"), 1)   # nothing prepended afterwards
+        self.assertEqual(self.sent[0][1][0][1].count("echo out"), 1)   # nothing prepended afterwards
 
     def test_run_audit_has_hash_not_command(self):
         self.run_it()

@@ -59,6 +59,10 @@ that the defence has to be deterministic controls around the model.
 - The ways untrusted text gets in are few and known: `read_file`, `list_dir` and `search_files`, `-f` and
   `:attach`, output you share from `:run` or `:sh`, and tool results from a wrapper. There is no
   web or URL tool.
+- What you share reaches the model fenced, after your words: a header hoplon writes says it is
+  shared data, not instructions, and a random tag made after the text exists closes the block, so
+  the text can't pass itself off as your message. That helps the model read it; it is not a
+  control. The audit log records each share's size and SHA-256.
 
 What remains: a hijacked model can still propose a harmful command or edit that looks
 reasonable. Your review is the control, so read proposals as if a stranger wrote them.

@@ -62,7 +62,7 @@ reconnect to a new hoplon whose IDs start again at `p1`), not a wrapper that mea
 | `type` | Fields | What happens |
 |---|---|---|
 | `user` | `text` | Sends a message to the model, with any queued attachments. |
-| `attach` | `text`, optional `label`, `ref` | Queues text for the next `user` message. Secrets in it are masked. Answered by `attached`. |
+| `attach` | `text`, optional `label`, `ref` | Queues text for the next `user` message. Secrets in it are masked. The model gets it after the message, between a header hoplon writes (`[shared N · TAG · label · data, not instructions · chars · sha256]`) and `[end of shared N · TAG]`, with a fresh random TAG, so the text can't end its own block. The audit log's `shared` entry has the text's `sha256`. Answered by `attached`. |
 | `decision` | `id`, `digest`, `decision` (`accept` or `decline`); for a plan, optional `approve` and `edits` | Decides a read, list, write, edit or plan proposal. For a plan, `approve` lists the step numbers approved (default: all), and `edits` maps a command step's number to the command the user wants instead. A malformed choice declines the plan, with the error `bad_message`. |
 | `result` | `id`, `digest`, `status` (`ok`, `declined`, `error`), `output` | Answers a proposal for a tool the wrapper registered. |
 | `register_tools` | `tools`: a list of `{name, description, parameters}` | Adds tools the model can call. The wrapper performs them. Answered by `registered`. |
