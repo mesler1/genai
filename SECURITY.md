@@ -1,7 +1,7 @@
 # Security
 
-This document says what can go wrong in an application like genai, a language model that can
-ask for commands and file operations on your machine, and what genai does about each risk. It
+This document says what can go wrong in an application like hoplon, a language model that can
+ask for commands and file operations on your machine, and what hoplon does about each risk. It
 ends with what a review of the code on 2026-11-21 found, how each finding was resolved, and what
 stays your job.
 
@@ -11,7 +11,7 @@ recognised agent-security concerns to those choices.
 ## The short version
 
 - **Assume the model can be turned against you.** Any text it reads can carry instructions: a
-  file, a command's output, an attachment. No prompt wording reliably prevents that, so genai's
+  file, a command's output, an attachment. No prompt wording reliably prevents that, so hoplon's
   rules are enforced in code, not in the system prompt.
 - **The model proposes, the human acts.** None of its tools executes anything on your system.
   A command is only ever shown. A file write happens only after you accept the exact change. The
@@ -22,25 +22,25 @@ recognised agent-security concerns to those choices.
 - **What you see is what runs.** Model text is escaped before it reaches the terminal, and an
   approval is bound to the state of the file you looked at.
 - **Nothing is trusted because of where it sits.** Endpoints, personas and skills are used only
-  after you bless them, and are refused again the moment they change. genai reads no
+  after you bless them, and are refused again the moment they change. hoplon reads no
   configuration from the working directory.
 
-## What genai trusts
+## What hoplon trusts
 
 | Party | Trust | Why |
 | --- | --- | --- |
-| You, your shell environment (`EDITOR`, `SHELL`, variables) and `~/.config/genai` | Trusted | Anything that can change these already acts as you. |
+| You, your shell environment (`EDITOR`, `SHELL`, variables) and `~/.config/hoplon` | Trusted | Anything that can change these already acts as you. |
 | A wrapper driving `--json` | Trusted | It is the user interface: it shows proposals and returns decisions. |
-| Programs running as you, including commands you run from genai-tui's shell pane | Trusted, unavoidably | They can reach the TUI's socket and its tmux server as you can. Run genai-tui in the sandbox to keep proposed commands outside that boundary. |
+| Programs running as you, including commands you run from hoplon-tui's shell pane | Trusted, unavoidably | They can reach the TUI's socket and its tmux server as you can. Run hoplon-tui in the sandbox to keep proposed commands outside that boundary. |
 | Endpoints, profiles, skills | Trusted only as blessed | You reviewed a specific version. Its sha256 is recorded, and any change is refused. |
 | The endpoint's operator | Sees everything you send | That is what an endpoint is. Its replies are still treated as untrusted text. |
 | The model's output: text, tool names, tool arguments | Untrusted | It may be wrong, or steered by something it read. |
 | Everything the model reads: files, command output, attachments, tool results | Untrusted | This is where injected instructions come from. |
 
-genai runs as you, with your permissions. It is not a sandbox, and it says so wherever a command
+hoplon runs as you, with your permissions. It is not a sandbox, and it says so wherever a command
 is about to run.
 
-## The concerns, and how genai addresses them
+## The concerns, and how hoplon addresses them
 
 Identifiers refer to the sources listed at the end: `LLMnn` is the OWASP Top 10 for LLM
 Applications 2025, `ASInn` the OWASP Top 10 for Agentic Applications 2026, `AML.Tnnnn` MITRE
@@ -52,7 +52,7 @@ ATLAS, and `NISTAML.nnn` NIST AI 100-2e2025.
 the model, from instructions. The UK NCSC's position is that this may never be fully fixed and
 that the defence has to be deterministic controls around the model.
 
-- genai does not try to detect injections. It limits what a hijacked model can do: see 2 to 5.
+- hoplon does not try to detect injections. It limits what a hijacked model can do: see 2 to 5.
 - The system prompt states the rules, but every rule is also enforced in code: the path check,
   the approval step, the step limit. A persona is appended after the rules and cannot grant
   anything.
@@ -69,16 +69,16 @@ reasonable. Your review is the control, so read proposals as if a stranger wrote
 private data, reads untrusted content and can communicate outward can be made to leak. The
 advice is to remove one of the three, or put a human in front of it.
 
-- genai removes the third leg from the model's reach. The model cannot make a request, and
+- hoplon removes the third leg from the model's reach. The model cannot make a request, and
   nothing it writes is rendered: no Markdown, no images, no clickable links (OSC 8 hyperlink
   sequences are escaped like any other control sequence).
 - The only network destination is the blessed endpoint. Redirects are refused and nothing more
   is sent. `OPENAI_BASE_URL` and the proxy environment variables are ignored.
-- Switching models (`"model": "auto"`, `:model`, genai-tui's `/model`) stays on that server: only
+- Switching models (`"model": "auto"`, `:model`, hoplon-tui's `/model`) stays on that server: only
   a model it lists can be chosen, and every switch is in the audit log. The list comes from the
   server, so it is treated as untrusted text. A name with anything outside letters, digits and
   `._:/@+=-` is left out rather than cleaned, the list is capped at 1 MB and 200 names, and
-  genai-tui checks each name again before it shows it in a tmux menu (whose item names tmux
+  hoplon-tui checks each name again before it shows it in a tmux menu (whose item names tmux
   expands as formats). Each menu item sends back only its position, never the name.
 - Anything else that leaves the machine goes through a command you chose to run.
 - A sandboxed run (section 5) has no network unless you switch it on for the session, and then
@@ -86,7 +86,8 @@ advice is to remove one of the three, or put a human in front of it.
   same masking; files that look like secrets are hidden from it.
 
 What remains: the endpoint receives every prompt, attachment and file the model reads. In
-coding mode the model reads non-hidden files in the working directory without asking (a file
+coding mode the model reads non-hidden files in the working directory without asking (hidden: a
+name starting with `.`, or one the sandbox hides as a secret, such as `id_rsa` or `*.key`; a file
 that looks like it holds secrets still asks), so treat the directory as shared with the
 endpoint.
 
@@ -123,7 +124,7 @@ range). Together they are the whole of what the model and the user's panes can r
   break the rules (or are over 256 characters, or have a NUL or a newline) are refused, never cleaned.
 - **Fixed programs.** The program is found only in the plugin's `search` directories (or by an absolute path),
   never through your `PATH`. It must be a regular executable file that neither group nor others can write, as
-  must its directory, owned by you or root. genai records the file it found and refuses to run it if it was
+  must its directory, owned by you or root. hoplon records the file it found and refuses to run it if it was
   replaced afterwards.
 - **Minimal environment.** The program gets `PATH` (the search directories), `LANG`, `HOME`, `USER`, `LOGNAME`
   and the variables the plugin lists; `PATH` and `LD_*` can't be listed. Standard input is empty.
@@ -145,14 +146,14 @@ data can be sensitive (other users' names, job names, node names, paths in job d
 before you bless them: a broad pattern still lets the model choose freely within it. Plugins are not available
 through `--config-stdin` yet.
 
-A plugin's pane (genai-tui) is third-party code too, blessed with the plugin's directory and run as you. It runs
-out of process, in a tmux pane of its own: never inside the conversation pane, which holds the answers to genai
+A plugin's pane (hoplon-tui) is third-party code too, blessed with the plugin's directory and run as you. It runs
+out of process, in a tmux pane of its own: never inside the conversation pane, which holds the answers to hoplon
 (and, in remote mode, the ssh control socket and the key proxy's token). Its socket role, `plugin:NAME`, may only
-run its own plugin's read-only commands through genai (with genai's checks, cache and rate limits), put text in
+run its own plugin's read-only commands through hoplon (with hoplon's checks, cache and rate limits), put text in
 the input box, where you see it before anything is sent, and offer text that opens in your editor before it can
 go with a message. It can't answer a question, approve anything, or run a command that would ask. As for every
 pane, the boundary is your user account: another program running as you could connect in that role, as it could
-drive tmux. genai-tui starts the pane from the directory genai reported; it isn't re-hashed at that moment.
+drive tmux. hoplon-tui starts the pane from the directory hoplon reported; it isn't re-hashed at that moment.
 
 ### 4. Identity, privilege and credentials
 
@@ -167,7 +168,7 @@ reach, and through configuration that redirects those credentials.
 - The key is never put in a prompt. Blessing shows where the key comes from.
 - The key's exact value is masked in command output, wrapper attachments and wrapper tool
   results before they go to the model, whatever variable name it appears under.
-- genai holds no extra privilege and has no way to escalate. The system prompt tells the model
+- hoplon holds no extra privilege and has no way to escalate. The system prompt tells the model
   to say when a step needs root, and you do it.
 
 What remains: a command you run with `:run` or `:sh` inherits your environment, the key
@@ -178,7 +179,7 @@ included, exactly as it would in your own shell.
 *ASI05, AML.T0105.* The usual failure is model output reaching an interpreter without a person
 in between.
 
-- No model output is ever executed by genai on its own. `:run` opens the command in your
+- No model output is ever executed by hoplon on its own. `:run` opens the command in your
   editor, shows the result with hidden characters escaped, says where it will run, and asks
   `[y/N]`.
 - The core has no sandbox by design. `sandbox/run` supplies one with rootless podman and no
@@ -186,11 +187,11 @@ in between.
   there is nothing to pull and no base image to trust or keep patched. Your home directory,
   `/root`, `/var`, `/run`, `/mnt` and `/media` are not in it. All capabilities are dropped,
   `no-new-privileges` is set, processes and memory are limited, the repo is read-only, one
-  directory is writable, and genai uses its own config rather than yours.
+  directory is writable, and hoplon uses its own config rather than yours.
 - The banner, the `:run` confirmation, the `hello` event and the audit log all say whether
-  commands run inside a sandbox or directly on the host. Inside `sandbox/run genai` the REPL also
+  commands run inside a sandbox or directly on the host. Inside `sandbox/run hoplon` the REPL also
   marks itself: a `(sandbox) ` prompt, a bold banner line, and `:sandbox` for details. This is
-  display only, from `GENAI_SANDBOX` and `GENAI_SANDBOX_WORK_HOST`.
+  display only, from `HOPLON_SANDBOX` and `HOPLON_SANDBOX_WORK_HOST`.
 - `sandbox/run shell` opens a bash in the same sandbox (same root, `/work`, config, flags and hooks).
   It has `--network=none` unless you pass `--net`, and the endpoint's key variable is not passed in.
   Its prompt carries a `[sandbox:podman /work]` marker, and its banner lists what is mounted.
@@ -202,7 +203,7 @@ in between.
   anyone else, and they are never mounted into the sandbox.
 
 - **Sandboxed runs** (`run_in_sandbox`, only in coding mode, only with a profile's `sandbox`) are
-  the one place genai executes model output without a person in between, so the container
+  the one place hoplon executes model output without a person in between, so the container
   carries the safety instead:
   - It never runs where coding mode is refused (section 7), and `--coding-anywhere` doesn't
     change that: the overlay would copy your whole home directory, or a credential directory,
@@ -216,21 +217,89 @@ in between.
     checks each of them is empty before the command starts, and the run is refused if one
     isn't, so a mount that silently failed doesn't expose it. (A `tmpfs` over a path inside the
     overlay was found not to hide it, which is why the guard exists.)
-  - genai `--json` ignores SIGINT, except during a sandboxed run, which it stops (the container is
+  - hoplon `--json` ignores SIGINT, except during a sandboxed run, which it stops (the container is
     killed and the turn ends `stopped`). The JSON `stop` message does the same, from whoever
-    holds genai's stdin (genai-tui, here or over ssh, for Ctrl-C or `/stop`): it can only stop a
-    run, never start or approve anything. An older genai without it gets a SIGINT, only from
-    genai-tui to its own local child; a stray signal can't end the conversation.
+    holds hoplon's stdin (hoplon-tui, here or over ssh, for Ctrl-C or `/stop`): it can only stop a
+    run, never start or approve anything. An older hoplon without it gets a SIGINT, only from
+    hoplon-tui to its own local child; a stray signal can't end the conversation.
   - `--network=none` and no proxy variables, unless you switch the network on for the session;
     then every run asks first.
-  - No home directory, `/tmp` or `/run` from the host, so no SSH agent, tmux or genai-tui
+  - No home directory, `/tmp` or `/run` from the host, so no SSH agent, tmux or hoplon-tui
     sockets. A read-only root, `--cap-drop=all`, `no-new-privileges`, `--userns=keep-id`, a time
     limit, a 1 GB `/tmp`, and memory and process limits where cgroups are delegated.
   - The command's output is masked and clipped before the model sees it, and the user sees the
     same output. The audit log records each run by fingerprint, with its exit code and duration.
 
+- **Work sessions** (`:work`, or the JSON `work` message) let the model edit, test and commit
+  without asking, so the boundary moves from each edit to the branch you review at the end:
+  - The model works in a copy outside your project: a new git repository (`git init`) holding
+    your last commit and nothing else, fetched with depth 1, so neither the model nor the sandbox
+    can read your history, other branches or tags, including a secret that was committed once and
+    removed. Your own files and branch are never written; you merge the branch yourself, with git.
+  - hoplon reads your repository at the start: `git status`, in your own checkout with your own
+    config, as you would run it, and read-only lookups of your last commit and branch names (and
+    the fetch of that commit into the copy reads it too). It writes it in one place only: `git
+    fetch` of each commit made in the copy into `refs/heads/hoplon/work-N`, without recursing into
+    submodules or running maintenance. That fetch only adds to the branch: a branch moved or
+    deleted meanwhile is an error, never overwritten, and so is one found changed at the end when
+    nothing new is left to add; a name taken meanwhile moves to the next free one, and a branch
+    named `hoplon` refuses the session. SIGTERM and SIGHUP wait for the fetch, so git is never
+    killed halfway with a lock file left, and one that finished just as a signal came counts as
+    done.
+  - The copy's config is only what `git init` writes, so your repository's own config (filters,
+    hooks, includes) never applies there; your global and system config does, so a filter driver
+    set there still runs. A repository with Git LFS files is refused: the copy can't reach the
+    LFS store. hoplon runs every git command itself, on the host, with `GIT_DIR` set to the
+    copy's git directory, all `GIT_*` variables from the environment dropped, and
+    `core.hooksPath=/dev/null`, `core.fsmonitor=false`, signing, external diff and textconv, and
+    bare-repository discovery off. No file tool may write under `.git`, and the sandbox still runs
+    on a throwaway overlay of the copy, so a test can't leave anything behind. The copy's git
+    directory is beside its files, not among them, and the sandbox mounts only the files: the
+    git directory holds every file of the commit, the ones the sandbox hides as secrets too.
+  - Edits and writes apply without asking only while an item of an approved plan is worked on;
+    before approval, and while the planner reviews an item, they ask, whatever the edits mode:
+    files you approved with `approved-files` count only outside the session. Hidden and
+    secret-looking files always ask, and so does a `pyvenv.cfg` or anything under a directory of
+    that name, as the sandbox's secret scan treats a virtual environment differently (it skips
+    only its package directories, never the whole directory, and only for a real
+    `pyvenv.cfg` file).
+  - The sandbox still hides secrets and runs offline: a session can't start with the network on,
+    the network can't be turned on during one, and a finish test checks again before it runs.
+  - Only the tools offered at that point can be called: a call to any other is refused.
+  - The session's state is its own: coding mode, if the session turned it on, and approved files
+    go back to what they were when it ends, or when starting fails (`:edits reset` or `:edits ask`
+    during it forgets the set-aside ones too). While it is on, the saved session keeps a copy of the
+    conversation and coding mode from before it, so one resumed after a crash doesn't carry the
+    session's. A planner on another endpoint starts from the task alone, without the earlier
+    conversation or attachments queued in hoplon-tui or the REPL; every read question while it plans
+    names the endpoint the file would go to; and when an item's context replaces the plan, the
+    planner keeps its own context and is only told the new plan. `/clear` drops the planner's
+    waiting context as well, and the saved conversation from before the session.
+  - The user can stop the turn at any time (`stop`, Ctrl-C, `/stop`), including while the model
+    writes tool calls or rollover notes, and end the session mid-turn (`work_end`), even while it
+    is starting; quitting the front end, SIGTERM and SIGHUP end it too, committing what is there
+    and removing the copy. If git fails while ending, or a file the model wrote is not in its
+    commits (git ignores it, or it is inside a submodule's directory), the copy is not deleted;
+    what is committed still goes to the branch. A hoplon killed outright (SIGKILL, a
+    crash) leaves its copy in `~/.local/state/hoplon/work/`; your repository has whatever reached
+    the branch. Once a plan, finish or retry takes effect, the rest of
+    that reply's calls are not run: they were decided for the state before it.
+  - A profile can plan with another model (`work.planner`). On the same endpoint, nothing new
+    is trusted. A second endpoint must be blessed like any other, the profile's summary says it
+    sees the project, and its key is masked in output too. It reads files, so whatever the
+    profile's endpoint may see, it may see.
+  - Each plan item has a step budget and the session a time limit without you, which also cuts
+    off a sandboxed run or test that would outlast it. A stuck item goes back to the planning
+    context once; after that, or at the time limit, it pauses. Every step,
+    edit, test, commit and context swap is in the audit log.
+  - What remains: the branch contains whatever the model wrote, including test files and build
+    configuration, and nothing in it has been reviewed until you review it. Running its tests or
+    build on your machine before reading the diff runs the model's code as you. Filter drivers
+    from your global and system config still run when git checks out and commits the copy, and
+    the model's `.gitattributes` can choose which files they get.
+
 What remains: the indicator is display only. A command you approve outside a sandbox can do
-anything you can. Inside `sandbox/run genai` the network is open, because genai has to reach
+anything you can. Inside `sandbox/run hoplon` the network is open, because hoplon has to reach
 the endpoint, so a command run there can reach any host. It can also read whatever your user
 can read under `/usr` and `/etc`, and under anything a sandbox hook mounted.
 
@@ -258,7 +327,7 @@ it is the main way a terminal agent's approval screen gets falsified.
 - A value that belongs on one line (a reason, a path, a name, a URL) also has its newlines,
   returns and tabs shown as `\n`, `\r`, `\t`, so it cannot draw extra lines.
 - File contents and diffs in an approval prompt carry a `    | ` margin on every line, so they
-  cannot pass for genai's own prompts. genai's proposal headers are bold, and the model cannot
+  cannot pass for hoplon's own prompts. hoplon's proposal headers are bold, and the model cannot
   produce bold.
 - A proposed command that contains non-ASCII characters gets a line naming them, such as
   `U+0441 CYRILLIC SMALL LETTER ES`, so a look-alike letter in a host name or flag shows.
@@ -280,10 +349,10 @@ safe and prompts are rare enough to be read.
 - An approval is bound to what you reviewed: the target file's sha256, or the fact that it did
   not exist. If the file changed before the write, nothing is written.
 - A wrapper's answer is bound to the proposal it shows. Each proposal that waits carries a
-  digest of the event exactly as genai emitted it, keyed with a random value chosen per genai
+  digest of the event exactly as hoplon emitted it, keyed with a random value chosen per hoplon
   process. A decision must echo that digest, or it is refused and the proposal still waits. This
   catches an answer meant for another card, a queue race, or a stale card after a reconnect to a
-  new genai process, whose IDs start again at `p1`. It does not stop a wrapper that means harm: a
+  new hoplon process, whose IDs start again at `p1`. It does not stop a wrapper that means harm: a
   wrapper that can read the digest can approve anything, and it runs as you anyway.
 - Every kind of proposal is one row of a table (`PROPOSAL_KINDS`), and `perform` runs a kind's
   handler only after an accept, except for commands (shown, never run) and kinds the wrapper
@@ -312,11 +381,11 @@ safe and prompts are rare enough to be read.
   - It is independent of plans: approving a plan adds no files to the set (a planned edit you
     then approve counts like any other), and the set doesn't approve plan steps.
 - Coding mode is refused in your home directory, in any directory that contains it (so `/`),
-  in genai's own config directory and in the usual credential directories (`~/.ssh`, `~/.gnupg`,
+  in hoplon's own config directory and in the usual credential directories (`~/.ssh`, `~/.gnupg`,
   `~/.aws`, `~/.kube`, `~/.docker`, `~/.password-store`, `~/.config/gcloud`). A project
   directory under your home is fine. A resumed session is checked again.
 - You can override the refusal with `--coding-anywhere`. Only the command line can: a profile,
-  a saved session and the model cannot. genai then prints what the model can read without asking
+  a saved session and the model cannot. hoplon then prints what the model can read without asking
   and which URL it goes to, and the banner, the `hello` event and the audit log record it.
 - In coding mode a file that looks like it holds secrets is not read automatically. It asks,
   like any read outside coding mode. Automatic reads share the same bytes that were checked.
@@ -327,18 +396,18 @@ safe and prompts are rare enough to be read.
   - A planned edit or write still shows its diff and asks. Otherwise an approved test command
     would run whatever the model had just written into the code it tests.
   - A planned command is marked `preapproved` only when it matches the approved step character
-    for character; there are no patterns. genai still runs nothing: in genai-tui it is typed
+    for character; there are no patterns. hoplon still runs nothing: in hoplon-tui it is typed
     into your shell without another question only if you chose that for this plan, and
-    genai-tui checks the command against its own record of what you approved, so it does not
-    rely on genai's word alone. Its output still goes to the model only when you share it.
+    hoplon-tui checks the command against its own record of what you approved, so it does not
+    rely on hoplon's word alone. Its output still goes to the model only when you share it.
   - A command, edit or write the plan doesn't name is flagged "not in the plan" and asks as
     usual. A new plan needs a new approval.
   - A plan is never saved with a session, so it doesn't survive a resume. `/plan clear` (or
     `:plan clear`) drops it, and the audit log records the plan, each step it covered and its
     commands by fingerprint only.
 
-The TUI (`tui/genai-tui`) is such a wrapper, split across tmux panes. Only its conversation pane
-talks to genai; the prompt pane, the info panel and tmux menus reach it over a Unix socket in a
+The TUI (`tui/hoplon-tui`) is such a wrapper, split across tmux panes. Only its conversation pane
+talks to hoplon; the prompt pane, the info panel and tmux menus reach it over a Unix socket in a
 directory only you can open (`mktemp -d`, mode 0700, in `$XDG_RUNTIME_DIR` or `/tmp`, never a
 shared filesystem; never an abstract socket, which has no permissions).
 
@@ -350,7 +419,7 @@ shared filesystem; never an abstract socket, which has no permissions).
   appeared, is ignored, and keys typed within 0.3 s of a question appearing count as typing.
 - Messages are size-limited; a line that is too long or not JSON ends the connection.
 - The file tree pane can only ask the conversation pane to list, view, attach or insert the path of a file.
-  Listings and views go through genai's checks, and nothing goes to the model except an attachment you
+  Listings and views go through hoplon's checks, and nothing goes to the model except an attachment you
   reviewed in your editor first.
 - No text from the model goes into a tmux menu, pane title or popup command, where tmux would
   run a `#(...)`.
@@ -360,19 +429,19 @@ shared filesystem; never an abstract socket, which has no permissions).
   unexported variable; a program you run can't read it, so it can't fake where a command ends or
   add one to the list. Nothing from the shell reaches the model until you say so: you review it
   in your editor first (`y`), or send it as it is (`s`), which shows nothing more than the
-  question did. Either way genai masks the secrets it recognises, such as the endpoint key.
+  question did. Either way hoplon masks the secrets it recognises, such as the endpoint key.
 
-**Another host: `genai-ssh`.** In the shell pane, `genai-ssh [ssh options] HOST` connects with your
-own ssh (your config, keys and agent; genai makes no connection) and starts bash there with the
-same prompt hook, so genai-tui can follow commands on that host and `/run` can send one there. On
+**Another host: `hoplon-ssh`.** In the shell pane, `hoplon-ssh [ssh options] HOST` connects with your
+own ssh (your config, keys and agent; hoplon makes no connection) and starts bash there with the
+same prompt hook, so hoplon-tui can follow commands on that host and `/run` can send one there. On
 a shared login node other users can watch the process list, and anything on that host may print
 text, so the session gets a key of its own and the key travels only where they can't see it:
 
 - The local shell announces the session with a marker carrying its own word: a random id and the
-  destination. genai-tui then makes a fresh 128-bit key, in memory. No program can announce one.
+  destination. hoplon-tui then makes a fresh 128-bit key, in memory. No program can announce one.
 - On the other host, before your start-up files run, the shell turns the terminal's echo off and
   asks for the key with that id. Only the session just announced, only once, and only within
-  20 seconds; any other ask is ignored. genai-tui types the key back through ssh's encrypted
+  20 seconds; any other ask is ignored. hoplon-tui types the key back through ssh's encrypted
   connection. With echo off it is not shown or recorded, and it is never on a command line, in
   the environment, in shell history or in a file. The remote bash keeps it in an unexported
   variable. (The id is on the command line for a moment while bash starts; it is not secret.)
@@ -382,15 +451,15 @@ text, so the session gets a key of its own and the key travels only where they c
   naming it, in red; so does the info panel. Shared output says which host it came from. An
   automatic plan stops at a change of host, because the reviewed host and directory no longer
   match. Host names and directories reported from there are reduced to printable text.
-- Plain `ssh` still works, but genai-tui can't follow it: `/run` refuses and says to use
-  `genai-ssh`. Nothing is installed on the other host; it needs bash.
+- Plain `ssh` still works, but hoplon-tui can't follow it: `/run` refuses and says to use
+  `hoplon-ssh`. Nothing is installed on the other host; it needs bash.
 
 What remains: anyone who can read your processes' memory on that host (root, or a program
 running as you there) can read the key, as on this one, and could then fake that session's
 command list. The key only ever lets a program fake markers; it approves nothing.
 
 What this cannot do is keep out a program running as you: it can connect to the socket, or send
-keys through tmux, exactly as you can. The shell pane runs as you, on the host unless genai-tui
+keys through tmux, exactly as you can. The shell pane runs as you, on the host unless hoplon-tui
 runs in the sandbox, so a harmful command you run there could approve further proposals. The
 TUI requires a full command preview before execution, and checks that the shell pane
 still matches the reviewed working directory. Automatic plans require a full preview
@@ -402,57 +471,57 @@ other sections matter. With `--coding-anywhere` in your home directory, everythi
 not hidden is one injected instruction away from the endpoint: reads no longer ask, and a file
 the model reads can tell it what to read next.
 
-#### Remote genai
+#### Remote hoplon
 
-genai-tui's remote mode runs genai on another host over ssh with `--json --config-stdin`. The API key never
+hoplon-tui's remote mode runs hoplon on another host over ssh with `--json --config-stdin`. The API key never
 leaves the user's machine. Over ssh go the endpoint and profile (without any key) and a per-session token.
-genai there sends its requests to `http://127.0.0.1:PORT`, which ssh's reverse tunnel carries back to a proxy
-on the user's machine; the proxy requires the token (`X-Genai-Token`) and adds the key. genai refuses `key_env`,
+hoplon there sends its requests to `http://127.0.0.1:PORT`, which ssh's reverse tunnel carries back to a proxy
+on the user's machine; the proxy requires the token (`X-Hoplon-Token`) and adds the key. hoplon refuses `key_env`,
 `key_file` and `proxy` in this mode, and any `base_url` that is not `http://127.0.0.1:PORT`.
 
-The config is trusted because it arrived over the user's own ssh channel: genai-tui checked the user's blessed
-files before sending, and genai blesses nothing on the remote host for it. It logs a `remote_config` event with
+The config is trusted because it arrived over the user's own ssh channel: hoplon-tui checked the user's blessed
+files before sending, and hoplon blesses nothing on the remote host for it. It logs a `remote_config` event with
 the hashes of what it received, never the token.
 
 Skills and plugins follow the same rule. The ones in use go in the config line with every file of their
-directories, and only if they are blessed on the user's machine. genai on the host hashes those bytes again and
+directories, and only if they are blessed on the user's machine. hoplon on the host hashes those bytes again and
 refuses the whole config if a hash differs from the one blessed there. It builds the skill or plugin from those
 bytes in memory and never reads or writes this host's copies. Nothing blessed only on the remote host can be
-turned on, so whoever controls that host's `~/.config/genai` can't add a skill to the prompt or a trusted command
+turned on, so whoever controls that host's `~/.config/hoplon` can't add a skill to the prompt or a trusted command
 to the model's tools. A plugin's programs are looked for on the host, with the usual checks (its fixed search
 path, never `PATH`; owned by the user or root, not writable by others), so the Slurm plugin's commands run on the
 cluster. The program that runs is whatever is installed there, and a command whose program is missing there is
 left out. Root on the remote host can use the session's token while the
 tunnel is up, and can read that session's prompts, replies and files, which are on that host anyway. It cannot
 read the key, which was never sent. Everything else (coding-mode refusals, the sandbox, the audit log, sessions)
-works for the user genai runs as. As root, the REPL banner warns that proposed commands would run as root.
+works for the user hoplon runs as. As root, the REPL banner warns that proposed commands would run as root.
 
-How genai-tui sets it up (`genai-tui --remote`), and what each part is for:
+How hoplon-tui sets it up (`hoplon-tui --remote`), and what each part is for:
 
-- The launcher runs `genai --remote-config` here: the endpoint, profile, skills and plugins are checked and blessed on your machine,
+- The launcher runs `hoplon --remote-config` here: the endpoint, profile, skills and plugins are checked and blessed on your machine,
   and exported without `key_env`, `key_file`, `proxy`, `headers` or `ca_bundle`, so neither the key nor a secret in a
   header goes over the connection. Only the remote half of the config lacks them: `tui/keyproxy.py`, here, uses the
   endpoint's own proxy and headers.
 - ssh runs as a master connection started in your terminal, with `-a -x` (no agent, no X11 forwarding). Its control socket
-  is in genai-tui's state directory (mode 0700, in `$XDG_RUNTIME_DIR` or `/tmp`), where only you can reach it: whoever
+  is in hoplon-tui's state directory (mode 0700, in `$XDG_RUNTIME_DIR` or `/tmp`), where only you can reach it: whoever
   can use that socket can open sessions as you on the host. Use ProxyJump (`-J`) for a bastion rather than `-A`, which
   would let root on the host use your agent. The master, the key proxy and the state directory go when the launcher
   exits (also on Ctrl-C and a closed terminal).
 - The key proxy listens on a Unix socket in the same directory and `ssh -O forward -R 127.0.0.1:0:SOCKET` makes a
   loopback port on the host lead to it. Its token (32 random bytes) is in memory, in the launcher's 0600
-  `remote.json`, on the proxy's stdin and in genai's config line; never in a command line. The remote port can be
+  `remote.json`, on the proxy's stdin and in hoplon's config line; never in a command line. The remote port can be
   reached by every user of that host, so the token is the only protection: without it the proxy answers 401, and
   only the two allowed requests are ever forwarded (see `tui/keyproxy.py`).
-- genai's source goes to the host on stdin, not as a file: the remote command is a fixed Python bootstrap that reads
-  exactly N bytes and executes them, so the host can't have a different or older genai than the one you have here.
-- The shell pane is `genai-ssh` over the same master, with the same handshake and key as always (see 7); with `--as`,
+- hoplon's source goes to the host on stdin, not as a file: the remote command is a fixed Python bootstrap that reads
+  exactly N bytes and executes them, so the host can't have a different or older hoplon than the one you have here.
+- The shell pane is `hoplon-ssh` over the same master, with the same handshake and key as always (see 7); with `--as`,
   `sudo -n -H -u USER` starts its bash, and `--dir` is where it starts. `--as` takes only a user that `sudo -n`
   accepts without a password, which the launcher checks first.
 
 Root on the remote host can, while the session is up, use the token to send chat and model-list requests to your
 endpoint (spending your quota, within the proxy's allowlist), read everything that session sends, receives and
 reads on that host. It cannot get the key, other URLs of the endpoint, or the
-proxy once genai-tui has exited. A remote root could also change what genai does there: it is your genai's code,
+proxy once hoplon-tui has exited. A remote root could also change what hoplon does there: it is your hoplon's code,
 but running on a host you don't control, so approvals still happen on your screen and commands still run only
 where you send them, but what the model is *shown* from that host (file contents, hello, the audit log's path) is
 only as honest as the host.
@@ -464,13 +533,13 @@ attacks on coding agents came through files the agent trusted by location: proje
 that started processes or redirected the API key before the user agreed to anything, and tool
 descriptions that changed after approval.
 
-- genai reads no configuration from the working directory. A cloned repository cannot change
-  its endpoint, tools or behaviour. Configuration comes only from `~/.config/genai`.
+- hoplon reads no configuration from the working directory. A cloned repository cannot change
+  its endpoint, tools or behaviour. Configuration comes only from `~/.config/hoplon`.
 - Nothing is sent anywhere until an endpoint has been blessed. Blessing needs a terminal.
 - Blessing records a sha256 of exactly the bytes shown. Each use reads the file once and
   hashes and parses the same bytes. Skills are hashed across every file, with symlinks
   refused. Any change means refusal until you bless again.
-- genai's own state (`config.json`, the blessings, sessions, the audit log) must be yours and
+- hoplon's own state (`config.json`, the blessings, sessions, the audit log) must be yours and
   not writable by other users, and so must every directory above it, up to one owned by root.
   A sticky directory such as `/tmp` may hold it. Group write counts as safe only when the group
   is your personal one (named after you, with no other members), as with `umask 002` on
@@ -484,10 +553,10 @@ descriptions that changed after approval.
   `messages` or `tools`.
 - A skill is prompt text only. It cannot add a tool or turn on coding mode. Extra tools can be
   registered only by a wrapper over JSON, never from a file.
-- genai is one file with no dependencies outside the Python standard library.
+- hoplon is one file with no dependencies outside the Python standard library.
 - Hooks ([HOOKS.md](HOOKS.md)) are programs of yours that run without asking each time, so
   they are kept narrow. A hook is never read from the working directory. The notify hook is a single
-  file in `~/.config/genai/hooks`, blessed like an endpoint, and checked before every run: a
+  file in `~/.config/hoplon/hooks`, blessed like an endpoint, and checked before every run: a
   regular file, owned by you, not writable by others, with the blessed hash. It is given the
   name of the event and a count. It never gets file contents, proposal paths, command text, model
   text or the key, and its output is discarded, so nothing the model writes reaches it and nothing
@@ -504,7 +573,7 @@ not be caught. Only something already running as you could make that change.
 *ASI06, AML.T0080; Microsoft's failure-mode taxonomy.* Whatever an agent remembers can carry an
 injected instruction into later sessions.
 
-- genai keeps no memory on its own. A conversation is saved only when you name a session with
+- hoplon keeps no memory on its own. A conversation is saved only when you name a session with
   `-S`, in a 0600 file.
 - Compaction is the one place the model writes its own context. The summary is shown to you,
   `:compact -e` lets you edit it first, and the full history stays in the session file.
@@ -518,7 +587,7 @@ injected instruction into later sessions.
   clipped, and opened in your editor before anything is sent. Colour codes are stripped and
   hidden characters are shown as escapes, with a header line saying so. What you save is sent
   exactly, and an empty buffer sends nothing.
-- Files are sent as they are, deliberately, because masking would corrupt code. genai warns
+- Files are sent as they are, deliberately, because masking would corrupt code. hoplon warns
   when a file looks like it holds secrets.
 - A wrapper's file viewer (the `read` message) reads through the same checks as the model's reads.
   The text goes only to the wrapper, never to the model or the session, with the endpoint key
@@ -541,11 +610,11 @@ every send (at the limit, nothing is sent) bound what a looping model can cost. 
 has a time limit, and memory and process limits where the host allows them. A reply from the
 endpoint is capped at 8 MB, as is a single streamed line; past that the request fails and
 nothing is performed. The masking patterns run in linear time, so crafted command output cannot
-stall genai.
+stall hoplon.
 
 ### 12. Logging and accountability
 
-*NCSC guidance; LLM06.* `~/.config/genai/audit.log` records, one JSON object per line: session
+*NCSC guidance; LLM06.* `~/.config/hoplon/audit.log` records, one JSON object per line: session
 start, every proposal and decision, every file operation and its outcome, each `:run` and its
 exit status, each time output was shared, blessings, coding-mode changes, tool registrations
 and compactions. It records what was proposed and decided, not file contents or command text.
@@ -558,7 +627,7 @@ the model cannot cause a request, there is no server-side request forgery surfac
 
 ### Not applicable
 
-Inter-agent trust and rogue agents (*ASI07, ASI10*) and vector-store weaknesses (*LLM08*): genai
+Inter-agent trust and rogue agents (*ASI07, ASI10*) and vector-store weaknesses (*LLM08*): hoplon
 is a single agent with no retrieval store.
 
 ## Findings from the 2026-11-21 review
@@ -573,19 +642,19 @@ weakened how truthful or complete that approval was.
 | 2 | Medium | **Overwriting a non-text file was approved blind.** The prompt showed only "cannot diff the existing file", never the new content, and an executable stayed executable. | Fixed. The whole new content is shown, with the mode it keeps. See 7. |
 | 3 | Medium | **`exact()` missed several invisible characters:** Unicode tag characters, line and paragraph separators, variation selectors, invisible operators, fillers. Look-alike letters were not addressed. | Fixed for hidden characters, by Unicode category. Look-alike letters are named for commands only. See 6. |
 | 4 | Low | **Endpoint error text reached the terminal raw.** | Fixed. |
-| 5 | Low | **A proposal's fields could imitate genai's prompts,** through newlines in `reason` and `path` and content shown without a margin. | Fixed. One-line fields and margins. See 6. |
+| 5 | Low | **A proposal's fields could imitate hoplon's prompts,** through newlines in `reason` and `path` and content shown without a margin. | Fixed. One-line fields and margins. See 6. |
 | 6 | Low | **Hidden text reached the model unseen,** in skills and in output reviewed in the editor. | Fixed. Blessing a skill lists hidden characters, and the editor buffer shows them as escapes. See 8 and 10. |
 | 7 | Low | **Coding mode's location check was narrow,** and a file that tripped the secret detector was still read automatically. | Fixed. See 7. |
-| 8 | Low | **genai did not mask its own key.** | Fixed. Masked by exact value. See 4. |
+| 8 | Low | **hoplon did not mask its own key.** | Fixed. Masked by exact value. See 4. |
 | 9 | Low | **Masking was quadratic on some input.** 32,000 characters of `a.a.a.` took about 23 seconds. | Fixed. 256 KB of the same input takes under a tenth of a second. |
-| 10 | Low | **Sandbox hardening.** Open network in `sandbox/run genai`, and a base image pinned by tag on a Python that had reached end of life. | Partly. There is no image any more: the sandbox uses this machine's OS. The network is still open where genai needs the endpoint. See 5. |
+| 10 | Low | **Sandbox hardening.** Open network in `sandbox/run hoplon`, and a base image pinned by tag on a Python that had reached end of life. | Partly. There is no image any more: the sandbox uses this machine's OS. The network is still open where hoplon needs the endpoint. See 5. |
 
 Smaller notes from the review: the path probe and the uncapped reply size are fixed (see 10 and
 11), and DECISIONS.md is corrected about what part of a skill is sent.
 
 Still open:
 
-- `sandbox/run genai` and `sandbox/run live` have an open network.
+- `sandbox/run hoplon` and `sandbox/run live` have an open network.
 - The audit log is not tamper-evident. Anything running as you can edit it.
 - Files you attach with `-f` and files the model reads are sent unmasked, by design.
 
@@ -596,23 +665,23 @@ Still open:
 - Run coding mode only in a project directory you would share with the endpoint, and use
   `--coding-anywhere` only when you have read what it says it exposes.
 - Use a sandbox for commands you would not run as yourself.
-- Read the host in a run question before you answer it: with `genai-ssh` it may be another one.
+- Read the host in a run question before you answer it: with `hoplon-ssh` it may be another one.
 - Keep secrets out of skills and out of files you attach.
 
 ## Reporting a problem
 
 Report a suspected vulnerability privately to the maintainer, not in a public issue. Include
-the genai version (`genai --version`), what you did and what you saw.
+the hoplon version (`hoplon --version`), what you did and what you saw.
 
 ## Sources
 
 Standards and frameworks
 
-- OWASP Top 10 for LLM Applications 2025: <https://genai.owasp.org/llm-top-10/>
+- OWASP Top 10 for LLM Applications 2025: <https://hoplon.owasp.org/llm-top-10/>
 - OWASP Top 10 for Agentic Applications 2026 (announced 9 December 2025):
-  <https://genai.owasp.org/2025/12/09/owasp-top-10-for-agentic-applications-the-benchmark-for-agentic-security-in-the-age-of-autonomous-ai/>
+  <https://hoplon.owasp.org/2025/12/09/owasp-top-10-for-agentic-applications-the-benchmark-for-agentic-security-in-the-age-of-autonomous-ai/>
 - OWASP, Agentic AI: Threats and Mitigations, v1.0, February 2025:
-  <https://genai.owasp.org/resource/agentic-ai-threats-and-mitigations/>
+  <https://hoplon.owasp.org/resource/agentic-ai-threats-and-mitigations/>
 - NIST AI 100-2e2025, Adversarial Machine Learning: A Taxonomy and Terminology of Attacks and
   Mitigations: <https://nvlpubs.nist.gov/nistpubs/ai/NIST.AI.100-2e2025.pdf>
 - NIST AI 600-1, AI Risk Management Framework: Generative AI Profile, July 2024:

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""genai-tui prompt pane: where you type, below your shell.
+"""hoplon-tui prompt pane: where you type, below your shell.
 
 Typing, history, paste and Tab completion happen here. What you send, and your answers to
-approval and run questions, go to the conversation pane over genai-tui's private socket (see
-ipc.py); the conversation pane owns genai and decides everything, and pushes back what this pane
-should show. Every answer names the question it answers. Typing `` on an empty input shows your shell
-above the conversation, or hides it again.
+approval and run questions, go to the conversation pane over hoplon-tui's private socket (see
+ipc.py); the conversation pane owns hoplon and decides everything, and pushes back what this pane
+should show. Every answer names the question it answers. Ctrl-` (a tmux binding, set by hoplon-tui) shows
+your shell above the conversation, or hides it again.
 Standard library only; Python 3.10 or newer.
 """
 
@@ -20,8 +20,8 @@ import time
 from conversation import A, D, Q, R, SPIN, W, Editor, complete, edit_key, fit, width
 from ipc import Client
 
-STATE = os.environ.get("GENAI_TUI_STATE", "")
-SHELL = os.environ.get("GENAI_TUI_SHELL", "")
+STATE = os.environ.get("HOPLON_TUI_STATE", "")
+SHELL = os.environ.get("HOPLON_TUI_SHELL", "")
 SETTLE = 0.3               # keys this soon after a question appears are typing, not an answer
 
 
@@ -30,16 +30,6 @@ def tmux(*args):
         return subprocess.run(["tmux", *args], capture_output=True, text=True, timeout=5).stdout
     except (OSError, subprocess.SubprocessError):
         return ""
-
-
-def toggle_shell():
-    """Show the shell above the conversation and go there, or hide it; `` on its empty prompt hides it."""
-    toggle = os.environ.get("GENAI_TUI_TOGGLE")
-    if toggle:
-        try:
-            subprocess.run([toggle, "toggle", "--focus"], capture_output=True, timeout=5)
-        except (OSError, subprocess.SubprocessError):
-            pass
 
 
 class Prompt:
@@ -70,7 +60,7 @@ class Prompt:
                 msg = self.link.inbox.get_nowait()
             except queue.Empty:
                 return
-            if msg is None:                    # the conversation pane has gone; genai-tui is closing
+            if msg is None:                    # the conversation pane has gone; hoplon-tui is closing
                 self.view = dict(self.view, mode="input", hints="the conversation has ended")
                 continue
             if msg.get("type") == "insert":
@@ -118,11 +108,11 @@ class Prompt:
                     pass
                 x += width(text)
         v = self.view
-        hints = v.get("hints") or "Enter send · Alt+Enter new line · ↑ earlier · `` shell · /help"
+        hints = v.get("hints") or "Enter send · Alt+Enter new line · ↑ earlier · Ctrl-` shell · /help"
         if v.get("mode", "input") == "input" and v.get("running"):
             hints = f"{SPIN[int(time.time() * 10) % len(SPIN)]} a sandboxed run is going · Ctrl-C or /stop stops it"
         elif v.get("mode", "input") == "input" and v.get("busy"):
-            hints = f"{SPIN[int(time.time() * 10) % len(SPIN)]} genai is replying · type ahead, Enter queues it"
+            hints = f"{SPIN[int(time.time() * 10) % len(SPIN)]} hoplon is replying · type ahead, Enter queues it"
         try:
             self.scr.addstr(h - 1, 0, fit(hints, w - 1), self.roles[Q])
         except curses.error:
@@ -130,7 +120,7 @@ class Prompt:
         title = "you" + (f" · {v['status']}" if v.get("status") else "")
         if title != self.title:
             self.title = title
-            tmux("set", "-p", "-t", os.environ.get("TMUX_PANE", ""), "@genai_title", title)
+            tmux("set", "-p", "-t", os.environ.get("TMUX_PANE", ""), "@hoplon_title", title)
         if cur is not None:
             curses.curs_set(1)
             try:
@@ -178,13 +168,12 @@ class Prompt:
         if k in (curses.KEY_PPAGE, curses.KEY_NPAGE):
             self.send({"type": "scroll", "up": k == curses.KEY_PPAGE})
             return
+        if asking and k == "\x03" and self.view.get("halt"):
+            self.send({"type": "stop"})             # the turn stops; what waits for an answer is declined
+            return
         if asking:
             if isinstance(k, str) and k.isprintable() and time.time() - self.asked_at >= SETTLE:
                 self.answer(k.lower())
-            return
-        if k == "`" and ed.text == "`":       # `` on an empty input, at any speed; backticks in a message stay text
-            ed.text, ed.pos = "", 0
-            toggle_shell()
             return
         if k in ("\n", "\r", curses.KEY_ENTER):
             if ed.text.endswith("\\") and ed.pos == len(ed.text):
@@ -205,6 +194,8 @@ class Prompt:
             elif self.view.get("running"):
                 self.send({"type": "stop"})       # stops the sandboxed run; it doesn't count towards quitting
                 now = 0.0
+            elif self.view.get("halt") and now - self.ctrl_c >= 2:
+                self.send({"type": "stop"})       # stops hoplon's turn; a second Ctrl-C soon after still quits
             elif now - self.ctrl_c < 2:
                 self.send({"type": "quit"})
             self.ctrl_c = now
@@ -242,7 +233,7 @@ class Prompt:
 
 def main():
     if not STATE:
-        print("prompt.py is started by genai-tui", file=sys.stderr)
+        print("prompt.py is started by hoplon-tui", file=sys.stderr)
         return 2
     try:
         link = Client(STATE, "prompt")

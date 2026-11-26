@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Send one choice from a tmux menu to the conversation pane, over genai-tui's private socket.
+"""Send one choice from a tmux menu to the conversation pane, over hoplon-tui's private socket.
 
 Usage: request.py share mark|all|last
        request.py mark|unmark
@@ -40,7 +40,7 @@ def main(argv):
     else:
         print(__doc__, file=sys.stderr)
         return 2
-    state = os.environ.get("GENAI_TUI_STATE")
+    state = os.environ.get("HOPLON_TUI_STATE")
     if not state:
         return 1
     try:

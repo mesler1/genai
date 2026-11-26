@@ -14,12 +14,12 @@ import unittest
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SCRIPT = os.path.join(os.path.dirname(HERE), "genai")
+SCRIPT = os.path.join(os.path.dirname(HERE), "hoplon")
 sys.path.insert(0, HERE)
 from fakeapi import FakeAPI, reply  # noqa: E402
 
-_loader = importlib.machinery.SourceFileLoader("genai_mod", SCRIPT)
-_spec = importlib.util.spec_from_loader("genai_mod", _loader)
+_loader = importlib.machinery.SourceFileLoader("hoplon_mod", SCRIPT)
+_spec = importlib.util.spec_from_loader("hoplon_mod", _loader)
 G = importlib.util.module_from_spec(_spec)
 _loader.exec_module(G)
 
@@ -131,7 +131,7 @@ class TestEndpointKey(unittest.TestCase):
         self.assertIn('"endpoint key": 1', out.getvalue())
 
     def test_external_tool_result(self):
-        tmp = tempfile.mkdtemp(prefix="genai-test-")
+        tmp = tempfile.mkdtemp(prefix="hoplon-test-")
         self.addCleanup(shutil.rmtree, tmp, True)
         eng = types.SimpleNamespace(audit=G.Audit(os.path.join(tmp, "audit.log")),
                                     secrets=lambda: [KEY])
@@ -193,12 +193,13 @@ class Editor(unittest.TestCase):
 
 class TestRunColours(unittest.TestCase):
     def test_colour_codes_are_removed_from_run_output(self):
-        tmp = tempfile.mkdtemp(prefix="genai-test-")
+        tmp = tempfile.mkdtemp(prefix="hoplon-test-")
         self.addCleanup(shutil.rmtree, tmp, True)
         p = G.Proposal("c1", "command", "tc1", command="ls", reason="r")
         bufs = []
         eng = types.SimpleNamespace(commands=[p], sandbox=None, audit=G.Audit(os.path.join(tmp, "audit.log")),
-                                    secrets=lambda: [], share=lambda *a: None, user_turn=lambda *a: None)
+                                    secrets=lambda: [], share=lambda *a: None, user_turn=lambda *a: None,
+                                    ui=G.PlainUI())
 
         def edit(text, title, what, cancel):
             bufs.append(text)
@@ -226,7 +227,7 @@ class TestReplyCap(unittest.TestCase):
 
     def test_oversized_non_streaming_reply(self):
         with FakeAPI([reply("x" * 5000)]) as api, mock.patch.object(G, "REPLY_CAP", 1000):
-            with self.assertRaises(G.GenaiError) as cm:
+            with self.assertRaises(G.HoplonError) as cm:
                 self.client(api, False).chat([{"role": "user", "content": "hi"}], None, lambda t: None)
         self.assertEqual((cm.exception.code, cm.exception.kind), (G.EXIT_API, "api"))
         self.assertIn("exceeded", str(cm.exception))
@@ -234,14 +235,14 @@ class TestReplyCap(unittest.TestCase):
 
     def test_oversized_streamed_reply(self):
         with FakeAPI([reply("x" * 5000)]) as api, mock.patch.object(G, "REPLY_CAP", 1000):
-            with self.assertRaises(G.GenaiError) as cm:
+            with self.assertRaises(G.HoplonError) as cm:
                 self.client(api, True).chat([{"role": "user", "content": "hi"}], None, lambda t: None)
         self.assertEqual((cm.exception.code, cm.exception.kind), (G.EXIT_API, "api"))
         self.assertIn("exceeded", str(cm.exception))
 
     def test_oversized_single_line(self):
         r = io.BytesIO(b"data: " + b"x" * 5000 + b"\n")
-        with mock.patch.object(G, "REPLY_CAP", 1000), self.assertRaises(G.GenaiError):
+        with mock.patch.object(G, "REPLY_CAP", 1000), self.assertRaises(G.HoplonError):
             G.Client._stream(object(), r, lambda t: None)
 
     def test_replies_under_the_cap_still_work(self):

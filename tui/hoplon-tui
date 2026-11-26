@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
-# genai-tui: genai in tmux, as one coding agent. The conversation, the prompt you type into below
-# it, and an info panel on the right. Your own shell runs hidden: `` on an empty line shows it above
-# the conversation, or hides it again. /run types a proposed command into that shell, /share sends
+# hoplon-tui: hoplon in tmux, as one coding agent. The conversation, the prompt you type into below
+# it, and an info panel on the right. Your own shell runs hidden: Ctrl-` shows it above the
+# conversation, or hides it again. /run types a proposed command into that shell, /share sends
 # what it printed, and right-clicking the shell marks where shell context starts. Clicking a proposed
 # command, or Alt+1..Alt+9 (Alt+1 the newest), opens its menu: run it, edit it, paste it or copy it.
-# In the shell, genai-ssh [ssh options] HOST connects to another host in a way genai-tui can follow.
-# Features (/model, /copy, /decline, /raw, /system and /files, genai-ssh's handshake) can be switched off: {"disable":
-# ["copy", "model"]} in ${XDG_CONFIG_HOME:-~/.config}/genai/tui.json, or GENAI_TUI_DISABLE=copy,model.
+# In the shell, hoplon-ssh [ssh options] HOST connects to another host in a way hoplon-tui can follow.
+# Features (/model, /copy, /decline, /raw, /system and /files, hoplon-ssh's handshake) can be switched off: {"disable":
+# ["copy", "model"]} in ${XDG_CONFIG_HOME:-~/.config}/hoplon/tui.json, or HOPLON_TUI_DISABLE=copy,model.
 # /files shows or hides a file tree on the left (--files starts with it shown): browsing sends nothing to the model.
-# --remote [USER@]HOST [--dir PATH] [--as USER] [-- ssh options] keeps this screen and the API key here and runs genai
-# (and the shell pane) on that host over ssh; see "Remote mode" in the README.
-# Usage: genai-tui [-h] [-p PROFILE] [-e ENDPOINT] [-S SESSION] [-k SKILL] [--coding] [--no-panel] [--files]
+# --remote [USER@]HOST [--dir PATH] [--as USER] [-- ssh options] keeps this screen and the API key here and runs hoplon
+# (and the shell pane) on that host over ssh; see "Remote mode" in docs/hoplon-tui.md.
+# Usage: hoplon-tui [-h] [-p PROFILE] [-e ENDPOINT] [-S SESSION] [-k SKILL] [--coding] [--no-panel] [--files]
 #                  [--remote [USER@]HOST [--dir PATH] [--as USER] [-- SSH-OPTION...]]
 set -euo pipefail
 here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
-die() { echo "genai-tui: $*" >&2; exit 1; }
+die() { echo "hoplon-tui: $*" >&2; exit 1; }
 
-py=${GENAI_PYTHON:-}
+py=${HOPLON_PYTHON:-}
 if [ -z "$py" ]; then
   for c in python3 python3.13 python3.12 python3.11 python3.10; do
     if command -v "$c" >/dev/null && "$c" -c 'import sys; sys.exit(sys.version_info < (3, 10))' 2>/dev/null; then
@@ -56,30 +56,30 @@ command -v tmux >/dev/null || die "tmux is not installed"
 read -r maj min < <(tmux -V | sed -nE 's/[^0-9]*([0-9]+)\.([0-9]+).*/\1 \2/p') || true
 (( ${maj:-0} * 100 + ${min:-0} >= 302 )) || die "tmux 3.2 or newer is required (found $(tmux -V))"
 "$py" -c 'import curses' 2>/dev/null || die "$py has no curses module (on SUSE it is a separate package, such as python311-curses)"
-if [ -n "${TMUX:-}" ] && [ "${GENAI_TUI_NESTED:-}" != 1 ]; then
-  die "you are already inside tmux, whose prefix key would reach the outer tmux. Set GENAI_TUI_NESTED=1 to start it anyway."
+if [ -n "${TMUX:-}" ] && [ "${HOPLON_TUI_NESTED:-}" != 1 ]; then
+  die "you are already inside tmux, whose prefix key would reach the outer tmux. Set HOPLON_TUI_NESTED=1 to start it anyway."
 fi
 
 # Private to this run: a tmux server (your own tmux and its config are never touched), and a
 # directory only you can open, for the socket the panes talk over (tui/ipc.py). It goes in
 # $XDG_RUNTIME_DIR (per user, in memory, cleared at logout) or else /tmp: never a shared filesystem
 # such as home on a cluster, where a socket can only be reached from one node anyway.
-sock="${GENAI_TUI_SOCKET:-genai-tui-$$}"
+sock="${HOPLON_TUI_SOCKET:-hoplon-tui-$$}"
 t() { tmux -L "$sock" "$@"; }
 base=${XDG_RUNTIME_DIR:-}
 { [ -n "$base" ] && [ -d "$base" ] && [ -w "$base" ]; } || base=/tmp
-state=$(mktemp -d "$base/genai-tui.XXXXXX")
+state=$(mktemp -d "$base/hoplon-tui.XXXXXX")
 chmod 700 "$state"
 q() { printf '%q' "$1"; }
 
 # Remote mode. Everything that can ask you something (ssh's password or second factor) happens here, in your own
 # terminal, before tmux starts. What is set up, and why it keeps the API key on this machine (SECURITY.md):
-#   1. genai --remote-config: your endpoint and profile, and the skills and plugins in use, checked and blessed
+#   1. hoplon --remote-config: your endpoint and profile, and the skills and plugins in use, checked and blessed
 #      here, without any key.
 #   2. an ssh master connection, whose control socket lives in the private state directory.
 #   3. tui/keyproxy.py on a Unix socket there: it adds the key to requests that carry this session's token.
 #   4. a reverse forward: a port on the remote host's loopback leads to that socket.
-#   5. $state/remote.json: how the conversation pane starts genai over the master, with the config it reads first.
+#   5. $state/remote.json: how the conversation pane starts hoplon over the master, with the config it reads first.
 remote_q() { ssh -S "$state/cm" ${ssh_opts[@]+"${ssh_opts[@]}"} "$remote" "$@"; }
 remote_cleanup() {
   [ -z "${kpfd:-}" ] || exec {kpfd}>&-         # the key proxy ends when its stdin does
@@ -93,9 +93,9 @@ if [ -n "$remote" ]; then
   trap 'exit 130' INT TERM HUP
   sudo_as=
   [ -z "$r_as" ] || sudo_as="sudo -n -H -u $(q "$r_as") -- "
-  echo "genai-tui: checking your endpoint, profile, skills and plugins (genai --remote-config)" >&2
-  gcmd=("$py" "$here/../genai")
-  [ -z "${GENAI_BIN:-}" ] || gcmd=("$GENAI_BIN")
+  echo "hoplon-tui: checking your endpoint, profile, skills and plugins (hoplon --remote-config)" >&2
+  gcmd=("$py" "$here/../hoplon")
+  [ -z "${HOPLON_BIN:-}" ] || gcmd=("$HOPLON_BIN")
   gargs=(--remote-config)
   [ -z "$r_profile" ] || gargs+=(-p "$r_profile")
   [ -z "$r_endpoint" ] || gargs+=(-e "$r_endpoint")
@@ -103,7 +103,7 @@ if [ -n "$remote" ]; then
   "${gcmd[@]}" "${gargs[@]}" > "$state/export.json" || exit 3
   chmod 600 "$state/export.json"
   epname=$("$py" -c 'import json, sys; print(json.load(open(sys.argv[1]))["endpoint_name"])' "$state/export.json")
-  echo "genai-tui: connecting to $remote (ssh asks here if it needs a password or a second factor)" >&2
+  echo "hoplon-tui: connecting to $remote (ssh asks here if it needs a password or a second factor)" >&2
   # -a: never forward your ssh agent to that host (use ProxyJump, -J, for a bastion). ControlPersist=no: the master
   # lasts as long as this launcher does, and not a moment longer.
   ssh -M -S "$state/cm" -o ControlPersist=no -a -x -fN ${ssh_opts[@]+"${ssh_opts[@]}"} "$remote" \
@@ -113,11 +113,11 @@ if [ -n "$remote" ]; then
     remote_q "sudo -n -u $(q "$r_as") true" >/dev/null 2>&1 \
       || die "--as needs sudo to $r_as without a password on $remote (sudo -n)"
   fi
-  # The first of these that is Python 3.10 or newer, as the user genai will run as (their PATH may differ).
+  # The first of these that is Python 3.10 or newer, as the user hoplon will run as (their PATH may differ).
   probe='for c in python3 python3.13 python3.12 python3.11 python3.10; do command -v $c >/dev/null 2>&1 && '
   probe+='$c -c "import sys; sys.exit(sys.version_info < (3, 10))" 2>/dev/null && { echo $c; exit 0; }; done; exit 1'
   rpy=$(remote_q "${sudo_as}sh -c $(q "$probe")" 2>/dev/null | tail -n 1) || true
-  [[ $rpy =~ ^python3(\.[0-9]+)?$ ]] || die "genai needs Python 3.10+ on $remote${r_as:+ (as $r_as)}"
+  [[ $rpy =~ ^python3(\.[0-9]+)?$ ]] || die "hoplon needs Python 3.10+ on $remote${r_as:+ (as $r_as)}"
   if [ -n "$r_dir" ]; then
     remote_q "${sudo_as}test -d $(q "$r_dir")" >/dev/null 2>&1 \
       || die "$r_dir is not a directory on $remote${r_as:+ (as $r_as)}"
@@ -142,46 +142,46 @@ if [ -n "$remote" ]; then
   printf '%s\n' "$token" | "$py" "$here/remote.py" write "$state" "$remote" "$r_as" "$r_dir" "$port" "$rpy" -- \
     ${ssh_opts[@]+"${ssh_opts[@]}"}
   unset token
-  echo "genai-tui: genai will run on $remote${r_as:+ as $r_as}${r_dir:+ in $r_dir}, using $rpy there" >&2
+  echo "hoplon-tui: hoplon will run on $remote${r_as:+ as $r_as}${r_dir:+ in $r_dir}, using $rpy there" >&2
 fi
 
 read -r rows cols < <(stty size 2>/dev/null) || true
 cols=${cols:-120}
-# In remote mode the shell pane is a genai-ssh session to the same host, as the same user, in the same directory,
-# started below: see __genai_remote_shell in shellrc.
+# In remote mode the shell pane is a hoplon-ssh session to the same host, as the same user, in the same directory,
+# started below: see __hoplon_remote_shell in shellrc.
 shell_env=()
-[ -z "$remote" ] || shell_env=(-e "GENAI_TUI_REMOTE_DEST=$remote" -e "GENAI_TUI_SSH_CM=$state/cm"
-  -e "GENAI_TUI_SSH_AS=$r_as" -e "GENAI_TUI_SSH_DIR=$r_dir")
+[ -z "$remote" ] || shell_env=(-e "HOPLON_TUI_REMOTE_DEST=$remote" -e "HOPLON_TUI_SSH_CM=$state/cm"
+  -e "HOPLON_TUI_SSH_AS=$r_as" -e "HOPLON_TUI_SSH_DIR=$r_dir")
 # The panes' TERM. screen-256color, not tmux-256color: an ssh from the shell pane takes TERM with it, and
 # many hosts (SLES among them) have no tmux-256color, where the shell then draws erased characters as
 # blanks. It has to be set before the first pane starts, so the server starts first.
 t -f /dev/null start-server \; set -g default-terminal screen-256color \; \
-  new-session -d -s genai -n genai -x "$cols" -y "${rows:-40}" -c "$PWD" \
-  -e "GENAI_TUI_TOGGLE=$here/shell-toggle" ${shell_env[@]+"${shell_env[@]}"} "bash --rcfile $(q "$here/shellrc") -i"
+  new-session -d -s hoplon -n hoplon -x "$cols" -y "${rows:-40}" -c "$PWD" \
+  -e "HOPLON_TUI_TOGGLE=$here/shell-toggle" ${shell_env[@]+"${shell_env[@]}"} "bash --rcfile $(q "$here/shellrc") -i"
 started=1
-shell=$(t display -p -t genai '#{pane_id}')
+shell=$(t display -p -t hoplon '#{pane_id}')
 # tmux copies what the shell prints into a FIFO the conversation pane reads, in memory, to know each
 # command's output (tui/recorder.py). The shell waits for this before its first prompt.
 mkfifo -m 600 "$state/shell.out"
 t pipe-pane -O -t "$shell" "exec cat > $(q "$state/shell.out")"
 # The file tree, on the left of everything. It starts in a window of its own, made first so that
 # leaving it doesn't resize the other panes.
-tree=$(t split-window -d -h -b -f -l 34 -t "$shell" -e "GENAI_TUI_STATE=$state" -P -F '#{pane_id}' \
+tree=$(t split-window -d -h -b -f -l 34 -t "$shell" -e "HOPLON_TUI_STATE=$state" -P -F '#{pane_id}' \
   "$(q "$py") $(q "$here/files.py")")
 [ "$files" = 1 ] || t break-pane -d -s "$tree" -n files
-side=$(t split-window -d -h -f -l 42 -t "$shell" -e "GENAI_TUI_STATE=$state" -P -F '#{pane_id}' \
+side=$(t split-window -d -h -f -l 42 -t "$shell" -e "HOPLON_TUI_STATE=$state" -P -F '#{pane_id}' \
   "$(q "$py") $(q "$here/panel.py")")
 # Top to bottom: the shell, the conversation, the prompt. The shell is hidden once it all exists.
-prompt=$(t split-window -d -v -l 3 -t "$shell" -e "GENAI_TUI_STATE=$state" -e "GENAI_TUI_SHELL=$shell" \
-  -e "GENAI_TUI_TOGGLE=$here/shell-toggle" -P -F '#{pane_id}' "$(q "$py") $(q "$here/prompt.py")")
+prompt=$(t split-window -d -v -l 3 -t "$shell" -e "HOPLON_TUI_STATE=$state" -e "HOPLON_TUI_SHELL=$shell" \
+  -e "HOPLON_TUI_TOGGLE=$here/shell-toggle" -P -F '#{pane_id}' "$(q "$py") $(q "$here/prompt.py")")
 conv_env=()
-[ -z "$remote" ] || conv_env=(-e "GENAI_TUI_REMOTE=$state/remote.json")
+[ -z "$remote" ] || conv_env=(-e "HOPLON_TUI_REMOTE=$state/remote.json")
 conv_cmd="$(q "$py") $(q "$here/conversation.py")"
 [ $# -eq 0 ] || conv_cmd+=" $(printf '%q ' "$@")"     # printf with no arguments would still print ''
-conv=$(t split-window -d -v -l 60% -t "$shell" -c "$PWD" -e "GENAI_TUI_SHELL=$shell" -e "GENAI_TUI_PANEL=$side" \
-  -e "GENAI_TUI_FILES=$tree" -e "GENAI_TUI_TOGGLE=$here/shell-toggle" \
-  -e "GENAI_TUI_STATE=$state" -e "GENAI_TUI_PROMPT=$prompt" ${conv_env[@]+"${conv_env[@]}"} -P -F '#{pane_id}' \
-  "$conv_cmd; rc=\$?; if [ \$rc -ne 0 ]; then echo; echo \"genai-tui: the conversation ended with code \$rc. Press Enter.\"; read -r _; fi; tmux kill-server")
+conv=$(t split-window -d -v -l 60% -t "$shell" -c "$PWD" -e "HOPLON_TUI_SHELL=$shell" -e "HOPLON_TUI_PANEL=$side" \
+  -e "HOPLON_TUI_FILES=$tree" -e "HOPLON_TUI_TOGGLE=$here/shell-toggle" \
+  -e "HOPLON_TUI_STATE=$state" -e "HOPLON_TUI_PROMPT=$prompt" ${conv_env[@]+"${conv_env[@]}"} -P -F '#{pane_id}' \
+  "$conv_cmd; rc=\$?; if [ \$rc -ne 0 ]; then echo; echo \"hoplon-tui: the conversation ended with code \$rc. Press Enter.\"; read -r _; fi; tmux kill-server")
 if [ "$panel" = 0 ] || [ "$cols" -lt 100 ]; then
   t break-pane -d -s "$side" -n panel
 fi
@@ -191,29 +191,29 @@ t set -g history-limit 50000
 t set -g mouse on
 t set -g focus-events on
 t set -g pane-border-status top
-t set -g pane-border-format ' #{@genai_title} '
+t set -g pane-border-format ' #{@hoplon_title} '
 t set -g pane-border-lines single
 t set -g pane-border-style 'fg=brightblack'
 t set -g pane-active-border-style 'fg=blue,bold'
 t set -g status-style 'bg=default,fg=default'
-t set -g status-left ' genai │ '
+t set -g status-left ' hoplon │ '
 t set -g status-left-length 20
-if [ -n "$remote" ]; then       # the host that matters is the one genai runs on
-  t set -g status-right "#{@genai_sandbox} genai on ${remote//#/##} │ \`\` shows the shell │ Ctrl-b o: other pane │ Ctrl-b d: detach "
+if [ -n "$remote" ]; then       # the host that matters is the one hoplon runs on
+  t set -g status-right "#{@hoplon_sandbox} hoplon on ${remote//#/##} │ Ctrl-\` shell │ Ctrl-b o: other pane │ Ctrl-b d: detach "
 else
-  t set -g status-right '#{@genai_sandbox} #H │ `` shows the shell │ Ctrl-b o: other pane │ Ctrl-b d: detach '
+  t set -g status-right '#{@hoplon_sandbox} #H │ Ctrl-` shell │ Ctrl-b o: other pane │ Ctrl-b d: detach '
 fi
 t set -g window-status-format ''          # hidden panes live in other windows; don't list them
 t set -g window-status-current-format ''
 t set -g status-right-length 130
-t set -g @genai_prompt_pane "$prompt"
-t set -g @genai_shell_pane "$shell"
-t set -g @genai_conv_pane "$conv"
-t set -p -t "$conv" @genai_title 'genai'
-t set -p -t "$shell" @genai_title 'shell · `` hides it · right-click: shell context'
-t set -p -t "$prompt" @genai_title 'you'
-t set -p -t "$side" @genai_title 'info · /panel hides it'
-t set -p -t "$tree" @genai_title 'files · /files hides it'
+t set -g @hoplon_prompt_pane "$prompt"
+t set -g @hoplon_shell_pane "$shell"
+t set -g @hoplon_conv_pane "$conv"
+t set -p -t "$conv" @hoplon_title 'hoplon'
+t set -p -t "$shell" @hoplon_title 'shell · Ctrl-` hides it · right-click: shell context'
+t set -p -t "$prompt" @hoplon_title 'you'
+t set -p -t "$side" @hoplon_title 'info · /panel hides it'
+t set -p -t "$tree" @hoplon_title 'files · /files hides it'
 
 # Right-click in the shell pane: tmux's own menu for shell context. -O keeps it open when the button is
 # released off an item (tmux 3.2 has it); a click chooses. Each request goes to the
@@ -224,12 +224,12 @@ cat > "$state/menu.conf" <<EOF
 bind -n MouseDown3Pane {
   if -F "#{==:#{pane_id},$shell}" {
     display-menu -O -t= -x M -y M -T " shell context " \\
-      "Mark start of context here" m { set -gF @genai_ctx_mark "#{e|-:#{e|+:#{history_size},#{mouse_y}},#{?scroll_position,#{scroll_position},0}}" ; run-shell -b "$req mark" } \\
+      "Mark start of context here" m { set -gF @hoplon_ctx_mark "#{e|-:#{e|+:#{history_size},#{mouse_y}},#{?scroll_position,#{scroll_position},0}}" ; run-shell -b "$req mark" } \\
       "Share from the mark" s { run-shell -b "$req share mark" } \\
       "Share all shell history" a { run-shell -b "$req share all" } \\
       "Share the last command" l { run-shell -b "$req share last" } \\
       "" \\
-      "Clear the mark" c { set -gu @genai_ctx_mark ; run-shell -b "$req unmark" ; display-message "genai: shell context mark cleared" }
+      "Clear the mark" c { set -gu @hoplon_ctx_mark ; run-shell -b "$req unmark" ; display-message "hoplon: shell context mark cleared" }
   } {
     select-pane -t= ; send-keys -M
   }
@@ -239,22 +239,25 @@ EOF
 for n in 1 2 3 4 5 6 7 8 9; do
   echo "bind -n M-$n if -F \"#{==:#{pane_id},$shell}\" { send-keys M-$n } { run-shell -b \"$req menu open $n\" }"
 done >> "$state/menu.conf"
-t set-environment -g GENAI_TUI_STATE "$state"
+t set-environment -g HOPLON_TUI_STATE "$state"
 t source-file "$state/menu.conf"
-t set-environment -g GENAI_TUI_TOGGLE "$here/shell-toggle"
+t set-environment -g HOPLON_TUI_TOGGLE "$here/shell-toggle"
+# Ctrl-` shows the shell, or hides it, from any pane. Most terminals send it as NUL, the same byte as
+# Ctrl-Space, which tmux names C-Space; a terminal that reports keys in full sends C-`.
+for k in C-Space C-\`; do t bind -n "$k" run-shell "$(q "$here/shell-toggle") toggle --focus"; done
 t run-shell "$(q "$here/shell-toggle") hide"
 t select-pane -t "$prompt"
-# The shell pane runs genai-ssh to the host at once, as a command, so it is followed like any genai-ssh session.
-[ -z "$remote" ] || t send-keys -t "$shell" -l ' __genai_remote_shell' \; send-keys -t "$shell" Enter
-t attach -t genai || true
+# The shell pane runs hoplon-ssh to the host at once, as a command, so it is followed like any hoplon-ssh session.
+[ -z "$remote" ] || t send-keys -t "$shell" -l ' __hoplon_remote_shell' \; send-keys -t "$shell" Enter
+t attach -t hoplon || true
 if t has-session 2>/dev/null; then
   if [ -n "$remote" ]; then
     # Leaving would close the key proxy and the ssh connection with it, so the session can't outlive this command.
-    echo "genai-tui: detached. This command keeps the ssh connection and the key proxy up: Ctrl-C ends the session." >&2
+    echo "hoplon-tui: detached. This command keeps the ssh connection and the key proxy up: Ctrl-C ends the session." >&2
     echo "Reattach from another terminal: tmux -L $sock attach" >&2
     while t has-session 2>/dev/null; do sleep 1; done
   else
-    echo "genai-tui is still running in the background. Reattach: tmux -L $sock attach"
+    echo "hoplon-tui is still running in the background. Reattach: tmux -L $sock attach"
   fi
 fi
 # (Remote mode removes it in its exit trap, after it has closed the ssh master whose socket is in it.)

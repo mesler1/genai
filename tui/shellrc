@@ -1,22 +1,22 @@
-# genai-tui's shell pane: your own ~/.bashrc, plus invisible markers around each command, so the
+# hoplon-tui's shell pane: your own ~/.bashrc, plus invisible markers around each command, so the
 # conversation pane knows each command, its exit code and its output (tui/recorder.py). tmux shows
-# nothing for them; genai-tui reads them, with the output, from tmux, in memory only.
+# nothing for them; hoplon-tui reads them, with the output, from tmux, in memory only.
 
 # The word in every marker. It is not exported, so no program run from here can read it, and print
 # markers of its own that would be believed. The first marker announces it, once tmux is copying
 # this pane's output and before anything else has run.
-if [ -n "${__genai_remote:-}" ]; then
-  # On another host, started by genai-ssh (below). Before anything else runs here, ask genai-tui for this
+if [ -n "${__hoplon_remote:-}" ]; then
+  # On another host, started by hoplon-ssh (below). Before anything else runs here, ask hoplon-tui for this
   # session's key: echo off, so the key typed back through ssh is neither shown nor recorded, and only for the
-  # session genai-ssh announced (tui/recorder.py). Without it, this is a plain shell that genai-tui can't follow.
-  __genai_nonce=
+  # session hoplon-ssh announced (tui/recorder.py). Without it, this is a plain shell that hoplon-tui can't follow.
+  __hoplon_nonce=
   if stty -echo 2>/dev/null; then
-    printf '\e]6973;ssh;R;%s\a' "$__genai_remote"
-    IFS= read -r -t 20 __genai_nonce || __genai_nonce=
+    printf '\e]6973;ssh;R;%s\a' "$__hoplon_remote"
+    IFS= read -r -t 20 __hoplon_nonce || __hoplon_nonce=
     stty echo
   fi
-  [[ $__genai_nonce =~ ^[0-9a-f]{32}$ ]] || __genai_nonce=
-  unset __genai_remote
+  [[ $__hoplon_nonce =~ ^[0-9a-f]{32}$ ]] || __hoplon_nonce=
+  unset __hoplon_remote
   # The start-up files ssh would have run without a command (a login shell's; they usually read ~/.bashrc).
   [ -f /etc/profile ] && . /etc/profile
   if [ -f ~/.bash_profile ]; then . ~/.bash_profile
@@ -24,16 +24,16 @@ if [ -n "${__genai_remote:-}" ]; then
   elif [ -f ~/.profile ]; then . ~/.profile
   fi
 else
-  __genai_nonce=$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
-  if [ -n "${TMUX:-}" ] && [ -n "$__genai_nonce" ]; then
+  __hoplon_nonce=$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
+  if [ -n "${TMUX:-}" ] && [ -n "$__hoplon_nonce" ]; then
     for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
       [ "$(tmux display -p -t "$TMUX_PANE" '#{pane_pipe}' 2>/dev/null)" = 1 ] && break
       sleep 0.1
     done
-    printf '\e]6973;%s;H\a' "$__genai_nonce"
-    __genai_rc=${BASH_SOURCE[0]}           # this file, which genai-ssh sends to the other host
+    printf '\e]6973;%s;H\a' "$__hoplon_nonce"
+    __hoplon_rc=${BASH_SOURCE[0]}           # this file, which hoplon-ssh sends to the other host
   else
-    __genai_nonce=
+    __hoplon_nonce=
   fi
   [ -f ~/.bashrc ] && . ~/.bashrc
 fi
@@ -46,49 +46,37 @@ HISTCONTROL=${HISTCONTROL//ignoredups/}
 HISTCONTROL=${HISTCONTROL//erasedups/}
 
 # A command starts: bash prints PS0 after you press Enter and before the command runs.
-[ -n "$__genai_nonce" ] && PS0="${PS0:-}"$'\e]6973;'"$__genai_nonce"$';S\a'
+[ -n "$__hoplon_nonce" ] && PS0="${PS0:-}"$'\e]6973;'"$__hoplon_nonce"$';S\a'
 # Continuation prompts accept bracketed input too, but must not receive a proposed command.
-[ -n "$__genai_nonce" ] && PS2='\['$'\e]6973;'"$__genai_nonce"$';P\a''\]'"${PS2:-}"
+[ -n "$__hoplon_nonce" ] && PS2='\['$'\e]6973;'"$__hoplon_nonce"$';P\a''\]'"${PS2:-}"
 # The next prompt: the exit code, whether a new history entry was made, the command line (base64),
-# how many lines the prompt takes, and the directory and host name (base64; a genai-ssh session shows them).
-__genai_prompt() {
+# how many lines the prompt takes, and the directory and host name (base64; a hoplon-ssh session shows them).
+__hoplon_prompt() {
   local rc=$? h num new=0 cmd= p
-  [ -n "$__genai_nonce" ] || return "$rc"
+  [ -n "$__hoplon_nonce" ] || return "$rc"
   h=$(HISTTIMEFORMAT= history 1)           # "  123  the command": its number changes only for a new entry
   h=${h#"${h%%[! ]*}"}
   num=${h%%[!0-9]*}
-  if [ -z "${__genai_hnum+set}" ]; then
-    __genai_hnum=$num                      # the first prompt: nothing has run yet
-  elif [ "$num" != "$__genai_hnum" ]; then
+  if [ -z "${__hoplon_hnum+set}" ]; then
+    __hoplon_hnum=$num                      # the first prompt: nothing has run yet
+  elif [ "$num" != "$__hoplon_hnum" ]; then
     new=1
-    __genai_hnum=$num
+    __hoplon_hnum=$num
     h=${h#"$num"}
     cmd=$(printf '%s' "${h#"${h%%[! ]*}"}" | base64 -w0)
   fi
   p=${PS1//\\n/$'\n'}
   p=${p//[!$'\n']/}
-  printf '\e]6973;%s;D;%s;%s;%s;%s;%s;%s\a' "$__genai_nonce" "$rc" "$new" "$cmd" "$(( ${#p} + 1 ))" \
+  printf '\e]6973;%s;D;%s;%s;%s;%s;%s;%s\a' "$__hoplon_nonce" "$rc" "$new" "$cmd" "$(( ${#p} + 1 ))" \
     "$(printf %s "$PWD" | base64 -w0)" "$(printf %s "${HOSTNAME:-}" | base64 -w0)"
   return "$rc"
 }
-PROMPT_COMMAND="__genai_prompt${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
+PROMPT_COMMAND="__hoplon_prompt${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
 
-# `` on an empty command line hides this shell again (it keeps running) and goes back to the prompt.
-# Anywhere else `` is typed as it is, and a single ` types after a moment (readline's keyseq-timeout).
-__genai_hide() {
-  if [ -n "$READLINE_LINE" ] || [ -z "${TMUX:-}" ] || [ -z "${GENAI_TUI_TOGGLE:-}" ]; then
-    READLINE_LINE="${READLINE_LINE:0:READLINE_POINT}\`\`${READLINE_LINE:READLINE_POINT}"
-    READLINE_POINT=$((READLINE_POINT + 2))
-    return
-  fi
-  "$GENAI_TUI_TOGGLE" hide
-}
-bind -x '"``": __genai_hide' 2>/dev/null
-
-# genai-ssh [ssh options] [user@]host: ssh to a shell genai-tui can follow, as it follows this one. Nothing is
-# installed there and no key is on the command line: see tui/recorder.py. Only here, in genai-tui's shell pane.
-if [ -n "${__genai_rc:-}" ]; then
-  genai-ssh() {
+# hoplon-ssh [ssh options] [user@]host: ssh to a shell hoplon-tui can follow, as it follows this one. Nothing is
+# installed there and no key is on the command line: see tui/recorder.py. Only here, in hoplon-tui's shell pane.
+if [ -n "${__hoplon_rc:-}" ]; then
+  hoplon-ssh() {
     local a dest= skip= n=0 at=0 id rc inner via=()
     for a in "$@"; do                      # the destination: the first argument that isn't an option or its value
       n=$((n + 1))
@@ -100,34 +88,34 @@ if [ -n "${__genai_rc:-}" ]; then
       esac
     done
     if [ -z "$dest" ] || [ "$at" -ne $# ]; then
-      echo "usage: genai-ssh [ssh options] [user@]host   (it starts a shell there; no remote command)" >&2
+      echo "usage: hoplon-ssh [ssh options] [user@]host   (it starts a shell there; no remote command)" >&2
       return 2
     fi
-    if [ ! -r "$__genai_rc" ]; then
-      echo "genai-ssh: can't read $__genai_rc" >&2
+    if [ ! -r "$__hoplon_rc" ]; then
+      echo "hoplon-ssh: can't read $__hoplon_rc" >&2
       return 1
     fi
     id=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
-    rc=$({ printf '__genai_remote=%s\n' "$id"; cat "$__genai_rc"; } | base64 -w0)
-    printf '\e]6973;%s;X;%s;%s\a' "$__genai_nonce" "$id" "$(printf %s "$dest" | base64 -w0)"
-    # genai-tui --remote: reuse its ssh connection (no new login), in its directory, as its user. sudo closes
+    rc=$({ printf '__hoplon_remote=%s\n' "$id"; cat "$__hoplon_rc"; } | base64 -w0)
+    printf '\e]6973;%s;X;%s;%s\a' "$__hoplon_nonce" "$id" "$(printf %s "$dest" | base64 -w0)"
+    # hoplon-tui --remote: reuse its ssh connection (no new login), in its directory, as its user. sudo closes
     # the descriptors a process substitution would use, so bash makes it itself, inside the sudo.
-    inner="bash -c 'exec bash --rcfile <(printf %s \"\$1\" | base64 -d) -i' genai-ssh $rc"
-    [ -z "${GENAI_TUI_SSH_CM:-}" ] || via=(-S "$GENAI_TUI_SSH_CM")
-    [ -z "${GENAI_TUI_SSH_AS:-}" ] || inner="sudo -n -H -u $(printf %q "$GENAI_TUI_SSH_AS") -- $inner"
+    inner="bash -c 'exec bash --rcfile <(printf %s \"\$1\" | base64 -d) -i' hoplon-ssh $rc"
+    [ -z "${HOPLON_TUI_SSH_CM:-}" ] || via=(-S "$HOPLON_TUI_SSH_CM")
+    [ -z "${HOPLON_TUI_SSH_AS:-}" ] || inner="sudo -n -H -u $(printf %q "$HOPLON_TUI_SSH_AS") -- $inner"
     inner="exec $inner"
-    [ -z "${GENAI_TUI_SSH_DIR:-}" ] || inner="cd -- $(printf %q "$GENAI_TUI_SSH_DIR") && $inner"
+    [ -z "${HOPLON_TUI_SSH_DIR:-}" ] || inner="cd -- $(printf %q "$HOPLON_TUI_SSH_DIR") && $inner"
     command ssh -t ${via[@]+"${via[@]}"} "$@" "$inner"
   }
-  # genai-tui --remote starts this at once: the shell pane is a genai-ssh session to the host genai runs on, and
+  # hoplon-tui --remote starts this at once: the shell pane is a hoplon-ssh session to the host hoplon runs on, and
   # when it ends (the connection drops, or you type exit there) it says so and offers to reconnect, rather than
-  # leaving a prompt on this machine while genai works on the other.
-  if [ -n "${GENAI_TUI_REMOTE_DEST:-}" ]; then
-    __genai_remote_shell() {
+  # leaving a prompt on this machine while hoplon works on the other.
+  if [ -n "${HOPLON_TUI_REMOTE_DEST:-}" ]; then
+    __hoplon_remote_shell() {
       local _
       while :; do
-        genai-ssh "$GENAI_TUI_REMOTE_DEST"
-        printf '\ndisconnected from %s — Enter reconnects, Ctrl-D closes this pane\n' "$GENAI_TUI_REMOTE_DEST"
+        hoplon-ssh "$HOPLON_TUI_REMOTE_DEST"
+        printf '\ndisconnected from %s — Enter reconnects, Ctrl-D closes this pane\n' "$HOPLON_TUI_REMOTE_DEST"
         read -r _ || exit 0
       done
     }

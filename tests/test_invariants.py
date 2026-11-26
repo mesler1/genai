@@ -11,18 +11,18 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_coding_guard import Guard, Ui  # noqa: E402
-from test_genai import G  # noqa: E402
+from test_hoplon import G  # noqa: E402
 
 
 def proposal(kind, n=1):
     """A proposal of this kind with the fields the gate itself reads; the handlers are not reached."""
     return G.Proposal(f"p{n}", kind, f"c{n}", command="true", path="a.txt", steps=[], tool="t", goal="g",
-                      reason="r")
+                      items=["i"], summary="s", reason="r")
 
 
 class TestTable(unittest.TestCase):
-    def test_every_tool_genai_offers_has_a_kind(self):
-        offered = [t["function"]["name"] for t in G.TOOLS + [G.SEARCH_TOOL, G.RUN_TOOL]]
+    def test_every_tool_hoplon_offers_has_a_kind(self):
+        offered = [t["function"]["name"] for t in G.TOOLS + [G.SEARCH_TOOL, G.RUN_TOOL, G.WORK_PLAN_TOOL, G.FINISH_TOOL, G.RETRY_TOOL]]
         self.assertEqual(sorted(set(offered)), sorted(G.INTRINSICS))
         self.assertEqual(sorted(G.BY_TOOL), sorted(G.INTRINSICS))
 

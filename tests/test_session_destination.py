@@ -4,7 +4,7 @@ import json
 import os
 import subprocess
 
-from test_genai import FakeAPI, SCRIPT, Tmp, bless_path, make_home, reply
+from test_hoplon import FakeAPI, SCRIPT, Tmp, bless_path, make_home, reply
 
 
 class TestSessionDestination(Tmp):

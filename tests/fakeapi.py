@@ -3,6 +3,7 @@
 import http.server
 import json
 import threading
+import time
 
 
 def reply(text):
@@ -17,12 +18,19 @@ def calls(*pairs):
     return {"tool_calls": list(pairs)}
 
 
+def slow(turn, seconds):
+    """turn, streamed with a pause of seconds after its first piece: time for a stop to come mid-reply."""
+    return dict(turn, pause=seconds)
+
+
 class FakeAPI:
     """Serves the scripted turns in order. Each turn is reply(...) or call(...)."""
 
-    def __init__(self, turns, stream=True, usage=None, status=200, redirect=None, error_message="nope", models=None):
+    def __init__(self, turns, stream=True, usage=None, status=200, redirect=None, error_message="nope", models=None,
+                 models_status=200):
         self.turns = list(turns)
         self.models = models if models is not None else [{"id": "fake-model"}]
+        self.models_status = models_status
         self.requests = []
         self.stream = stream
         self.usage = usage
@@ -37,7 +45,7 @@ class FakeAPI:
 
             def do_GET(self):
                 api.requests.append({"path": self.path, "headers": dict(self.headers)})
-                self._json(200, {"object": "list", "data": api.models})
+                self._json(api.models_status, {"object": "list", "data": api.models})
 
             def do_POST(self):
                 n = int(self.headers.get("Content-Length", 0))
@@ -70,8 +78,14 @@ class FakeAPI:
                 self.send_header("Content-Type", "text/event-stream")
                 self.end_headers()
 
+                sent = [0]
+
                 def send(obj):
                     self.wfile.write(b"data: " + json.dumps(obj).encode() + b"\n\n")
+                    sent[0] += 1
+                    if sent[0] == 1 and turn.get("pause"):
+                        self.wfile.flush()
+                        time.sleep(turn["pause"])
 
                 text = turn.get("content") or ""
                 for i in range(0, len(text), 7):

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""genai-tui info panel: the session, context use, skills and proposals, beside the conversation.
+"""hoplon-tui info panel: the session, context use, skills and proposals, beside the conversation.
 
-The conversation pane pushes what to show over genai-tui's private socket (see ipc.py), and this
+The conversation pane pushes what to show over hoplon-tui's private socket (see ipc.py), and this
 pane sends requests back the same way. It connects in the "panel" role, which may only switch
 coding mode and skills, ask for the skill list, or ask to share a shell command's output (which you
-then review): it can never approve anything or reach genai.
+then review): it can never approve anything or reach hoplon.
 Standard library only; Python 3.10 or newer.
 """
 
@@ -14,10 +14,10 @@ import os
 import queue
 import sys
 
-from conversation import A, D, Q, R, STATE_MARK, W, clean, fit, width
+from conversation import A, D, Q, R, STATE_MARK, W, clean, fit, one_row, width
 from ipc import Client
 
-STATE = os.environ.get("GENAI_TUI_STATE", "")
+STATE = os.environ.get("HOPLON_TUI_STATE", "")
 
 
 def bar(used, limit, w):
@@ -55,9 +55,9 @@ def view(st, w, sel):
             add([(f"{label:9}", Q), (fit(clean(value or "?"), w - 11), role), (" ▾", A)], "model")
             continue
         add([(f"{label:9}", Q), (fit(clean(value or "?"), w - 9), role)])
-    gw = h.get("genai_where")
+    gw = h.get("hoplon_where")
     if gw:
-        add([("genai    ", Q), (fit(clean(gw[0].removeprefix("genai runs ")), w - 9), R if gw[1] == R else W)])
+        add([("hoplon    ", Q), (fit(clean(gw[0].removeprefix("hoplon runs ")), w - 9), R if gw[1] == R else W)])
     where = h.get("shell_where")
     if where:
         add([("commands ", Q), (fit("run " + clean(where), w - 9), D if where.startswith("inside") else W)])
@@ -68,9 +68,9 @@ def view(st, w, sel):
          (fit("  c switches" if not coding else "  reads without asking", w - 14), Q)], "coding")
     head("SANDBOX")
     if h.get("sandbox"):
-        add([("genai    ", Q), (fit(f"in the {clean(h['sandbox'])} sandbox", w - 9), D)])
+        add([("hoplon    ", Q), (fit(f"in the {clean(h['sandbox'])} sandbox", w - 9), D)])
     else:
-        add([("genai    ", Q), (fit("not sandboxed", w - 9), "")])      # the usual way to run it: not a fault
+        add([("hoplon    ", Q), (fit("not sandboxed", w - 9), "")])      # the usual way to run it: not a fault
     run, going = st.get("runner"), st.get("running")
     if going:
         add([("model's  ", Q), (fit(f"RUNNING {clean(going.get('id', '?'))} · {going.get('secs', 0)}s", w - 9), W)])
@@ -90,7 +90,7 @@ def view(st, w, sel):
     ctx = st.get("context") or [None, None]
     add(bar(ctx[0] or 0, ctx[1], w) if ctx[0] is not None else [("not measured yet", Q)])
     if st.get("busy"):
-        add([("… genai is replying", W)])
+        add([("… hoplon is replying", W)])
     plan = st.get("plan")
     if plan:
         head("PLAN")
@@ -103,6 +103,14 @@ def view(st, w, sel):
         add([("commands run on their own" if plan.get("auto") else "each planned command asks once",
               W if plan.get("auto") else Q)])
         add([("/plan clear drops it", Q)])
+    work = st.get("work")
+    if work:
+        head("WORK")
+        add([(fit(one_row(work.get("branch", "")), w), A)])
+        add([(fit(one_row(work.get("status", "")), w), "")])
+        for line in (work.get("items") or [])[:14]:
+            add([(fit(one_row(line), w), D if str(line).startswith("✓") else Q)])
+        add([("/work end stops it", Q)])
     edits = st.get("edits") or {}
     if edits.get("mode") == "approved-files":
         head("EDITS")
@@ -128,7 +136,7 @@ def view(st, w, sel):
              (fit(clean(s.get("name", "")), w - 16), "" if blessed else Q),
              (" " + ("" if blessed else s.get("status", "")), R if s.get("status") == "changed" else Q)], i)
         if i == sel and not blessed:
-            add([(fit(f"  bless: genai --bless {clean(s.get('path', ''))}", w), Q)], i)
+            add([(fit(f"  bless: hoplon --bless {clean(s.get('path', ''))}", w), Q)], i)
     plugins = st.get("plugins") or []
     if plugins:
         head("PLUGINS")
@@ -280,7 +288,7 @@ class Panel:
 
 def main():
     if not STATE:
-        print("panel.py is started by genai-tui", file=sys.stderr)
+        print("panel.py is started by hoplon-tui", file=sys.stderr)
         return 2
     try:
         link = Client(STATE, "panel")

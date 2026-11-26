@@ -8,7 +8,7 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from test_genai import G, Tmp, make_home  # noqa: E402
+from test_hoplon import G, Tmp, make_home  # noqa: E402
 
 GENERIC = "declined by the user"
 
@@ -67,13 +67,13 @@ class Guard(Tmp):
 class TestWhere(Guard):
     def refused(self, cwd):
         eng, _ = self.engine(cwd)
-        with self.assertRaises(G.GenaiError) as cm:
+        with self.assertRaises(G.HoplonError) as cm:
             eng.set_coding(True)
         return str(cm.exception)
 
     def test_refused_places(self):
         places = [self.home, os.path.dirname(self.home), "/",
-                  os.path.join(self.xdg, "genai"), os.path.join(self.xdg, "genai", "sessions")]
+                  os.path.join(self.xdg, "hoplon"), os.path.join(self.xdg, "hoplon", "sessions")]
         for d in (".ssh", ".gnupg", ".aws", ".kube", ".docker", ".password-store", ".config/gcloud",
                   ".ssh/keys", ".config/gcloud/configurations"):
             places.append(os.path.join(self.home, d))
@@ -84,11 +84,11 @@ class TestWhere(Guard):
     def test_message_names_the_rule(self):
         self.assertIn("home directory", self.refused(self.home))
         self.assertIn("~/.ssh", self.refused(self.mkdir(self.home, ".ssh")))
-        self.assertIn("config directory", self.refused(self.mkdir(self.xdg, "genai")))
+        self.assertIn("config directory", self.refused(self.mkdir(self.xdg, "hoplon")))
 
     def test_allowed_places(self):
         for d in (os.path.join(self.home, ".sshkeys"), os.path.join(self.home, "project"),
-                  os.path.join(self.home, ".config", "other"), os.path.join(self.xdg, "genai-x"),
+                  os.path.join(self.home, ".config", "other"), os.path.join(self.xdg, "hoplon-x"),
                   self.path("elsewhere")):
             self.mkdir(d)
             eng, _ = self.engine(d)
@@ -102,7 +102,7 @@ class TestWhere(Guard):
             self.assertIsNone(G.coding_refusal(self.path("al")))
 
     def test_every_refusal_has_a_stated_risk(self):
-        for d in (self.home, os.path.dirname(self.home), self.mkdir(self.xdg, "genai"), self.mkdir(self.home, ".aws")):
+        for d in (self.home, os.path.dirname(self.home), self.mkdir(self.xdg, "hoplon"), self.mkdir(self.home, ".aws")):
             self.assertIn(G.coding_refusal(d)[1], G.CODING_RISKS, d)
 
     def test_real_path_is_compared(self):
@@ -113,7 +113,7 @@ class TestWhere(Guard):
 
     def test_flag_errors_but_profile_gets_a_notice(self):
         ssh = self.mkdir(self.home, ".ssh")
-        with self.assertRaises(G.GenaiError):
+        with self.assertRaises(G.HoplonError):
             self.engine(ssh, coding="--coding")
         eng, ui = self.engine(ssh, coding="profile coder")
         self.assertFalse(eng.session.coding)
@@ -136,14 +136,14 @@ class TestOverride(Guard):
 
     def test_refusal_names_the_override(self):
         eng, _ = self.engine(self.home)
-        with self.assertRaises(G.GenaiError) as cm:
+        with self.assertRaises(G.HoplonError) as cm:
             eng.set_coding(True)
         self.assertIn("--coding-anywhere", str(cm.exception))
 
     def test_override_turns_it_on_and_states_the_risk(self):
         for d, phrase, risk in ((self.home, "your home directory", "every file under your home directory"),
                                 (self.mkdir(self.home, ".ssh"), "~/.ssh", "credentials kept here"),
-                                (self.mkdir(self.xdg, "genai"), "config directory", "every saved session")):
+                                (self.mkdir(self.xdg, "hoplon"), "config directory", "every saved session")):
             eng, ui = self.engine(d, coding="--coding-anywhere", anywhere=True)
             self.assertTrue(eng.session.coding, d)
             self.assertEqual(eng.coding_from, "--coding-anywhere")

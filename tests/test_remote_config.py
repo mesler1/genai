@@ -1,4 +1,4 @@
-"""Tests for `genai --remote-config`: the resolved endpoint and profile as one JSON line, with nothing secret in it."""
+"""Tests for `hoplon --remote-config`: the resolved endpoint and profile as one JSON line, with nothing secret in it."""
 
 import base64
 import json
@@ -10,7 +10,7 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from fakeapi import FakeAPI  # noqa: E402
-from test_genai import G, SCRIPT, Proc, Tmp, bless_path, make_home  # noqa: E402
+from test_hoplon import G, SCRIPT, Proc, Tmp, bless_path, make_home  # noqa: E402
 
 
 class TestRemoteConfigExport(Tmp):
@@ -154,7 +154,7 @@ class TestRemoteConfigLine(Tmp):
                            ({"skills": [dict(good, extra=1)]}, "exactly"),
                            ({"skills": {"s": good}}, "must be a list"),
                            ({"plugins": [badname]}, "plugin 'pl'")):
-            with self.assertRaises(G.GenaiError) as e:
+            with self.assertRaises(G.HoplonError) as e:
                 self.parse(**extra)
             self.assertIn(why, str(e.exception), extra)
             self.assertEqual(e.exception.kind, "bad_config")

@@ -16,9 +16,9 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fakeapi import FakeAPI, call, reply  # noqa: E402
-from test_genai import G, Proc, Tmp, bless_path, make_home, write_json  # noqa: E402
+from test_hoplon import G, Proc, Tmp, bless_path, make_home, write_json  # noqa: E402
 
-IMAGE = os.environ.get("GENAI_TEST_SANDBOX_IMAGE", "registry.suse.com/bci/bci-base:15.6")
+IMAGE = os.environ.get("HOPLON_TEST_SANDBOX_IMAGE", "registry.suse.com/bci/bci-base:15.6")
 
 # Stands in for podman: logs its arguments, then runs the guard and the command on the host, in the project, with
 # /work meaning the project. It mounts nothing, so a path that should be hidden is still there and the guard trips.
@@ -50,7 +50,7 @@ for a in args[:i]:
     if a.startswith("--volume=") and a.endswith(":/work:O"):
         root = a[len("--volume="):-len(":/work:O")]
 paths = [root + p[len("/work"):] for p in args[i + 4:]]
-child = subprocess.Popen(["/bin/sh", "-c", args[i + 2], "genai-guard"] + paths, cwd=root, env=env)
+child = subprocess.Popen(["/bin/sh", "-c", args[i + 2], "hoplon-guard"] + paths, cwd=root, env=env)
 with open(pidfile, "w") as f:
     f.write(str(os.getpid()))
 def stop(*_):
@@ -104,9 +104,9 @@ class TestSandboxConfig(unittest.TestCase):
         for bad in ({"image": None}, {"image": "-x"}, {"image": "a b"}, {"network": "yes"}, {"timeout": 0},
                     {"timeout": 7200}, {"timeout": True}, {"engine": "apptainer"}, {"memory": "lots"},
                     {"pids": 1}, {"mounts": []}):
-            with self.assertRaises(G.GenaiError, msg=bad):
+            with self.assertRaises(G.HoplonError, msg=bad):
                 conf(**bad)
-        with self.assertRaises(G.GenaiError):
+        with self.assertRaises(G.HoplonError):
             G.Profile({"name": "p", "sandbox": "podman"}, "p.json")
 
     def test_summary_says_what_it_grants(self):
@@ -121,14 +121,14 @@ class TestSandboxConfig(unittest.TestCase):
             self.assertEqual(G.Sandbox(conf(), ".", print).problem(), "podman is not installed")
 
     def test_refused_where_coding_mode_is_refused_even_with_coding_anywhere(self):
-        home = os.path.realpath(tempfile.mkdtemp(prefix="genai-test-"))
+        home = os.path.realpath(tempfile.mkdtemp(prefix="hoplon-test-"))
         self.addCleanup(shutil.rmtree, home, True)
-        for d in ("proj", ".ssh/keys", ".config/genai"):
+        for d in ("proj", ".ssh/keys", ".config/hoplon"):
             os.makedirs(os.path.join(home, d))
         env = {"HOME": home, "XDG_CONFIG_HOME": os.path.join(home, ".config")}
         with mock.patch.dict(os.environ, env), mock.patch.object(G.shutil, "which", return_value="/usr/bin/podman"):
             for where, phrase in (("", "your home directory"), ("..", "contains your home directory"),
-                                  (".ssh/keys", "holds credentials"), (".config/genai", "config directory")):
+                                  (".ssh/keys", "holds credentials"), (".config/hoplon", "config directory")):
                 problem = G.Sandbox(conf(), os.path.join(home, where), print).problem()
                 self.assertIn(phrase, problem or "", where)
             self.assertIsNone(G.Sandbox(conf(), os.path.join(home, "proj"), print).problem())
@@ -162,7 +162,7 @@ class TestMasks(FakePodman):
 
     def test_too_big_to_check_refuses(self):
         root = self.project({f"f{i}": "" for i in range(5)})
-        with mock.patch.object(G, "SANDBOX_SCAN", 3), self.assertRaises(G.GenaiError):
+        with mock.patch.object(G, "SANDBOX_SCAN", 3), self.assertRaises(G.HoplonError):
             G.Sandbox(conf(), root, print).masks()
 
 
@@ -180,7 +180,7 @@ class TestArgv(FakePodman):
         a = self.argv(self.box())
         for flag in ("--network=none", "--http-proxy=false", "--pull=never", "--read-only", "--cap-drop=all",
                      "--userns=keep-id", "--security-opt=no-new-privileges", "--volume=/p:/work:O",
-                     "--volume=/dev/null:/work/.env:ro", "--volume=/empty:/work/.aws:ro", "--env=GENAI_CMD=make test",
+                     "--volume=/dev/null:/work/.env:ro", "--volume=/empty:/work/.aws:ro", "--env=HOPLON_CMD=make test",
                      "--env=HOME=/tmp", "--memory=4g", "--pids-limit=1024"):
             self.assertIn(flag, a)
         self.assertEqual(a[-2:], ["/work/.env", "/work/.aws"])
@@ -355,7 +355,7 @@ class TestInterrupt(FakePodman):
             self.assertEqual(r["status"], "stopped")
             self.assertEqual(g.until("done")["reason"], "stopped")
             self.assertTrue(any("kill" in c for c in self.podman_calls()))
-            g.send({"type": "user", "text": "again"})    # genai is still there
+            g.send({"type": "user", "text": "again"})    # hoplon is still there
             self.assertEqual(g.until("done")["reason"], "reply")
             g.close()
         self.assertTrue(any("stopped by the user" in str(m.get("content")) for m in api.requests[1]["body"]["messages"]))
@@ -380,7 +380,7 @@ class TestInterrupt(FakePodman):
                 time.sleep(0.05)
             time.sleep(0.3)
             started = time.monotonic()
-            g.send({"type": "stop"})                     # read while genai is busy with the run
+            g.send({"type": "stop"})                     # read while hoplon is busy with the run
             r = g.until("result")
             self.assertLess(time.monotonic() - started, 10)
             self.assertEqual(r["status"], "stopped")
@@ -413,8 +413,8 @@ class TestKill(unittest.TestCase):
             time.sleep(0.05)
         proc = mock.Mock()
         with mock.patch.object(G.subprocess, "run", side_effect=podman_kill):
-            self.box()._kill("genai-1", proc)            # returns: the SIGINT was ignored
-        self.assertEqual(calls[0][-2:], ["kill", "genai-1"])
+            self.box()._kill("hoplon-1", proc)            # returns: the SIGINT was ignored
+        self.assertEqual(calls[0][-2:], ["kill", "hoplon-1"])
         proc.wait.assert_called()
         self.assertIs(signal.getsignal(signal.SIGINT), raises)   # and Ctrl-C works again afterwards
 
@@ -423,8 +423,8 @@ class TestKill(unittest.TestCase):
         with mock.patch.object(G.subprocess, "Popen", side_effect=KeyboardInterrupt), \
                 mock.patch.object(G.Sandbox, "_kill", lambda self, name, proc: killed.append((name, proc))):
             with self.assertRaises(KeyboardInterrupt):
-                self.box()._podman(["podman", "run"], "genai-2", 100)
-        self.assertEqual(killed, [("genai-2", None)])
+                self.box()._podman(["podman", "run"], "hoplon-2", 100)
+        self.assertEqual(killed, [("hoplon-2", None)])
         self.assertFalse(G.Sandbox.running)                # a later stray SIGINT is ignored again
 
 

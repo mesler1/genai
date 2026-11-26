@@ -31,7 +31,7 @@ class Copy(Feature):
         if text is None:
             m.note("nothing to copy yet" if not arg else f"turn {turn} isn't on screen", self.core.R)
         elif not m.shell:
-            m.note("/copy needs tmux: start genai with genai-tui", self.core.R)
+            m.note("/copy needs tmux: start hoplon with hoplon-tui", self.core.R)
         else:
             m.actions.append(("copy", turn, text))
 

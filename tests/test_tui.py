@@ -35,7 +35,7 @@ IPC = load("ipc", os.path.join(REPO, "tui", "ipc.py"))
 REC = load("recorder", os.path.join(REPO, "tui", "recorder.py"))
 RAW = C.Model().feature("raw")
 F = importlib.import_module("features")
-G = load("genai_for_tui", os.path.join(REPO, "genai"))
+G = load("hoplon_for_tui", os.path.join(REPO, "hoplon"))
 
 
 def slurp(path):
@@ -160,7 +160,7 @@ class TestModel(unittest.TestCase):
         m.handle(dict({"type": "hello", "version": "1", "endpoint": {"name": "e", "model": "m", "base_url": "u"},
                        "sandbox": None}, **extra))
 
-    def test_clear_asks_genai_to_start_over(self):
+    def test_clear_asks_hoplon_to_start_over(self):
         m = C.Model()
         self.hello(m, features=["clear"])
         m.submit("hi")
@@ -174,7 +174,7 @@ class TestModel(unittest.TestCase):
         self.assertEqual(len(m.blocks), 1)
         self.assertIn("context cleared", text_of(m.blocks[0]))
         old = C.Model()
-        self.hello(old)                                      # a genai without "clear": only the screen clears
+        self.hello(old)                                      # a hoplon without "clear": only the screen clears
         old.submit("/clear")
         self.assertNotIn({"type": "clear"}, old.outbox)
         self.assertIn("only the screen", text_of(old.blocks[-1]))
@@ -330,13 +330,13 @@ class TestModel(unittest.TestCase):
                                         {"type": "decision", "id": "p2", "decision": "decline"}])
         m.handle({"type": "result", "id": "p1", "status": "ok", "detail": "wrote a"})
         m.handle({"type": "proposal", "id": "p5", "kind": "read", "path": ".env", "digest": "0123456789abcdef"})
-        m.decide(True)                                   # genai's digest goes back with the answer, unchanged
+        m.decide(True)                                   # hoplon's digest goes back with the answer, unchanged
         self.assertEqual(m.outbox[-1], {"type": "decision", "id": "p5", "decision": "accept",
                                         "digest": "0123456789abcdef"})
         self.assertEqual((m.cards["p1"].state, m.cards["p2"].state), ("done", "declined"))
         self.assertIn("secrets", text_of(m.cards["p2"]))
         self.assertIn("$ rm -rf ~", text_of(m.cards["p4"]))
-        self.assertIn("genai never runs it", text_of(m.cards["p4"]))
+        self.assertIn("hoplon never runs it", text_of(m.cards["p4"]))
 
     def test_model_text_is_escaped_everywhere(self):
         m = C.Model()
@@ -368,7 +368,7 @@ class TestModel(unittest.TestCase):
         m.handle({"type": "proposal", "id": "p1", "kind": "command", "command": "squeue"})
         m.submit("/run")
         self.assertIsNone(m.ask)
-        self.assertIn("genai-tui", text_of(m.blocks[-1]))
+        self.assertIn("hoplon-tui", text_of(m.blocks[-1]))
         m.shell = True
         m.submit("/run p9")
         self.assertIn("no command proposal to run with id p9", text_of(m.blocks[-1]))
@@ -408,7 +408,7 @@ class TestModel(unittest.TestCase):
         self.assertEqual(m.outbox[-2:], [{"type": "attach", "label": "context", "text": "reviewed"},
                                          {"type": "user", "text": "explain that context"}])
 
-    def test_review_buffer_matches_genai(self):
+    def test_review_buffer_matches_hoplon(self):
         buf = C.review_buffer("ls", 2, "OUTSIDE any sandbox, directly on this host", "x")
         self.assertIn("I ran this command OUTSIDE any sandbox, directly on this host (exit 2):\n```\nls\n```\nOutput:", buf)
         self.assertEqual(C.strip_comments("# a\nkeep\n#b\n"), "keep")
@@ -417,14 +417,14 @@ class TestModel(unittest.TestCase):
 
     def test_session_destination_confirmation_is_forwarded(self):
         args = C.parse_args(["-S", "saved", "--allow-session-endpoint-change"])
-        self.assertEqual(C.genai_args(args), ["-S", "saved", "--allow-session-endpoint-change"])
+        self.assertEqual(C.hoplon_args(args), ["-S", "saved", "--allow-session-endpoint-change"])
 
-    def test_options_split_between_the_tui_and_genai(self):
+    def test_options_split_between_the_tui_and_hoplon(self):
         a = C.parse_args(["-p", "hpc", "-S", "night", "-k", "slurm", "-k", "draft", "--coding", "--no-panel"])
-        self.assertEqual(C.genai_args(a), ["-p", "hpc", "-S", "night", "-k", "slurm", "-k", "draft", "--coding"])
-        self.assertEqual(C.genai_args(C.parse_args(["--coding", "--coding-anywhere"])), ["--coding-anywhere"])
+        self.assertEqual(C.hoplon_args(a), ["-p", "hpc", "-S", "night", "-k", "slurm", "-k", "draft", "--coding"])
+        self.assertEqual(C.hoplon_args(C.parse_args(["--coding", "--coding-anywhere"])), ["--coding-anywhere"])
         with self.assertRaises(SystemExit):
-            C.parse_args(["--json"])                              # genai's own wrapper flags aren't options here
+            C.parse_args(["--json"])                              # hoplon's own wrapper flags aren't options here
 
     def test_panel_snapshot_and_requests(self):
         m = C.Model()
@@ -558,9 +558,9 @@ class TestSandboxStatus(unittest.TestCase):
         return m.cards[pid]
 
     def test_panel_states(self):
-        self.assertIn("genai    in the podman sandbox", self.panel(self.model(sandbox={"name": "podman"})))
+        self.assertIn("hoplon    in the podman sandbox", self.panel(self.model(sandbox={"name": "podman"})))
         text = self.panel(self.model())
-        self.assertIn("genai    not sandboxed", text)
+        self.assertIn("hoplon    not sandboxed", text)
         self.assertIn("model's  ready · offline · dev:1", text)
         self.assertIn("model's  none", self.panel(self.model(runner=None)))
         self.assertIn("model's  can't run: no podman", self.panel(self.model(runner=dict(self.RUNNER, problem="no podman"))))
@@ -582,7 +582,7 @@ class TestSandboxStatus(unittest.TestCase):
         card.started -= 5
         self.assertIn("⏵ sandbox p3 5s", m.tmux_status())
         m2 = self.model()
-        self.start(m2, pid="#[fg=red]x")                       # not an id genai would send: left out
+        self.start(m2, pid="#[fg=red]x")                       # not an id hoplon would send: left out
         status = m2.tmux_status()
         self.assertNotIn("x", status.replace("fg=yellow", "").replace("#[default]", "").replace("box", ""))
         self.assertIn("⏵ sandbox 0s", status)
@@ -612,7 +612,7 @@ class TestSandboxStatus(unittest.TestCase):
         m.submit("/stop")
         self.assertIn("nothing is running", text_of(m.blocks[-1]))
         self.start(m)
-        m.submit("/stop")                                     # works while genai is busy
+        m.submit("/stop")                                     # works while hoplon is busy
         self.assertEqual(m.actions, [("interrupt",)])
         self.assertIn("stopping the sandboxed run p3", text_of(m.blocks[-1]))
         m = self.model(features=())
@@ -646,12 +646,12 @@ class TestSandboxStatus(unittest.TestCase):
         self.assertEqual(m.outbox, [])
         self.assertIn("A command in the shell pane stops with Ctrl-C there", text_of(m.blocks[-1], 200))
 
-    def test_a_run_ends_when_genai_exits(self):
+    def test_a_run_ends_when_hoplon_exits(self):
         m = self.model()
         card = self.start(m)
         m.exit(1)
         self.assertIsNone(m.running_card())
-        self.assertEqual((card.state, card.detail), ("error", "genai exited before it finished"))
+        self.assertEqual((card.state, card.detail), ("error", "hoplon exited before it finished"))
         self.assertNotIn("RUNNING", self.panel(m))
         self.assertNotIn("⏵", m.tmux_status())
 
@@ -671,14 +671,14 @@ class TestSandboxStatus(unittest.TestCase):
         card = self.start(m)
         m.submit("/sandbox")
         text = "\n".join(text_of(b, 200) for b in m.blocks)
-        self.assertIn("genai: not sandboxed", text)
-        self.assertIn("sandbox/run genai runs it in a podman sandbox", text)
+        self.assertIn("hoplon: not sandboxed", text)
+        self.assertIn("sandbox/run hoplon runs it in a podman sandbox", text)
         self.assertIn("image dev:1, offline, 300s time limit, 4g memory, 1024 processes", text)
         self.assertIn(f"RUNNING {card.id}", text)
         m = self.model(sandbox={"name": "podman"}, runner=None)
         m.submit("/sandbox")
         text = "\n".join(text_of(b, 200) for b in m.blocks)
-        self.assertIn("genai: in the podman sandbox", text)
+        self.assertIn("hoplon: in the podman sandbox", text)
         self.assertIn("the model's sandbox: none", text)
 
 
@@ -717,7 +717,7 @@ class TestEditsFeature(unittest.TestCase):
         m = self.model(features=())
         m.submit("/edits ask")
         self.assertEqual(m.outbox, [])
-        self.assertIn("this genai can't", text_of(m.blocks[-1], 200))
+        self.assertIn("this hoplon can't", text_of(m.blocks[-1], 200))
 
     def test_an_auto_applied_edit_is_shown_in_full(self):
         m = self.model({"mode": "approved-files", "files": ["a.txt"]})
@@ -733,9 +733,228 @@ class TestEditsFeature(unittest.TestCase):
         self.assertEqual(card.state, "done")
 
 
+class TestWorkFeature(unittest.TestCase):
+    ITEMS = [{"n": 1, "title": "Core model", "status": "todo", "commit": None},
+             {"n": 2, "title": "Curses \x1b[2J front end", "status": "todo", "commit": None}]
+
+    def model(self, features=("work",)):
+        m = C.Model()
+        m.handle({"type": "hello", "version": "1", "endpoint": {"name": "e", "model": "m", "base_url": "u"},
+                  "sandbox": None, "features": list(features)})
+        m.outbox.clear()
+        return m
+
+    def panel(self, m):
+        PANEL = load("panel", os.path.join(REPO, "tui", "panel.py"))
+        lines, _ = PANEL.view(m.snapshot(), 42, None)
+        return "\n".join("".join(t for t, _ in ln) for ln in lines)
+
+    def shown(self, m, n=12):
+        return "\n".join(text_of(b, 200) for b in m.blocks[-n:])
+
+    def test_a_session_from_start_to_end(self):
+        m = self.model()
+        m.submit("/work make a game")
+        self.assertEqual(m.outbox, [{"type": "work", "task": "make a game"}])
+        self.assertTrue(m.busy)
+        m.handle({"type": "work", "state": "started", "branch": "hoplon/work-1", "base": "abc1234def", "path": "/x",
+                  "steps_per_item": 30, "time_limit": 3600, "test": None, "current": None, "items": [],
+                  "role": "plan", "planner": {"endpoint": "e", "model": "big"}})
+        self.assertIn("work session on branch hoplon/work-1", self.shown(m))
+        self.assertIn("plans with big on e", self.shown(m))
+        m.handle({"type": "proposal", "id": "p1", "kind": "work_plan", "goal": "a game",
+                  "reason": "a game", "items": ["Core model", "Curses front end"], "digest": "d"})
+        card = m.cards["p1"]
+        self.assertEqual(m.pending, [card])
+        self.assertEqual(card.title(), "work plan · 2 items")
+        self.assertIn(" 2. Curses front end", text_of(card, 100))
+        self.assertEqual(text_of(card, 100).count("a game"), 1)
+        m.decide(True)
+        self.assertEqual(m.outbox[-1]["id"], "p1")
+        m.handle({"type": "work", "state": "plan", "items": self.ITEMS, "current": 1, "role": "item"})
+        m.handle({"type": "proposal", "id": "p2", "kind": "write", "path": "a.py", "content": "x", "auto": True,
+                  "work": True})
+        self.assertIn("(work session)", text_of(m.cards["p2"], 100))
+        self.assertIn("WORK", self.panel(m))
+        self.assertIn("0 of 2 done · on item 1", self.panel(m))
+        done = [dict(self.ITEMS[0], status="done", commit="1234567890"), self.ITEMS[1]]
+        m.handle({"type": "proposal", "id": "p3", "kind": "finish", "n": 1, "summary": "core", "notes": "n",
+                  "auto": True})
+        self.assertIn("finish item 1: core  (work session)", text_of(m.cards["p3"], 100))
+        m.handle({"type": "work", "state": "item", "items": done, "current": 2, "role": "item"})
+        self.assertIn("item 1 committed as 1234567: Core model", self.shown(m))
+        self.assertIn("✓  1. Core model  1234567", self.panel(m))
+        self.assertIn("next, item 2 of 2", self.shown(m))
+        self.assertNotIn("\x1b", self.panel(m))
+        m.handle({"type": "work", "state": "context", "role": "review", "item": 2, "why": "the item used its steps"})
+        self.assertIn("the planner, to review item 2", self.shown(m))
+        self.assertIn("1 of 2 done · planner reviews item 2", self.panel(m))
+        m.handle({"type": "done", "reason": "work_limit"})
+        self.assertIn("paused at a limit", self.shown(m))
+        self.assertFalse(m.busy)
+        m.submit("/work")
+        self.assertIn("1 of 2 done", self.shown(m))
+        m.submit("/work end")
+        self.assertEqual(m.outbox[-1], {"type": "work_end"})
+        m.handle({"type": "work", "state": "ended", "why": "ended", "branch": "hoplon/work-1", "base": "abc1234def",
+                  "commits": ["1234567 1. core"], "stat": " 1 file changed", "unfinished": "89abcdef",
+                  "commands": ["git merge hoplon/work-1"], "items": done})
+        text = self.shown(m)
+        self.assertIn("the work is on branch hoplon/work-1", text)
+        self.assertIn("committed as 89abcde", text)
+        self.assertIn("git merge hoplon/work-1", text)
+        self.assertNotIn("WORK", self.panel(m))
+        m.submit("/work")
+        self.assertIn("the last work session ended", self.shown(m, 1))
+
+    def test_refusals_and_waiting(self):
+        m = self.model()
+        m.submit("/work end")
+        self.assertIn("no work session is on", self.shown(m, 1))
+        m.submit("/work t")
+        m.handle({"type": "error", "code": "work_refused", "message": "uncommitted changes"})
+        self.assertIn("no work session: uncommitted changes", self.shown(m, 1))
+        self.assertFalse(m.busy)
+        m.submit("hi")
+        m.outbox.clear()
+        m.submit("/work t")
+        self.assertEqual(m.outbox, [])
+        self.assertIn("has to wait", self.shown(m, 1))
+        m = self.model(features=())
+        m.submit("/work t")
+        self.assertEqual(m.outbox, [])
+        self.assertIn("this hoplon can't run work sessions", self.shown(m, 1))
+
+    def test_work_end_and_stop_reach_a_busy_hoplon_that_can_halt(self):
+        m = self.model(features=("work", "stop", "halt"))
+        m.submit("/work t")
+        m.handle({"type": "work", "state": "started", "branch": "hoplon/work-1", "base": "abc", "items": []})
+        self.assertTrue(m.busy)
+        m.stop()
+        self.assertEqual(m.outbox[-1], {"type": "stop"})
+        self.assertIn("stopping hoplon's turn", self.shown(m, 1))
+        m.submit("/work end")
+        self.assertEqual(m.outbox[-1], {"type": "work_end"})
+        m.handle({"type": "work", "state": "ended", "why": "ended", "branch": "hoplon/work-1", "path": "/s/copy",
+                  "problems": ["what was left could not be committed: git add failed"], "commits": "not a list"})
+        text = self.shown(m)
+        self.assertIn("could not be committed", text)
+        self.assertIn("the copy is still at /s/copy", text)
+
+    def test_a_finish_test_runs_with_a_clock_and_stops(self):
+        m = self.model(features=("work", "stop"))
+        m.handle({"type": "proposal", "id": "p1", "kind": "finish", "n": 1, "summary": "s", "test": "make test",
+                  "auto": True})
+        self.assertIs(m.running_card(), m.cards["p1"])
+        m.stop()
+        self.assertEqual(m.outbox[-1], {"type": "stop"})
+
+    def test_odd_event_fields_are_shown_safely(self):
+        m = self.model()
+        m.handle({"type": "work", "state": "started", "branch": "b\nFAKE", "items": "nope", "time_limit": "x"})
+        m.handle({"type": "work", "state": "plan", "current": "1", "role": "item",
+                  "items": [{"n": 1, "title": "one\n✓  2. fake", "status": "todo"}, "junk", 3]})
+        panel = self.panel(m)
+        self.assertIn("one⏎✓  2. fake", panel)
+        self.assertIn("b⏎FAKE", panel)
+        self.assertNotIn("\n✓  2. fake", panel)
+        m.handle({"type": "work", "state": "item", "current": 1, "items": [{"n": "1", "status": "done"}]})
+        self.assertIn("✓  ?. ", self.panel(m))
+        m.handle({"type": "proposal", "id": "p1", "kind": "work_plan", "goal": "g", "items": ["a\nb"], "digest": "d"})
+        self.assertIn(" 1. a⏎b", text_of(m.cards["p1"], 100))
+
+
+    def test_a_path_with_a_line_break_stays_on_one_row(self):
+        m = self.model()
+        m.handle({"type": "proposal", "id": "p1", "kind": "write", "path": "a\nb.py", "content": "x", "auto": True,
+                  "work": True})
+        self.assertEqual(m.cards["p1"].title(), "create a⏎b.py")
+        m.handle({"type": "proposal", "id": "p2", "kind": ["odd"], "items": 3, "digest": "d"})
+        self.assertEqual(m.cards["p2"].title(), "['odd']")
+
+    def test_a_stopped_turn_leaves_nothing_waiting_or_running(self):
+        m = self.model(features=("work", "halt", "stop"))
+        m.busy = True
+        m.handle({"type": "proposal", "id": "p1", "kind": "work_plan", "goal": "g", "reason": "g",
+                  "items": ["a"], "digest": "d"})
+        m.handle({"type": "proposal", "id": "p2", "kind": "finish", "n": 1, "summary": "s", "auto": True,
+                  "test": "make test"})
+        self.assertTrue(m.pending and m.running_card())
+        m.handle({"type": "done", "reason": "stopped"})
+        self.assertEqual(m.pending, [])
+        self.assertIsNone(m.running_card())
+        self.assertEqual((m.cards["p1"].state, m.cards["p2"].state), ("stopped", "stopped"))
+        m.handle({"type": "proposal", "id": "p3", "kind": "write", "path": "x", "content": "x", "auto": True})
+        m.handle({"type": "result", "id": "p3", "status": "skipped", "detail": "not run"})
+        self.assertEqual(m.cards["p3"].state, "stopped")
+
+    def test_odd_work_fields_dont_break_the_panel(self):
+        m = self.model()
+        m.handle({"type": "work", "state": "started", "branch": "b", "items": [], "role": "plan"})
+        m.handle({"type": "work", "state": "context", "role": ["item"], "item": 1, "why": "w"})
+        m.handle({"type": "work", "state": "item", "items": [{"n": 1, "title": "t", "status": ["done"]}],
+                  "current": 1})
+        self.assertIn("WORK", self.panel(m))
+        m.submit("/work")
+        self.assertIn("1. t", self.shown(m))
+
+    def test_how_a_session_ended_is_told_apart(self):
+        m = self.model()
+        m.handle({"type": "work", "state": "started", "branch": "hoplon/work-1", "base": "abc", "items": []})
+        m.handle({"type": "work", "state": "ended", "why": "ended", "branch": None, "path": "/s/copy/tree",
+                  "problems": ["1 file the model wrote is not in its commits"], "commits": ["abc one"]})
+        text = self.shown(m)
+        self.assertIn("the work is not on a branch; it is in the copy at /s/copy/tree", text)
+        self.assertNotIn("nothing was changed", text)
+        m.submit("/work")
+        self.assertIn("the work is in the copy at /s/copy/tree", self.shown(m, 1))
+        m.handle({"type": "work", "state": "started", "branch": "hoplon/work-2", "base": "abc", "items": []})
+        m.handle({"type": "work", "state": "ended", "why": ["odd"], "branch": None, "path": None})
+        self.assertIn("nothing was changed, so no branch was made", self.shown(m, 1))
+
+    def test_work_end_reaches_a_session_still_starting(self):
+        m = self.model(features=("work", "stop", "halt"))
+        m.submit("/work t")
+        m.submit("/work end")                           # hoplon hasn't said started yet
+        self.assertEqual(m.outbox[-1], {"type": "work_end"})
+        m.handle({"type": "error", "code": "not_running", "message": "no work session is on"})
+        self.assertIn("no work session is on", self.shown(m, 1))
+        self.assertNotIn("sandbox", self.shown(m, 1))
+
+    def test_hoplon_exiting_mid_session_says_where_the_work_is(self):
+        m = self.model()
+        m.handle({"type": "work", "state": "started", "branch": "hoplon/work-1", "base": "abc", "path": "/s/c/tree",
+                  "items": []})
+        m.exit(1)
+        self.assertIn("the copy is at /s/c/tree", self.shown(m))
+        self.assertNotIn("WORK", self.panel(m))
+        m.submit("/work end")
+        self.assertIn("no work session is on", self.shown(m, 1))
+
+    def test_a_failed_finish_test_shows_its_output(self):
+        m = self.model()
+        m.handle({"type": "proposal", "id": "p1", "kind": "finish", "n": 1, "summary": "s", "test": "make test",
+                  "auto": True})
+        m.handle({"type": "result", "id": "p1", "status": "error", "detail": "the test command failed (exit 1)",
+                  "output": "FAILED test_core"})
+        self.assertIn("FAILED test_core", text_of(m.cards["p1"], 100))
+
+    def test_ctrl_c_in_the_prompt_pane_stops_a_turn_even_during_a_question(self):
+        p = C_PROMPT.Prompt.__new__(C_PROMPT.Prompt)
+        sent = []
+        p.send = lambda msg: sent.append(msg) or True
+        p.view, p.ctrl_c, p.paste, p.asked_at = {"mode": "approval", "halt": True}, 0.0, None, 0.0
+        p.ed = C.Editor()
+        p.key("\x03")
+        p.view = {"mode": "input", "busy": True, "halt": True}
+        p.key("\x03")
+        p.key("\x03")
+        self.assertEqual(sent, [{"type": "stop"}, {"type": "stop"}, {"type": "quit"}])
+
+
 class TestPluginsFeature(unittest.TestCase):
     ROWS = [{"name": "slurm", "description": "cluster", "enabled": True, "blessed": True, "status": "blessed",
-             "pane": "slurm.py", "dir": "/opt/genai/plugins/slurm",
+             "pane": "slurm.py", "dir": "/opt/hoplon/plugins/slurm",
              "commands": [{"name": "queue", "describe": "the queue", "read_only": True, "params": {}},
                           {"name": "cancel", "describe": "cancel a job", "read_only": False, "params": {}}]},
             {"name": "off", "description": "not on", "enabled": False, "blessed": True, "pane": None, "dir": "/x",
@@ -760,7 +979,7 @@ class TestPluginsFeature(unittest.TestCase):
         m.submit("/plugins off on")
         self.assertEqual(m.outbox[-1], {"type": "plugin", "name": "off", "on": True})
         m.submit("/plugins slurm pane")
-        self.assertEqual(m.actions[-1], ("plugin_pane", "slurm", "/opt/genai/plugins/slurm/slurm.py"))
+        self.assertEqual(m.actions[-1], ("plugin_pane", "slurm", "/opt/hoplon/plugins/slurm/slurm.py"))
         m.submit("/plugins off pane")
         self.assertIn("switch it on first", self.notes(m, 1))
         m.submit("/plugins nope on")
@@ -845,7 +1064,7 @@ class TestPlan(unittest.TestCase):
                   "plan_id": "p1", "plan_step": 3})
         self.assertEqual(m.actions[-1][0], "plan_cmd")
         m.actions = []
-        # genai saying so is not enough: the user left this one out
+        # hoplon saying so is not enough: the user left this one out
         m.handle({"type": "proposal", "id": "p3", "kind": "command", "command": "rm -rf build", "preapproved": True,
                   "plan_id": "p1", "plan_step": 4})
         self.assertEqual(m.actions, [])
@@ -901,7 +1120,7 @@ class TestRawView(unittest.TestCase):
         m.submit("/raw")
         self.assertEqual(m.outbox, [])
         m.handle({"type": "proposal", "id": "p1", "kind": "write", "path": "x", "content": "y"})
-        m.submit("/raw")                                   # genai answers while a proposal waits
+        m.submit("/raw")                                   # hoplon answers while a proposal waits
         self.assertEqual(m.outbox, [{"type": "trace"}])
 
     def test_rendered_exchange(self):
@@ -920,8 +1139,8 @@ class TestRawView(unittest.TestCase):
         self.assertNotIn("\u202e", text)
         self.assertNotIn("\x1b", text)
         self.assertIn("no longer has", RAW.render_trace({"exchanges": [], "kept": [5, 34]}, {}))
-        sys_text = RAW.render_system({"system": "You are genai", "tools": [{"name": "t"}], "model": "m"})
-        self.assertIn("You are genai", sys_text)
+        sys_text = RAW.render_system({"system": "You are hoplon", "tools": [{"name": "t"}], "model": "m"})
+        self.assertIn("You are hoplon", sys_text)
 
 
 def mark(kind, *args, nonce="0123456789abcdef"):
@@ -949,7 +1168,7 @@ class TestRecorder(unittest.TestCase):
         self.assertEqual(r.done, 2)
 
     def remote_session(self, r, sid="5" * 32, dest="me@hpc1"):
-        """The local shell announces a genai-ssh session, and the remote shell asks for its key."""
+        """The local shell announces a hoplon-ssh session, and the remote shell asks for its key."""
         import base64
         r.feed(mark("H") + mark("S") + mark("X", sid, base64.b64encode(dest.encode()).decode()))
         r.feed(mark("R", sid, nonce="ssh"))
@@ -960,7 +1179,7 @@ class TestRecorder(unittest.TestCase):
         b = lambda t: base64.b64encode(t.encode()).decode()   # noqa: E731
         return mark("D", str(rc), "1" if cmd else "0", b(cmd or ""), "1", b(cwd), b(host), nonce=key)
 
-    def test_genai_ssh_follows_the_remote_shell_with_its_own_key(self):
+    def test_hoplon_ssh_follows_the_remote_shell_with_its_own_key(self):
         r = REC.Recorder()
         key = self.remote_session(r)
         self.assertRegex(key, r"^[0-9a-f]{32}$")
@@ -975,12 +1194,12 @@ class TestRecorder(unittest.TestCase):
         r.feed(mark("S", nonce=key) + b"long job\r\n")
         self.assertIsNone(r.remote_prompt())                           # busy there: nothing can be sent
         self.assertEqual(r.running().text(), "long job")
-        r.feed(b"Connection closed\r\n" + done(255, "genai-ssh hpc1"))     # ssh ended: the local prompt is back
+        r.feed(b"Connection closed\r\n" + done(255, "hoplon-ssh hpc1"))     # ssh ended: the local prompt is back
         self.assertIsNone(r.remote)
-        self.assertEqual((r.last().host, r.last().cmd), (None, "genai-ssh hpc1"))
+        self.assertEqual((r.last().host, r.last().cmd), (None, "hoplon-ssh hpc1"))
         self.assertNotIn(key, "".join(c.text() for c in r.finished()))
 
-    def test_genai_ssh_handshake_is_once_for_the_session_announced_and_in_time(self):
+    def test_hoplon_ssh_handshake_is_once_for_the_session_announced_and_in_time(self):
         import base64
         r = REC.Recorder()
         r.feed(mark("H") + mark("S") + mark("R", "5" * 32, nonce="ssh"))         # nothing announced
@@ -1062,15 +1281,15 @@ class TestFeatures(unittest.TestCase):
     """tui/features: the registry, and switching features off."""
 
     def setUp(self):
-        self.config = tempfile.mkdtemp(prefix="genai-config-")
+        self.config = tempfile.mkdtemp(prefix="hoplon-config-")
         self.addCleanup(shutil.rmtree, self.config, True)
-        os.makedirs(os.path.join(self.config, "genai"))
+        os.makedirs(os.path.join(self.config, "hoplon"))
 
     def environ(self, **extra):
         return dict({"XDG_CONFIG_HOME": self.config}, **extra)
 
     def write_config(self, text):
-        with open(os.path.join(self.config, "genai", "tui.json"), "w") as f:
+        with open(os.path.join(self.config, "hoplon", "tui.json"), "w") as f:
             f.write(text)
 
     def model(self, environ):
@@ -1079,17 +1298,17 @@ class TestFeatures(unittest.TestCase):
 
     def test_all_built_in_features_load(self):
         on = F.load(core=C.CORE)
-        self.assertEqual([f.name for f in on], ["model", "copy", "decline", "raw", "ssh", "files", "sandbox", "edits", "plugins"])
+        self.assertEqual([f.name for f in on], ["model", "copy", "decline", "raw", "ssh", "files", "sandbox", "edits", "plugins", "work"])
         m = C.Model()
         self.assertEqual([f.name for f in m.features], [f.name for f in on])
-        self.assertEqual(list(m.commands())[-9:], ["/model", "/copy", "/decline", "/raw", "/system", "/files", "/sandbox", "/edits", "/plugins"])
+        self.assertEqual(list(m.commands())[-10:], ["/model", "/copy", "/decline", "/raw", "/system", "/files", "/sandbox", "/edits", "/plugins", "/work"])
         self.assertEqual(C.feature_requests(on), {"panel": {"models"}, "menu": {"model", "copy", "raw", "system"},
                           "files": {"list", "view", "attach", "insert"}})
 
     def test_environment_disables_a_feature(self):
-        m, warning = self.model(self.environ(GENAI_TUI_DISABLE="copy, model"))
+        m, warning = self.model(self.environ(HOPLON_TUI_DISABLE="copy, model"))
         self.assertIsNone(warning)
-        self.assertEqual([f.name for f in m.features], ["decline", "raw", "ssh", "files", "sandbox", "edits", "plugins"])
+        self.assertEqual([f.name for f in m.features], ["decline", "raw", "ssh", "files", "sandbox", "edits", "plugins", "work"])
         m.submit("/copy")
         self.assertIn("unknown command /copy (/help lists them)", text_of(m.blocks[-1]))
         m.submit("/help")
@@ -1105,7 +1324,7 @@ class TestFeatures(unittest.TestCase):
         self.write_config('{"disable": ["decline", "raw"]}')
         m, warning = self.model(self.environ())
         self.assertIsNone(warning)
-        self.assertEqual([f.name for f in m.features], ["model", "copy", "ssh", "files", "sandbox", "edits", "plugins"])
+        self.assertEqual([f.name for f in m.features], ["model", "copy", "ssh", "files", "sandbox", "edits", "plugins", "work"])
         m.submit("/decline")
         self.assertIn("unknown command /decline", text_of(m.blocks[-1]))
 
@@ -1117,12 +1336,12 @@ class TestFeatures(unittest.TestCase):
         for text in ("{not json", '{"disable": "copy"}', '["copy"]', '{"disable": [1]}'):
             self.write_config(text)
             m, warning = self.model(self.environ())
-            self.assertEqual(len(m.features), 9, text)
+            self.assertEqual(len(m.features), 10, text)
             self.assertIn("was ignored, so every feature is on", warning)
 
     def test_the_hub_refuses_the_requests_of_a_disabled_feature(self):
-        names, _ = F.disabled_names(self.environ(GENAI_TUI_DISABLE="copy"))
-        d = tempfile.mkdtemp(prefix="genai-ipc-")
+        names, _ = F.disabled_names(self.environ(HOPLON_TUI_DISABLE="copy"))
+        d = tempfile.mkdtemp(prefix="hoplon-ipc-")
         os.chmod(d, 0o700)
         self.addCleanup(shutil.rmtree, d, True)
         hub = IPC.Hub(d, C.feature_requests(F.load(names, C.CORE)))
@@ -1183,7 +1402,7 @@ class TestFeatures(unittest.TestCase):
 
 
 class TestFilesFeature(unittest.TestCase):
-    """tui/features/files.py: what the file tree pane may ask for, and how genai's answers come back."""
+    """tui/features/files.py: what the file tree pane may ask for, and how hoplon's answers come back."""
 
     def model(self, **extra):
         m = C.Model()
@@ -1235,7 +1454,7 @@ class TestFilesFeature(unittest.TestCase):
         feature.view(app, {"path": "a.env", "size": 12, "secret": True, "redacted": {"api_key": 1},
                            "text": "KEY=\x1b[31mred\x07\n"})
         shown = app.view_text.call_args[0][0]
-        self.assertTrue(shown.startswith("a.env · 12 bytes\ngenai thinks this file holds secrets; masked: 1 api_key"))
+        self.assertTrue(shown.startswith("a.env · 12 bytes\nhoplon thinks this file holds secrets; masked: 1 api_key"))
         self.assertNotIn("\x1b", shown)
         self.assertNotIn("\x07", shown)
         self.assertIn("\\x1b[31mred\\x07", shown)
@@ -1246,7 +1465,7 @@ class TestFilesFeature(unittest.TestCase):
         app.edit.return_value = "File a.env:\n```\nKEY=1\n```"
         feature.attach(app, {"path": "a.env", "size": 5, "secret": True, "redacted": {"api_key": 1}, "text": "KEY=1"})
         buffer = app.edit.call_args[0][0]
-        self.assertTrue(buffer.startswith("# genai thinks this file holds secrets"))
+        self.assertTrue(buffer.startswith("# hoplon thinks this file holds secrets"))
         self.assertIn("# EVERYTHING below is sent to the model as saved", buffer)
         self.assertIn("File a.env:\n```\nKEY=1\n```", buffer)
         self.assertEqual(app.m.next_attachments, [{"type": "attach", "label": "file a.env",
@@ -1266,13 +1485,13 @@ class TestFilesFeature(unittest.TestCase):
                 m.request({"type": kind, "path": bad}, "files")
         self.assertEqual((m.outbox, self.panes(m), m.actions), ([], [], []))
 
-    def test_a_genai_without_files_says_so(self):
+    def test_a_hoplon_without_files_says_so(self):
         m = self.model(features=[])
         m.request({"type": "list", "path": "."}, "files")
         self.assertEqual((m.outbox, self.panes(m)),
-                         ([], [("files", {"type": "unavailable", "reason": "this genai can't list files"})]))
+                         ([], [("files", {"type": "unavailable", "reason": "this hoplon can't list files"})]))
         m.submit("/files")
-        self.assertIn("this genai can't list files", text_of(m.blocks[-1]))
+        self.assertIn("this hoplon can't list files", text_of(m.blocks[-1]))
 
     def test_the_files_command_shows_or_hides_the_pane(self):
         m = self.model()
@@ -1284,7 +1503,7 @@ class TestFilesFeature(unittest.TestCase):
         m = C.Model(F.load({"files"}, C.CORE))
         m.submit("/files")
         self.assertIn("unknown command /files", text_of(m.blocks[-1]))
-        d = tempfile.mkdtemp(prefix="genai-ipc-")
+        d = tempfile.mkdtemp(prefix="hoplon-ipc-")
         os.chmod(d, 0o700)
         self.addCleanup(shutil.rmtree, d, True)
         hub = IPC.Hub(d, C.feature_requests(m.features))
@@ -1318,7 +1537,7 @@ class TestSocket(unittest.TestCase):
     """tui/ipc.py: the private socket between the panes."""
 
     def setUp(self):
-        self.dir = tempfile.mkdtemp(prefix="genai-ipc-")
+        self.dir = tempfile.mkdtemp(prefix="hoplon-ipc-")
         os.chmod(self.dir, 0o700)
         self.addCleanup(shutil.rmtree, self.dir, True)
         self.hub = IPC.Hub(self.dir)
@@ -1413,9 +1632,9 @@ class TmuxCase(unittest.TestCase):
     """Helpers for driving a private tmux server; no tests of its own."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="genai-tui-test-")
+        self.tmp = tempfile.mkdtemp(prefix="hoplon-tui-test-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
-        self.sock = f"genai-tui-test-{os.getpid()}"
+        self.sock = f"hoplon-tui-test-{os.getpid()}"
         self.addCleanup(self.tmux, "kill-server")
 
     def tmux(self, *args):
@@ -1440,7 +1659,7 @@ class TmuxCase(unittest.TestCase):
 
     def config(self, api):
         """A config home with the fake endpoint blessed, and an empty working directory."""
-        home = os.path.join(self.tmp, "cfg", "genai")
+        home = os.path.join(self.tmp, "cfg", "hoplon")
         os.makedirs(os.path.join(home, "endpoints"))
         ep = os.path.join(home, "endpoints", "test.json")
         with open(ep, "w") as f:
@@ -1455,7 +1674,7 @@ class TmuxCase(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which("tmux"), "needs tmux")
 class TestInTmux(TmuxCase):
-    """The pane for real: genai --json against the fake endpoint, typed into through tmux."""
+    """The pane for real: hoplon --json against the fake endpoint, typed into through tmux."""
 
     def start(self, api):
         home = self.config(api)
@@ -1505,12 +1724,12 @@ class TestInTmux(TmuxCase):
 
 
 @unittest.skipUnless(shutil.which("tmux") and shutil.which("script"), "needs tmux and script")
-class TestGenaiTui(TmuxCase):
-    """tui/genai-tui itself: the conversation pane above a real bash pane, started through a pseudo-terminal."""
+class TestHoplonTui(TmuxCase):
+    """tui/hoplon-tui itself: the conversation pane above a real bash pane, started through a pseudo-terminal."""
 
     def start(self, api, editor="true", path=None, args="-e test", keep_home=False):
         home = self.home if keep_home else self.config(api)      # keep_home: the test made self.home with config()
-        if not args:        # genai then finds the endpoint the way a bare `genai` does
+        if not args:        # hoplon then finds the endpoint the way a bare `hoplon` does
             conf = dict(G.STARTER_CONFIG, default_endpoint="test")
             G.write_private(os.path.join(home, "config.json"), json.dumps(conf))
         self.runtime = tempfile.mkdtemp(prefix="gr-", dir="/tmp")      # short: socket paths are limited
@@ -1524,27 +1743,27 @@ class TestGenaiTui(TmuxCase):
                 f.write("#!/bin/sh\nexit 0\n")
             os.chmod(pager, 0o700)
         env = dict(os.environ, XDG_CONFIG_HOME=os.path.dirname(home), HOME=self.tmp, LANG="C.UTF-8",
-                   TERM="xterm-256color", GENAI_TUI_SOCKET=self.sock, EDITOR=editor, VISUAL=editor,
+                   TERM="xterm-256color", HOPLON_TUI_SOCKET=self.sock, EDITOR=editor, VISUAL=editor,
                    XDG_RUNTIME_DIR=self.runtime, PATH=f"{path}:{os.environ['PATH']}" if path else os.environ["PATH"])
         if path and os.path.exists(os.path.join(path, "less")):
-            env["GENAI_TUI_PAGER"] = os.path.join(path, "less")      # the test's pager stands in for genai-tui's
+            env["HOPLON_TUI_PAGER"] = os.path.join(path, "less")      # the test's pager stands in for hoplon-tui's
         env.pop("TMUX", None)
-        self.proc = subprocess.Popen(["script", "-qfc", f"stty cols 110 rows 40; {REPO}/tui/genai-tui {args}",
+        self.proc = subprocess.Popen(["script", "-qfc", f"stty cols 110 rows 40; {REPO}/tui/hoplon-tui {args}",
                                       "/dev/null"], cwd=self.wd, env=env, stdin=subprocess.PIPE,
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.addCleanup(lambda: (self.tmux("kill-server"), self.proc.wait(10)))
         end = time.time() + 10
-        while time.time() < end and not {"genai", "you", "shell"} <= set(self.panes()):
+        while time.time() < end and not {"hoplon", "you", "shell"} <= set(self.panes()):
             time.sleep(0.1)
         self.wait_for("Type a message")
 
     def panes(self):
-        out = self.tmux("list-panes", "-a", "-F", "#{pane_id} #{@genai_title}")
+        out = self.tmux("list-panes", "-a", "-F", "#{pane_id} #{@hoplon_title}")
         return {t.split(" ")[0]: p for p, _, t in (ln.partition(" ") for ln in out.splitlines())}
 
     def screen(self, pane=None):
         """One pane, or the conversation and the prompt pane together."""
-        names = [pane] if pane else ["genai", "you"]
+        names = [pane] if pane else ["hoplon", "you"]
         return "\n".join(self.tmux("capture-pane", "-p", "-t", self.panes()[n]) for n in names)
 
     def type(self, text, enter=True):
@@ -1564,7 +1783,7 @@ class TestGenaiTui(TmuxCase):
         self.proc.stdin.write(keys.encode())
         self.proc.stdin.flush()
 
-    def click(self, text, pane="genai", button=0, hold=0.3):
+    def click(self, text, pane="hoplon", button=0, hold=0.3):
         """A click on the first row of a pane showing text, at the terminal as a mouse sends it: the press, the
         button held a moment (long enough for a menu to open), then the release."""
         y = next(i for i, ln in enumerate(self.screen(pane).splitlines()) if text in ln)
@@ -1605,24 +1824,24 @@ class TestGenaiTui(TmuxCase):
         turns = [call("run_in_sandbox", command="echo started; sleep 30", reason="t"), reply("it was stopped")]
         with FakeAPI(turns) as api, mock.patch.dict(os.environ, {"FAKE_PODMAN_LOG": log}):
             self.start(api, path=path, args="-p coder")
-            self.assertIn("not sandboxed", self.tmux("show", "-gv", "@genai_sandbox"))
+            self.assertIn("not sandboxed", self.tmux("show", "-gv", "@hoplon_sandbox"))
             self.type("go")
-            self.wait_for("Ctrl-C (or /stop) stops it", pane="genai")
+            self.wait_for("Ctrl-C (or /stop) stops it", pane="hoplon")
             self.wait_for("RUNNING p", pane="info")
             end = time.time() + 10
             while not os.path.exists(log + ".pid") and time.time() < end:
                 time.sleep(0.05)
-            self.assertRegex(self.tmux("show", "-gv", "@genai_sandbox"), r"⏵ sandbox p[0-9]+ [0-9]+s")
+            self.assertRegex(self.tmux("show", "-gv", "@hoplon_sandbox"), r"⏵ sandbox p[0-9]+ [0-9]+s")
             self.tmux("send-keys", "-t", self.panes()["you"], "C-c")
-            self.wait_for("■ stopped", pane="genai")
-            self.wait_for("stopped; send a message to continue", pane="genai")
-            self.type("carry on")                               # genai is still there
-            self.wait_for("it was stopped", pane="genai")
+            self.wait_for("■ stopped", pane="hoplon")
+            self.wait_for("stopped; send a message to continue", pane="hoplon")
+            self.type("carry on")                               # hoplon is still there
+            self.wait_for("it was stopped", pane="hoplon")
             self.assertTrue(any("stopped by the user" in str(m.get("content"))
                                 for m in api.requests[-1]["body"]["messages"]))
             self.assertTrue(any("kill" in ln for ln in open(log)))
-            self.assertIn("not sandboxed", self.tmux("show", "-gv", "@genai_sandbox"))
-            self.assertNotIn("genai exited", self.screen())
+            self.assertIn("not sandboxed", self.tmux("show", "-gv", "@hoplon_sandbox"))
+            self.assertNotIn("hoplon exited", self.screen())
 
     def test_starts_with_no_arguments(self):
         with FakeAPI([reply("hello")]) as api:
@@ -1694,7 +1913,7 @@ class TestGenaiTui(TmuxCase):
             self.key("y")
             self.wait_for("p1 finished (exit 0). Share the output with the model?")
             self.assertIn("via-menu", self.screen("shell"))
-            self.assertEqual(self.window()[0], ["shell", "genai", "you"])     # shown, to watch it run
+            self.assertEqual(self.window()[0], ["shell", "hoplon", "you"])     # shown, to watch it run
             self.key("n")
             self.type("again")
             self.wait_for("or /run p2, to send")
@@ -1702,12 +1921,12 @@ class TestGenaiTui(TmuxCase):
             time.sleep(0.5)
             self.at_terminal("c")
             self.wait_for("p1 copied")
-            self.assertEqual(self.tmux("show-buffer", "-b", "genai-copy"), "echo via-menu")
+            self.assertEqual(self.tmux("show-buffer", "-b", "hoplon-copy"), "echo via-menu")
             self.click("echo at-prompt")
             time.sleep(0.5)
             self.at_terminal("c")                                  # "Copy it"
             self.wait_for("p2 copied")
-            self.assertEqual(self.tmux("show-buffer", "-b", "genai-copy"), "echo at-prompt")
+            self.assertEqual(self.tmux("show-buffer", "-b", "hoplon-copy"), "echo at-prompt")
             self.click("echo at-prompt")
             time.sleep(0.5)
             self.at_terminal("p")
@@ -1722,7 +1941,7 @@ class TestGenaiTui(TmuxCase):
 
     def test_info_panel_switches_coding_and_skills(self):
         with FakeAPI([reply("hi")]) as api:
-            home = os.path.join(self.tmp, "cfg", "genai")
+            home = os.path.join(self.tmp, "cfg", "hoplon")
             os.makedirs(os.path.join(home, "skills", "slurm"))
             with open(os.path.join(home, "skills", "slurm", "SKILL.md"), "w") as f:
                 f.write("# Slurm help\n")
@@ -1740,7 +1959,7 @@ class TestGenaiTui(TmuxCase):
             self.type("/panel")
             time.sleep(0.5)
             self.assertNotIn("info", [t.split(" ")[0] for t in
-                                      self.tmux("list-panes", "-t", "genai:0", "-F", "#{@genai_title}").split()])
+                                      self.tmux("list-panes", "-t", "hoplon:0", "-F", "#{@hoplon_title}").split()])
 
     def test_click_a_shell_command_in_the_panel_to_share_it(self):
         with FakeAPI([reply("got it")]) as api:
@@ -1765,7 +1984,7 @@ class TestGenaiTui(TmuxCase):
             self.wait_for("from fake")
             self.type("/model")
             time.sleep(0.5)
-            env = dict(os.environ, GENAI_TUI_STATE=self.runtime_state())
+            env = dict(os.environ, HOPLON_TUI_STATE=self.runtime_state())
             subprocess.run([sys.executable, os.path.join(REPO, "tui", "request.py"), "model", "1"], env=env, check=True)
             self.wait_for("model: coder-model from your next message")
             self.wait_for("coder-model ▾", pane="info")
@@ -1775,7 +1994,7 @@ class TestGenaiTui(TmuxCase):
 
     def fake_ssh(self):
         """A PATH with an ssh that runs the remote command here through sh, as sshd runs it through your login
-        shell, in a "remote" home of its own; with no command, a plain shell genai-tui can't follow."""
+        shell, in a "remote" home of its own; with no command, a plain shell hoplon-tui can't follow."""
         bindir = os.path.join(self.tmp, "ssh-bin")
         remote = os.path.join(self.tmp, "remote-home")
         os.makedirs(bindir)
@@ -1793,12 +2012,12 @@ class TestGenaiTui(TmuxCase):
             os.chmod(os.path.join(bindir, n), 0o700)
         return bindir, remote
 
-    def test_genai_ssh_runs_and_shares_commands_on_the_other_host(self):
+    def test_hoplon_ssh_runs_and_shares_commands_on_the_other_host(self):
         turns = [call("propose_command", command="echo on-$PWD", reason="where am I"), reply("seen it")]
         with FakeAPI(turns) as api:
             bindir, remote = self.fake_ssh()
             self.start(api, path=bindir)
-            self.shell("genai-ssh -p 2222 me@hpc1")
+            self.shell("hoplon-ssh -p 2222 me@hpc1")
             self.wait_for("following the shell on the other host")
             self.wait_for("ON ANOTHER HOST", pane="info")                # the panel says where commands run now
             time.sleep(0.5)
@@ -1836,7 +2055,7 @@ class TestGenaiTui(TmuxCase):
             self.type("/run")
             self.wait_for("Run p1 in the shell pane?")
             self.key("y")
-            self.wait_for("genai-ssh [ssh options] HOST")               # refused, and told how
+            self.wait_for("hoplon-ssh [ssh options] HOST")               # refused, and told how
             self.assertNotIn("hostname\n", self.screen("shell"))
 
     def test_decline_from_the_menu(self):
@@ -1845,7 +2064,7 @@ class TestGenaiTui(TmuxCase):
             self.start(api)
             self.type("go")
             self.wait_for("or /run p1, to send")
-            env = dict(os.environ, GENAI_TUI_STATE=self.runtime_state())
+            env = dict(os.environ, HOPLON_TUI_STATE=self.runtime_state())
             subprocess.run([sys.executable, os.path.join(REPO, "tui", "request.py"), "menu", "decline", "p1"],
                            env=env, check=True)
             self.wait_for("you declined it")
@@ -1859,19 +2078,19 @@ class TestGenaiTui(TmuxCase):
             self.start(api)
             self.type("the question")
             self.wait_for("the answer")
-            env = dict(os.environ, GENAI_TUI_STATE=self.runtime_state())
+            env = dict(os.environ, HOPLON_TUI_STATE=self.runtime_state())
             subprocess.run([sys.executable, os.path.join(REPO, "tui", "request.py"), "copy", "1"], env=env, check=True)
             self.wait_for("turn 1 copied")
-            self.assertEqual(self.tmux("show-buffer", "-b", "genai-copy"), "> the question\n\nthe answer\n")
-            self.tmux("delete-buffer", "-b", "genai-copy")
+            self.assertEqual(self.tmux("show-buffer", "-b", "hoplon-copy"), "> the question\n\nthe answer\n")
+            self.tmux("delete-buffer", "-b", "hoplon-copy")
             self.type("/copy")
             end = time.time() + 5
-            while time.time() < end and not self.tmux("show-buffer", "-b", "genai-copy"):
+            while time.time() < end and not self.tmux("show-buffer", "-b", "hoplon-copy"):
                 time.sleep(0.1)
-            self.assertIn("the answer", self.tmux("show-buffer", "-b", "genai-copy"))
+            self.assertIn("the answer", self.tmux("show-buffer", "-b", "hoplon-copy"))
 
     def test_raw_view_from_the_menu_and_by_command(self):
-        bindir = tempfile.mkdtemp(prefix="genai-tui-bin-")
+        bindir = tempfile.mkdtemp(prefix="hoplon-tui-bin-")
         self.addCleanup(shutil.rmtree, bindir, True)
         seen = os.path.join(bindir, "seen")
         with open(os.path.join(bindir, "less"), "w") as f:                 # a pager that keeps what it was shown
@@ -1896,10 +2115,10 @@ class TestGenaiTui(TmuxCase):
             end = time.time() + 10
             while time.time() < end and "system prompt and tools" not in slurp(seen):
                 time.sleep(0.1)
-            self.assertIn("You are genai", slurp(seen))
+            self.assertIn("You are hoplon", slurp(seen))
             self.assertEqual([n for n in os.listdir(self.runtime_state()) if n.startswith("raw-")], [])
 
-    def test_the_slurm_console_runs_its_commands_through_genai(self):
+    def test_the_slurm_console_runs_its_commands_through_hoplon(self):
         with FakeAPI([reply("ok")]) as api:
             home = self.config(api)
             fake = os.path.join(self.tmp, "slurm-bin")
@@ -1935,7 +2154,7 @@ class TestGenaiTui(TmuxCase):
             self.wait_for("c002", pane="you")
 
     def test_the_file_tree_browses_views_attaches_and_inserts(self):
-        bindir = tempfile.mkdtemp(prefix="genai-tui-bin-")
+        bindir = tempfile.mkdtemp(prefix="hoplon-tui-bin-")
         self.addCleanup(shutil.rmtree, bindir, True)
         seen = os.path.join(bindir, "seen")
         with open(os.path.join(bindir, "less"), "w") as f:                 # a pager that keeps what it was shown
@@ -1996,7 +2215,7 @@ class TestGenaiTui(TmuxCase):
             self.assertNotIn("app.py", self.screen("files"))
 
     def runtime_state(self):
-        return next(os.path.join(self.runtime, d) for d in os.listdir(self.runtime) if d.startswith("genai-tui."))
+        return next(os.path.join(self.runtime, d) for d in os.listdir(self.runtime) if d.startswith("hoplon-tui."))
 
     def test_an_approved_plan_runs_its_command_on_its_own(self):
         steps = [{"kind": "read", "path": "a.txt", "why": "look"}, {"kind": "edit", "path": "a.txt", "why": "fix"},
@@ -2025,7 +2244,7 @@ class TestGenaiTui(TmuxCase):
             self.assertIn("planned-new", self.sent(api))
             self.type("check again")
             self.wait_for("or /run p5, to send")
-            self.wait_for("step 3 of the plan, already run once", pane="genai")
+            self.wait_for("step 3 of the plan, already run once", pane="hoplon")
             self.assertEqual(self.screen("shell").count("cat a.txt"), 1)
 
     def test_a_mark_survives_resizing(self):
@@ -2042,7 +2261,7 @@ class TestGenaiTui(TmuxCase):
             time.sleep(0.5)
             self.at_terminal("m")
             time.sleep(0.5)
-            self.tmux("resize-window", "-t", "genai:0", "-x", "220")
+            self.tmux("resize-window", "-t", "hoplon:0", "-x", "220")
             time.sleep(0.5)
             self.type("/share mark")
             self.wait_for("Share 2 lines of shell history from the mark with the model?")
@@ -2078,48 +2297,41 @@ class TestGenaiTui(TmuxCase):
 
     def window(self):
         """Titles of the visible panes, top to bottom, and which one is active."""
-        rows = self.tmux("list-panes", "-t", "genai:0", "-F", "#{pane_top} #{pane_left} #{pane_active} #{@genai_title}")
+        rows = self.tmux("list-panes", "-t", "hoplon:0", "-F", "#{pane_top} #{pane_left} #{pane_active} #{@hoplon_title}")
         rows = sorted((int(t), int(lf), a, title.split(" ")[0]) for t, lf, a, title in
                       (ln.split(" ", 3) for ln in rows.splitlines()))
         return [r[3] for r in rows if r[1] == 0], next(r[3] for r in rows if r[2] == "1")
 
     def show_shell(self):
-        self.type("`", enter=False)
-        self.type("`", enter=False)
+        self.at_terminal("\x00")             # Ctrl-` as most terminals send it
         time.sleep(0.6)
 
-    def test_shell_hidden_until_backticks(self):
+    def test_ctrl_backtick_shows_and_hides_the_shell_from_any_pane(self):
         with FakeAPI([reply("hello")]) as api:
             self.start(api)
-            self.assertEqual(self.window(), (["genai", "you"], "you"))          # the shell starts hidden
+            self.assertEqual(self.window(), (["hoplon", "you"], "you"))          # the shell starts hidden
             self.type("hi")
             self.wait_for("● hello")
-            self.type("`", enter=False)
-            time.sleep(0.8)                                                   # however slowly it is typed
-            self.type("`", enter=False)
+            self.type("a `` b", enter=False)                                  # backticks are only text now
+            self.at_terminal("\x00")                                          # Ctrl-`, sent as NUL
             time.sleep(0.6)
-            self.assertEqual(self.window(), (["shell", "genai", "you"], "shell"))   # above the conversation
-            self.tmux("send-keys", "-t", self.panes()["shell"], "-l", "``")
-            time.sleep(1)
-            self.assertEqual(self.window(), (["genai", "you"], "you"))
-            self.assertNotIn("`", self.screen("you").splitlines()[0])           # the taps didn't stay in the input
-            self.type("a ``code`` b", enter=False)                             # not on an empty input: just text
-            time.sleep(0.3)
-            self.assertEqual(self.window()[0], ["genai", "you"])
-            self.assertIn("a ``code`` b", self.screen("you"))
-            self.tmux("send-keys", "-t", self.panes()["you"], "C-u")
-            self.show_shell()
-            self.tmux("send-keys", "-t", self.panes()["shell"], "-l", "echo ``x")   # mid-command: typed as is
-            time.sleep(1)
-            self.assertEqual(self.window()[0], ["shell", "genai", "you"])
+            self.assertEqual(self.window(), (["shell", "hoplon", "you"], "shell"))   # above the conversation
+            self.shell("echo ``x")
             self.assertIn("echo ``x", self.screen("shell"))
+            self.at_terminal("\x00")                                          # from the shell: hides it
+            time.sleep(0.6)
+            self.assertEqual(self.window(), (["hoplon", "you"], "you"))
+            self.assertIn("a `` b", self.screen("you"))                        # the input is untouched
+            self.at_terminal("\x1b[96;5u")                                    # Ctrl-` reported in full
+            time.sleep(0.6)
+            self.assertEqual(self.window()[0], ["shell", "hoplon", "you"])
 
     def test_an_answer_must_name_the_question_showing(self):
         with FakeAPI([call("write_file", path="x.txt", content="x\n", reason="r"), reply("done")]) as api:
             self.start(api)
             self.type("go")
             self.wait_for("Allow p1: create x.txt?")
-            state = [d for d in os.listdir(self.runtime) if d.startswith("genai-tui.")][0]
+            state = [d for d in os.listdir(self.runtime) if d.startswith("hoplon-tui.")][0]
             c = IPC.Client(os.path.join(self.runtime, state), "prompt")
             self.addCleanup(c.close)
             for q in (None, "approve:p2", "ask:1"):                    # stale, early or made up
@@ -2158,7 +2370,7 @@ class TestGenaiTui(TmuxCase):
             self.assertNotIn("should-not-run", self.screen("shell"))
 
     def test_edit_first_and_share_your_own_command(self):
-        editor = os.path.join(tempfile.mkdtemp(prefix="genai-tui-ed-"), "ed")
+        editor = os.path.join(tempfile.mkdtemp(prefix="hoplon-tui-ed-"), "ed")
         with open(editor, "w") as f:
             f.write("#!/bin/sh\nsed -i 's/echo original/echo edited/' \"$1\"\n")
         os.chmod(editor, 0o700)

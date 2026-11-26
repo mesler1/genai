@@ -1,11 +1,11 @@
-"""/plugins: the plugins genai offers (trusted commands), switched on and off, and each one's own pane.
+"""/plugins: the plugins hoplon offers (trusted commands), switched on and off, and each one's own pane.
 
 A plugin can declare a "pane": a program in its directory, blessed with the rest of it, that shows something (the
-Slurm console shows nodes and jobs). genai-tui runs it out of process, in a tmux pane of its own, never inside the
-conversation pane, which holds the API key's way in (the key proxy's token, in remote mode) and every answer to genai.
+Slurm console shows nodes and jobs). hoplon-tui runs it out of process, in a tmux pane of its own, never inside the
+conversation pane, which holds the API key's way in (the key proxy's token, in remote mode) and every answer to hoplon.
 The pane connects to the private socket as "plugin:NAME" (tui/ipc.py) and may only:
 
-  run     one of its own plugin's read-only commands, through genai, with genai's checks, cache and rate limits;
+  run     one of its own plugin's read-only commands, through hoplon, with hoplon's checks, cache and rate limits;
           the answer ("ran") comes back to that pane alone
   insert  put text in the input box (where you see it before anything is sent)
   attach  offer text for your next message, which opens in your editor first, like shell context
@@ -34,12 +34,12 @@ class Plugins(Feature):
     actions = ("plugin_pane", "plugin_attach")
 
     def __init__(self):
-        self.rows = None           # genai's plugins event, as received
+        self.rows = None           # hoplon's plugins event, as received
         self.asked = {}            # our run id -> (the pane role that asked, the pane's own id for it)
         self.n = 0
         self.panes = {}            # plugin name -> tmux pane id, once started
 
-    # -- what genai said
+    # -- what hoplon said
 
     def plugin(self, name):
         return next((r for r in self.rows or [] if isinstance(r, dict) and r.get("name") == name), None)
@@ -72,7 +72,7 @@ class Plugins(Feature):
             m.note(f"no plugin named {c.clean(name)} (/plugins lists them)", c.R)
         elif what in ("on", "off") and len(words) == 2:
             if m.busy:
-                m.note("wait until genai has replied, then switch it", c.W)
+                m.note("wait until hoplon has replied, then switch it", c.W)
                 return
             m.send({"type": "plugin", "name": name, "on": what == "on"})
         elif what == "pane" and len(words) == 2:
@@ -84,10 +84,10 @@ class Plugins(Feature):
         c = self.core
         if self.rows is None:
             m.send({"type": "plugins"})
-            m.note("asking genai for its plugins; /plugins again shows them")
+            m.note("asking hoplon for its plugins; /plugins again shows them")
             return
         if not self.rows:
-            m.note("no plugins found (see the README: Plugins)")
+            m.note("no plugins found (see docs/plugins.md)")
         for r in self.rows:
             if not isinstance(r, dict):
                 continue
@@ -107,7 +107,7 @@ class Plugins(Feature):
         elif (m.hello or {}).get("remote"):
             m.note("plugin panes don't run in remote mode yet", c.W)
         elif not (isinstance(pane, str) and PANE_NAME.fullmatch(pane) and isinstance(d, str) and os.path.isabs(d)):
-            m.note(f"plugin {c.clean(name)}: genai gave no usable pane", c.R)
+            m.note(f"plugin {c.clean(name)}: hoplon gave no usable pane", c.R)
         else:
             m.actions.append(("plugin_pane", name, os.path.join(d, pane)))
 
@@ -174,7 +174,7 @@ class Plugins(Feature):
             return
         _, name, path = action
         if not app.shell or not app.state_dir:
-            app.m.note("plugin panes need genai-tui", self.core.R)
+            app.m.note("plugin panes need hoplon-tui", self.core.R)
             return
         pid = self.panes.get(name)
         if pid and app.shell.tmux("display", "-p", "-t", pid, "#{pane_id}").strip() == pid:
@@ -186,14 +186,14 @@ class Plugins(Feature):
         tui = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         me = os.environ.get("TMUX_PANE", "")
         pid = app.shell.tmux("split-window", "-d", "-h", "-f", "-l", "60", "-t", me,
-                             "-e", f"GENAI_TUI_STATE={app.state_dir}", "-e", f"GENAI_TUI_PLUGIN={name}",
+                             "-e", f"HOPLON_TUI_STATE={app.state_dir}", "-e", f"HOPLON_TUI_PLUGIN={name}",
                              "-e", f"PYTHONPATH={tui}", "-c", os.path.dirname(path), "-P", "-F", "#{pane_id}",
                              cmd).strip()
         if not pid:
             app.m.note(f"could not start the {name} pane", self.core.R)
             return
         self.panes[name] = pid
-        app.shell.tmux("set", "-p", "-t", pid, "@genai_title", f"{name} · /plugins {name} pane hides it")
+        app.shell.tmux("set", "-p", "-t", pid, "@hoplon_title", f"{name} · /plugins {name} pane hides it")
 
 
 FEATURE = Plugins
