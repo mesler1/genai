@@ -935,6 +935,12 @@ class TestEndToEnd(Tmp):
             g.send({"type": "system"})
             sysev = g.until("system")
             self.assertIn("You are hoplon", sysev["system"])
+            where = sysev["system"].split("# Where things are", 1)[1]     # what the model can and can't reach
+            self.assertIn("You can't run anything yourself", where)
+            self.assertIn(f"commands you propose run there, as the user, on {socket.gethostname()}", where)
+            self.assertIn("plan stand-ins before you build", where)
+            self.assertIn("call propose_command", sysev["system"])
+            self.assertNotIn("Trusted commands", sysev["system"])
             self.assertIn("propose_command", [t["function"]["name"] for t in sysev["tools"]])
             g.send({"type": "user", "text": "make x"})
             p = g.until("proposal")
@@ -1506,6 +1512,7 @@ class TestEndToEnd(Tmp):
             self.assertIn("ls -la", r.stdout)
             self.assertIn("declined: no terminal", r.stderr)
             self.assertIn("non-interactive", api.requests[0]["body"]["messages"][0]["content"])
+            self.assertNotIn("# Where things are", api.requests[0]["body"]["messages"][0]["content"])
             self.assertFalse(os.path.exists(os.path.join(wd, "x")))
 
 

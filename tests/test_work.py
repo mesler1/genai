@@ -114,7 +114,14 @@ class WorkTest(FakePodman):
         tools = [t["function"]["name"] for t in api.requests[0]["body"]["tools"]]
         self.assertIn("finish_item", tools)
         self.assertNotIn("propose_command", tools)
-        self.assertIn("# This is a work session", api.requests[0]["body"]["messages"][0]["content"])
+        system = api.requests[0]["body"]["messages"][0]["content"]
+        self.assertIn("# This is a work session", system)
+        self.assertNotIn("call propose_command", system)          # the tool isn't offered here
+        self.assertIn("there is no propose_command", system)
+        where = system.split("# Where things are", 1)[1]
+        self.assertIn("see only the copy of the project", where)
+        self.assertIn("throwaway copy of the copy: offline", where)
+        self.assertIn("out of reach for the whole session", where)
 
     def test_finish_needs_a_passing_test_and_a_change(self):
         turns = [call("propose_work_plan", goal="g", items=["one"]),
@@ -353,7 +360,7 @@ class WorkTest(FakePodman):
     def test_an_item_that_fills_the_context_goes_on_in_a_fresh_one(self):
         big = "x" * 4000 + "\n"
         turns = ([call("propose_work_plan", goal="g", items=["one"])]
-                 + [call("read_file", path="big.txt", reason="r")] * 5 + [reply("NOTES: big.txt is all x"), reply("ok")])
+                 + [call("read_file", path="big.txt", reason="r")] * 4 + [reply("NOTES: big.txt is all x"), reply("ok")])
         self.repo({"big.txt": big})
         with FakeAPI(turns) as api:
             g = self.start(api, context_limit=8000)
@@ -940,13 +947,13 @@ class WorkTest(FakePodman):
     def test_a_stop_while_the_model_writes_rollover_notes_pauses_the_session(self):
         big = "x" * 4000 + "\n"
         turns = ([call("propose_work_plan", goal="g", items=["one"])]
-                 + [call("read_file", path="big.txt", reason="r")] * 5 + [slow(reply("NOTES: slow"), 3)])
+                 + [call("read_file", path="big.txt", reason="r")] * 4 + [slow(reply("NOTES: slow"), 3)])
         self.repo({"big.txt": big})
         with FakeAPI(turns) as api:
             g = self.start(api, context_limit=8000)
             g.send({"type": "work", "task": "t"})
             self.approve(g)
-            self.wait_requests(api, 7)
+            self.wait_requests(api, 6)
             time.sleep(0.5)
             g.send({"type": "stop"})
             self.assertEqual(g.until("done")["reason"], "stopped")

@@ -82,6 +82,16 @@ The model then has a `run_in_sandbox` tool. Each command runs in a rootless podm
 An offline run needs no approval: you see the command, then its exit code and output, and so does
 the model. Ctrl-C stops it and ends the turn. Every run is in the audit log, by fingerprint.
 
+**What the model is told.** Whenever someone can see what runs, the system prompt has a "Where
+things are" section, built from how this session is set up: what its file tools see, whether
+`run_in_sandbox` is there and what it can't see (the network, your home, secret-looking files),
+that commands it proposes and trusted commands run on the live system, and that it sees that
+system only through what you share. So when a task depends on something live, such as logs, a
+server or a cluster's tools, the model plans stand-ins first: a small sample you save into the
+project, invented data, a fake server the test starts on `127.0.0.1`, or a stub command. In a
+work session it is told the live system is out of reach for the whole session. This guides the
+model; it enforces nothing, and the limits above hold whatever it is told.
+
 **Seeing it in hoplon-tui.** The info panel's SANDBOX section has a line for each of the three things
 that run, marked ⊡ (green) where it is sandboxed and ▲ where it isn't:
 

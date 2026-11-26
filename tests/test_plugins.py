@@ -638,6 +638,17 @@ class TestJson(PluginBase):
         with open(os.path.join(self.home, "audit.log")) as f:
             return [json.loads(x) for x in f]
 
+    def test_the_prompt_says_trusted_commands_read_the_live_system(self):
+        with FakeAPI([]) as api:
+            g = self.start(api)
+            g.send({"type": "system"})
+            system = g.until("system")["system"]
+            g.close()
+        self.assertIn("# Trusted commands", system)
+        where = system.split("# Where things are", 1)[1]
+        self.assertIn("Trusted commands (plugin__command tools) run on this host too", where)
+        self.assertIn("what the user shares with you and what trusted commands return", where)
+
     def test_hello_and_plugins_event(self):
         with FakeAPI([]) as api:
             g = self.start(api)
