@@ -97,3 +97,6 @@ or set `HOPLON_TUI_DISABLE=copy,model` for one run. Names are `model`, `copy`, `
 `ssh`, `files`, `sandbox`, `edits`, `plugins` (without it, no plugin pane can connect) and `work`. A disabled feature has no command, help line or menu item, and hoplon-tui's socket
 refuses its requests. Without `ssh`, a hoplon-ssh session isn't followed. No file means
 everything is on; a file that can't be read is ignored, with a note in the conversation.
+
+hoplon-tui shows a splash while tmux starts, for about a second, on a terminal of at least 60×24.
+`HOPLON_TUI_SPLASH=0` or `NO_COLOR` turns it off.

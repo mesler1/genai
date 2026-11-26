@@ -1748,6 +1748,7 @@ class TestHoplonTui(TmuxCase):
         if path and os.path.exists(os.path.join(path, "less")):
             env["HOPLON_TUI_PAGER"] = os.path.join(path, "less")      # the test's pager stands in for hoplon-tui's
         env.pop("TMUX", None)
+        env["HOPLON_TUI_SPLASH"] = "0"         # the splash holds the screen before tmux attaches
         self.proc = subprocess.Popen(["script", "-qfc", f"stty cols 110 rows 40; {REPO}/tui/hoplon-tui {args}",
                                       "/dev/null"], cwd=self.wd, env=env, stdin=subprocess.PIPE,
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

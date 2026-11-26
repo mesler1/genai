@@ -14,7 +14,7 @@
 #                  [--remote [USER@]HOST [--dir PATH] [--as USER] [-- SSH-OPTION...]]
 set -euo pipefail
 here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
-die() { echo "hoplon-tui: $*" >&2; exit 1; }
+die() { [ -z "${splash_at:-}" ] || printf '\e[?25h\e[?1049l'; echo "hoplon-tui: $*" >&2; exit 1; }
 
 py=${HOPLON_PYTHON:-}
 if [ -z "$py" ]; then
@@ -147,6 +147,16 @@ fi
 
 read -r rows cols < <(stty size 2>/dev/null) || true
 cols=${cols:-120}
+# The splash, on the terminal's alternate screen while tmux starts: only on a terminal at least 60x24,
+# and not with NO_COLOR or HOPLON_TUI_SPLASH=0 set. tui/splash.ans is drawn to fit 60 columns.
+splash_at=
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${HOPLON_TUI_SPLASH:-1}" != 0 ] && [ "${rows:-0}" -ge 24 ] && [ "$cols" -ge 60 ] && [ -r "$here/splash.ans" ]; then
+  printf '\e[?1049h\e[?25l\e[H\e[2J'
+  printf '\e[%dH' $(( (rows - 24) / 2 + 1 ))     # no newline after the last line: on 24 rows it would scroll
+  nl=
+  while IFS= read -r l; do printf '%s%*s%s' "$nl" $(( (cols - 60) / 2 )) '' "$l"; nl=$'\n'; done < "$here/splash.ans"
+  splash_at=${EPOCHREALTIME/./}
+fi
 # In remote mode the shell pane is a hoplon-ssh session to the same host, as the same user, in the same directory,
 # started below: see __hoplon_remote_shell in shellrc.
 shell_env=()
@@ -249,6 +259,12 @@ t run-shell "$(q "$here/shell-toggle") hide"
 t select-pane -t "$prompt"
 # The shell pane runs hoplon-ssh to the host at once, as a command, so it is followed like any hoplon-ssh session.
 [ -z "$remote" ] || t send-keys -t "$shell" -l ' __hoplon_remote_shell' \; send-keys -t "$shell" Enter
+if [ -n "$splash_at" ]; then                     # keep it up for at least 1.2 s, then hand the screen to tmux
+  left=$(( 1200000 - (${EPOCHREALTIME/./} - splash_at) ))
+  [ "$left" -le 0 ] || sleep "$(( left / 1000000 )).$(printf %06d $(( left % 1000000 )))"
+  printf '\e[?25h\e[?1049l'
+  splash_at=
+fi
 t attach -t hoplon || true
 if t has-session 2>/dev/null; then
   if [ -n "$remote" ]; then
