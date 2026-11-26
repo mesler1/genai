@@ -88,7 +88,7 @@ class Files(Feature):
 
     def action(self, app, action):
         if action[0] == "files":
-            app.toggle_pane(app.files, "files", ["-b", "-l", "34"], "file tree")
+            app.toggle_pane(app.files, "files", app.FILES_JOIN, "file tree")
         elif action[0] == "insert":
             if app.prompt and app.shell:
                 app.shell.tmux("select-pane", "-t", app.prompt)

@@ -95,7 +95,8 @@ key always asks. Remove an entry from that file, or the file, to be asked again.
 ## File tree
 
 `/files` shows or hides a file tree of the working directory on the left (`hoplon-tui --files` starts
-with it shown). Move with the arrow keys; Right or Enter opens a directory and Left closes it; `.`
+with it shown, as does a profile whose `layout` says `"files": "shown"`; see
+[endpoints-and-profiles.md](endpoints-and-profiles.md)). Move with the arrow keys; Right or Enter opens a directory and Left closes it; `.`
 shows or hides hidden files and `r` refreshes. On a file, Enter views it in the pager, `a` attaches it
 to your next message and `i` puts its path in the input box. A `⚠` marks a file hoplon thinks holds
 secrets, `⚿` one the model would have to ask about first, and `↪` a symlink, which is not followed.

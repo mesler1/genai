@@ -1637,8 +1637,11 @@ class TestPersonaProfiles(Tmp):
         p = self.prof(endpoint="work-llm", persona="Be terse.", skills=["a"], params={"temperature": 0.1}, coding=True)
         self.assertTrue(p.coding)
         self.assertIsNone(self.prof().skills)                     # not set: default_skills apply
+        self.assertEqual(self.prof(layout={"files": "shown", "shell": "hidden"}).layout,
+                         {"files": "shown", "shell": "hidden"})
         for bad in ({"coding": "yes"}, {"params": {"model": "x"}}, {"skills": "a"}, {"endpoint": "../x"},
-                    {"persona": 3}, {"temperature": 1}):
+                    {"persona": 3}, {"temperature": 1}, {"layout": {"slurm": "shown"}}, {"layout": {"files": "on"}},
+                    {"layout": ["files"]}):
             with self.assertRaises(G.HoplonError, msg=bad):
                 self.prof(**bad)
         with self.assertRaises(G.HoplonError) as e:

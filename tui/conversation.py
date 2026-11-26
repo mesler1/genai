@@ -1691,8 +1691,10 @@ SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 
 class App:
-    def __init__(self, scr, child, shell=None):
+    def __init__(self, scr, child, shell=None, chosen=()):
         self.scr, self.child, self.shell = scr, child, shell
+        self.chosen = set(chosen)  # panes the command line showed or hid (--files, --no-panel): the profile's layout
+                                   # leaves those as they are
         on, warning = configured_features()
         self.m, self.ed = Model(on), Editor()
         if warning:
@@ -2081,21 +2083,42 @@ class App:
             return False
         return True
 
-    def toggle_panel(self):
-        self.toggle_pane(self.panel, "panel", ["-l", "42"], "info panel")
+    PANEL_JOIN, FILES_JOIN = ["-l", "42"], ["-b", "-l", "34"]
 
-    def toggle_pane(self, pane, name, join, what):
-        """Show a side pane beside this one, or break it out to a window of its own again."""
+    def toggle_panel(self):
+        self.toggle_pane(self.panel, "panel", self.PANEL_JOIN, "info panel")
+
+    def toggle_pane(self, pane, name, join, what, want=None):
+        """Show a side pane beside this one, or break it out to a window of its own again; want: True to show
+        it, False to hide it, None to switch."""
         if not pane:
             self.m.note(f"there is no {what} in this session", R)
             return
         me = os.environ.get("TMUX_PANE", "")
         here = self.shell.tmux("display", "-p", "-t", me, "#{window_id}").strip()
         there = self.shell.tmux("display", "-p", "-t", pane, "#{window_id}").strip()
-        if here == there:
+        shown = here == there
+        if shown and want is not True:
             self.shell.tmux("break-pane", "-d", "-s", pane, "-n", name)
-        else:
+        elif not shown and want is not False:
             self.shell.tmux("join-pane", "-d", "-h", "-f", *join, "-s", pane, "-t", me)
+
+    def lay_out(self, layout):
+        """The profile's layout: which of the file tree, the info panel and the shell start shown. Checked
+        again here, as hoplon checks it; a pane the command line chose stays as chosen, and the info panel
+        stays hidden on a screen under 100 columns, as the launcher leaves it."""
+        if not isinstance(layout, dict) or not self.shell:
+            return
+        want = {k: v == "shown" for k, v in layout.items() if k not in self.chosen and v in ("shown", "hidden")}
+        if "files" in want and self.files:
+            self.toggle_pane(self.files, "files", self.FILES_JOIN, "file tree", want["files"])
+        wide = self.shell.tmux("display", "-p", "#{window_width}").strip()
+        if "panel" in want and self.panel and (not want["panel"] or (wide.isdigit() and int(wide) >= 100)):
+            self.toggle_pane(self.panel, "panel", self.PANEL_JOIN, "info panel", want["panel"])
+        if "shell" in want:
+            toggle = os.environ.get("HOPLON_TUI_TOGGLE")
+            if toggle:
+                subprocess.run([toggle, "show" if want["shell"] else "hide"], capture_output=True, timeout=5)
 
     def click(self):
         """The wheel scrolls; a click on a command card opens its menu; a right-click anywhere opens the raw view's.
@@ -2612,6 +2635,7 @@ class App:
                 if ev.get("type") == "hello" and self.shell:
                     epn = (ev.get("endpoint") or {})
                     self.shell.title(f"hoplon · {epn.get('name', '?')}: {epn.get('model', '?')}")
+                    self.lay_out((ev.get("profile") or {}).get("layout"))
         for msg in self.m.outbox:
             self.child.send(msg)
         self.m.outbox = []
@@ -2754,7 +2778,8 @@ def main(argv):
             return 2
     child = Child(hoplon_args(args), info)
     try:
-        curses.wrapper(lambda scr: App(scr, child, Shell.from_env()).run())
+        chosen = ["files"] * args.files + ["panel"] * args.no_panel
+        curses.wrapper(lambda scr: App(scr, child, Shell.from_env(), chosen).run())
     finally:
         child.close()
     return 0

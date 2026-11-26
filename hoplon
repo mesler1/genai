@@ -78,7 +78,8 @@ REMOTE_URL = re.compile(r"http://127\.0\.0\.1:([0-9]{1,5})((?:/[A-Za-z0-9._~-]+)
 TOKEN_RE = re.compile(r"[0-9A-Fa-f]{32,128}")
 TOKEN_HEADER = "X-Hoplon-Token"
 PROFILE_KEYS = {"name", "description", "endpoint", "persona", "skills", "plugins", "params", "coding", "sandbox",
-                "edits", "work"}
+                "edits", "work", "layout"}
+LAYOUT_PANES = ("files", "panel", "shell")   # hoplon-tui's panes a profile's "layout" may show or hide
 EDITS_MODES = ("ask", "approved-files")   # "approved-files": a further edit to a file you approved applies
 NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
 ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -2107,6 +2108,11 @@ class Profile:
         self.work = parse_work(data["work"], path) if "work" in data else None
         if self.work and not self.sandbox:
             raise HoplonError(f"{path}: 'work' needs a 'sandbox': a work session tests in it", EXIT_PROFILE)
+        self.layout = data.get("layout", {})       # for hoplon-tui: which of its panes start shown
+        if not (isinstance(self.layout, dict) and set(self.layout) <= set(LAYOUT_PANES)
+                and all(v in ("shown", "hidden") for v in self.layout.values())):
+            raise HoplonError(f"{path}: 'layout' must map {', '.join(LAYOUT_PANES)} to \"shown\" or \"hidden\"",
+                              EXIT_PROFILE)
 
     @classmethod
     def load(cls, path):
@@ -6422,7 +6428,8 @@ def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()
                           "set_coding", "skills", "files", "read", "trace", "system", "plan", "network", "clear",
                           "models", "plugins", "interrupt", "edits", "stop", "digest", "work", "halt"],
              "endpoint": engine.endpoint.info(),
-             "profile": {"name": engine.profile.name, "description": engine.profile.description}
+             "profile": dict({"name": engine.profile.name, "description": engine.profile.description},
+                             **({"layout": engine.profile.layout} if engine.profile.layout else {}))
              if engine.profile else None,
              "session": engine.session.id,
              "resumed": engine.session.resumed, "coding": engine.session.coding,

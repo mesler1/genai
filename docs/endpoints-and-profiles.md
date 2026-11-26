@@ -38,6 +38,10 @@ model, default skills, sampling settings and coding mode:
   ask; declining an edit to a file takes it out of the set. `:edits` (or `/edits` in hoplon-tui)
   shows the files, `:edits reset` forgets them, and `:edits ask|approved-files` switches for this
   session. The set is never saved, so a resumed session starts empty. Blessing flags the field.
+- `"layout"`: which of hoplon-tui's panes start shown, as `{"files": "shown", "panel": "hidden",
+  "shell": "shown"}` (any of the three, each `"shown"` or `"hidden"`). Panes it leaves out start as
+  they always do. `--files` and `--no-panel` on the command line win over it; `/files`, `/panel` and
+  Ctrl-` still show and hide them afterwards. The REPL ignores it.
 - Endpoints, profiles and skills are each blessed with `hoplon --bless PATH`. A profile can only use an
   endpoint and skills that are blessed on their own. If any file changes, hoplon refuses it until you
   bless it again.

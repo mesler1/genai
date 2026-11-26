@@ -2429,6 +2429,49 @@ class TestHoplonTui(TmuxCase):
             self.assertGreater(len(asked()), before)                # /model asked hoplon for the server's list
             self.at_terminal("q")
 
+    def layout_profile(self, layout):
+        plain = self.config
+
+        def config(api):                                   # and a blessed profile with that layout
+            home = plain(api)
+            prof = os.path.join(home, "profiles", "laid.json")
+            os.makedirs(os.path.dirname(prof), exist_ok=True)
+            with open(prof, "w") as f:
+                json.dump({"name": "laid", "endpoint": "test", "layout": layout}, f)
+            G.Config(home).set_blessed(prof, {"kind": "profile", "name": "laid", "hash": G.hash_file(prof)})
+            return home
+        self.config = config
+
+    def beside(self):
+        """The names of the panes on screen, in the conversation's window."""
+        out = self.tmux("list-panes", "-t", self.panes()["hoplon"], "-F", "#{@hoplon_title}")
+        return {pane_name(t) for t in out.splitlines()}
+
+    def wait_beside(self, name, shown=True):
+        end = time.time() + 5
+        while (name in self.beside()) != shown and time.time() < end:
+            time.sleep(0.1)
+        self.assertEqual(name in self.beside(), shown, self.beside())
+
+    def test_the_profile_lays_out_the_panes(self):
+        self.layout_profile({"files": "shown", "panel": "hidden", "shell": "shown"})
+        with FakeAPI([reply("hi")]) as api:
+            self.start(api, args="-p laid")
+            self.wait_beside("files")
+            self.wait_beside("info", shown=False)
+            self.wait_beside("shell")
+            self.type("/files")                                 # and /files still switches it
+            self.wait_beside("files", shown=False)
+
+    def test_the_command_line_wins_over_the_profiles_layout(self):
+        self.layout_profile({"panel": "shown", "files": "hidden"})
+        with FakeAPI([reply("hi")]) as api:
+            self.start(api, args="-p laid --no-panel --files")
+            self.wait_for("Type a message")
+            time.sleep(0.5)
+            self.assertNotIn("info", self.beside())
+            self.assertIn("files", self.beside())
+
     def test_switch_model_from_the_drop_down(self):
         with FakeAPI([reply("from fake"), reply("from coder")],
                      models=[{"id": "fake-model"}, {"id": "coder-model", "max_model_len": 65536}]) as api:
