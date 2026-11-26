@@ -49,6 +49,32 @@ SNAPSHOT_CAP = 8 * WRITE_CAP   # maximum existing file size for an approved over
 ATTACH_CAP = 256 * 1024        # bytes per -f file
 OUTPUT_CAP = 32 * 1024         # chars of command output before head/tail cut
 REPLY_CAP = 8 * 1024 * 1024    # bytes of one endpoint reply (and of one streamed line)
+PROGRESS_EVERY = 0.5        # seconds between progress reports while a reply streams
+PATH_ARG = re.compile(r'"path"\s*:\s*"((?:[^"\\]|\\.){1,240})"')
+
+
+def completion_tokens(usage):
+    n = (usage or {}).get("completion_tokens")
+    return n if type(n) is int and n >= 0 else None
+
+
+def progress_report(reasoning, delta, calls, pieces, thinking):
+    """What a streaming reply is doing now: thinking (pieces so far), writing a tool call (its name, the path it
+    names once that has arrived, and the size of its arguments so far), or writing text."""
+    if reasoning:
+        return {"phase": "thinking", "tokens": thinking}
+    if delta.get("tool_calls") and calls:
+        slot = calls[max(calls)]
+        head = "".join(slot["args"])[:4096]
+        found = PATH_ARG.search(head)
+        out = {"phase": "tool", "tool": slot["name"][:64], "bytes": slot.get("size", 0)}
+        if found:
+            try:
+                out["path"] = json.loads('"' + found.group(1) + '"')
+            except ValueError:
+                pass
+        return out
+    return {"phase": "text", "tokens": pieces - thinking}
 LIST_CAP = 500                 # entries per list_dir
 SEARCH_FILES = 2000            # files one search_files looks in
 SEARCH_MATCHES = 200           # matching lines it returns
@@ -3227,11 +3253,13 @@ class Client:
             ex["response"].append(text)
             ex["response_bytes"] += len(text)
 
-    def chat(self, messages, tools, on_text, max_tokens=None):
-        """Send one request. Returns (message, usage)."""
+    def chat(self, messages, tools, on_text, max_tokens=None, on_progress=None):
+        """Send one request. Returns (message, usage). on_progress, if given, hears what is arriving while the
+        reply streams (progress_report), about twice a second; self.generated is then what the reply took."""
         self._ex = None
+        self.generated = None
         try:
-            msg, usage = self._chat(messages, tools, on_text, max_tokens)
+            msg, usage = self._chat(messages, tools, on_text, max_tokens, on_progress)
         except HoplonError as e:
             if self._ex is not None:
                 self._ex.update(status="error", error=str(e), ms=int(1000 * (time.time() - self._ex["started"])))
@@ -3240,7 +3268,7 @@ class Client:
             self._ex.update(status="ok", message=msg, usage=usage, ms=int(1000 * (time.time() - self._ex["started"])))
         return msg, usage
 
-    def _chat(self, messages, tools, on_text, max_tokens=None):
+    def _chat(self, messages, tools, on_text, max_tokens=None, on_progress=None):
         params = dict(self.params)
         stream = bool(params.pop("stream", True))
         body = {"model": self.p.model, "messages": messages, "stream": stream}
@@ -3249,6 +3277,7 @@ class Client:
             body["tools"] = tools
         if max_tokens:
             body["max_tokens"] = max_tokens
+        started = time.time()
         with self._request("/chat/completions", body, trace=True) as r:
             if self._ex is not None:
                 self._ex["stream"] = stream
@@ -3263,11 +3292,15 @@ class Client:
                 msg = data["choices"][0].get("message", {})
                 if msg.get("content"):
                     on_text(msg["content"])
+                done = completion_tokens(data.get("usage"))
+                if done is not None:
+                    self.generated = {"tokens": done, "estimated": False, "seconds": time.time() - started}
                 return self._clean(msg.get("content"), msg.get("tool_calls") or []), data.get("usage")
-            return self._stream(r, on_text)
+            return self._stream(r, on_text, on_progress)
 
-    def _stream(self, r, on_text):
+    def _stream(self, r, on_text, on_progress=None):
         content, calls, usage, size = [], {}, None, 0
+        pieces, thinking, first, told = 0, 0, None, 0.0   # streamed pieces (about a token each), of them thinking
         while True:
             raw = r.readline(REPLY_CAP + 1)
             size += len(raw)
@@ -3293,6 +3326,11 @@ class Client:
                 usage = chunk["usage"]
             for ch in chunk.get("choices") or []:
                 delta = ch.get("delta") or {}
+                reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+                if delta.get("content") or reasoning or delta.get("tool_calls"):
+                    pieces += 1
+                    thinking += bool(reasoning)
+                    first = first or time.time()
                 if delta.get("content"):
                     content.append(delta["content"])
                     on_text(delta["content"])
@@ -3307,6 +3345,14 @@ class Client:
                         slot["name"] += fn["name"]
                     if fn.get("arguments"):
                         slot["args"].append(fn["arguments"])
+                        slot["size"] = slot.get("size", 0) + len(fn["arguments"].encode("utf-8"))
+                if on_progress and time.time() - told >= PROGRESS_EVERY and pieces:
+                    told = time.time()
+                    on_progress(progress_report(reasoning, delta, calls, pieces, thinking))
+        done = completion_tokens(usage)
+        if pieces or done is not None:
+            self.generated = {"tokens": done if done is not None else pieces, "estimated": done is None,
+                              "seconds": time.time() - first if first else 0.0}
         tool_calls = [{"id": s["id"] or f"call_{i}", "type": "function",
                        "function": {"name": s["name"], "arguments": "".join(s["args"])}}
                       for i, s in sorted(calls.items())]
@@ -4238,8 +4284,15 @@ class Engine:
                 raise Halted
             if chunk:
                 self.ui.text(chunk)
-        msg, usage = self.active()[1].chat(msgs, self.tools() if tools else None, text, max_tokens)
+        def progress(report):
+            if self.halt:
+                raise Halted
+            self.ui.progress(report)
+        client = self.active()[1]
+        msg, usage = client.chat(msgs, self.tools() if tools else None, text, max_tokens, progress)
         self.ui.text_end()
+        if client.generated:
+            self.ui.generated(client.generated)
         if usage and usage.get("total_tokens"):
             self.session.usage = (int(usage["total_tokens"]), len(self.session.messages) + 1)
         return msg
@@ -5287,6 +5340,12 @@ class PlainUI:
     def notice(self, msg):
         eprint(f"hoplon: {one_line(msg)[0]}")
 
+    def progress(self, report):
+        pass                    # the REPL shows the reply's text as it comes; hoplon-tui shows the rest
+
+    def generated(self, stats):
+        pass
+
     def context(self, used, limit):
         pass
 
@@ -5574,6 +5633,13 @@ class JsonUI:
 
     def text_end(self):
         pass
+
+    def progress(self, report):
+        self.emit(dict(report, type="progress"))
+
+    def generated(self, stats):
+        self.emit({"type": "generated", "tokens": stats["tokens"], "estimated": stats["estimated"],
+                   "seconds": round(stats["seconds"], 2)})
 
     def notice(self, msg):
         self.emit({"type": "notice", "message": msg})
@@ -6426,7 +6492,7 @@ def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()
              "features": ["proposals", "decisions", "attach", "register_tools", "compact", "context", "coding",
                           "fixtures", "leftovers",
                           "set_coding", "skills", "files", "read", "trace", "system", "plan", "network", "clear",
-                          "models", "plugins", "interrupt", "edits", "stop", "digest", "work", "halt"],
+                          "models", "plugins", "interrupt", "edits", "stop", "digest", "work", "halt", "progress"],
              "endpoint": engine.endpoint.info(),
              "profile": dict({"name": engine.profile.name, "description": engine.profile.description},
                              **({"layout": engine.profile.layout} if engine.profile.layout else {}))

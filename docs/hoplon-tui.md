@@ -162,6 +162,13 @@ for you`), coding mode or chat, a work session's item, and a context gauge that 
 and ember at 90%. On its right are the sandbox and the host, and tmux's keys when the terminal is
 wide enough.
 
+While hoplon replies, the prompt pane's bottom line (and the info panel) says what is arriving:
+`thinking · ~3,200 tokens`, `writing game/index.html · 18 KB` as a tool call streams in, or
+`replying · ~400 tokens`. When the turn ends, a quiet line under it gives what the model generated
+and how fast: `+1,240 tokens · 38 tok/s · 33 s`, summed over the turn's requests and counting thinking
+and tool calls. A `~` means hoplon counted streamed pieces, about a token each, because the server
+reported no usage.
+
 The colours are "bronze on iron": bronze for hoplon's badge, the focused pane and key hints; brass
 for what waits on you and for anything live, outside the sandbox; patina for the sandbox and for
 what ran fine; ember for errors and risks. They need a 256-colour terminal and fall back to the

@@ -1376,6 +1376,22 @@ class TestEndToEnd(Tmp):
             self.assertEqual(g.until("done", "error")["type"], "done")
             g.close()
 
+    def test_a_reply_reports_its_progress_and_what_it_generated(self):
+        with FakeAPI([call("write_file", path="a.txt", content="hi"), reply("ok")]) as api:
+            home, path = make_home(self.tmp, api.url)
+            bless_path(home, path)
+            os.makedirs(self.path("wd"))
+            g = Proc(home, self.path("wd"), ["-e", "test"])
+            self.assertIn("progress", g.until("hello")["features"])
+            g.send({"type": "user", "text": "write it"})
+            prog = g.until("progress")
+            self.assertEqual((prog["phase"], prog["tool"]), ("tool", "write_file"))
+            gen = g.until("generated")
+            self.assertTrue(gen["estimated"])
+            self.assertGreater(gen["tokens"], 0)
+            self.assertGreaterEqual(gen["seconds"], 0)
+            g.close()
+
     def test_non_streaming_and_usage(self):
         with FakeAPI([reply("x")], usage={"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}) as api:
             home, path = make_home(self.tmp, api.url, params={"stream": False})
@@ -1383,6 +1399,8 @@ class TestEndToEnd(Tmp):
             os.makedirs(self.path("wd"))
             g = Proc(home, self.path("wd"), ["-e", "test"])
             g.send({"type": "user", "text": "hi"})
+            gen = g.until("generated")
+            self.assertEqual((gen["tokens"], gen["estimated"]), (2, False))    # the server's own count
             done = g.until("done")
             g.close()
             self.assertFalse(api.requests[0]["body"]["stream"])

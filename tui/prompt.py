@@ -106,7 +106,8 @@ class Prompt:
         if v.get("mode", "input") == "input" and v.get("running"):
             hints = f"{SPIN[int(time.time() * 10) % len(SPIN)]} a sandboxed run is going · Ctrl-C or /stop stops it"
         elif v.get("mode", "input") == "input" and v.get("busy"):
-            hints = f"{SPIN[int(time.time() * 10) % len(SPIN)]} hoplon is replying · type ahead, Enter queues it"
+            doing = v.get("doing") if isinstance(v.get("doing"), str) else "hoplon is replying"
+            hints = f"{SPIN[int(time.time() * 10) % len(SPIN)]} {doing} · type ahead, Enter queues it"
         try:
             self.scr.addstr(h - 1, 0, fit(hints, w - 1), self.roles[Q])
         except curses.error:

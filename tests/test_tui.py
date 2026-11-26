@@ -336,6 +336,32 @@ class TestModel(unittest.TestCase):
         self.assertNotIn({"type": "clear"}, old.outbox)
         self.assertIn("only the screen", text_of(old.blocks[-1]))
 
+    def test_progress_says_what_is_arriving_and_the_turn_ends_with_its_rate(self):
+        notes = lambda m: "\n".join(text_of(b, 200) for b in m.blocks[-6:])
+        m = C.Model()
+        m.handle({"type": "hello", "endpoint": {}})
+        m.submit("go")
+        m.handle({"type": "progress", "phase": "thinking", "tokens": 3200})
+        self.assertEqual(m.doing, "thinking · ~3,200 tokens")
+        m.handle({"type": "text", "text": "Hello *"})
+        m.handle({"type": "progress", "phase": "text", "tokens": 2})
+        m.handle({"type": "text", "text": "*there**."})
+        self.assertEqual(sum(isinstance(b, C.Reply) for b in m.blocks), 1)      # one reply, not split
+        m.handle({"type": "progress", "phase": "tool", "tool": "write_file", "bytes": 18 * 1024,
+                  "path": "game/\x1b[2Jindex.html"})
+        self.assertEqual(m.doing, "writing game/\\x1b[2Jindex.html · 18 KB")      # the model's path, cleaned
+        m.handle({"type": "progress", "phase": "tool", "tool": "run_in_sandbox", "bytes": 300})
+        self.assertEqual(m.doing, "writing a run_in_sandbox call · 300 B")
+        self.assertEqual(m.snapshot()["doing"], m.doing)
+        m.handle({"type": "generated", "tokens": 1000, "estimated": True, "seconds": 20.0})
+        m.handle({"type": "generated", "tokens": 240, "estimated": False, "seconds": 12.6})
+        m.handle({"type": "done"})
+        self.assertIsNone(m.doing)
+        self.assertIn("+~1,240 tokens · 38 tok/s · 33 s", notes(m))
+        m.submit("again")
+        m.handle({"type": "done"})                                     # nothing generated: no line
+        self.assertEqual(notes(m).count("tokens"), 1)
+
     def test_reply_streams_into_one_block(self):
         m = C.Model()
         self.hello(m)

@@ -133,6 +133,41 @@ def cut(s, w):
     return "".join(out)
 
 
+def size_text(n):
+    """Bytes as people read them: 812 B, 18 KB, 2.4 MB."""
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n // 1024} KB"
+    return f"{n / (1024 * 1024):.1f} MB"
+
+
+def progress_text(ev):
+    """hoplon's progress event as a few words: what the reply streaming now is doing. The model chose the path,
+    so it is cleaned and cut short."""
+    phase = ev.get("phase")
+    n = ev.get("tokens") if type(ev.get("tokens")) is int else 0
+    if phase == "thinking":
+        return f"thinking · ~{n:,} tokens"
+    if phase == "tool":
+        size = ev.get("bytes") if type(ev.get("bytes")) is int else 0
+        path = ev.get("path") if isinstance(ev.get("path"), str) else ""
+        tool = ev.get("tool") if isinstance(ev.get("tool"), str) else ""
+        what = clean(path)[-60:] if path else (f"a {clean(tool)[:40]} call" if tool else "a tool call")
+        return f"writing {what} · {size_text(size)}"
+    if phase == "text":
+        return f"replying · ~{n:,} tokens"
+    return None
+
+
+def gen_text(tokens, seconds, estimated):
+    """A turn's generation, after it: tokens the model wrote (thinking and tool calls too) and its rate."""
+    out = f"+{'~' if estimated else ''}{tokens:,} tokens"
+    if seconds >= 0.5:
+        out += f" · {tokens / seconds:.0f} tok/s · {seconds:.0f} s"
+    return out
+
+
 def fit(s, w):
     """s cut to w cells, with … when something was dropped."""
     if width(s) <= w:
@@ -584,6 +619,8 @@ class Model:
         self.coding = False
         self.runner = None         # the profile's sandbox, from hello and network events
         self.context = None        # (used, limit)
+        self.doing = None          # what the reply streaming now is doing ("thinking · ~3,200 tokens"), or None
+        self.gen = None            # this turn's generated [tokens, seconds, estimated], summed over its requests
         self.exited = None         # hoplon's exit code once it has gone
         self.quit = False
         self.shell = False         # a shell pane is there (inside hoplon-tui)
@@ -661,7 +698,7 @@ class Model:
 
     def handle(self, ev):
         t = ev.get("type")
-        if t != "text":
+        if t not in ("text", "progress", "generated"):    # these come mid-reply and add no block
             self.reply = None
         if t == "hello":
             self.hello, self.coding, self.runner = ev, bool(ev.get("coding")), ev.get("runner")
@@ -717,10 +754,21 @@ class Model:
                 self.note(f"plan {self.plan.get('id')} approved: {n} step{'s' if n != 1 else ''}"
                           + ("; planned commands run on their own" if self.plan_auto else
                              "; each planned command asks once") + " · /plan shows it", D)
+        elif t == "progress":
+            self.doing = progress_text(ev)
+        elif t == "generated":
+            n, secs = ev.get("tokens"), ev.get("seconds")
+            if type(n) is int and n >= 0 and isinstance(secs, (int, float)) and secs >= 0:
+                g = self.gen or [0, 0.0, False]
+                self.gen = [g[0] + n, g[1] + secs, g[2] or bool(ev.get("estimated"))]
         elif t == "done":
             if ev.get("exchanges"):
                 self.exchanges[self.turn] = ev["exchanges"]
             self.busy = False
+            self.doing = None
+            if self.gen and self.gen[0]:
+                self.note(gen_text(*self.gen))
+            self.gen = None
             self.retire("the turn ended before you answered")
             self.context = ((ev.get("context") or {}).get("used"), (ev.get("context") or {}).get("limit"))
             if ev.get("reason") == "step_limit":
@@ -742,6 +790,7 @@ class Model:
             if self.busy and not self.pending and ev.get("code") not in ("busy", "unknown_id", "bad_message",
                                                                          "unknown_type", "not_running"):
                 self.busy = False          # a failed turn ends without a done event
+                self.doing = self.gen = None
                 self.next_queued()
         elif t == "notice":
             self.note(clean(ev.get("message", "")), W)
@@ -1089,7 +1138,8 @@ class Model:
             "session": {"endpoint": ep.get("name"), "model": ep.get("model"), "profile": prof.get("name"),
                         "session": h.get("session"), "sandbox": sb.get("name") if sb else None,
                         "shell_where": self.shell_where, "hoplon_where": hoplon_where(h)},
-            "coding": self.coding, "busy": self.busy, "context": list(self.context or (None, None)),
+            "coding": self.coding, "busy": self.busy, "doing": self.doing if self.busy else None,
+            "context": list(self.context or (None, None)),
             "runner": self.runner and {"network": bool(self.runner.get("network")), "problem": self.runner.get("problem"),
                                        "image": self.runner.get("image")},
             "running": run and {"id": clean(run.id), "secs": run.elapsed(), "stoppable": run.stoppable},
@@ -2037,7 +2087,8 @@ class App:
             lines = [[(t, "question" if i == 0 and r in (A, W) else ("key" if t.strip() in ("y", "n", "v", "e", "a") else r))
                       for t, r in segs] for i, segs in enumerate(lines)]
         return {"mode": mode, "lines": lines if mode != "input" else [], "hints": "" if mode == "input" else hints,
-                "busy": self.m.busy, "running": self.m.running_card() is not None,
+                "busy": self.m.busy, "doing": self.m.doing if self.m.busy else None,
+                "running": self.m.running_card() is not None,
                 "halt": self.m.busy and self.m.can_halt() and self.m.exited is None,
                 "status": " · ".join(status), "exited": self.m.exited is not None,
                 "q": self.question()}

@@ -102,7 +102,8 @@ def view(st, w, sel):
         n = st["shared"]
         add([(fit(f"{n} shared, sent with your next message · /shared", w), D)])
     if st.get("busy"):
-        add([("… hoplon is replying", W)])
+        doing = st.get("doing") if isinstance(st.get("doing"), str) else "hoplon is replying"
+        add([(fit("… " + doing, w), W)])
     plan = st.get("plan")
     if plan:
         head("PLAN")

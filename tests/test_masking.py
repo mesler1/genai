@@ -4,6 +4,7 @@ Run: python3 -m unittest discover -s tests"""
 import importlib.machinery
 import importlib.util
 import io
+import json
 import os
 import shutil
 import sys
@@ -255,6 +256,33 @@ class TestReplyCap(unittest.TestCase):
         r = io.BytesIO(b"data: " + b"x" * 5000 + b"\n")
         with mock.patch.object(G, "REPLY_CAP", 1000), self.assertRaises(G.HoplonError):
             G.Client._stream(object(), r, lambda t: None)
+
+    def sse(self, *deltas, usage=None):
+        lines = [b"data: " + json.dumps({"choices": [{"delta": d}]}).encode() + b"\n" for d in deltas]
+        if usage:
+            lines.append(b"data: " + json.dumps({"choices": [], "usage": usage}).encode() + b"\n")
+        return io.BytesIO(b"".join(lines) + b"data: [DONE]\n")
+
+    def test_a_stream_reports_thinking_then_the_file_a_tool_call_writes(self):
+        args = json.dumps({"path": "game/index.html", "content": "<html>" + "x" * 3000})
+        deltas = [{"reasoning_content": "hm"}] * 3 + [
+            {"tool_calls": [{"index": 0, "id": "c1", "function": {"name": "write_file", "arguments": args[:20]}}]},
+            {"tool_calls": [{"index": 0, "function": {"arguments": args[20:40]}}]},
+            {"tool_calls": [{"index": 0, "function": {"arguments": args[40:]}}]}]
+        seen, me = [], types.SimpleNamespace(_got=lambda line: None, _clean=G.Client._clean)
+        with mock.patch.object(G, "PROGRESS_EVERY", 0):
+            msg, _ = G.Client._stream(me, self.sse(*deltas), lambda t: None, seen.append)
+        self.assertEqual(seen[:3], [{"phase": "thinking", "tokens": n} for n in (1, 2, 3)])
+        self.assertEqual(seen[3], {"phase": "tool", "tool": "write_file", "bytes": 20})     # no path yet
+        self.assertEqual(seen[-1], {"phase": "tool", "tool": "write_file", "bytes": len(args),
+                                    "path": "game/index.html"})
+        self.assertEqual(json.loads(msg["tool_calls"][0]["function"]["arguments"])["path"], "game/index.html")
+        self.assertEqual((me.generated["tokens"], me.generated["estimated"]), (6, True))     # pieces, no usage
+
+    def test_the_servers_usage_counts_when_it_sends_one(self):
+        me = types.SimpleNamespace(_got=lambda line: None, _clean=G.Client._clean)
+        G.Client._stream(me, self.sse({"content": "hi"}, usage={"completion_tokens": 42}), lambda t: None)
+        self.assertEqual((me.generated["tokens"], me.generated["estimated"]), (42, False))
 
     def test_replies_under_the_cap_still_work(self):
         for stream in (False, True):
