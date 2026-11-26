@@ -233,6 +233,13 @@ in between.
     limit, a 1 GB `/tmp`, and memory and process limits where cgroups are delegated.
   - The command's output is masked and clipped before the model sees it, and the user sees the
     same output. The audit log records each run by fingerprint, with its exit code and duration.
+  - Real samples (`/fixtures`) reach a run only through a folder outside the project, mounted
+    read-only at `/fixtures`, after the user approves exactly what is in it. Secret-looking names,
+    contents hoplon would redact, links and non-regular files block the approval. The approval is a
+    digest of names, sizes and contents, checked again before every run; any change drops it. The
+    model can only ask for samples (`request_samples` shows a card and ends its turn); it never
+    chooses or reads a host path. What a run prints still goes to the model, which the approval
+    question says. Adds, approvals, drops and clears are in the audit log.
 
 - **Work sessions** (`:work`, or the JSON `work` message) let the model edit, test and commit
   without asking, so the boundary moves from each edit to the branch you review at the end:

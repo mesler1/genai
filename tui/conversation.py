@@ -439,6 +439,7 @@ class Card(Block):
                           + (f" ({row(ev['glob'])})" if ev.get("glob") else ""),
                 "write": f"{'overwrite' if ev.get('exists') else 'create'} {path}",
                 "command": "command", "external": f"tool {row(ev.get('tool', ''))}",
+                "samples": "samples requested",
                 "sandbox": f"sandbox · {'ONLINE' if ev.get('network') else 'offline'}",
                 "trusted": f"{row(ev.get('plugin', '?'))} · {row(ev.get('command', '?'))}"
                            + (" · read-only" if ev.get("read_only") else ""),
@@ -465,6 +466,14 @@ class Card(Block):
             out.append(("this file looks like it contains secrets", R))
         if ev.get("flagged"):
             out.append(("hidden or control characters are shown as \\x.. or \\u.... escapes", R))
+        if k == "samples":
+            out += [(ln, "") for ln in clean(str(ev.get("what", ""))).split("\n")]
+            files = ev.get("files") if isinstance(ev.get("files"), list) else []
+            out.append(("files its tests will read in /fixtures: " + ", ".join(one_row(str(f)) for f in files[:20]), D))
+            if ev.get("suggest"):
+                out.append(("you could make them with:  " + one_row(str(ev["suggest"])), ""))
+            out.append(("Make them in your shell (scrub anything private), then /fixtures add FILE… and /fixtures "
+                        "use. The model never runs anything for this.", A))
         if k in ("command", "sandbox"):
             for i, ln in enumerate(command_text(ev.get("command", "")).split("\n")):
                 out.append((("$ " if i == 0 else "  ") + ln, ""))
@@ -522,8 +531,8 @@ class Card(Block):
         k = self.ev.get("kind")
         if k in ("edit", "write"):
             return "⊡ the copy" if self.ev.get("work") else "⊡→▲ your files"
-        return {"command": "⊡→▲ your shell", "trusted": "▲ runs live", "sandbox": "⊡ a throwaway run"}.get(
-            k if isinstance(k, str) else None, "")
+        return {"command": "⊡→▲ your shell", "trusted": "▲ runs live", "sandbox": "⊡ a throwaway run",
+                "samples": "▲→⊡ from your side"}.get(k if isinstance(k, str) else None, "")
 
     def lines(self, w):
         if self.state == "auto":
@@ -615,6 +624,15 @@ class Model:
     def send(self, msg):
         self.outbox.append(msg)
 
+    def ask_approval(self, kind, ev):
+        """An approval question for a feature's request. Only the core builds and answers these. fixtures_use offers
+        exactly the digest hoplon listed; hoplon refuses it if the files changed since, and checks again before runs."""
+        if kind == "fixtures_use" and isinstance(ev, dict) and isinstance(ev.get("digest"), str):
+            self.ask = {"kind": kind, "digest": ev["digest"],
+                        "question": clean(str(ev.get("ask") or "Use these samples for this job?"))}
+        elif kind == "fixtures_clear":
+            self.ask = {"kind": kind, "question": "Delete the samples folder and everything in it?"}
+
     def feature(self, name):
         return next((f for f in self.features if f.name == name), None)
 
@@ -665,6 +683,8 @@ class Model:
                 self.number_commands()
                 if ev.get("preapproved") and self.command_authorized(card) and self.shell:
                     self.actions.append(("plan_cmd", card))
+            elif ev.get("kind") == "samples":
+                card.state = "shown"                    # nothing to approve: you make them, then /fixtures
             elif ev.get("kind") == "invalid":
                 card.state = "error"
                 card.detail = f"the model asked for a tool that does not exist: {ev.get('tool', '?')}"
@@ -1722,6 +1742,10 @@ class App:
                 lines.append([("  It doesn't all fit here: ", W), ("y", A), (" or ", ""), ("v", A),
                               (" view it in full first   ", ""), ("e", A), (" edit   ", ""), ("n", A), (" cancel", "")])
                 return lines, None, "y or v view the whole command first · e edit · n or Esc cancel"
+            if ask["kind"] in ("fixtures_use", "fixtures_clear"):
+                yes = "use them" if ask["kind"] == "fixtures_use" else "delete it"
+                return ([[(ask["question"], A)], [("  y", A), (f" {yes}   ", ""), ("n", A), (" no", "")]], None,
+                        f"y {yes} · n or Esc no")
             lines = [[(ask["question"], A)],
                      [("  y", A), (" review it in your editor, then send   ", ""), ("s", A), (" send it as it is   ", ""),
                       ("n", A), (" keep it to yourself", "")]]
@@ -2186,6 +2210,17 @@ class App:
             elif k in ("n", "\x1b"):
                 m.ask = None
                 m.note(f"{card.id}: not run")
+        elif ask["kind"] in ("fixtures_use", "fixtures_clear"):
+            m.ask = None
+            fx = next((f for f in m.features if f.name == "fixtures"), None)
+            if k != "y":
+                m.note("samples: not approved" if ask["kind"] == "fixtures_use" else "samples folder: kept")
+            elif ask["kind"] == "fixtures_use":
+                m.send({"type": "fixtures", "action": "use", "digest": ask["digest"]})
+            else:
+                m.send({"type": "fixtures", "action": "clear"})
+            if fx and k == "y":
+                fx.then = "show"
         else:
             m.ask = None
             if k in ("y", "s"):                             # y: review it in your editor first; s: send it as it is

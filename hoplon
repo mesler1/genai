@@ -70,7 +70,7 @@ EXIT_OK, EXIT_ERROR, EXIT_USAGE, EXIT_PROFILE, EXIT_API, EXIT_CONTEXT = 0, 1, 2,
 EXIT_INTERRUPT = 130
 
 INTRINSICS = ("propose_command", "read_file", "list_dir", "write_file", "edit_file", "propose_plan", "run_in_sandbox",
-              "search_files", "propose_work_plan", "finish_item", "retry_item")
+              "search_files", "propose_work_plan", "finish_item", "retry_item", "request_samples")
 PLAN_STEPS = 30                # steps one plan may have
 ENDPOINT_KEYS = {"name", "base_url", "model", "key_env", "key_file", "context_limit", "timeout",
                  "ca_bundle", "headers", "params", "allow_http", "proxy", "description"}
@@ -453,6 +453,153 @@ _GUARD = ('for p in "$@"; do if [ -d "$p" ]; then [ -z "$(ls -A "$p")" ] || { ec
           'c=$HOPLON_CMD; unset HOPLON_CMD HOPLON_GUARD; exec /bin/sh -c "$c"')
 
 
+FIXTURES_FILES = 200            # files one samples folder may hold
+FIXTURES_BYTES = 64 * 1024 * 1024
+FIXTURES_ASK = ("Use these samples for this job? Test output may send their contents to the model endpoint.")
+
+
+class Fixtures:
+    """Real samples for the model's runs: a private folder per project and job, outside the project, so neither git,
+    the work session's copy nor the model's file tools reach it. The user fills it; nothing is used until they approve
+    exactly what is there, after the secret checks. Approved, it is mounted read-only at /fixtures in each sandboxed
+    run, and checked before each one: if anything changed, the approval is gone. The approval lasts this process only;
+    the folder lasts until /fixtures clear, or the end of a work session that used it."""
+
+    def __init__(self, root, project, job):
+        self.root, self.project = root, os.path.realpath(project)
+        base = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(self.project) or "root")[:40]
+        self.group = os.path.join(root, f"{base}-{hashlib.sha256(self.project.encode()).hexdigest()[:8]}")
+        self.job = re.sub(r"[^A-Za-z0-9._-]", "_", job)[:80]
+        self.dir = os.path.join(self.group, self.job)
+        self.approved = None          # the digest the user approved, this process only
+        self.used_in_work = False
+
+    def problem(self):
+        """Why the root can't hold samples, or None."""
+        real, home = os.path.realpath(self.root), os.path.realpath(os.path.expanduser("~"))
+        if real == home or home.startswith(real + os.sep):
+            return f"fixtures_dir {self.root} is or holds your home directory"
+        if real == self.project or real.startswith(self.project + os.sep):
+            return f"fixtures_dir {self.root} is inside this project, where git and the model's file tools reach it"
+        if any(c in self.dir for c in ":,"):
+            return "the samples folder's path contains ':' or ',', which podman can't mount"
+        return None
+
+    def ensure(self):
+        problem = self.problem()
+        if problem:
+            raise HoplonError(problem, EXIT_USAGE, "fixtures")
+        for d in (self.root, self.group, self.dir):
+            ensure_dir(d)
+            os.chmod(d, 0o700)
+        state_directory(self.dir)
+        meta = os.path.join(self.group, self.job + ".json")
+        if not os.path.exists(meta):
+            write_private(meta, json.dumps({"project": self.project, "job": self.job, "created": now(),
+                                            "pid": os.getpid()}) + "\n")
+        return self.dir
+
+    def scan(self, values=()):
+        """What the folder holds: [{name, size, sha256, flag}], flag saying why a file can't be used, or None."""
+        out, total = [], 0
+        if not os.path.isdir(self.dir):
+            return out
+        for top, dirs, files in os.walk(self.dir):
+            dirs.sort()
+            for d in list(dirs):
+                if os.path.islink(os.path.join(top, d)):
+                    dirs.remove(d)
+                    out.append({"name": os.path.relpath(os.path.join(top, d), self.dir), "size": 0, "sha256": "",
+                                "flag": "a symbolic link"})
+            for f in sorted(files):
+                path = os.path.join(top, f)
+                rel = os.path.relpath(path, self.dir)
+                row = {"name": rel, "size": 0, "sha256": "", "flag": None}
+                out.append(row)
+                if len(out) > FIXTURES_FILES:
+                    raise HoplonError(f"the samples folder has more than {FIXTURES_FILES} files", EXIT_USAGE, "fixtures")
+                if not is_plain_file(path):
+                    row["flag"] = "not a regular file"
+                    continue
+                with open(path, "rb") as fh:
+                    data = fh.read(FIXTURES_BYTES + 1)
+                total += len(data)
+                if total > FIXTURES_BYTES:
+                    raise HoplonError(f"the samples come to more than {FIXTURES_BYTES // 2**20} MB", EXIT_USAGE,
+                                      "fixtures")
+                row["size"], row["sha256"] = len(data), hashlib.sha256(data).hexdigest()
+                text = data.decode("utf-8", "replace")
+                counts = redact(text, values)[1]
+                if secret_name(f):
+                    row["flag"] = "its name looks like a secret's"
+                elif counts:
+                    row["flag"] = f"it looks like it holds a secret ({redaction_note(counts)})"
+                elif any(c in rel for c in ":,"):
+                    row["flag"] = "its name contains ':' or ','"
+        return out
+
+    @staticmethod
+    def digest(rows):
+        return hashlib.sha256(json.dumps([[r["name"], r["size"], r["sha256"]] for r in rows]).encode()).hexdigest()
+
+    def add(self, paths, cwd):
+        """Copy files into the folder, each under its own name. Returns the names."""
+        self.ensure()
+        names = []
+        for p in paths:
+            src = os.path.join(cwd, os.path.expanduser(p))
+            if not is_plain_file(src):
+                raise HoplonError(f"{p}: not a regular file (only files can be added; links are refused)", EXIT_USAGE,
+                                  "fixtures")
+            name = os.path.basename(src)
+            dst = os.path.join(self.dir, name)
+            if os.path.islink(dst):
+                os.unlink(dst)
+            shutil.copyfile(src, dst, follow_symlinks=False)
+            os.chmod(dst, 0o600)
+            names.append(name)
+        self.approved = None if names else self.approved
+        return names
+
+    def approve(self, digest, values=()):
+        rows = self.scan(values)
+        if not rows:
+            raise HoplonError("the samples folder is empty: add files first", EXIT_USAGE, "fixtures")
+        bad = [r for r in rows if r["flag"]]
+        if bad:
+            raise HoplonError(f"{bad[0]['name']} can't be used: {bad[0]['flag']}. Scrub or replace it, or remove it "
+                              "from the folder", EXIT_USAGE, "fixtures")
+        if digest != self.digest(rows):
+            raise HoplonError("the samples changed since they were listed: look again before approving", EXIT_USAGE,
+                              "fixtures")
+        self.approved = digest
+        return rows
+
+    def mount(self, values=()):
+        """The folder to mount for a run, after checking it is what the user approved; None if nothing is approved.
+        Raises HoplonError (and forgets the approval) if it changed."""
+        if not self.approved:
+            return None
+        rows = self.scan(values)
+        if self.digest(rows) != self.approved or any(r["flag"] for r in rows):
+            self.approved = None
+            raise HoplonError("the samples changed since you approved them, so the run was not started: approve them "
+                              "again with /fixtures use", EXIT_USAGE, "fixtures")
+        return self.dir
+
+    def clear(self):
+        self.approved = None
+        if os.path.isdir(self.dir):
+            shutil.rmtree(self.dir)
+        meta = os.path.join(self.group, self.job + ".json")
+        if os.path.exists(meta):
+            os.unlink(meta)
+        try:
+            os.rmdir(self.group)
+        except OSError:
+            pass
+
+
 def parse_sandbox(data, path):
     """A profile's "sandbox" object, checked. The image is required: offline, the project's tools and
     dependencies have to be in it already."""
@@ -576,12 +723,13 @@ class Sandbox:
         except OSError:
             return False
 
-    def argv(self, name, command, files, dirs, empty, guard):
+    def argv(self, name, command, files, dirs, empty, guard, fixtures=None):
         net = ["--network=none", "--http-proxy=false"] if not self.network else []
         limits = [f"--memory={self.conf['memory']}", f"--pids-limit={self.conf['pids']}"] if self.limits else []
         mounts = [f"--volume={self.root}:/work:O"]
         mounts += [f"--volume=/dev/null:/work/{f}:ro" for f in files]
         mounts += [f"--volume={empty}:/work/{d}:ro" for d in dirs]
+        mounts += [f"--volume={fixtures}:/fixtures:ro"] if fixtures else []
         return ([self.podman, "--log-level=error", "run", "--rm", f"--name={name}", "--pull=never", "--init",
                  "--userns=keep-id", "--read-only", f"--tmpfs=/tmp:rw,size={SANDBOX_TMP},mode=1777",
                  "--cap-drop=all", "--security-opt=no-new-privileges", "--workdir=/work",
@@ -589,7 +737,7 @@ class Sandbox:
                 + net + limits + mounts + [self.conf["image"], "/bin/sh", "-c", _GUARD, "hoplon-guard"]
                 + [f"/work/{p}" for p in files + dirs])
 
-    def run(self, command, values=(), cap=OUTPUT_CAP * 8, timeout=None):
+    def run(self, command, values=(), cap=OUTPUT_CAP * 8, timeout=None, fixtures=None):
         """Run command; returns (ran, exit code or None, output, note). ran is False when the command never
         started; the exit code is None when it was killed at the time limit (the sandbox's, or timeout seconds if
         that is sooner). Ctrl-C stops the container and is raised again."""
@@ -610,7 +758,8 @@ class Sandbox:
         with tempfile.TemporaryDirectory(prefix="hoplon-empty-") as empty:
             os.chmod(empty, 0o500)
             for attempt in (1, 2):
-                rc, out = self._podman(self.argv(name, command, files, dirs, empty, guard), name, cap, deadline)
+                rc, out = self._podman(self.argv(name, command, files, dirs, empty, guard, fixtures), name, cap,
+                                       deadline)
                 if attempt == 1 and self.limits and rc in (125, 126) and "cgroup" in out:
                     self.limits = False
                     self.notice("this host doesn't let podman limit memory or processes (cgroups aren't delegated "
@@ -728,6 +877,14 @@ def run_git(args, cwd, env=None, ok=(0,)):
 def git_line(out):
     """A path git printed: its line, without the newline but with any spaces it ends with."""
     return out.rstrip("\n")
+
+
+def state_home():
+    return os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
+
+
+def fixtures_home():
+    return os.path.join(state_home(), "hoplon", "fixtures")
 
 
 def work_home():
@@ -1071,6 +1228,8 @@ STARTER_CONFIG = {
              "default_plugins: plugins (trusted commands) used when the profile doesn't list its own "
              "(--plugin adds more). "
              "endpoint_dirs, profile_dirs, skill_dirs, plugin_dirs: extra directories to search, after the ones here. "
+             "fixtures_dir: where /fixtures keeps real samples for the model's test runs (default: "
+             "~/.local/state/hoplon/fixtures); outside any project. "
              "Endpoints, profiles, skills and plugins must be blessed: hoplon --bless PATH",
     "default_profile": None,
     "default_endpoint": None,
@@ -1080,6 +1239,7 @@ STARTER_CONFIG = {
     "profile_dirs": [],
     "skill_dirs": [],
     "plugin_dirs": [],
+    "fixtures_dir": None,
 }
 
 
@@ -1101,6 +1261,10 @@ class Config:
             v = data.get(k, [])
             if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
                 raise HoplonError(f"config.json: {k} must be a list of strings")
+        fx = data.get("fixtures_dir")
+        if fx is not None and not (isinstance(fx, str) and fx.strip()):
+            raise HoplonError("config.json: fixtures_dir must be a directory or null")
+        self.fixtures_dir = os.path.abspath(os.path.expanduser(fx)) if fx else fixtures_home()
         self.default_profile = data.get("default_profile")
         self.default_endpoint = data.get("default_endpoint")
         self.default_skills = list(data.get("default_skills", []))
@@ -2786,6 +2950,18 @@ RUN_TOOL = _tool("run_in_sandbox", "Run ONE shell command (build, test, lint, tr
                  "look like secrets are hidden. Use it to check your work, then fix what fails.",
                  {"command": {"type": "string"}, "reason": _REASON}, ["command", "reason"])
 
+SAMPLES_TOOL = _tool("request_samples", "Ask the user for real samples your tests need from the live system (log "
+                     "lines, an API's responses, a command's output), when invented data won't do. You never get them "
+                     "yourself: the user makes them in their shell and puts them in a private samples folder, which "
+                     "run_in_sandbox then sees read-only at /fixtures once they approve it. Your turn ends here.",
+                     {"what": {"type": "string", "description": "What the samples are, and how many: for example "
+                               "'200 lines of /var/log/app.log, including a failed login'."},
+                      "files": {"type": "array", "items": {"type": "string"},
+                                "description": "The file names your tests will read under /fixtures."},
+                      "suggest": {"type": "string", "description": "Optional: a command the user could run to make "
+                                  "them, such as tail -n 200 /var/log/app.log > app.log."},
+                      "reason": _REASON}, ["what", "files", "reason"])
+
 # Offered only in a work session, in place of propose_plan and propose_command.
 WORK_PLAN_TOOL = _tool("propose_work_plan", "Propose the plan for this work session: the items, in order, each a "
                        "piece of the task you can finish and commit on its own. The user approves it before you start. "
@@ -3286,6 +3462,7 @@ class Kind:
 
 PROPOSAL_KINDS = {k.name: k for k in (       # every kind of proposal there is; a call for any other tool is invalid
     Kind("command", "propose_command", "build_command", "perform_command", shown=True),
+    Kind("samples", "request_samples", "build_samples", "perform_samples", shown=True),
     Kind("sandbox", "run_in_sandbox", "build_sandbox", "run_sandboxed", bulk=True),
     Kind("search", "search_files", "search_proposal", "perform_file", bulk=True),
     Kind("read", "read_file", "build_read", "perform_file", bulk=True),
@@ -3361,6 +3538,7 @@ class Engine:
         self.client = client or Client(endpoint, profile.params if profile else None)
         self.audit = cfg.audit
         self.wd = Workdir(os.getcwd())
+        self.fixtures = None     # this job's samples folder (Fixtures), made when first needed
         self.external = {}       # name -> tool schema registered by a wrapper
         self.counter = 0
         self.warned = False
@@ -3760,6 +3938,13 @@ class Engine:
                        removed=removed, problems=problems)
         self.work, self.wd = None, w.home
         self.box.root = os.path.realpath(w.home.root)
+        fx = getattr(self, "fixtures", None)
+        if fx and fx.used_in_work:
+            try:
+                fx.clear()
+                self.audit.log("fixtures_clear", dir=fx.dir, source="work_end")
+            except OSError as e:
+                self.ui.notice(f"the samples folder {fx.dir} could not be removed: {e}")
         self.session.held = None
         if w.before:
             self.approved_files.clear()
@@ -3890,7 +4075,8 @@ class Engine:
             return ([t for t in TOOLS if t["function"]["name"] not in ("propose_command", "propose_plan")]
                     + [SEARCH_TOOL, RUN_TOOL, WORK_PLAN_TOOL, FINISH_TOOL]
                     + ([RETRY_TOOL] if self.work.role == "review" else []))
-        return (TOOLS + ([SEARCH_TOOL] if self.can_search() else []) + ([RUN_TOOL] if self.can_run() else [])
+        return (TOOLS + ([SEARCH_TOOL] if self.can_search() else [])
+                + ([RUN_TOOL, SAMPLES_TOOL] if self.can_run() else [])
                 + [c.schema(host) for c in self.trusted_tools().values()]
                 + list(self.external.values()))
 
@@ -3907,6 +4093,13 @@ class Engine:
             trusted = (" Trusted commands (plugin__command tools) run on this host too: they read the live system."
                        if self.trusted_tools() else "")
             live, standins = WHERE_LIVE.replace("{host}", host).replace("{trusted}", trusted), WHERE_STANDINS
+        fx = getattr(self, "fixtures", None)
+        if fx and fx.approved and self.can_run():
+            runs += (" The user approved real samples for this job: run_in_sandbox sees them read-only in /fixtures. "
+                     "Commit only invented data, never a copy of them.")
+        elif self.can_run() and not self.work:
+            standins += (" If only real samples will do, ask with request_samples: the user makes them, and your runs "
+                         "see them read-only in /fixtures once approved.")
         return (WHERE_RULES.replace("{files}", "the copy of the project" if self.work else "the working directory")
                 .replace("{runs}", runs).replace("{live}", live)
                 .replace("{trusted_see}", "" if self.work or not self.trusted_tools() else " and what trusted commands return")
@@ -4141,6 +4334,20 @@ class Engine:
         p = Proposal(pid, "command", call_id, command=cmd, reason=reason)
         self.commands.append(p)
         return p
+
+    def build_samples(self, pid, call_id, args, reason, name):
+        what, files, suggest = args.get("what"), args.get("files"), args.get("suggest")
+        if self.work or not self.can_run():
+            raise ValueError("request_samples is not available now")
+        if not isinstance(what, str) or not what.strip():
+            raise ValueError("what is required")
+        if not isinstance(files, list) or not files or not all(isinstance(f, str) and f.strip() for f in files):
+            raise ValueError("files must list the file names your tests will read")
+        if suggest is not None and not isinstance(suggest, str):
+            raise ValueError("suggest must be a command, as text")
+        fx = self.fixtures_store()
+        return Proposal(pid, "samples", call_id, what=what, files=files[:20], suggest=suggest or "", reason=reason,
+                        folder=fx.dir)
 
     def build_sandbox(self, pid, call_id, args, reason, name):
         cmd = args.get("command")
@@ -4429,7 +4636,9 @@ class Engine:
                 p.auto, p.fields["approved_file"] = True, True
                 self.audit.log("auto_edit", id=p.id, kind=p.kind, path=p.fields["path"])
         for p in live:
-            if PROPOSAL_KINDS[p.kind].shown:
+            if p.kind == "samples":
+                self.ui.show_samples(p)
+            elif PROPOSAL_KINDS[p.kind].shown:
                 self.ui.show_command(p)
             elif p.auto:
                 p.decision = "accept"
@@ -4548,6 +4757,47 @@ class Engine:
 
     def perform_command(self, p):
         return "shown to the user, not run. If they run it, they may send you the output."
+
+    def perform_samples(self, p):
+        return ("shown to the user, not run: nothing runs for a sample request. Wait for them: once they have put the samples in the folder and approved them, "
+                "run_in_sandbox sees them read-only at /fixtures.")
+
+    def fixtures_store(self):
+        """This job's samples folder (not created until something is added)."""
+        if getattr(self, "fixtures", None) is None:
+            root = os.path.realpath(self.wd.root if not self.work else self.work.home.root)
+            self.fixtures = Fixtures(self.cfg.fixtures_dir, root, self.session.id or f"run-{os.getpid()}")
+        return self.fixtures
+
+    def fixtures_info(self):
+        fx = self.fixtures_store()
+        try:
+            rows = fx.scan(self.secrets())
+            problem = fx.problem()
+        except (HoplonError, OSError) as e:
+            rows, problem = [], str(e)
+        return {"dir": fx.dir, "files": rows, "digest": Fixtures.digest(rows), "approved": bool(fx.approved),
+                "problem": problem, "ask": FIXTURES_ASK}
+
+    def fixtures_action(self, action, source, paths=(), cwd=None, digest=None):
+        """add, use (approve exactly what was listed), drop (forget the approval) or clear (delete the folder)."""
+        fx = self.fixtures_store()
+        if action == "add":
+            names = fx.add(paths, cwd or os.getcwd())
+            self.audit.log("fixtures_add", files=names, dir=fx.dir, source=source)
+        elif action == "use":
+            rows = fx.approve(digest, self.secrets())
+            self.audit.log("fixtures_use", digest=digest, files=[[r["name"], r["size"], r["sha256"]] for r in rows],
+                           source=source)
+        elif action == "drop":
+            fx.approved = None
+            self.audit.log("fixtures_drop", source=source)
+        elif action == "clear":
+            fx.clear()
+            self.audit.log("fixtures_clear", dir=fx.dir, source=source)
+        else:
+            raise HoplonError("fixtures: unknown action", EXIT_USAGE, "bad_message")
+        return self.fixtures_info()
 
     def perform_plan(self, p):
         if p.decision != "accept" or not self.plan or self.plan["id"] != p.id:
@@ -4710,7 +4960,11 @@ class Engine:
             return f"not run: {why}"
         started = time.monotonic()
         try:
-            ran, rc, out, note = self.box.run(p.fields["command"], self.secrets(), timeout=left)
+            fx = self.fixtures_store()
+            mount = fx.mount(self.secrets())
+            if mount and self.work:
+                fx.used_in_work = True
+            ran, rc, out, note = self.box.run(p.fields["command"], self.secrets(), timeout=left, fixtures=mount)
         except KeyboardInterrupt:
             p.stopped = True
             self.audit.log("sandbox_exit", id=p.id, exit=None, stopped=True)
@@ -4933,6 +5187,13 @@ class PlainUI:
     def context(self, used, limit):
         pass
 
+    def show_samples(self, p):
+        f = p.fields
+        self.out.write(f"\n[samples requested {p.id}] {one_line(f['what'])[0]}\n"
+                       f"    files: {', '.join(one_line(x)[0] for x in f['files'])}\n"
+                       + (f"    suggested: {show_exact(f['suggest'])}\n" if f["suggest"] else ""))
+        self.out.flush()
+
     def show_command(self, p):
         self.out.write(f"\n[proposed command {p.id}] {one_line(p.fields['reason'])[0]}\n"
                        f"    {show_exact(p.fields['command'])}\n")
@@ -4990,6 +5251,16 @@ class TtyUI(PlainUI):
 
     def __init__(self, out=sys.stdout):
         super().__init__(out)
+
+    def show_samples(self, p):
+        f = p.fields
+        self.out.write(f"\n\033[1m▲→⊡ samples requested [{p.id}]\033[0m: {one_line(f['reason'])[0]}\n"
+                       f"{margin(f['what'])}\n"
+                       f"    files your tests will read in /fixtures: {', '.join(one_line(x)[0] for x in f['files'])}\n"
+                       + (f"    you could make them with:  {show_exact(f['suggest'])}\n" if f["suggest"] else "")
+                       + "\nMake them in your shell (scrub anything private), then :fixtures add FILE… and "
+                         ":fixtures use. The model never runs anything for this.\n")
+        self.out.flush()
 
     def show_command(self, p):
         cmd = show_exact(p.fields["command"])
@@ -5204,6 +5475,9 @@ class JsonUI:
     def context(self, used, limit):
         if used >= WARN_FRACTION * limit:
             self.emit({"type": "context", "used": used, "limit": limit})
+
+    def show_samples(self, p):
+        self.emit(p.event())
 
     def show_command(self, p):
         ev = p.event()
@@ -5436,6 +5710,7 @@ Commands (on an empty buffer):
   :attach PATH    attach a file to your next message
   :coding on|off  let the model read and list files here without asking
   :network [on|off]  the sandbox's network, for this session (on: each sandboxed run asks)
+  :fixtures [add FILE…|use|drop|clear]  real samples, read-only at /fixtures in sandboxed runs once you approve them
   :edits [ask|approved-files|reset]  approved-files: a further edit to a file you approved applies without asking
   :plan [clear]   show the approved plan and how far it has got, or drop it
   :work TASK      a work session: the model plans, then codes and tests on a git branch of its own without
@@ -5750,6 +6025,8 @@ class Repl:
                 info = self.e.edits_info()
                 print(f"edits: {info['mode']}" + ("" if info["mode"] == "ask" else
                       "; applied without asking: " + (", ".join(one_line(f)[0] for f in info["files"]) or "none yet")))
+            elif cmd == "fixtures":
+                self.do_fixtures(arg)
             elif cmd == "network":
                 if arg in ("on", "off"):
                     self.e.set_network(arg == "on")
@@ -5871,6 +6148,38 @@ class Repl:
         if kept:
             self.send("", self.attachments + [("the output of my :sh session, as I reviewed it", kept)])
 
+    def do_fixtures(self, arg):
+        words = shlex.split(arg) if arg else []
+        what = words[0] if words else ""
+        if what not in ("", "add", "use", "drop", "clear") or (what == "add") != (len(words) > 1):
+            print("usage: :fixtures, :fixtures add FILE…, :fixtures use, :fixtures drop or :fixtures clear")
+            return
+        if what == "clear" and not ask_yes("Delete the samples folder and everything in it?"):
+            return
+        if what == "use":
+            info = self.e.fixtures_info()
+            self.print_fixtures(info)
+            if not info["files"] or any(r["flag"] for r in info["files"]) or not ask_yes(FIXTURES_ASK):
+                print("Not approved." if info["files"] else "Nothing to approve.")
+                return
+            info = self.e.fixtures_action("use", ":fixtures", digest=info["digest"])
+        elif what:
+            info = self.e.fixtures_action(what, ":fixtures", words[1:], os.getcwd())
+        else:
+            info = self.e.fixtures_info()
+        self.print_fixtures(info)
+
+    @staticmethod
+    def print_fixtures(info):
+        print(f"samples folder: {info['dir']}" + (f"  ({info['problem']})" if info["problem"] else ""))
+        for r in info["files"]:
+            print(f"  {'✗' if r['flag'] else '·'} {show_exact(r['name'])}  {r['size']} bytes"
+                  + (f"  — can't be used: {r['flag']}" if r["flag"] else ""))
+        if not info["files"]:
+            print("  empty: :fixtures add FILE… copies files in")
+        print("approved: the model's sandboxed runs see them read-only at /fixtures" if info["approved"] else
+              "not approved: :fixtures use checks them and asks")
+
     def do_compact(self, edit):
         report = self.e.compact(
             edit_summary=(lambda s: edit_text(s, "Compaction summary", "what the model keeps of older turns",
@@ -5979,6 +6288,7 @@ def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()
     ui.emit({"type": "hello", "protocol": PROTOCOL, "version": VERSION,
              "host": socket.gethostname(), "user": user, "uid": uid, "remote": remote,
              "features": ["proposals", "decisions", "attach", "register_tools", "compact", "context", "coding",
+                          "fixtures",
                           "set_coding", "skills", "files", "read", "trace", "system", "plan", "network", "clear",
                           "models", "plugins", "interrupt", "edits", "stop", "digest", "work", "halt"],
              "endpoint": engine.endpoint.info(),
@@ -6117,6 +6427,21 @@ def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()
             if mode is not None:
                 engine.set_edits(mode, "wrapper")
             ui.emit({"type": "edits", **engine.edits_info()})
+        elif t == "fixtures":
+            action, paths, digest = msg.get("action"), msg.get("paths") or [], msg.get("digest")
+            if action not in (None, "add", "use", "drop", "clear") or not isinstance(paths, list) \
+                    or not all(isinstance(x, str) and x for x in paths) or (action == "add") != bool(paths) \
+                    or (action == "use" and not isinstance(digest, str)) or not isinstance(msg.get("cwd", ""), str):
+                ui.error("fixtures takes 'action' (add with 'paths' and 'cwd', use with the listing's 'digest', drop "
+                         "or clear), or nothing to list", "bad_message")
+                continue
+            try:
+                info = engine.fixtures_action(action, "wrapper", paths, msg.get("cwd"), digest) if action \
+                    else engine.fixtures_info()
+            except (HoplonError, OSError) as err:
+                ui.error(f"fixtures: {err}", getattr(err, "kind", None) or "fixtures")
+                info = engine.fixtures_info()
+            ui.emit({"type": "fixtures", **info})
         elif t == "network":
             on = msg.get("on")
             if on is not None and not isinstance(on, bool):

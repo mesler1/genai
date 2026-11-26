@@ -98,6 +98,12 @@ def view(st, w, sel):
         add([("project files ", Q), (fit("▲ yours, some edits don't ask", V), W)])
     else:
         add([("project files ", Q), (fit("▲ yours, edits ask", V), "")])
+    fx = st.get("fixtures")
+    if fx and fx.get("files"):
+        n = fx["files"]
+        add([("samples       ", Q), (fit(f"⊡ {n} file{'s' if n != 1 else ''} at /fixtures" if fx.get("approved")
+                                         else f"{n} file{'s' if n != 1 else ''}, not approved · /fixtures use", V),
+                                     D if fx.get("approved") else Q)])
     add([(fit("/sandbox shows the details", w), Q)])
     head("CONTEXT")
     ctx = st.get("context") or [None, None]

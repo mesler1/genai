@@ -124,6 +124,32 @@ says (`"network": true` starts it on, which blessing flags). While it is on, **e
 command asks first**, because code that can read the project and reach the network could send the
 project anywhere.
 
+**Real samples (`/fixtures`).** Sometimes a stand-in won't do: a parser should see real log lines.
+The model can't fetch them; it asks with `request_samples`, which shows a `▲→⊡ samples requested`
+card (what it needs, the file names its tests will read, and a command you could use to make them)
+and ends its turn. It never runs anything for this. You make the files on your side, scrub
+anything private, and then:
+
+- `/fixtures add FILE…` (`:fixtures add` in the REPL) copies them, regular files only, into a
+  private folder (mode 0700, files 0600) **outside the project**:
+  `~/.local/state/hoplon/fixtures/PROJECT-HASH/JOB/`, where JOB is the session. The root can be
+  changed with `fixtures_dir` in config.json; a root inside the project, or one that is or holds
+  your home directory, is refused.
+- `/fixtures use` runs the secret checks (secret-looking names, contents hoplon would redact,
+  links and other non-regular files) and, if nothing is flagged, asks you to approve exactly the
+  files listed, by a digest of their names, sizes and contents. Flagged files can't be approved:
+  scrub or replace them.
+- Once approved, each sandboxed run mounts the folder read-only at `/fixtures`, and the model is
+  told they are there and to commit only invented data. Before each run hoplon checks the files
+  still match what you approved; if anything changed, the approval is dropped and the run doesn't
+  happen until you approve again.
+- `/fixtures` lists the folder; `/fixtures drop` withdraws the approval; `/fixtures clear` deletes
+  the folder. The approval lasts while hoplon runs. The folder stays until you clear it, or until
+  a work session that used it ends.
+
+Test output from those runs goes to the model, so an approved sample may reach the model endpoint:
+that is what the approval question says. The info panel's WHERE section has a `samples` line.
+
 **Not in your home directory.** The sandbox never runs where coding mode is refused (your home
 directory, a directory above it, `~/.ssh` and other credential directories, hoplon's config
 directory), even with `--coding-anywhere`: the copy would hold everything there, and offline runs
