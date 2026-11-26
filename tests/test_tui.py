@@ -1,6 +1,8 @@
 """Tests for the TUI's conversation pane (tui/conversation.py). Run: python3 -m unittest discover -s tests"""
 
+import contextlib
 import importlib.machinery
+import io
 import importlib.util
 import json
 import os
@@ -35,6 +37,8 @@ IPC = load("ipc", os.path.join(REPO, "tui", "ipc.py"))
 REC = load("recorder", os.path.join(REPO, "tui", "recorder.py"))
 RAW = C.Model().feature("raw")
 F = importlib.import_module("features")
+P = importlib.import_module("palette")
+Dock = importlib.import_module("dock")
 G = load("hoplon_for_tui", os.path.join(REPO, "hoplon"))
 
 
@@ -45,6 +49,159 @@ def slurp(path):
 
 def text_of(block, w=60):
     return "\n".join("".join(t for t, _ in ln) for ln in block.lines(w))
+
+
+class FakeTmux:
+    """Just enough tmux for the dock: which window each pane is in, and pane options."""
+
+    def __init__(self, **panes):
+        self.win, self.opts, self.calls, self.n = dict(panes), {}, [], 10
+
+    def __call__(self, *a):
+        self.calls.append(a)
+        if a[0] == "display":
+            pane = a[a.index("-t") + 1]
+            if pane not in self.win:
+                return ""
+            return (self.win[pane] if a[-1] == "#{window_id}" else pane) + "\n"
+        if a[0] == "swap-pane":
+            s, t = a[a.index("-s") + 1], a[a.index("-t") + 1]
+            self.win[s], self.win[t] = self.win[t], self.win[s]
+        elif a[0] == "join-pane":
+            self.win[a[a.index("-s") + 1]] = self.win[a[a.index("-t") + 1]]
+        elif a[0] == "break-pane":
+            self.n += 1
+            self.win[a[a.index("-s") + 1]] = f"@{self.n}"
+        elif a[0] == "set" and "-pu" in a:
+            self.opts.pop(a[a.index("-t") + 1], None)
+        elif a[0] == "set":
+            self.opts[a[a.index("-t") + 1]] = a[-1]
+        return ""
+
+
+class TestDock(unittest.TestCase):
+    def dock(self):
+        t = FakeTmux(**{"%conv": "@0", "%info": "@0", "%slurm": "@5", "%top": "@6"})
+        d = Dock.Dock(t, "%conv", environ={})
+        d.add("info", "%info", 42, select=False)
+        return t, d
+
+    def test_one_tab_shows_its_title_and_toggles(self):
+        t, d = self.dock()
+        self.assertTrue(d.shown())
+        self.assertEqual(t.opts, {})                                    # one tab: no strip
+        d.toggle()
+        self.assertFalse(d.shown())
+        d.toggle()
+        self.assertTrue(d.shown())
+        self.assertIn(("join-pane", "-d", "-h", "-f", "-l", "42", "-s", "%info", "-t", "%conv"), t.calls)
+
+    def test_a_second_tab_swaps_in_and_the_first_keeps_running_parked(self):
+        t, d = self.dock()
+        d.add("slurm", "%slurm", 60)
+        self.assertEqual((d.active, t.win["%slurm"]), ("slurm", "@0"))
+        self.assertNotEqual(t.win["%info"], "@0")                       # parked, not closed
+        self.assertIn(("resize-pane", "-t", "%slurm", "-x", "60"), t.calls)
+        self.assertEqual(list(t.opts), ["%slurm"])                      # the strip is on the pane on screen
+        strip = t.opts["%slurm"]
+        self.assertLess(strip.index("info"), strip.index("slurm"))
+        self.assertIn("#[fg=#0E1113,bg=#D4A05A,bold] slurm ", strip)
+        d.next()
+        self.assertEqual((d.active, t.win["%info"]), ("info", "@0"))
+        self.assertIn("#[fg=#0E1113,bg=#D4A05A,bold] info ", t.opts["%info"])
+
+    def test_hiding_and_showing_keeps_the_active_tab(self):
+        t, d = self.dock()
+        d.add("slurm", "%slurm", 60)
+        d.hide()
+        self.assertFalse(d.shown())
+        d.show()
+        self.assertEqual((d.active, t.win["%slurm"]), ("slurm", "@0"))
+
+    def test_removing_the_tab_on_screen_brings_another_and_a_dead_pane_is_forgotten(self):
+        t, d = self.dock()
+        d.add("slurm", "%slurm", 60)
+        d.remove("slurm")
+        self.assertEqual((d.names(), d.active, t.win["%info"]), (["info"], "info", "@0"))
+        self.assertIn("%slurm", t.win)                                  # still running, parked
+        self.assertEqual(t.opts, {})
+        d.add("slurm", "%slurm", 60)
+        del t.win["%slurm"]                                             # its program ended
+        d.next()
+        self.assertEqual(d.names(), ["info"])
+
+    def test_names_must_be_safe_for_tmux(self):
+        t, d = self.dock()
+        self.assertFalse(d.add("#{evil}", "%top", 60))
+        self.assertFalse(d.add("info", "%top", 60))                     # once each
+        self.assertEqual(d.names(), ["info"])
+
+    def test_without_colour_the_active_tab_is_reversed(self):
+        t = FakeTmux(**{"%conv": "@0", "%info": "@0", "%slurm": "@5"})
+        d = Dock.Dock(t, "%conv", environ={"NO_COLOR": "1"})
+        d.add("info", "%info", 42, select=False)
+        d.add("slurm", "%slurm", 60)
+        self.assertIn("#[reverse] slurm #[default]", t.opts["%slurm"])
+        self.assertNotIn("fg=", t.opts["%slurm"])
+
+
+class TestPalette(unittest.TestCase):
+    class Curses:
+        A_DIM, A_BOLD, A_REVERSE, COLOR_YELLOW, COLOR_RED, COLOR_CYAN, COLOR_WHITE, COLOR_BLACK = 1, 2, 4, 3, 1, 6, 7, 0
+        error = Exception
+
+        def __init__(self, colors):
+            self.COLORS, self.pairs, self.grounds = colors, {}, {}
+
+        def use_default_colors(self):
+            pass
+
+        def has_colors(self):
+            return self.COLORS > 0
+
+        def init_pair(self, i, fg, bg):
+            self.pairs[i], self.grounds[i] = fg, bg
+
+        def color_pair(self, i):
+            return 1000 + i
+
+    def test_256_colours_use_the_design_codes(self):
+        c = self.Curses(256)
+        roles = P.roles(c, environ={})
+        self.assertEqual(sorted(c.pairs.values()), sorted([245, 179, 178, 109, 167, 179, 94, 230]))
+        self.assertEqual(c.pairs[list(P.ROLES).index("risk") + 1], 167)
+        self.assertEqual(set(roles), {"", *P.ROLES, *P.LOGO})
+        self.assertEqual([(c.pairs[i], c.grounds[i]) for i in (6, 7, 8)], [(179, -1), (94, 179), (230, 94)])
+        self.assertEqual(roles["mark"], c.color_pair(8) | c.A_BOLD)
+
+    def test_the_logo_is_a_centred_shield_and_an_outline_without_colour(self):
+        rows = P.logo("hoplon 1.0.0")
+        self.assertEqual(["".join(t for t, _ in r) for r in rows], ["▄▄▄▄▄", "█(H)█  hoplon 1.0.0", "▀▀▀▀▀"])
+        self.assertEqual([r for _, r in rows[0]], ["rim", "rim_field", "rim"])
+        roles = P.roles(self.Curses(256), environ={"NO_COLOR": "1"})
+        self.assertEqual((roles["rim"], roles["rim_field"], roles["mark"]), (0, 4, 2))   # reversed: ▄▀▀▀▄ … ▀▄▄▄▀
+
+    def test_16_and_8_colours_fall_back(self):
+        c = self.Curses(16)
+        P.roles(c, environ={})
+        self.assertEqual(c.pairs[1], 8)                                   # quiet: bright black
+        self.assertEqual((c.pairs[7], c.grounds[7]), (c.COLOR_BLACK, c.COLOR_YELLOW))   # the logo's field
+        c = self.Curses(8)
+        P.roles(c, environ={})
+        self.assertEqual((c.pairs[1], c.pairs[2]), (c.COLOR_WHITE, c.COLOR_YELLOW))
+
+    def test_no_color_keeps_only_bold_and_dim(self):
+        c = self.Curses(256)
+        roles = P.roles(c, environ={"NO_COLOR": "1"})
+        self.assertEqual(c.pairs, {})
+        self.assertEqual((roles["quiet"], roles["accent"], roles["waiting"]), (c.A_DIM, c.A_BOLD, 0))
+        self.assertEqual(P.tmux("bronze", bold=True, environ={"NO_COLOR": "1"}), "#[bold]")
+        self.assertEqual(P.tmux("patina", environ={"NO_COLOR": "1"}), "")
+        self.assertEqual(P.tmux("iron", "brass", bold=True, environ={}), "#[fg=#0E1113,bg=#E3B341,bold]")
+
+    def test_brass_bronze_and_ember_stay_apart_on_256_colours(self):
+        codes = [P.TOKENS[t][1] for t in ("bronze", "brass", "ember", "patina", "dim")]
+        self.assertEqual(len(set(codes)), len(codes))
 
 
 class TestText(unittest.TestCase):
@@ -179,6 +336,32 @@ class TestModel(unittest.TestCase):
         self.assertNotIn({"type": "clear"}, old.outbox)
         self.assertIn("only the screen", text_of(old.blocks[-1]))
 
+    def test_progress_says_what_is_arriving_and_the_turn_ends_with_its_rate(self):
+        notes = lambda m: "\n".join(text_of(b, 200) for b in m.blocks[-6:])
+        m = C.Model()
+        m.handle({"type": "hello", "endpoint": {}})
+        m.submit("go")
+        m.handle({"type": "progress", "phase": "thinking", "tokens": 3200})
+        self.assertEqual(m.doing, "thinking · ~3,200 tokens")
+        m.handle({"type": "text", "text": "Hello *"})
+        m.handle({"type": "progress", "phase": "text", "tokens": 2})
+        m.handle({"type": "text", "text": "*there**."})
+        self.assertEqual(sum(isinstance(b, C.Reply) for b in m.blocks), 1)      # one reply, not split
+        m.handle({"type": "progress", "phase": "tool", "tool": "write_file", "bytes": 18 * 1024,
+                  "path": "game/\x1b[2Jindex.html"})
+        self.assertEqual(m.doing, "writing game/\\x1b[2Jindex.html · 18 KB")      # the model's path, cleaned
+        m.handle({"type": "progress", "phase": "tool", "tool": "run_in_sandbox", "bytes": 300})
+        self.assertEqual(m.doing, "writing a run_in_sandbox call · 300 B")
+        self.assertEqual(m.snapshot()["doing"], m.doing)
+        m.handle({"type": "generated", "tokens": 1000, "estimated": True, "seconds": 20.0})
+        m.handle({"type": "generated", "tokens": 240, "estimated": False, "seconds": 12.6})
+        m.handle({"type": "done"})
+        self.assertIsNone(m.doing)
+        self.assertIn("+~1,240 tokens · 38 tok/s · 33 s", notes(m))
+        m.submit("again")
+        m.handle({"type": "done"})                                     # nothing generated: no line
+        self.assertEqual(notes(m).count("tokens"), 1)
+
     def test_reply_streams_into_one_block(self):
         m = C.Model()
         self.hello(m)
@@ -203,7 +386,7 @@ class TestModel(unittest.TestCase):
         m.submit("/decline")                                   # the latest
         self.assertEqual((m.cards["p2"].state, m.cards["p1"].state), ("declined", "shown"))
         self.assertEqual((m.cards["p2"].key, m.keyed(1).id), (None, "p1"))   # Alt+1 moves to what's still open
-        self.assertIn("p2 · command", text_of(m.cards["p2"]))
+        self.assertIn("p2 · ⊡→▲ your shell · command", text_of(m.cards["p2"]))
         self.assertNotIn("/run p2", text_of(m.cards["p2"]))
         m.submit("/decline p2")
         self.assertIn("p2 is declined", text_of(m.blocks[-1]))
@@ -248,7 +431,7 @@ class TestModel(unittest.TestCase):
         self.assertIsNone(m.cards["p2"].key)
         self.assertIsNone(m.keyed(10))
         head = text_of(m.cards["p11"])
-        self.assertIn("p11 · command · Alt+1", head)
+        self.assertIn("p11 · ⊡→▲ your shell · command · Alt+1", head)
         self.assertIn("click it, press Alt+1, or /run p11", head)
 
     def test_model_picker(self):
@@ -290,7 +473,7 @@ class TestModel(unittest.TestCase):
         m.shell_where = "OUTSIDE any sandbox, directly on this host"
         self.hello(m, remote=True, host="login1", user="svc")
         banner = text_of(m.blocks[0], 120)
-        self.assertIn("Approved commands run ON ANOTHER HOST, login1, over ssh", banner)
+        self.assertIn("Commands you approve run ON ANOTHER HOST, login1, over ssh", banner)
         self.assertNotIn("directly on this host", banner)
 
     def test_trusted_command_card_shows_what_ran_and_its_output(self):
@@ -303,7 +486,7 @@ class TestModel(unittest.TestCase):
         self.assertEqual(card.state, "running")
         m.handle({"type": "result", "id": "p1", "status": "ok", "output": "cn042|down*\x1b[2J", "exit": 0})
         text = text_of(card, 80)
-        self.assertIn("p1 · slurm · down_nodes · read-only", text)
+        self.assertIn("p1 · ▲ runs live · slurm · down_nodes · read-only", text)
         self.assertIn("$ sinfo -R -h", text)
         self.assertIn("│ cn042|down*\\x1b[2J", text)                     # output escaped, as everywhere
 
@@ -315,6 +498,17 @@ class TestModel(unittest.TestCase):
         m.handle({"type": "done", "reason": "reply", "context": {}})
         self.assertEqual(m.outbox[-1], {"type": "user", "text": "two"})
         self.assertTrue(m.busy)
+
+    def test_a_secret_looking_read_can_be_allowed_as_not_secret(self):
+        m = C.Model()
+        m.submit("go")
+        m.handle({"type": "proposal", "id": "p1", "kind": "read", "path": "ptop", "secret": True, "digest": "d1"})
+        m.handle({"type": "proposal", "id": "p2", "kind": "read", "path": "b", "digest": "d2"})
+        m.decide(True, not_secret=True)
+        m.decide(True, not_secret=True)                  # only a secret-looking read takes it
+        self.assertEqual(m.outbox[1:], [{"type": "decision", "id": "p1", "decision": "accept", "digest": "d1",
+                                         "not_secret": True},
+                                        {"type": "decision", "id": "p2", "decision": "accept", "digest": "d2"}])
 
     def test_approvals_go_in_order_and_cards_follow_results(self):
         m = C.Model()
@@ -478,6 +672,28 @@ class TestSandboxRuns(unittest.TestCase):
                   "sandbox": None, "coding": True, "runner": dict(self.RUNNER, **runner)})
         return m
 
+    def test_the_header_says_what_hoplon_is_doing_and_how_full_the_context_is(self):
+        m = C.Model()
+        self.assertEqual(m.tmux_header(), "")                       # nothing before hello
+        m.handle({"type": "hello", "version": "1", "session": "tui-ab#[x]",
+                  "endpoint": {"name": "work#{pane}", "model": "big-model", "base_url": "u"},
+                  "profile": {"name": "coder"}, "sandbox": None, "coding": False, "runner": self.RUNNER})
+        h = m.tmux_header()
+        self.assertNotIn("#{", h)                                   # names can't carry tmux formats
+        self.assertNotIn("#[x", h)
+        for want in ("workpane", "big-model", "coder", "tui-abx", "● ready", "chat", "──────── ctx"):
+            self.assertIn(want, h)
+        m.handle({"type": "context", "used": 75000, "limit": 100000})
+        m.handle({"type": "coding", "on": True})
+        h = m.tmux_header()
+        self.assertIn("#[fg=#E3B341]━━━━━━", h)                    # 75%: brass, 6 of 8
+        self.assertIn("75%", h)
+        self.assertIn("◆ coding", h)
+        m.handle({"type": "context", "used": 95000, "limit": 100000})
+        self.assertIn("#[fg=#E8776A]━━━━━━━━", m.tmux_header())    # 95%: ember
+        m.submit("go")
+        self.assertIn("● working", m.tmux_header())
+
     def test_banner_says_the_model_runs_things_offline(self):
         self.assertIn("offline", text_of(self.model().blocks[0], 200))
         self.assertIn("WITH the network", text_of(self.model(network=True).blocks[0], 200))
@@ -528,14 +744,21 @@ class TestSandboxRuns(unittest.TestCase):
         self.assertEqual(snap["runner"]["network"], True)
         PANEL = load("panel", os.path.join(REPO, "tui", "panel.py"))
         lines, _ = PANEL.view(snap, 42, None)
-        self.assertIn("model's  ready · ONLINE · dev:1", "\n".join("".join(t for t, _ in ln) for ln in lines))
+        self.assertIn("model's runs  ⊡ sandboxed · ONLINE", "\n".join("".join(t for t, _ in ln) for ln in lines))
         m.submit("go")
         m.submit("/network off")
         self.assertNotEqual(m.outbox[-1], {"type": "network", "on": False})   # waits until the reply ends
 
 
+def pane_name(title):
+    """A pane's name from its title: the first word, or "shell" for the shell pane, whose title says whether it is
+    live."""
+    return "shell" if "your shell" in title or title.startswith("shell") else title.split(" ")[0]
+
+
 class TestSandboxStatus(unittest.TestCase):
-    """The SANDBOX panel section, tmux's status line, a running card's clock, and stopping a run."""
+    """The WHERE panel section, the shell pane's title, tmux's status line, a running card's clock, and stopping
+    a run."""
     RUNNER = TestSandboxRuns.RUNNER
 
     def model(self, sandbox=None, runner=RUNNER, features=("interrupt",), remote=False):
@@ -558,25 +781,71 @@ class TestSandboxStatus(unittest.TestCase):
         return m.cards[pid]
 
     def test_panel_states(self):
-        self.assertIn("hoplon    in the podman sandbox", self.panel(self.model(sandbox={"name": "podman"})))
+        self.assertIn("hoplon itself ⊡ in the podman sandbox", self.panel(self.model(sandbox={"name": "podman"})))
         text = self.panel(self.model())
-        self.assertIn("hoplon    not sandboxed", text)
-        self.assertIn("model's  ready · offline · dev:1", text)
-        self.assertIn("model's  none", self.panel(self.model(runner=None)))
-        self.assertIn("model's  can't run: no podman", self.panel(self.model(runner=dict(self.RUNNER, problem="no podman"))))
+        self.assertIn("hoplon itself ▲ this host", text)
+        self.assertIn("model's runs  ⊡ sandboxed · offline\n              dev:1", text)
+        self.assertIn("model's runs  none", self.panel(self.model(runner=None)))
+        self.assertIn("model's runs  can't run: no podman",
+                      self.panel(self.model(runner=dict(self.RUNNER, problem="no podman"))))
         m = self.model()
         card = self.start(m)
         card.started -= 12
         text = self.panel(m)
-        self.assertIn("model's  RUNNING p3 · 12s", text)
+        self.assertIn("model's runs  ⊡ RUNNING p3 · 12s", text)
         self.assertIn("Ctrl-C or /stop stops it", text)
         m.handle({"type": "result", "id": "p3", "status": "ok", "detail": "exit 0"})
-        self.assertIn("model's  ready", self.panel(m))
+        self.assertIn("model's runs  ⊡ sandboxed", self.panel(m))
+
+    def test_project_files_say_whose_they_are(self):
+        text = self.panel(self.model())
+        self.assertTrue(text.startswith("WHERE\n"))                 # the session's details are in the header
+        self.assertIn("project files ▲ yours, edits ask", text)
+        PANEL = load("panel", os.path.join(REPO, "tui", "panel.py"))
+        for extra, want in (({"work": {"branch": "hoplon/work-3", "status": "s"}}, "project files ⊡ copy hoplon/work-3"),
+                            ({"edits": {"mode": "approved-files", "files": []}}, "project files ▲ yours, some edits")):
+            st = dict(self.model().snapshot(), **extra)
+            lines, _ = PANEL.view(st, 42, None)
+            self.assertIn(want, "\n".join("".join(t for t, _ in ln) for ln in lines))
+
+    def test_the_shell_title_says_whether_it_is_live(self):
+        m = self.model()
+        m.shell_where = "OUTSIDE any sandbox, directly on this host"
+        self.assertIn(f"▲ LIVE: your shell on {socket.gethostname()}#[default] · Ctrl-`", m.shell_title())
+        m.shell_where = "inside the podman sandbox"
+        self.assertIn("⊡ your shell, inside the podman sandbox", m.shell_title())
+        m = self.model(remote=True)
+        m.hello["host"] = "#[fg=red]evil#{host}"
+        m.shell_where = C.remote_where("x")
+        self.assertIn("▲ LIVE: your shell on fgredevilhost, over ssh", m.shell_title())   # no tmux format gets in
+        m.shell_where = "with unverified isolation"
+        self.assertTrue(m.shell_title().startswith("your shell, isolation unverified"))
+
+    def test_cards_name_where_they_act(self):
+        m = self.model()
+        for pid, ev, want in (("p1", {"kind": "edit", "path": "a.py"}, "⊡→▲ your files · edit a.py"),
+                              ("p2", {"kind": "edit", "path": "a.py", "work": True}, "⊡ the copy · edit a.py"),
+                              ("p3", {"kind": "command", "command": "ls"}, "⊡→▲ your shell · command"),
+                              ("p4", {"kind": "trusted", "plugin": "slurm", "command": "jobs"}, "▲ runs live · slurm"),
+                              ("p5", {"kind": "read", "path": "a.py"}, "─ p5 · read a.py"),
+                              ("p6", {"kind": "write", "path": "b.py", "in_copy": True}, "⊡ the copy · create b.py")):
+            m.handle(dict(ev, type="proposal", id=pid, reason="r"))
+            head = "".join(t for t, _ in m.cards[pid].lines(80)[1])
+            self.assertIn(want, head)
 
     def test_tmux_status_holds_only_fixed_words_and_a_checked_id(self):
         self.assertEqual(C.Model().tmux_status(), "")
-        self.assertIn("not sandboxed", self.model().tmux_status())
+        self.assertIn("⊡ model's runs sandboxed", self.model().tmux_status())
+        self.assertIn("▲ no sandbox", self.model(runner=None).tmux_status())
         self.assertIn("⊡ sandbox", self.model(sandbox={"name": "podman"}).tmux_status())
+        waiting = self.model(runner=None)
+        waiting.submit("go")
+        waiting.handle({"type": "proposal", "id": "p1", "kind": "write", "path": "a", "content": "x", "reason": "r",
+                        "digest": "d"})
+        self.assertIn("#[fg=#0E1113,bg=#E3B341,bold] ⏸ waiting for you", waiting.tmux_header())
+        self.assertNotIn("waiting", waiting.tmux_status())
+        waiting.decide(False)                                   # answered: no longer waiting
+        self.assertNotIn("waiting for you", waiting.tmux_header())
         m = self.model()
         card = self.start(m)
         card.started -= 5
@@ -584,7 +853,7 @@ class TestSandboxStatus(unittest.TestCase):
         m2 = self.model()
         self.start(m2, pid="#[fg=red]x")                       # not an id hoplon would send: left out
         status = m2.tmux_status()
-        self.assertNotIn("x", status.replace("fg=yellow", "").replace("#[default]", "").replace("box", ""))
+        self.assertNotIn("x", re.sub(r"#\[[^]]*\]", "", status).replace("box", ""))
         self.assertIn("⏵ sandbox 0s", status)
 
     def test_running_card_shows_its_clock_and_ends_stopped(self):
@@ -1277,6 +1546,255 @@ class TestRecorder(unittest.TestCase):
         self.assertTrue(m.busy)
 
 
+class TestSamplesAndLeftovers(unittest.TestCase):
+    """/fixtures and /leftovers: the feature lists and sends; only the core builds and answers the approval."""
+
+    def model(self):
+        m = C.Model()
+        m.handle({"type": "hello", "version": "1", "endpoint": {"name": "e", "model": "m", "base_url": "u"},
+                  "sandbox": None, "features": ["fixtures", "leftovers", "alerts", "shared"]})
+        m.outbox.clear()
+        return m
+
+    def answer(self, m, key):
+        import types
+        C.App.answer(types.SimpleNamespace(m=m), key)
+
+    def test_fixtures_use_asks_for_exactly_the_listed_digest(self):
+        m = self.model()
+        m.submit("/fixtures use")
+        self.assertEqual(m.outbox, [{"type": "fixtures"}])
+        m.handle({"type": "fixtures", "dir": "/s/p/j", "files": [{"name": "app.log", "size": 9, "flag": None}],
+                  "digest": "d1", "approved": False, "problem": None, "ask": "Use these samples?"})
+        self.assertEqual((m.ask["kind"], m.ask["digest"]), ("fixtures_use", "d1"))
+        self.assertIn("app.log", "".join(text_of(b) for b in m.blocks))
+        m.outbox.clear()
+        self.answer(m, "y")
+        self.assertEqual(m.outbox, [{"type": "fixtures", "action": "use", "digest": "d1"}])
+        self.assertIsNone(m.ask)
+
+    def test_flagged_samples_are_never_offered(self):
+        m = self.model()
+        m.submit("/fixtures use")
+        m.handle({"type": "fixtures", "dir": "/s", "files": [{"name": "k", "size": 1, "flag": "secret"}],
+                  "digest": "d1", "approved": False, "problem": None})
+        self.assertIsNone(m.ask)
+        self.assertIn("scrub or replace", text_of(m.blocks[-1]))
+
+    def test_a_samples_card_is_shown_and_asks_nothing(self):
+        m = self.model()
+        m.submit("hi")
+        m.handle({"type": "proposal", "id": "p1", "kind": "samples", "what": "200 log lines", "files": ["app.log"],
+                  "suggest": "tail -n 200 x > app.log", "reason": "real lines", "folder": "/s"})
+        card = m.cards["p1"]
+        self.assertEqual((card.state, m.pending), ("shown", []))
+        body = text_of(card)
+        self.assertIn("▲→⊡", body)
+        self.assertIn("/fixtures add", body)
+
+    def test_leftovers_clean_asks_then_sends_the_listed_ids(self):
+        m = self.model()
+        m.submit("/leftovers clean")
+        self.assertEqual(m.outbox, [{"type": "leftovers"}])
+        items = [{"id": "temp:1", "kind": "temp", "what": "a captured :sh session", "path": "/t/hoplon-sh-a",
+                  "bytes": 1, "age": 7200, "stale": "left over, 2 h old", "safe": True, "remove": "rm -rf -- /t/a",
+                  "note": ""},
+                 {"id": "work:2", "kind": "work", "what": "work session copy", "path": "/w/x", "bytes": 9,
+                  "age": 9, "stale": "its work session has ended", "safe": False, "remove": "rm -rf -- /w/x",
+                  "note": "it may hold commits"}]
+        m.handle({"type": "leftovers", "items": items})
+        text = "".join(text_of(b) for b in m.blocks)
+        self.assertIn("left over: 2 (2 likely stale)", text)
+        self.assertIn("! it may hold commits", text)
+        self.assertEqual((m.ask["kind"], m.ask["ids"]), ("leftovers_clean", ["temp:1"]))
+        m.outbox.clear()
+        self.answer(m, "n")
+        self.assertEqual(m.outbox, [])
+        m.ask_approval("leftovers_clean", {"ids": ["temp:1"]})
+        self.answer(m, "y")
+        self.assertEqual(m.outbox, [{"type": "leftovers", "action": "clean", "ids": ["temp:1"]}])
+
+
+class TestSessionName(unittest.TestCase):
+    def check(self, *argv, environ=None):
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, environ or {}), contextlib.redirect_stdout(out):
+            self.assertEqual(C.main(["--check", *argv]), 0)
+        return dict(ln.split("=", 1) for ln in out.getvalue().splitlines())
+
+    def test_a_name_is_made_up_unless_one_is_given(self):
+        home = tempfile.mkdtemp(prefix="hoplon-test-")
+        self.addCleanup(shutil.rmtree, home, True)
+        got = self.check("-e", "x", environ={"XDG_CONFIG_HOME": home})
+        self.assertRegex(got["new_session"], r"^tui-[a-z0-9]{6}$")
+        self.assertEqual(got["session_file"], os.path.join(home, "hoplon", "sessions", got["new_session"] + ".json"))
+        given = self.check("-S", "mine", environ={"XDG_CONFIG_HOME": home})
+        self.assertNotIn("new_session", given)
+        self.assertEqual(given["session_file"], os.path.join(home, "hoplon", "sessions", "mine.json"))
+        self.assertNotIn("session_file", self.check("--remote", "host.invalid"))     # remote has no sessions yet
+
+    def test_not_saved_with_no_save_or_save_sessions_false(self):
+        home = tempfile.mkdtemp(prefix="hoplon-test-")
+        self.addCleanup(shutil.rmtree, home, True)
+        env = {"XDG_CONFIG_HOME": home}
+        self.assertEqual(self.check("--no-save", environ=env), {})
+        os.makedirs(os.path.join(home, "hoplon"))
+        with open(os.path.join(home, "hoplon", "tui.json"), "w") as f:
+            json.dump({"save_sessions": False}, f)
+        self.assertEqual(self.check(environ=env), {})
+        self.assertIn("session_file", self.check("-S", "mine", environ=env))     # naming one always saves it
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            C.parse_args(["--no-save", "-S", "mine"])
+
+    def test_a_made_up_name_is_never_one_in_use(self):
+        where = tempfile.mkdtemp(prefix="hoplon-test-")
+        self.addCleanup(shutil.rmtree, where, True)
+        open(os.path.join(where, "tui-aaaaaa.json"), "w").close()
+        tries = iter(["aaaaaa", "bbbbbb"])
+        self.assertEqual(C.fresh_session(where, lambda: next(tries)), "tui-bbbbbb")
+
+
+class TestShared(unittest.TestCase):
+    """hoplon-share in the shell pane queues output for your next message; /shared lists and takes it back."""
+
+    def model(self):
+        m = C.Model([f for f in F.load(core=C.CORE) if f.name == "shared"])
+        m.sent = []
+        m.send = m.sent.append
+        return m
+
+    def test_shares_wait_for_the_next_message_with_their_notes(self):
+        m = self.model()
+        m.request({"type": "piped", "note": "the flaky one", "command": "make test", "rc": 2, "text": "FAIL x\n",
+                   "cwd": "/w"}, "pipe")
+        m.request({"type": "piped", "note": "", "command": None, "rc": None, "text": "a\nb\n"}, "pipe")
+        m.request({"type": "piped", "text": 5}, "pipe")                      # malformed: ignored
+        self.assertEqual(len(m.next_attachments), 2)
+        self.assertIn("2 waiting", text_of(m.blocks[-1]))
+        self.assertEqual(m.sent, [])                                         # nothing starts a turn
+        self.assertEqual(m.next_attachments[0]["label"],
+                         "shared from the shell pane: the flaky one — `make test` (exit 2) in /w")
+        self.assertIn("exit code unknown", m.next_attachments[1]["label"])
+        m.submit("/shared")
+        self.assertIn("the flaky one", "\n".join(text_of(b) for b in m.blocks[-4:]))
+        m.submit("/shared drop 2")
+        self.assertEqual(len(m.next_attachments), 1)
+        m.submit("/shared drop 9")
+        self.assertIn("usage", text_of(m.blocks[-1]))
+        m.hello = {"type": "hello"}
+        m.submit("what do you make of this?")
+        self.assertEqual([x["type"] for x in m.sent], ["attach", "user"])
+        self.assertEqual(m.sent[0]["text"], "FAIL x")
+        self.assertEqual(m.next_attachments, [])
+
+    def test_clear_and_the_panel_count(self):
+        m = self.model()
+        m.request({"type": "piped", "text": "x"}, "pipe")
+        view = {}
+        m.features[0].snapshot(m, view)
+        self.assertEqual(view["shared"], 1)
+        m.submit("/shared clear")
+        self.assertEqual(m.next_attachments, [])
+
+    def test_only_the_pipe_role_may_send_it(self):
+        hub_roles = C.feature_requests([f for f in F.load(core=C.CORE) if f.name == "shared"])
+        self.assertEqual(hub_roles, {"pipe": {"piped"}})
+
+
+class TestShareClient(unittest.TestCase):
+    """tui/share.py against a real socket: what it passes through, and what it sends."""
+
+    def setUp(self):
+        self.state = tempfile.mkdtemp(prefix="hs-", dir="/tmp")
+        self.addCleanup(shutil.rmtree, self.state, True)
+        self.hub = IPC.Hub(self.state, {"pipe": {"piped"}})
+        self.addCleanup(self.hub.close)
+
+    def run_share(self, args, stdin=None):
+        env = dict(os.environ, HOPLON_TUI_STATE=self.state)
+        r = subprocess.run([sys.executable, os.path.join(REPO, "tui", "share.py"), *args], input=stdin, env=env,
+                           capture_output=True, timeout=20)
+        msgs = []
+        while True:
+            try:
+                role, msg = self.hub.inbox.get(timeout=2)
+            except queue.Empty:
+                break
+            if role == "pipe":
+                msgs.append(msg)
+                break
+        return r, msgs
+
+    def test_piped_output_passes_through_and_is_sent_without_escapes(self):
+        r, msgs = self.run_share(["--note", "colours"], stdin=b"\x1b[31mred\x1b[0m line\nnext\n")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout, b"\x1b[31mred\x1b[0m line\nnext\n")            # your screen: unchanged
+        self.assertIn(b"2 lines queued for your next message", r.stderr)
+        self.assertEqual(msgs[0]["text"], "red line\nnext\n")
+        self.assertEqual((msgs[0]["note"], msgs[0]["command"], msgs[0]["rc"]), ("colours", None, None))
+
+    def test_a_command_is_run_and_its_exit_code_kept(self):
+        r, msgs = self.run_share(["--note", "n", "sh", "-c", "echo out; echo err >&2; exit 3"])
+        self.assertEqual(r.returncode, 3)
+        self.assertEqual(msgs[0]["rc"], 3)
+        self.assertEqual(sorted(msgs[0]["text"].split()), ["err", "out"])
+        self.assertEqual(msgs[0]["command"], "sh -c echo out; echo err >&2; exit 3")
+
+    def test_outside_hoplon_tui_it_says_so(self):
+        r = subprocess.run([sys.executable, os.path.join(REPO, "tui", "share.py")], input=b"x",
+                           env={k: v for k, v in os.environ.items() if k != "HOPLON_TUI_STATE"},
+                           capture_output=True, timeout=20)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn(b"only in hoplon-tui's shell pane", r.stderr)
+
+    def test_a_missing_command_is_127(self):
+        r, msgs = self.run_share(["no-such-command-zq91"])
+        self.assertEqual(r.returncode, 127)
+        self.assertEqual(msgs, [])
+
+
+class TestAlerts(unittest.TestCase):
+    def setUp(self):
+        self.home = tempfile.mkdtemp(prefix="hoplon-test-")
+        self.addCleanup(shutil.rmtree, self.home, True)
+
+    def feature(self, env=None, tui=None):
+        if tui is not None:
+            os.makedirs(os.path.join(self.home, "hoplon"), exist_ok=True)
+            with open(os.path.join(self.home, "hoplon", "tui.json"), "w") as f:
+                json.dump(tui, f)
+        alerts = importlib.import_module("features.alerts")
+        with mock.patch.dict(os.environ, dict({"XDG_CONFIG_HOME": self.home}, **(env or {}))):
+            os.environ.pop("HOPLON_TUI_ALERTS", None) if not env else None
+            return alerts.Alerts()
+
+    def run_polls(self, feature, cards):
+        import types
+        rang = []
+        app = types.SimpleNamespace(m=types.SimpleNamespace(pending=[]), bell=lambda: rang.append(1))
+        for ids in cards:
+            app.m.pending = [types.SimpleNamespace(id=i) for i in ids]
+            feature.poll(app)
+        return len(rang)
+
+    def test_the_bell_rings_once_per_card_as_it_starts_to_wait(self):
+        self.assertEqual(self.run_polls(self.feature(), [["p1"], ["p1"], ["p1", "p2"], []]), 2)
+
+    def test_off_in_tui_json_or_the_environment_or_by_command(self):
+        self.assertEqual(self.run_polls(self.feature(tui={"alerts": False}), [["p1"]]), 0)
+        self.assertEqual(self.run_polls(self.feature(env={"HOPLON_TUI_ALERTS": "off"}, tui={"alerts": True}),
+                                        [["p1"]]), 0)
+        self.assertTrue(self.feature(tui={"alerts": "no"}).on)          # malformed: the default
+        f = self.feature()
+        m = C.Model(features=[f])
+        f.core = C.CORE
+        m.submit("/alerts off")
+        self.assertIn("no bell", text_of(m.blocks[-1]))
+        self.assertEqual(self.run_polls(f, [["p1"]]), 0)
+        m.submit("/alerts sometimes")
+        self.assertIn("usage", text_of(m.blocks[-1]))
+
+
 class TestFeatures(unittest.TestCase):
     """tui/features: the registry, and switching features off."""
 
@@ -1298,17 +1816,17 @@ class TestFeatures(unittest.TestCase):
 
     def test_all_built_in_features_load(self):
         on = F.load(core=C.CORE)
-        self.assertEqual([f.name for f in on], ["model", "copy", "decline", "raw", "ssh", "files", "sandbox", "edits", "plugins", "work"])
+        self.assertEqual([f.name for f in on], ["model", "copy", "decline", "raw", "ssh", "files", "sandbox", "edits", "plugins", "work", "fixtures", "leftovers", "alerts", "shared"])
         m = C.Model()
         self.assertEqual([f.name for f in m.features], [f.name for f in on])
-        self.assertEqual(list(m.commands())[-10:], ["/model", "/copy", "/decline", "/raw", "/system", "/files", "/sandbox", "/edits", "/plugins", "/work"])
-        self.assertEqual(C.feature_requests(on), {"panel": {"models"}, "menu": {"model", "copy", "raw", "system"},
-                          "files": {"list", "view", "attach", "insert"}})
+        self.assertEqual(list(m.commands())[-14:], ["/model", "/copy", "/decline", "/raw", "/system", "/files", "/sandbox", "/edits", "/plugins", "/work", "/fixtures", "/leftovers", "/alerts", "/shared"])
+        self.assertEqual(C.feature_requests(on), {"menu": {"model", "models", "copy", "raw", "system"},
+                          "files": {"list", "view", "attach", "insert"}, "pipe": {"piped"}})
 
     def test_environment_disables_a_feature(self):
         m, warning = self.model(self.environ(HOPLON_TUI_DISABLE="copy, model"))
         self.assertIsNone(warning)
-        self.assertEqual([f.name for f in m.features], ["decline", "raw", "ssh", "files", "sandbox", "edits", "plugins", "work"])
+        self.assertEqual([f.name for f in m.features], ["decline", "raw", "ssh", "files", "sandbox", "edits", "plugins", "work", "fixtures", "leftovers", "alerts", "shared"])
         m.submit("/copy")
         self.assertIn("unknown command /copy (/help lists them)", text_of(m.blocks[-1]))
         m.submit("/help")
@@ -1324,7 +1842,7 @@ class TestFeatures(unittest.TestCase):
         self.write_config('{"disable": ["decline", "raw"]}')
         m, warning = self.model(self.environ())
         self.assertIsNone(warning)
-        self.assertEqual([f.name for f in m.features], ["model", "copy", "ssh", "files", "sandbox", "edits", "plugins", "work"])
+        self.assertEqual([f.name for f in m.features], ["model", "copy", "ssh", "files", "sandbox", "edits", "plugins", "work", "fixtures", "leftovers", "alerts", "shared"])
         m.submit("/decline")
         self.assertIn("unknown command /decline", text_of(m.blocks[-1]))
 
@@ -1336,7 +1854,7 @@ class TestFeatures(unittest.TestCase):
         for text in ("{not json", '{"disable": "copy"}', '["copy"]', '{"disable": [1]}'):
             self.write_config(text)
             m, warning = self.model(self.environ())
-            self.assertEqual(len(m.features), 10, text)
+            self.assertEqual(len(m.features), 14, text)
             self.assertIn("was ignored, so every feature is on", warning)
 
     def test_the_hub_refuses_the_requests_of_a_disabled_feature(self):
@@ -1727,8 +2245,9 @@ class TestInTmux(TmuxCase):
 class TestHoplonTui(TmuxCase):
     """tui/hoplon-tui itself: the conversation pane above a real bash pane, started through a pseudo-terminal."""
 
-    def start(self, api, editor="true", path=None, args="-e test", keep_home=False):
+    def start(self, api, editor="true", path=None, args="-e test", keep_home=False, out=None):
         home = self.home if keep_home else self.config(api)      # keep_home: the test made self.home with config()
+        self.home = home
         if not args:        # hoplon then finds the endpoint the way a bare `hoplon` does
             conf = dict(G.STARTER_CONFIG, default_endpoint="test")
             G.write_private(os.path.join(home, "config.json"), json.dumps(conf))
@@ -1750,7 +2269,7 @@ class TestHoplonTui(TmuxCase):
         env.pop("TMUX", None)
         self.proc = subprocess.Popen(["script", "-qfc", f"stty cols 110 rows 40; {REPO}/tui/hoplon-tui {args}",
                                       "/dev/null"], cwd=self.wd, env=env, stdin=subprocess.PIPE,
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                     stdout=out or subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.addCleanup(lambda: (self.tmux("kill-server"), self.proc.wait(10)))
         end = time.time() + 10
         while time.time() < end and not {"hoplon", "you", "shell"} <= set(self.panes()):
@@ -1759,7 +2278,7 @@ class TestHoplonTui(TmuxCase):
 
     def panes(self):
         out = self.tmux("list-panes", "-a", "-F", "#{pane_id} #{@hoplon_title}")
-        return {t.split(" ")[0]: p for p, _, t in (ln.partition(" ") for ln in out.splitlines())}
+        return {pane_name(t): p for p, _, t in (ln.partition(" ") for ln in out.splitlines())}
 
     def screen(self, pane=None):
         """One pane, or the conversation and the prompt pane together."""
@@ -1778,6 +2297,10 @@ class TestHoplonTui(TmuxCase):
         time.sleep(C_PROMPT.SETTLE + 0.1)
         self.tmux("send-keys", "-t", self.panes()["you"], k)
 
+    def header(self):
+        """Rows above the panes: the header, tmux's status line at the top."""
+        return 1 if self.tmux("show", "-gv", "status-position").strip() == "top" else 0
+
     def at_terminal(self, keys):
         """Keys typed at the terminal itself, so they reach tmux (and its menus) first."""
         self.proc.stdin.write(keys.encode())
@@ -1789,7 +2312,7 @@ class TestHoplonTui(TmuxCase):
         y = next(i for i, ln in enumerate(self.screen(pane).splitlines()) if text in ln)
         top, left = (int(v) for v in self.tmux("display", "-p", "-t", self.panes()[pane],
                                                  "#{pane_top} #{pane_left}").split())
-        at = f"{button};{left + 5};{top + y + 1}"
+        at = f"{button};{left + 5};{top + y + 1 + self.header()}"
         self.at_terminal(f"\x1b[<{at}M")
         time.sleep(hold)
         self.at_terminal(f"\x1b[<{at}m")
@@ -1800,6 +2323,34 @@ class TestHoplonTui(TmuxCase):
 
     def sent(self, api):
         return [m for m in api.requests[-1]["body"]["messages"] if m["role"] == "user"][-1]["content"]
+
+    def test_hoplon_share_queues_output_for_the_next_message(self):
+        with FakeAPI([reply("looked at both")]) as api:
+            self.start(api)
+            self.shell("printf 'first-zq91\\n' | hoplon-share --note 'the first'")
+            self.wait_for("the first")
+            self.shell("hoplon-share --note 'the second' sh -c 'echo second-zq91; exit 4'")
+            self.wait_for("2 waiting")
+            self.assertEqual(api.requests, [])                     # nothing started a turn
+            self.type("what do you make of these?")
+            self.wait_for("looked at both")
+        body = json.dumps(api.requests[-1]["body"]["messages"])
+        for seen in ("first-zq91", "second-zq91", "the first", "the second", "(exit 4)"):
+            self.assertIn(seen, body)
+
+    def test_a_conversation_is_kept_in_a_session_and_the_way_back_is_shown(self):
+        out = open(os.path.join(self.tmp, "launcher.out"), "w+")
+        self.addCleanup(out.close)
+        with FakeAPI([reply("noted")]) as api:
+            self.start(api, out=out)
+            self.type("remember this")
+            self.wait_for("noted")
+            self.type("/quit")
+            self.proc.wait(15)
+        out.seek(0)
+        said = re.findall(r"Resume this conversation: hoplon-tui -e test -S (tui-[a-z0-9]{6})", out.read())
+        self.assertEqual(len(said), 1, out.read())
+        self.assertTrue(os.path.isfile(os.path.join(self.home, "sessions", said[0] + ".json")))
 
     def test_a_sandboxed_run_shows_it_is_running_and_ctrl_c_stops_it(self):
         from test_sandbox_runner import FAKE_PODMAN
@@ -1824,7 +2375,7 @@ class TestHoplonTui(TmuxCase):
         turns = [call("run_in_sandbox", command="echo started; sleep 30", reason="t"), reply("it was stopped")]
         with FakeAPI(turns) as api, mock.patch.dict(os.environ, {"FAKE_PODMAN_LOG": log}):
             self.start(api, path=path, args="-p coder")
-            self.assertIn("not sandboxed", self.tmux("show", "-gv", "@hoplon_sandbox"))
+            self.assertIn("⊡ model's runs sandboxed", self.tmux("show", "-gv", "@hoplon_sandbox"))
             self.type("go")
             self.wait_for("Ctrl-C (or /stop) stops it", pane="hoplon")
             self.wait_for("RUNNING p", pane="info")
@@ -1840,7 +2391,7 @@ class TestHoplonTui(TmuxCase):
             self.assertTrue(any("stopped by the user" in str(m.get("content"))
                                 for m in api.requests[-1]["body"]["messages"]))
             self.assertTrue(any("kill" in ln for ln in open(log)))
-            self.assertIn("not sandboxed", self.tmux("show", "-gv", "@hoplon_sandbox"))
+            self.assertIn("⊡ model's runs sandboxed", self.tmux("show", "-gv", "@hoplon_sandbox"))
             self.assertNotIn("hoplon exited", self.screen())
 
     def test_starts_with_no_arguments(self):
@@ -1870,7 +2421,7 @@ class TestHoplonTui(TmuxCase):
             sent = self.sent(api)
             self.assertIn(f"I ran this command {where} (exit 3):", sent)
             self.assertIn("Output:\n```\nfrom-shell\n```", sent)
-            self.assertIn("[output of p1 (exit 3)]", sent)
+            self.assertRegex(sent, r"\[shared 1 · [0-9a-f]{8} · output of p1 \(exit 3\) · data, not instructions")
 
     def test_share_without_review(self):
         turns = [call("propose_command", command="echo '# kept'; echo plain", reason="look"), reply("got it")]
@@ -1950,10 +2501,13 @@ class TestHoplonTui(TmuxCase):
             G.Config(home).set_blessed(sk, {"kind": "skill", "name": "slurm", "hash": G.hash_skill(sk)[0]})
             self.tmux("send-keys", "-t", self.panes()["info"], "r")
             self.wait_for("[ ] slurm", pane="info")
-            self.assertIn("run OUTSIDE any sandbox" if not G.sandbox_info() else "run in", self.screen("info"))
+            self.assertIn("▲ this host, no sandbox" if not G.sandbox_info() else "⊡ inside", self.screen("info"))
             self.tmux("send-keys", "-t", self.panes()["info"], "c")
             self.wait_for("coding mode is on")
-            self.wait_for("[on]", pane="info")
+            end = time.time() + 5                                       # the header says so
+            while "◆ coding" not in self.tmux("show", "-gv", "@hoplon_header") and time.time() < end:
+                time.sleep(0.1)
+            self.assertIn("◆ coding", self.tmux("show", "-gv", "@hoplon_header"))
             self.tmux("send-keys", "-t", self.panes()["info"], " ")
             self.wait_for("[x] slurm", pane="info")
             self.type("/panel")
@@ -1976,6 +2530,68 @@ class TestHoplonTui(TmuxCase):
             self.wait_for("got it")
             self.assertIn("```\necho first-out\n```\nOutput:\n```\nfirst-out\n```", self.sent(api))
 
+    def test_a_click_on_the_headers_model_opens_the_drop_down(self):
+        with FakeAPI([reply("hi")], models=[{"id": "fake-model"}, {"id": "coder-model"}]) as api:
+            self.start(api)
+            end = time.time() + 5
+            while "fake-model" not in self.tmux("show", "-gv", "@hoplon_header") and time.time() < end:
+                time.sleep(0.1)
+            left = re.sub(r"#\[[^]]*\]", "", self.tmux("display", "-p", "#{T:status-left}"))
+            col = left.index("fake-model") + 2                      # 1-based, a character into the name
+            asked = lambda: [r for r in api.requests if r["path"].endswith("/models")]
+            before = len(asked())
+            self.at_terminal(f"\x1b[<0;{col};1M")
+            time.sleep(0.2)
+            self.at_terminal(f"\x1b[<0;{col};1m")
+            end = time.time() + 5
+            while len(asked()) == before and time.time() < end:
+                time.sleep(0.1)
+            self.assertGreater(len(asked()), before)                # /model asked hoplon for the server's list
+            self.at_terminal("q")
+
+    def layout_profile(self, layout):
+        plain = self.config
+
+        def config(api):                                   # and a blessed profile with that layout
+            home = plain(api)
+            prof = os.path.join(home, "profiles", "laid.json")
+            os.makedirs(os.path.dirname(prof), exist_ok=True)
+            with open(prof, "w") as f:
+                json.dump({"name": "laid", "endpoint": "test", "layout": layout}, f)
+            G.Config(home).set_blessed(prof, {"kind": "profile", "name": "laid", "hash": G.hash_file(prof)})
+            return home
+        self.config = config
+
+    def beside(self):
+        """The names of the panes on screen, in the conversation's window."""
+        out = self.tmux("list-panes", "-t", self.panes()["hoplon"], "-F", "#{@hoplon_title}")
+        return {pane_name(t) for t in out.splitlines()}
+
+    def wait_beside(self, name, shown=True):
+        end = time.time() + 5
+        while (name in self.beside()) != shown and time.time() < end:
+            time.sleep(0.1)
+        self.assertEqual(name in self.beside(), shown, self.beside())
+
+    def test_the_profile_lays_out_the_panes(self):
+        self.layout_profile({"files": "shown", "panel": "hidden", "shell": "shown"})
+        with FakeAPI([reply("hi")]) as api:
+            self.start(api, args="-p laid")
+            self.wait_beside("files")
+            self.wait_beside("info", shown=False)
+            self.wait_beside("shell")
+            self.type("/files")                                 # and /files still switches it
+            self.wait_beside("files", shown=False)
+
+    def test_the_command_line_wins_over_the_profiles_layout(self):
+        self.layout_profile({"panel": "shown", "files": "hidden"})
+        with FakeAPI([reply("hi")]) as api:
+            self.start(api, args="-p laid --no-panel --files")
+            self.wait_for("Type a message")
+            time.sleep(0.5)
+            self.assertNotIn("info", self.beside())
+            self.assertIn("files", self.beside())
+
     def test_switch_model_from_the_drop_down(self):
         with FakeAPI([reply("from fake"), reply("from coder")],
                      models=[{"id": "fake-model"}, {"id": "coder-model", "max_model_len": 65536}]) as api:
@@ -1987,7 +2603,10 @@ class TestHoplonTui(TmuxCase):
             env = dict(os.environ, HOPLON_TUI_STATE=self.runtime_state())
             subprocess.run([sys.executable, os.path.join(REPO, "tui", "request.py"), "model", "1"], env=env, check=True)
             self.wait_for("model: coder-model from your next message")
-            self.wait_for("coder-model ▾", pane="info")
+            end = time.time() + 5                                       # the header names it
+            while "coder-model" not in self.tmux("show", "-gv", "@hoplon_header") and time.time() < end:
+                time.sleep(0.1)
+            self.assertIn("coder-model", self.tmux("show", "-gv", "@hoplon_header"))
             self.type("and now?")
             self.wait_for("from coder")
             self.assertEqual([r["body"]["model"] for r in api.requests if r.get("body")], ["fake-model", "coder-model"])
@@ -2040,7 +2659,7 @@ class TestHoplonTui(TmuxCase):
             self.shell("exit")                                            # back here: commands run here again
             time.sleep(0.5)
             self.type("/run p1")
-            self.wait_for("directly on this host")
+            self.wait_for("It runs OUTSIDE any sandbox")                # here again, not on the other host
             self.key("n")
 
     def test_plain_ssh_is_not_followed_and_says_how(self):
@@ -2118,28 +2737,68 @@ class TestHoplonTui(TmuxCase):
             self.assertIn("You are hoplon", slurp(seen))
             self.assertEqual([n for n in os.listdir(self.runtime_state()) if n.startswith("raw-")], [])
 
+    def slurm_home(self, api):
+        """A config with the Slurm plugin on, blessed, over fake sinfo, squeue and scontrol."""
+        home = self.config(api)
+        fake = os.path.join(self.tmp, "slurm-bin")
+        os.mkdir(fake, 0o755)
+        nodes = "c001|batch*|idle|0/32/0/32|192000|none\nc002|batch*|drained|0/0/32/32|192000|bad DIMM\n"
+        for prog, body in (("sinfo", f'case "$*" in *-N*) printf "{nodes}";; *-s*) echo "batch*|up|1:00:00|2|0/1/1/2|0/32/32/64";; esac'),
+                           ("squeue", 'echo "7|batch|train|alice|RUNNING|1:00|1|c001"'),
+                           ("scontrol", 'echo "NodeName=$3 State=DRAIN Reason=bad_DIMM"')):
+            with open(os.path.join(fake, prog), "w") as f:
+                f.write("#!/bin/sh\n" + body + "\n")
+            os.chmod(os.path.join(fake, prog), 0o755)
+        pdir = os.path.join(home, "plugins", "slurm")
+        shutil.copytree(os.path.join(REPO, "plugins", "slurm"), pdir)
+        with open(os.path.join(pdir, "plugin.json")) as f:
+            manifest = json.load(f)
+        manifest["search"] = [fake]
+        with open(os.path.join(pdir, "plugin.json"), "w") as f:
+            json.dump(manifest, f)
+        G.Config(home).set_blessed(pdir, {"kind": "plugin", "name": "slurm", "hash": G.hash_skill(pdir)[0]})
+        G.write_private(os.path.join(home, "config.json"), json.dumps(dict(G.STARTER_CONFIG, default_plugins=["slurm"])))
+        return home
+
+    def test_plugin_panes_are_tabs_in_the_right_column(self):
+        with FakeAPI([reply("ok")]) as api:
+            self.home = self.slurm_home(api)
+            self.start(api, args="-e test", keep_home=True)
+            self.wait_beside("info")
+            self.type("/plugins slurm pane")
+            self.wait_beside("slurm")
+            self.wait_beside("info", shown=False)                      # it gave the slurm pane its place
+            strip = self.tmux("show", "-pv", "-t", self.panes()["slurm"], "@hoplon_tabs")
+            self.assertIn(" info ", strip)
+            self.assertIn(" slurm ", strip)
+            self.type("/tab")                                           # the next one, round to the first
+            self.wait_beside("info")
+            self.wait_beside("slurm", shown=False)
+            env = dict(os.environ, HOPLON_TUI_STATE=self.runtime_state())
+            subprocess.run([sys.executable, os.path.join(REPO, "tui", "request.py"), "tab", "1"], env=env, check=True)
+            self.wait_beside("slurm")                                   # the tab menu's second item
+            self.wait_for("bad DIMM", pane="slurm", timeout=15)         # it kept running while parked
+            self.type("/panel")
+            self.wait_beside("slurm", shown=False)
+            self.type("/panel")
+            self.wait_beside("slurm")                                   # back with the tab that was on screen
+            self.type("/plugins slurm pane")                            # on screen: it leaves the column
+            self.wait_beside("info")
+            self.assertNotIn("@hoplon_tabs", self.tmux("show", "-p", "-t", self.panes()["info"]))
+            self.type("/plugins slurm pane")
+            self.wait_beside("slurm")
+            left, top = self.tmux("display", "-p", "-t", self.panes()["slurm"], "#{pane_left} #{pane_top}").split()
+            x, y = int(left) + 5, int(top) + 1                          # 1-based: its top border, under the header
+            self.at_terminal(f"\x1b[<0;{x};{y}M")
+            time.sleep(0.2)
+            self.at_terminal(f"\x1b[<0;{x};{y}m")
+            time.sleep(0.8)
+            self.at_terminal("1")                                       # the menu's first tab
+            self.wait_beside("info")
+
     def test_the_slurm_console_runs_its_commands_through_hoplon(self):
         with FakeAPI([reply("ok")]) as api:
-            home = self.config(api)
-            fake = os.path.join(self.tmp, "slurm-bin")
-            os.mkdir(fake, 0o755)
-            nodes = "c001|batch*|idle|0/32/0/32|192000|none\nc002|batch*|drained|0/0/32/32|192000|bad DIMM\n"
-            for prog, body in (("sinfo", f'case "$*" in *-N*) printf "{nodes}";; *-s*) echo "batch*|up|1:00:00|2|0/1/1/2|0/32/32/64";; esac'),
-                               ("squeue", 'echo "7|batch|train|alice|RUNNING|1:00|1|c001"'),
-                               ("scontrol", 'echo "NodeName=$3 State=DRAIN Reason=bad_DIMM"')):
-                with open(os.path.join(fake, prog), "w") as f:
-                    f.write("#!/bin/sh\n" + body + "\n")
-                os.chmod(os.path.join(fake, prog), 0o755)
-            pdir = os.path.join(home, "plugins", "slurm")
-            shutil.copytree(os.path.join(REPO, "plugins", "slurm"), pdir)
-            with open(os.path.join(pdir, "plugin.json")) as f:
-                manifest = json.load(f)
-            manifest["search"] = [fake]
-            with open(os.path.join(pdir, "plugin.json"), "w") as f:
-                json.dump(manifest, f)
-            G.Config(home).set_blessed(pdir, {"kind": "plugin", "name": "slurm", "hash": G.hash_skill(pdir)[0]})
-            G.write_private(os.path.join(home, "config.json"), json.dumps(dict(G.STARTER_CONFIG, default_plugins=["slurm"])))
-            self.home = home
+            self.home = self.slurm_home(api)
             self.start(api, args="-e test --no-panel", keep_home=True)
             self.type("/plugins slurm pane")
             end = time.time() + 15
@@ -2235,6 +2894,10 @@ class TestHoplonTui(TmuxCase):
             self.key("a")
             self.wait_for("Allow p3: edit a.txt?")                     # the read didn't ask; the edit does
             self.assertIn("step 2 of the plan", self.screen())
+            end = time.time() + 5                                       # the header says so too
+            while "waiting for you" not in self.tmux("show", "-gv", "@hoplon_header") and time.time() < end:
+                time.sleep(0.1)
+            self.assertIn("⏸ waiting for you", self.tmux("show", "-gv", "@hoplon_header"))
             self.key("y")
             self.wait_for("p4 finished (exit 0). Share the output")    # run without another question
             self.assertIn("planned-new", self.screen("shell"))
@@ -2257,7 +2920,7 @@ class TestHoplonTui(TmuxCase):
                 self.shell(c)
             y = next(i for i, ln in enumerate(self.screen("shell").splitlines()) if ln.endswith("echo in-context"))
             top = int(self.tmux("display", "-p", "-t", sh, "#{pane_top}"))
-            self.at_terminal(f"\x1b[<2;5;{top + y + 1}M")
+            self.at_terminal(f"\x1b[<2;5;{top + y + 1 + self.header()}M")
             time.sleep(0.5)
             self.at_terminal("m")
             time.sleep(0.5)
@@ -2298,7 +2961,7 @@ class TestHoplonTui(TmuxCase):
     def window(self):
         """Titles of the visible panes, top to bottom, and which one is active."""
         rows = self.tmux("list-panes", "-t", "hoplon:0", "-F", "#{pane_top} #{pane_left} #{pane_active} #{@hoplon_title}")
-        rows = sorted((int(t), int(lf), a, title.split(" ")[0]) for t, lf, a, title in
+        rows = sorted((int(t), int(lf), a, pane_name(title)) for t, lf, a, title in
                       (ln.split(" ", 3) for ln in rows.splitlines()))
         return [r[3] for r in rows if r[1] == 0], next(r[3] for r in rows if r[2] == "1")
 

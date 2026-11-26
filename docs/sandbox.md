@@ -82,11 +82,38 @@ The model then has a `run_in_sandbox` tool. Each command runs in a rootless podm
 An offline run needs no approval: you see the command, then its exit code and output, and so does
 the model. Ctrl-C stops it and ends the turn. Every run is in the audit log, by fingerprint.
 
-**Seeing it in hoplon-tui.** The info panel has a SANDBOX section: whether hoplon itself runs in a
-sandbox (`in the podman sandbox`, green, or `not sandboxed`, the usual way to run it, from `hello`'s `sandbox`), and
-the model's sandbox: `none`, `ready · offline` or `ONLINE` with its image, `can't run: …`, or
-`RUNNING p3 · 12s` while a run is going. tmux's status line says `⊡ sandbox` or `not sandboxed`,
-and `⏵ sandbox p3 12s` during a run. A running card counts its seconds. Ctrl-C on an
+**What the model is told.** Whenever someone can see what runs, the system prompt has a "Where
+things are" section, built from how this session is set up: what its file tools see, whether
+`run_in_sandbox` is there and what it can't see (the network, your home, secret-looking files),
+that commands it proposes and trusted commands run on the live system, and that it sees that
+system only through what you share. So when a task depends on something live, such as logs, a
+server or a cluster's tools, the model plans stand-ins first: a small sample you save into the
+project, invented data, a fake server the test starts on `127.0.0.1`, or a stub command. In a
+work session it is told the live system is out of reach for the whole session. This guides the
+model; it enforces nothing, and the limits above hold whatever it is told.
+
+**Seeing it in hoplon-tui.** The info panel's WHERE section has a line for each thing that runs or
+changes, marked ⊡ (green) where it is isolated and ▲ where it is live:
+
+- `model's runs`: the model's own builds and tests. `⊡ sandboxed · offline` (or `ONLINE`) with its
+  image, `⊡ RUNNING p3 · 12s` during a run, `can't run: …`, or `none` when the profile has no sandbox
+  and the model's commands are only proposed.
+- `your commands`: the commands you approve, which run in your shell. Usually `▲ this host, no sandbox`.
+- `hoplon itself`: `▲ this host`, the usual way to run it, or `⊡ in the podman sandbox` under
+  `sandbox/run`.
+- `project files`: `▲ yours, edits ask`; `▲ yours, some edits don't ask` once you have let edits to
+  some files apply without asking; or `⊡ copy hoplon/work-3` during a work session, which changes a
+  copy on its own branch.
+
+The shell pane's title says the same about your shell: `▲ LIVE: your shell on HOST` (`, over ssh`
+in remote mode), or `⊡ your shell, inside the podman sandbox`.
+A card names where approving it acts: `⊡→▲ your files` for an edit or write (`⊡ the copy` in a work
+session), `⊡→▲ your shell` for a command, `▲ runs live` for a trusted command and `⊡ a throwaway run`
+for a sandboxed one. The arrow marks a crossing from what the model sees to your side. The REPL puts
+the same tags before each proposal.
+
+tmux's status line says `⊡ sandbox` when hoplon itself is sandboxed, `⊡ model's runs sandboxed` when
+only the model's runs are, `▲ no sandbox` otherwise, and `⏵ sandbox p3 12s` during a run. A running card counts its seconds. Ctrl-C on an
 empty input, or `/stop`, stops the run: hoplon-tui sends hoplon the `stop` message, which works in
 remote mode too (an older hoplon without it gets a SIGINT here, and in remote mode its run ends at
 its time limit). `/sandbox` prints all of it, with the image, network and limits.
@@ -97,6 +124,32 @@ says (`"network": true` starts it on, which blessing flags). While it is on, **e
 command asks first**, because code that can read the project and reach the network could send the
 project anywhere.
 
+**Real samples (`/fixtures`).** Sometimes a stand-in won't do: a parser should see real log lines.
+The model can't fetch them; it asks with `request_samples`, which shows a `▲→⊡ samples requested`
+card (what it needs, the file names its tests will read, and a command you could use to make them)
+and ends its turn. It never runs anything for this. You make the files on your side, scrub
+anything private, and then:
+
+- `/fixtures add FILE…` (`:fixtures add` in the REPL) copies them, regular files only, into a
+  private folder (mode 0700, files 0600) **outside the project**:
+  `~/.local/state/hoplon/fixtures/PROJECT-HASH/JOB/`, where JOB is the session. The root can be
+  changed with `fixtures_dir` in config.json; a root inside the project, or one that is or holds
+  your home directory, is refused.
+- `/fixtures use` runs the secret checks (secret-looking names, contents hoplon would redact,
+  links and other non-regular files) and, if nothing is flagged, asks you to approve exactly the
+  files listed, by a digest of their names, sizes and contents. Flagged files can't be approved:
+  scrub or replace them.
+- Once approved, each sandboxed run mounts the folder read-only at `/fixtures`, and the model is
+  told they are there and to commit only invented data. Before each run hoplon checks the files
+  still match what you approved; if anything changed, the approval is dropped and the run doesn't
+  happen until you approve again.
+- `/fixtures` lists the folder; `/fixtures drop` withdraws the approval; `/fixtures clear` deletes
+  the folder. The approval lasts while hoplon runs. The folder stays until you clear it, or until
+  a work session that used it ends.
+
+Test output from those runs goes to the model, so an approved sample may reach the model endpoint:
+that is what the approval question says. The info panel's WHERE section has a `samples` line.
+
 **Not in your home directory.** The sandbox never runs where coding mode is refused (your home
 directory, a directory above it, `~/.ssh` and other credential directories, hoplon's config
 directory), even with `--coding-anywhere`: the copy would hold everything there, and offline runs
@@ -105,3 +158,31 @@ project's own directory.
 
 The image is used as it is (`--pull=never`); pull or build it yourself. Podman is the only engine
 so far (`"engine": "podman"` or `"auto"`).
+
+## Leftovers
+
+Isolation leaves things behind: samples folders, work session copies kept after a problem, the
+`hoplon/work-N` branches in your repositories, a sandbox container or temp file left by a crash,
+hoplon-tui's private folders and tmux servers. `hoplon --leftovers` (`:leftovers` in the REPL,
+`/leftovers` in hoplon-tui) lists everything of these that is still there, with its size and age,
+whether it is in use, why it is likely stale, and the exact command that removes it:
+
+| What | Where | Likely stale when |
+| --- | --- | --- |
+| samples folder | `fixtures_dir` (`~/.local/state/hoplon/fixtures`) | the hoplon that made it has exited |
+| work session copy | `~/.local/state/hoplon/work` | its session has ended |
+| `hoplon/work-N` branch | each repository a work session ran in, and the current one | it is merged into your current branch |
+| sandbox container | `podman ps -a`, named `hoplon-PID-…` | the hoplon that started it has exited |
+| temp file or folder | `$TMPDIR`, `hoplon-*` | it is over an hour old |
+| hoplon-tui folder, tmux server | `$XDG_RUNTIME_DIR/hoplon-tui.*`, `/tmp/tmux-UID/hoplon-tui-*` | nothing answers on its socket |
+
+Some temp files can hold what you saw or typed: editor buffers you reviewed a command or plan
+in, and `:sh` captures. Many alike (old tmux sockets, say) are listed as one entry with one
+command.
+
+`hoplon --clean-stale` (`:leftovers clean`, `/leftovers clean`) removes the stale ones it can
+remove safely, after showing them and asking, and logs each in the audit log. It never removes
+anything in use, a branch that isn't merged (that is your work to review, then merge or
+delete), or a work copy holding commits its branch doesn't have; those are marked `!` with what
+to do instead, such as the `git fetch` that keeps the commits. Everything is looked at again just
+before it is removed, so what changed since the listing is left alone.

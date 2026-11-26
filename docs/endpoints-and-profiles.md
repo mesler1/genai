@@ -38,6 +38,10 @@ model, default skills, sampling settings and coding mode:
   ask; declining an edit to a file takes it out of the set. `:edits` (or `/edits` in hoplon-tui)
   shows the files, `:edits reset` forgets them, and `:edits ask|approved-files` switches for this
   session. The set is never saved, so a resumed session starts empty. Blessing flags the field.
+- `"layout"`: which of hoplon-tui's panes start shown, as `{"files": "shown", "panel": "hidden",
+  "shell": "shown"}` (any of the three, each `"shown"` or `"hidden"`). Panes it leaves out start as
+  they always do. `--files` and `--no-panel` on the command line win over it; `/files`, `/panel` and
+  Ctrl-` still show and hide them afterwards. The REPL ignores it.
 - Endpoints, profiles and skills are each blessed with `hoplon --bless PATH`. A profile can only use an
   endpoint and skills that are blessed on their own. If any file changes, hoplon refuses it until you
   bless it again.
@@ -55,6 +59,7 @@ model, default skills, sampling settings and coding mode:
 | See exactly what was sent | `:raw [N\|all]` and `:system` in the REPL, `/raw` and `/system` in hoplon-tui (in `$PAGER`, default `less`; your API key is never shown) |
 | Wrappers | `hoplon -p NAME --json` (JSON Lines over stdio) |
 | Lists | `hoplon --list-endpoints`, `--list-profiles`, `--list-skills`, `--list-plugins`, `--list-sessions` (each with `--json`) |
+| What is left over | `hoplon --leftovers` (with `--json`), `:leftovers` in the REPL, `/leftovers` in hoplon-tui: see [Leftovers](sandbox.md#leftovers); `hoplon --clean-stale` removes the stale ones after asking |
 
 Exit codes: 0 ok, 1 error, 2 usage, 3 endpoint or profile (none, unblessed, changed, key missing),
 4 endpoint request failed, 5 context full, 130 interrupted.

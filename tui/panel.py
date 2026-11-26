@@ -14,6 +14,7 @@ import os
 import queue
 import sys
 
+import palette
 from conversation import A, D, Q, R, STATE_MARK, W, clean, fit, one_row, width
 from ipc import Client
 
@@ -46,51 +47,63 @@ def view(st, w, sel):
     if not st:
         add([("waiting for the conversation…", Q)])
         return lines, acts
-    h = st.get("session") or {}
-    head("SESSION")
-    for label, value, role in (("endpoint", h.get("endpoint"), ""), ("model", h.get("model"), ""),
-                               ("profile", h.get("profile") or "none", "" if h.get("profile") else Q),
-                               ("session", h.get("session") or "not saved", "" if h.get("session") else Q)):
-        if label == "model":                             # a click opens the /model drop-down
-            add([(f"{label:9}", Q), (fit(clean(value or "?"), w - 11), role), (" ▾", A)], "model")
-            continue
-        add([(f"{label:9}", Q), (fit(clean(value or "?"), w - 9), role)])
-    gw = h.get("hoplon_where")
-    if gw:
-        add([("hoplon    ", Q), (fit(clean(gw[0].removeprefix("hoplon runs ")), w - 9), R if gw[1] == R else W)])
-    where = h.get("shell_where")
-    if where:
-        add([("commands ", Q), (fit("run " + clean(where), w - 9), D if where.startswith("inside") else W)])
-    else:
-        add([("commands ", Q), ("shown for manual execution", Q)])
-    coding = st.get("coding")
-    add([("coding   ", Q), ("[on] " if coding else "[off]", W if coding else ""),
-         (fit("  c switches" if not coding else "  reads without asking", w - 14), Q)], "coding")
-    head("SANDBOX")
-    if h.get("sandbox"):
-        add([("hoplon    ", Q), (fit(f"in the {clean(h['sandbox'])} sandbox", w - 9), D)])
-    else:
-        add([("hoplon    ", Q), (fit("not sandboxed", w - 9), "")])      # the usual way to run it: not a fault
+    h = st.get("session") or {}        # endpoint, model, profile, session and coding are in the header
+    head("WHERE")
+    # What is live and what is isolated: each line names one thing and marks it, ⊡ isolated or ▲ live.
+    L, V = 14, w - 14
     run, going = st.get("runner"), st.get("running")
     if going:
-        add([("model's  ", Q), (fit(f"RUNNING {clean(going.get('id', '?'))} · {going.get('secs', 0)}s", w - 9), W)])
-        add([(fit("  Ctrl-C or /stop stops it" if going.get("stoppable") else "  can't be stopped in remote mode yet",
-                  w), Q)])
+        add([("model's runs  ", Q), ("⊡ ", D),
+             (fit(f"RUNNING {clean(going.get('id', '?'))} · {going.get('secs', 0)}s", V - 2), W)])
+        add([(" " * L, ""), (fit("Ctrl-C or /stop stops it" if going.get("stoppable")
+                                 else "can't be stopped in remote mode yet", V), Q)])
     elif run and run.get("problem"):
-        add([("model's  ", Q), (fit(f"can't run: {clean(run['problem'])}", w - 9), R)])
+        add([("model's runs  ", Q), (fit(f"can't run: {clean(run['problem'])}", V), R)])
     elif run:
-        add([("model's  ", Q), ("ready · ", D), ("ONLINE" if run.get("network") else "offline",
-                                                 W if run.get("network") else D),
-             (fit(f" · {clean(run.get('image') or '?')}", max(w - 24, 4)), Q)])
-        add([(fit("  each run asks · /network" if run.get("network") else "  /network switches", w), Q)])
+        add([("model's runs  ", Q), ("⊡ sandboxed · ", D),
+             (fit("ONLINE" if run.get("network") else "offline", V - 14), W if run.get("network") else D)])
+        add([(" " * L, ""), (fit(clean(run.get("image") or "?"), V), Q)])
+        add([(" " * L, ""), (fit("each run asks · /network" if run.get("network") else "/network switches", V), Q)])
     else:
-        add([("model's  ", Q), ("none", Q)])
+        add([("model's runs  ", Q), (fit("none: they're only proposed", V), Q)])
+    where = h.get("shell_where")
+    if not where:
+        add([("your commands ", Q), (fit("you run them yourself", V), Q)])
+    elif where.startswith("inside"):
+        add([("your commands ", Q), ("⊡ ", D), (fit(clean(where), V - 2), D)])
+    else:
+        text = "this host, no sandbox" if where == "OUTSIDE any sandbox, directly on this host" else clean(where)
+        add([("your commands ", Q), (fit("▲ " + text, V), W)])
+    gw = h.get("hoplon_where")
+    if gw:                                   # remote mode: ON host AS user in dir, red as root
+        add([("hoplon itself ", Q), (fit("▲ " + clean(gw[0].removeprefix("hoplon runs ")), V), R if gw[1] == R else W)])
+    elif h.get("sandbox"):
+        add([("hoplon itself ", Q), (fit(f"⊡ in the {clean(h['sandbox'])} sandbox", V), D)])
+    else:
+        add([("hoplon itself ", Q), (fit("▲ this host", V), "")])      # the usual way to run it: not a fault
+    work, edits = st.get("work"), st.get("edits") or {}
+    if work:
+        add([("project files ", Q), ("⊡ ", D), (fit("copy " + one_row(work.get("branch", "")), V - 2), D)])
+    elif edits.get("mode") == "approved-files":
+        add([("project files ", Q), (fit("▲ yours, some edits don't ask", V), W)])
+    else:
+        add([("project files ", Q), (fit("▲ yours, edits ask", V), "")])
+    fx = st.get("fixtures")
+    if fx and fx.get("files"):
+        n = fx["files"]
+        add([("samples       ", Q), (fit(f"⊡ {n} file{'s' if n != 1 else ''} at /fixtures" if fx.get("approved")
+                                         else f"{n} file{'s' if n != 1 else ''}, not approved · /fixtures use", V),
+                                     D if fx.get("approved") else Q)])
     add([(fit("/sandbox shows the details", w), Q)])
     head("CONTEXT")
     ctx = st.get("context") or [None, None]
     add(bar(ctx[0] or 0, ctx[1], w) if ctx[0] is not None else [("not measured yet", Q)])
+    if st.get("shared"):
+        n = st["shared"]
+        add([(fit(f"{n} shared, sent with your next message · /shared", w), D)])
     if st.get("busy"):
-        add([("… hoplon is replying", W)])
+        doing = st.get("doing") if isinstance(st.get("doing"), str) else "hoplon is replying"
+        add([(fit("… " + doing, w), W)])
     plan = st.get("plan")
     if plan:
         head("PLAN")
@@ -177,14 +190,7 @@ class Panel:
         self.scr, self.link = scr, link
         self.st, self.sel, self.msg = None, 0, ""
         curses.curs_set(0)
-        curses.use_default_colors()
-        self.roles = {"": 0}
-        if curses.has_colors():
-            quiet = 8 if curses.COLORS >= 16 else curses.COLOR_WHITE
-            for i, (role, fg) in enumerate([(Q, quiet), (A, curses.COLOR_BLUE), (W, curses.COLOR_YELLOW),
-                                            (D, curses.COLOR_GREEN), (R, curses.COLOR_RED)], 1):
-                curses.init_pair(i, fg, -1)
-                self.roles[role] = curses.color_pair(i)
+        self.roles = palette.roles(curses)
         self.roles[A] |= curses.A_BOLD
         # The release too, though a click acts on the press: without it, ncurses holds the press back until the next
         # input arrives.
@@ -234,8 +240,6 @@ class Panel:
         st = self.st or {}
         if what == "coding":
             ok = self.request({"type": "coding", "on": not st.get("coding")})
-        elif what == "model":
-            ok = self.request({"type": "models"})
         elif isinstance(what, tuple) and what[0] == "cmd" and type(what[1]) is int:
             ok = self.request({"type": "command", "n": what[1]})
         elif isinstance(what, int) and what < len(self.skills()):

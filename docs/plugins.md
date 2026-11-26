@@ -47,8 +47,9 @@ sandbox output, and escaped wherever it is shown. `plugins/slurm/` has `sinfo`, 
 
 `/plugins` lists the plugins hoplon found; `/plugins NAME on|off` switches one, and `/help` and the info panel
 list the enabled ones' commands. A plugin's `pane` is a program in its directory (blessed with the rest of it)
-that hoplon-tui starts with `/plugins NAME pane`, in a tmux pane of its own; the same command hides and shows it
-again, like `/files`. A `.py` pane runs with hoplon-tui's Python, with `tui/` on `PYTHONPATH` so it can use
+that hoplon-tui starts with `/plugins NAME pane`, in a tmux pane of its own, as a tab in the right column beside the
+info panel (see "The right column" in [hoplon-tui.md](hoplon-tui.md)); the same command takes it out of the column
+and brings it back. A `.py` pane runs with hoplon-tui's Python, with `tui/` on `PYTHONPATH` so it can use
 `ipc.Client`; any other is run as a program.
 
 A pane never runs inside the conversation pane, and it never reaches hoplon. It connects to hoplon-tui's private

@@ -19,6 +19,7 @@ import queue
 import re
 import shlex
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -27,7 +28,9 @@ import time
 import unicodedata
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from features import disabled_names, load as load_features  # noqa: E402
+import palette  # noqa: E402
+from dock import Dock  # noqa: E402
+from features import disabled_names, load as load_features, tui_setting  # noqa: E402
 from ipc import Hub  # noqa: E402
 from recorder import Recorder, ago, fifo_path, label, trim  # noqa: E402
 import remote  # noqa: E402
@@ -52,7 +55,8 @@ COMMANDS = {
     "/commands": "list the commands run in the shell pane, numbered for /share N (also in the info panel)",
     "/mark": "shell context starts at the shell's current prompt (or right-click a line in the shell)",
     "/shell": "show the shell and move there (Ctrl-` hides it again)",
-    "/panel": "show or hide the info panel on the right",
+    "/panel": "show or hide the right column (the info panel and any plugin panes, as tabs)",
+    "/tab": "[NAME]: the next tab in the right column, or the one named",
     "/plan": "[clear]: show the approved plan, or drop it so everything asks again",
     "/stop": "stop the sandboxed run going on now, or hoplon's turn (Ctrl-C on an empty input does the same)",
     "/compact": "shrink the conversation when the context is getting full",
@@ -127,6 +131,41 @@ def cut(s, w):
         out.append(c)
         n += cells(c)
     return "".join(out)
+
+
+def size_text(n):
+    """Bytes as people read them: 812 B, 18 KB, 2.4 MB."""
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n // 1024} KB"
+    return f"{n / (1024 * 1024):.1f} MB"
+
+
+def progress_text(ev):
+    """hoplon's progress event as a few words: what the reply streaming now is doing. The model chose the path,
+    so it is cleaned and cut short."""
+    phase = ev.get("phase")
+    n = ev.get("tokens") if type(ev.get("tokens")) is int else 0
+    if phase == "thinking":
+        return f"thinking · ~{n:,} tokens"
+    if phase == "tool":
+        size = ev.get("bytes") if type(ev.get("bytes")) is int else 0
+        path = ev.get("path") if isinstance(ev.get("path"), str) else ""
+        tool = ev.get("tool") if isinstance(ev.get("tool"), str) else ""
+        what = clean(path)[-60:] if path else (f"a {clean(tool)[:40]} call" if tool else "a tool call")
+        return f"writing {what} · {size_text(size)}"
+    if phase == "text":
+        return f"replying · ~{n:,} tokens"
+    return None
+
+
+def gen_text(tokens, seconds, estimated):
+    """A turn's generation, after it: tokens the model wrote (thinking and tool calls too) and its rate."""
+    out = f"+{'~' if estimated else ''}{tokens:,} tokens"
+    if seconds >= 0.5:
+        out += f" · {tokens / seconds:.0f} tok/s · {seconds:.0f} s"
+    return out
 
 
 def fit(s, w):
@@ -317,8 +356,7 @@ class Banner(Block):
 
     def lines(self, w):
         h, ep = self.h, self.h.get("endpoint") or {}
-        rows = [(f"◆ hoplon {h.get('version', '?')}", A),
-                (f"{ep.get('name', '?')}: {ep.get('model', '?')} at {ep.get('base_url', '?')}", "")]
+        rows = [(f"{ep.get('name', '?')}: {ep.get('model', '?')} at {ep.get('base_url', '?')}", "")]
         where = hoplon_where(h)
         if where:
             rows.append(where)
@@ -341,13 +379,13 @@ class Banner(Block):
         elif run and run.get("problem"):
             rows.append((f"The profile's sandbox can't run here: {run['problem']}.", R))
         if self.shell_where:
-            rows.append((f"Approved commands run {self.shell_where}.", W))
+            rows.append((f"Commands you approve run {self.shell_where}.", W))
         else:
             rows.append(("Commands are shown for you to run in your own shell.", W))
         if h.get("skills"):
             rows.append((f"skills: {', '.join(h['skills'])}", ""))
         rows.append(("Type a message and press Enter. /help lists commands.", Q))
-        out = []
+        out = [[("  ", "")] + row for row in palette.logo(f"hoplon {clean(str(h.get('version', '?')))}")] + [[]]
         for text, role in rows:
             out += para(clean(text), role, w, "  ", "  ")
         return out
@@ -438,6 +476,7 @@ class Card(Block):
                           + (f" ({row(ev['glob'])})" if ev.get("glob") else ""),
                 "write": f"{'overwrite' if ev.get('exists') else 'create'} {path}",
                 "command": "command", "external": f"tool {row(ev.get('tool', ''))}",
+                "samples": "samples requested",
                 "sandbox": f"sandbox · {'ONLINE' if ev.get('network') else 'offline'}",
                 "trusted": f"{row(ev.get('plugin', '?'))} · {row(ev.get('command', '?'))}"
                            + (" · read-only" if ev.get("read_only") else ""),
@@ -464,6 +503,15 @@ class Card(Block):
             out.append(("this file looks like it contains secrets", R))
         if ev.get("flagged"):
             out.append(("hidden or control characters are shown as \\x.. or \\u.... escapes", R))
+        if k == "samples":
+            out += [(ln, "") for ln in clean(str(ev.get("what", ""))).split("\n")]
+            files = ev.get("files") if isinstance(ev.get("files"), list) else []
+            out.append(("files its tests will read in /fixtures: " + ", ".join(one_row(str(f)) for f in files[:20]), D))
+            if ev.get("suggest"):
+                out.append(("you could make them with:  " + one_row(str(ev["suggest"])), ""))
+            out += [("Make them in your shell, scrubbing anything private,", A),
+                    ("then /fixtures add FILE… and /fixtures use.", A),
+                    ("The model never runs anything for this.", Q)]
         if k in ("command", "sandbox"):
             for i, ln in enumerate(command_text(ev.get("command", "")).split("\n")):
                 out.append((("$ " if i == 0 else "  ") + ln, ""))
@@ -516,6 +564,14 @@ class Card(Block):
     def full_text(self):
         return "\n".join(t for t, _ in self.body(full=True))
 
+    def place(self):
+        """Where approving this acts: ▲ live, ⊡ isolated, an arrow where it crosses from the model to your side."""
+        k = self.ev.get("kind")
+        if k in ("edit", "write"):
+            return "⊡ the copy" if self.ev.get("work") or self.ev.get("in_copy") else "⊡→▲ your files"
+        return {"command": "⊡→▲ your shell", "trusted": "▲ runs live", "sandbox": "⊡ a throwaway run",
+                "samples": "▲→⊡ from your side"}.get(k if isinstance(k, str) else None, "")
+
     def lines(self, w):
         if self.state == "auto":
             why = "work session" if self.ev.get("work") or self.ev.get("kind") in ("finish", "retry") else \
@@ -523,7 +579,8 @@ class Card(Block):
             return [[("  ↳ ", Q), (fit(f"{self.title()}  ({why})", w - 4), Q)]]
         role = self.STATE_ROLE.get(self.state, Q)
         inner = max(w - 4, 8)
-        head = f"─ {self.id} · {self.title()}{f' · Alt+{self.key}' if self.key else ''} "
+        place = self.place()
+        head = f"─ {self.id} · {f'{place} · ' if place else ''}{self.title()}{f' · Alt+{self.key}' if self.key else ''} "
         tail = f" {STATE_MARK.get(self.state, '·')} {self.state} ─"
         head = fit(head, w - 2 - width(tail) - 1)
         fill = max(w - 2 - width(head) - width(tail), 1)
@@ -562,6 +619,8 @@ class Model:
         self.coding = False
         self.runner = None         # the profile's sandbox, from hello and network events
         self.context = None        # (used, limit)
+        self.doing = None          # what the reply streaming now is doing ("thinking · ~3,200 tokens"), or None
+        self.gen = None            # this turn's generated [tokens, seconds, estimated], summed over its requests
         self.exited = None         # hoplon's exit code once it has gone
         self.quit = False
         self.shell = False         # a shell pane is there (inside hoplon-tui)
@@ -605,6 +664,20 @@ class Model:
     def send(self, msg):
         self.outbox.append(msg)
 
+    def ask_approval(self, kind, ev):
+        """An approval question for a feature's request. Only the core builds and answers these. fixtures_use offers
+        exactly the digest hoplon listed; hoplon refuses it if the files changed since, and checks again before runs."""
+        if kind == "fixtures_use" and isinstance(ev, dict) and isinstance(ev.get("digest"), str):
+            self.ask = {"kind": kind, "digest": ev["digest"],
+                        "question": clean(str(ev.get("ask") or "Use these samples for this job?"))}
+        elif kind == "fixtures_clear":
+            self.ask = {"kind": kind, "question": "Delete the samples folder and everything in it?"}
+        elif kind == "leftovers_clean" and isinstance(ev, dict) and isinstance(ev.get("ids"), list) and ev["ids"]:
+            n = len(ev["ids"])
+            self.ask = {"kind": kind, "ids": [i for i in ev["ids"] if isinstance(i, str)],
+                        "question": f"Remove the {n} stale leftover{'s' if n != 1 else ''} marked ✗ "
+                                    "(not those marked !)?"}
+
     def feature(self, name):
         return next((f for f in self.features if f.name == name), None)
 
@@ -625,7 +698,7 @@ class Model:
 
     def handle(self, ev):
         t = ev.get("type")
-        if t != "text":
+        if t not in ("text", "progress", "generated"):    # these come mid-reply and add no block
             self.reply = None
         if t == "hello":
             self.hello, self.coding, self.runner = ev, bool(ev.get("coding")), ev.get("runner")
@@ -655,6 +728,8 @@ class Model:
                 self.number_commands()
                 if ev.get("preapproved") and self.command_authorized(card) and self.shell:
                     self.actions.append(("plan_cmd", card))
+            elif ev.get("kind") == "samples":
+                card.state = "shown"                    # nothing to approve: you make them, then /fixtures
             elif ev.get("kind") == "invalid":
                 card.state = "error"
                 card.detail = f"the model asked for a tool that does not exist: {ev.get('tool', '?')}"
@@ -679,14 +754,26 @@ class Model:
                 self.note(f"plan {self.plan.get('id')} approved: {n} step{'s' if n != 1 else ''}"
                           + ("; planned commands run on their own" if self.plan_auto else
                              "; each planned command asks once") + " · /plan shows it", D)
+        elif t == "progress":
+            self.doing = progress_text(ev)
+        elif t == "generated":
+            n, secs = ev.get("tokens"), ev.get("seconds")
+            if type(n) is int and n >= 0 and isinstance(secs, (int, float)) and secs >= 0:
+                g = self.gen or [0, 0.0, False]
+                self.gen = [g[0] + n, g[1] + secs, g[2] or bool(ev.get("estimated"))]
         elif t == "done":
             if ev.get("exchanges"):
                 self.exchanges[self.turn] = ev["exchanges"]
             self.busy = False
+            self.doing = None
+            if self.gen and self.gen[0]:
+                self.note(gen_text(*self.gen))
+            self.gen = None
             self.retire("the turn ended before you answered")
             self.context = ((ev.get("context") or {}).get("used"), (ev.get("context") or {}).get("limit"))
             if ev.get("reason") == "step_limit":
-                self.note("hoplon stopped after its step limit; send a message to continue", W)
+                self.note("hoplon paused: many steps in a row ran without you deciding anything (max_steps); "
+                          "send a message to continue", W)
             elif ev.get("reason") == "work_limit":
                 self.note("the work session paused at a limit: send a message to go on, or /work end", W)
             self.next_queued()
@@ -703,6 +790,7 @@ class Model:
             if self.busy and not self.pending and ev.get("code") not in ("busy", "unknown_id", "bad_message",
                                                                          "unknown_type", "not_running"):
                 self.busy = False          # a failed turn ends without a done event
+                self.doing = self.gen = None
                 self.next_queued()
         elif t == "notice":
             self.note(clean(ev.get("message", "")), W)
@@ -781,18 +869,83 @@ class Model:
             self.actions.append(("interrupt",))
 
     def tmux_status(self):
-        """The sandbox part of tmux's status-right. It is a tmux format, so only fixed words, a checked proposal id
-        and a number go in."""
+        """The sandbox part of tmux's status-right (the header's right side; "waiting for you" is on its left, in
+        tmux_header). A tmux format, so only fixed words, a checked proposal id and a number go in."""
         if self.hello is None:
             return ""
+        return self.sandbox_status()
+
+    def tmux_header(self):
+        """The header's information, after hoplon's badge: the endpoint and model, profile, session, what hoplon is
+        doing, a work session and the context gauge. A tmux format, so names are cut to the characters they may
+        hold (no "#")."""
+        if self.hello is None:
+            return ""
+        T = palette.tmux
+
+        def safe(v, n=32):
+            return re.sub(r"[^A-Za-z0-9._:@/+=-]", "", str(v or ""))[:n]
+        ep, prof = self.hello.get("endpoint") or {}, self.hello.get("profile") or {}
+        dim = T("dim")
+        # The model is a range of its own: a click on it opens the /model drop-down (hoplon-tui binds it).
+        parts = [f"{dim}{safe(ep.get('name')) or '?'}·#[fg=default]#[range=user|model]{T(bold=True)}"
+                 f"{safe(ep.get('model'), 40) or '?'} ▾#[nobold]#[norange]"]
+        if prof.get("name"):
+            parts.append(f"{T('bronze')}{safe(prof['name'])}#[fg=default]")
+        if self.hello.get("session"):
+            parts.append(f"{dim}{safe(self.hello['session'])}#[fg=default]")
+        if self.exited is not None:
+            parts.append(f"{T('ember', bold=True)}■ exited#[default]")
+        elif self.pending:
+            parts.append(f"{T('iron', 'brass', bold=True)} ⏸ waiting for you #[default]")
+        elif self.busy:
+            parts.append(f"{T('brass', bold=True)}● working#[default]")
+        else:
+            parts.append(f"{T('patina')}● ready#[default]")
+        parts.append(f"{T('patina', bold=True)}◆ coding#[default]" if self.coding else f"{dim}chat#[default]")
+        work = self.feature("work")
+        info = getattr(work, "info", None) if work else None
+        if isinstance(info, dict):
+            n, cur = len(info.get("items") or []), info.get("current")
+            at = f" {cur}/{n}" if isinstance(cur, int) and n else ""
+            parts.append(f"{T('patina', bold=True)}⚒ work{at}#[default]")
+        used, limit = self.context if self.context else (None, None)
+        if isinstance(used, int) and isinstance(limit, int) and limit > 0:
+            pct = min(100, 100 * used // limit)
+            tone = "patina" if pct < 70 else "brass" if pct < 90 else "ember"
+            full = min(8, round(pct * 8 / 100))
+            parts.append(f"{T(tone)}{'━' * full}{dim}{'─' * (8 - full)} {T(tone)}{pct}%#[fg=default]")
+        else:
+            parts.append(f"{dim}──────── ctx#[fg=default]")
+        return " " + f" {dim}│#[fg=default] ".join(parts) + " "
+
+    def shell_title(self):
+        """The shell pane's title: whether what you type there is live. A tmux format, so the host is reduced to
+        the characters a host name has."""
+        hints = " · Ctrl-` hides it · right-click: shell context"
+        where = self.shell_where or ""
+        if where.startswith("inside"):
+            return f"{palette.tmux('patina', bold=True)}⊡ your shell, {where}#[default]{hints}"
+        if where.startswith("ON ANOTHER HOST"):
+            host, how = (self.hello or {}).get("host"), ", over ssh"
+        elif where.startswith("OUTSIDE"):
+            host, how = socket.gethostname(), ""
+        else:
+            return f"your shell, isolation unverified{hints}"
+        host = re.sub(r"[^A-Za-z0-9._@-]", "", str(host or "")) or "?"
+        return f"{palette.tmux('brass', bold=True)}▲ LIVE: your shell on {host}{how}#[default]{hints}"
+
+    def sandbox_status(self):
         card = self.running_card()
         if card and PROPOSAL_ID.fullmatch(card.id):
-            return f" #[fg=yellow,bold]⏵ sandbox {card.id} {card.elapsed()}s#[default] │"
+            return f" {palette.tmux('patina', bold=True)}⏵ sandbox {card.id} {card.elapsed()}s#[default] │"
         if card:
-            return f" #[fg=yellow,bold]⏵ sandbox {card.elapsed()}s#[default] │"
+            return f" {palette.tmux('patina', bold=True)}⏵ sandbox {card.elapsed()}s#[default] │"
         if self.hello.get("sandbox"):
-            return " #[fg=green]⊡ sandbox#[default] │"
-        return " not sandboxed │"
+            return f" {palette.tmux('patina')}⊡ sandbox#[default] │"
+        if self.runner and not self.runner.get("problem"):
+            return f" {palette.tmux('patina')}⊡ model's runs sandboxed#[default] │"
+        return f" {palette.tmux('brass')}▲ no sandbox#[default] │"
 
     def network_text(self):
         r = self.runner
@@ -940,6 +1093,8 @@ class Model:
             self.actions.append(("focus_shell",))
         elif cmd == "/panel":
             self.actions.append(("panel",))
+        elif cmd == "/tab":
+            self.actions.append(("tab", arg.strip()))
         elif cmd == "/stop":
             self.stop()
         elif cmd == "/plan":
@@ -983,7 +1138,8 @@ class Model:
             "session": {"endpoint": ep.get("name"), "model": ep.get("model"), "profile": prof.get("name"),
                         "session": h.get("session"), "sandbox": sb.get("name") if sb else None,
                         "shell_where": self.shell_where, "hoplon_where": hoplon_where(h)},
-            "coding": self.coding, "busy": self.busy, "context": list(self.context or (None, None)),
+            "coding": self.coding, "busy": self.busy, "doing": self.doing if self.busy else None,
+            "context": list(self.context or (None, None)),
             "runner": self.runner and {"network": bool(self.runner.get("network")), "problem": self.runner.get("problem"),
                                        "image": self.runner.get("image")},
             "running": run and {"id": clean(run.id), "secs": run.elapsed(), "stoppable": run.stoppable},
@@ -1016,6 +1172,10 @@ class Model:
             self.actions.append(("share_cmd", msg["n"]))
         elif t == "mark" and isinstance(msg.get("on"), bool) and self.shell:
             self.actions.append(("mark_line",) if msg["on"] else ("unmark",))
+        elif t == "tabs" and self.shell:
+            self.actions.append(("panel",) if msg.get("hide") else ("tab_menu",))
+        elif t == "tab" and type(msg.get("n")) is int and self.shell:
+            self.actions.append(("tab", msg["n"]))
         else:
             for f in self.features:
                 if t in f.requests and (role is None or role in f.requests[t]):
@@ -1053,7 +1213,9 @@ class Model:
             msg["edits"] = {str(n): c for n, c in edits.items()}
         self.send(msg)
 
-    def decide(self, accept):
+    def decide(self, accept, not_secret=False):
+        """not_secret: you allowed a secret-looking read and said it holds none, so hoplon won't ask about it again
+        until the file changes."""
         if not self.pending:
             return
         card = self.pending.pop(0)
@@ -1062,7 +1224,8 @@ class Model:
         else:
             card.state = "accepted" if accept else "declined"
         card.changed()
-        self.send(answer(card, "decision", decision="accept" if accept else "decline"))
+        extra = {"not_secret": True} if accept and not_secret and card.ev.get("secret") else {}
+        self.send(answer(card, "decision", decision="accept" if accept else "decline", **extra))
 
 
 def answer(card, kind, **fields):
@@ -1586,8 +1749,10 @@ SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 
 class App:
-    def __init__(self, scr, child, shell=None):
+    def __init__(self, scr, child, shell=None, chosen=()):
         self.scr, self.child, self.shell = scr, child, shell
+        self.chosen = set(chosen)  # panes the command line showed or hid (--files, --no-panel): the profile's layout
+                                   # leaves those as they are
         on, warning = configured_features()
         self.m, self.ed = Model(on), Editor()
         if warning:
@@ -1601,6 +1766,9 @@ class App:
         self.panel = os.environ.get("HOPLON_TUI_PANEL") if shell else None
         self.files = os.environ.get("HOPLON_TUI_FILES") if shell else None
         self.prompt = os.environ.get("HOPLON_TUI_PROMPT") if shell else None   # input happens in that pane
+        self.dock = Dock(shell.tmux, os.environ.get("TMUX_PANE", "")) if shell else None   # the right column's tabs
+        if self.dock and self.panel:
+            self.dock.add("info", self.panel, self.PANEL_WIDTH, select=False)
         # the other panes connect here; a feature that is off has no requests, so the Hub refuses them
         self.hub = Hub(self.state_dir, feature_requests(on)) if self.state_dir else None
         if self.hub:
@@ -1624,16 +1792,11 @@ class App:
         self.last_total = 0
         self.ctrl_c = 0.0
         self.status = None         # the sandbox part of tmux's status line, as last set
+        self.header = None         # the header's information (tmux_header), as last set
+        self.shell_title = None    # the shell pane's title, as last set
         self.paste = None          # text of a bracketed paste in progress
         curses.curs_set(1)
-        curses.use_default_colors()
-        self.roles = {"": 0}
-        if curses.has_colors():
-            quiet = 8 if curses.COLORS >= 16 else curses.COLOR_WHITE
-            for i, (role, fg) in enumerate([(Q, quiet), (A, curses.COLOR_BLUE), (W, curses.COLOR_YELLOW),
-                                            (D, curses.COLOR_GREEN), (R, curses.COLOR_RED)], 1):
-                curses.init_pair(i, fg, -1)
-                self.roles[role] = curses.color_pair(i)
+        self.roles = palette.roles(curses)
         self.roles["bold"] = curses.A_BOLD
         self.roles["code"] = self.roles[A]
         curses.raw()               # Ctrl-C, Ctrl-S and friends arrive as keys instead of signals
@@ -1688,6 +1851,10 @@ class App:
                 lines.append([("  It doesn't all fit here: ", W), ("y", A), (" or ", ""), ("v", A),
                               (" view it in full first   ", ""), ("e", A), (" edit   ", ""), ("n", A), (" cancel", "")])
                 return lines, None, "y or v view the whole command first · e edit · n or Esc cancel"
+            if ask["kind"] in ("fixtures_use", "fixtures_clear", "leftovers_clean"):
+                yes = {"fixtures_use": "use them", "fixtures_clear": "delete it"}.get(ask["kind"], "remove them")
+                return ([[(ask["question"], A)], [("  y", A), (f" {yes}   ", ""), ("n", A), (" no", "")]], None,
+                        f"y {yes} · n or Esc no")
             lines = [[(ask["question"], A)],
                      [("  y", A), (" review it in your editor, then send   ", ""), ("s", A), (" send it as it is   ", ""),
                       ("n", A), (" keep it to yourself", "")]]
@@ -1723,6 +1890,9 @@ class App:
                 ep = (self.m.hello or {}).get("endpoint") or {}
                 to = c.ev.get("to") if isinstance(c.ev.get("to"), str) else ep.get("base_url", "the endpoint")
                 lines.append([(f"It looks like it holds secrets; allowing sends it to {clean(str(to))}", R)])
+                lines.append([("  y", A), (" yes   ", ""), ("a", A), (" not secrets   ", ""), ("n", A), (" no   ", ""),
+                              ("v", A), (" view it all", "")])
+                return lines, None, "y allow · a not secrets (until it changes) · n no · v view"
             elif isinstance(c.ev.get("to"), str):
                 lines.append([(f"  Allowing sends it to the planner, at {one_row(c.ev['to'])}", W)])
             lines.append([("  y", A), (" yes   ", ""), ("n", A), (" no   ", ""), ("v", A), (" view it all", "")])
@@ -1839,6 +2009,8 @@ class App:
         if m.pending:
             if k in ("y", "Y"):
                 m.decide(True)
+            elif k in ("a", "A") and m.pending[0].ev.get("secret"):
+                m.decide(True, not_secret=True)
             elif k in ("n", "N"):
                 m.decide(False)
             elif k in ("v", "V"):
@@ -1915,7 +2087,8 @@ class App:
             lines = [[(t, "question" if i == 0 and r in (A, W) else ("key" if t.strip() in ("y", "n", "v", "e", "a") else r))
                       for t, r in segs] for i, segs in enumerate(lines)]
         return {"mode": mode, "lines": lines if mode != "input" else [], "hints": "" if mode == "input" else hints,
-                "busy": self.m.busy, "running": self.m.running_card() is not None,
+                "busy": self.m.busy, "doing": self.m.doing if self.m.busy else None,
+                "running": self.m.running_card() is not None,
                 "halt": self.m.busy and self.m.can_halt() and self.m.exited is None,
                 "status": " · ".join(status), "exited": self.m.exited is not None,
                 "q": self.question()}
@@ -1972,21 +2145,77 @@ class App:
             return False
         return True
 
-    def toggle_panel(self):
-        self.toggle_pane(self.panel, "panel", ["-l", "42"], "info panel")
+    PANEL_WIDTH, FILES_JOIN = 42, ["-b", "-l", "34"]
 
-    def toggle_pane(self, pane, name, join, what):
-        """Show a side pane beside this one, or break it out to a window of its own again."""
+    def toggle_panel(self):
+        if not self.dock or not self.dock.tabs:
+            self.m.note("there is no right column in this session", R)
+            return
+        self.dock.toggle()
+
+    def switch_tab(self, which):
+        """/tab (the next tab), /tab NAME, or the tab menu's position."""
+        if not self.dock or not self.dock.tabs:
+            self.m.note("there is no right column in this session", R)
+            return
+        self.dock.prune()
+        names = self.dock.names()
+        if which == "":
+            self.dock.next()
+        elif type(which) is int:
+            if 0 <= which < len(names):
+                self.dock.select(names[which])
+        elif which in names:
+            self.dock.select(which)
+        else:
+            self.m.note(f"no tab {clean(which)[:40]}: the tabs are {', '.join(names)}", R)
+
+    def tab_menu(self):
+        """tmux's menu of the tabs, under the right column's border (a click on it opens this)."""
+        if not self.dock:
+            return
+        self.dock.prune()
+        items = []
+        for i, name in enumerate(self.dock.names()):          # names are checked: [a-z][a-z0-9-]*
+            items += [("• " if name == self.dock.active else "  ") + name, str(i + 1) if i < 9 else "",
+                      menu_item("tab", str(i))]
+        items += ["", "Hide the column", "h", menu_item("tabs", "hide"), "", "Cancel", "q", ""]
+        self.shell.popup_menu("-x", "R", "-y", "S", "-T", " tabs · ↑↓ Enter ", *items)
+
+    def toggle_pane(self, pane, name, join, what, want=None):
+        """Show a side pane beside this one, or break it out to a window of its own again; want: True to show
+        it, False to hide it, None to switch."""
         if not pane:
             self.m.note(f"there is no {what} in this session", R)
             return
         me = os.environ.get("TMUX_PANE", "")
         here = self.shell.tmux("display", "-p", "-t", me, "#{window_id}").strip()
         there = self.shell.tmux("display", "-p", "-t", pane, "#{window_id}").strip()
-        if here == there:
+        shown = here == there
+        if shown and want is not True:
             self.shell.tmux("break-pane", "-d", "-s", pane, "-n", name)
-        else:
+        elif not shown and want is not False:
             self.shell.tmux("join-pane", "-d", "-h", "-f", *join, "-s", pane, "-t", me)
+
+    def lay_out(self, layout):
+        """The profile's layout: which of the file tree, the info panel and the shell start shown. Checked
+        again here, as hoplon checks it; a pane the command line chose stays as chosen, and the info panel
+        stays hidden on a screen under 100 columns, as the launcher leaves it."""
+        if not isinstance(layout, dict) or not self.shell:
+            return
+        want = {k: v == "shown" for k, v in layout.items() if k not in self.chosen and v in ("shown", "hidden")}
+        if "files" in want and self.files:
+            self.toggle_pane(self.files, "files", self.FILES_JOIN, "file tree", want["files"])
+        wide = self.shell.tmux("display", "-p", "#{window_width}").strip()
+        if "panel" in want and self.dock and self.dock.tab("info"):
+            if not want["panel"]:
+                self.dock.hide()
+            elif wide.isdigit() and int(wide) >= 100:
+                self.dock.select("info")
+        if "shell" in want:
+            toggle = os.environ.get("HOPLON_TUI_TOGGLE")
+            if toggle:
+                subprocess.run([toggle, "show" if want["shell"] else "hide"], capture_output=True, timeout=5)
 
     def click(self):
         """The wheel scrolls; a click on a command card opens its menu; a right-click anywhere opens the raw view's.
@@ -2152,6 +2381,26 @@ class App:
             elif k in ("n", "\x1b"):
                 m.ask = None
                 m.note(f"{card.id}: not run")
+        elif ask["kind"] == "leftovers_clean":
+            m.ask = None
+            if k == "y":
+                m.send({"type": "leftovers", "action": "clean", "ids": ask["ids"]})
+                lo = m.feature("leftovers")
+                if lo:
+                    lo.then = "show"
+            else:
+                m.note("leftovers: nothing removed")
+        elif ask["kind"] in ("fixtures_use", "fixtures_clear"):
+            m.ask = None
+            fx = next((f for f in m.features if f.name == "fixtures"), None)
+            if k != "y":
+                m.note("samples: not approved" if ask["kind"] == "fixtures_use" else "samples folder: kept")
+            elif ask["kind"] == "fixtures_use":
+                m.send({"type": "fixtures", "action": "use", "digest": ask["digest"]})
+            else:
+                m.send({"type": "fixtures", "action": "clear"})
+            if fx and k == "y":
+                fx.then = "show"
         else:
             m.ask = None
             if k in ("y", "s"):                             # y: review it in your editor first; s: send it as it is
@@ -2410,6 +2659,13 @@ class App:
             if self.hub:
                 self.hub.close()
 
+    def bell(self):
+        """Ring the terminal bell (the alerts feature decides when)."""
+        try:
+            curses.beep()
+        except curses.error:
+            pass
+
     def pump(self):
         self.poll_run()
         for f in self.m.features:
@@ -2423,11 +2679,11 @@ class App:
                 self.sent.pop(msg, None)                  # a pane (re)connected: send it everything
             elif role == "prompt":
                 self.from_prompt(msg)
-            elif role in ("panel", "files"):
+            elif role in ("panel", "files", "pipe"):        # the Hub let through only what the role may send
                 self.m.request(msg, role)
             elif role.startswith("plugin:") and self.m.feature("plugins"):
                 self.m.feature("plugins").request(self.m, role, msg)
-            elif role == "menu" and (msg.get("type") in ("share", "mark") or self.m.takes(role, msg.get("type"))):
+            elif role == "menu" and (msg.get("type") in ("share", "mark", "tabs", "tab") or self.m.takes(role, msg.get("type"))):
                 self.m.request(msg, role)
             elif role == "menu" and msg.get("type") == "menu" and msg.get("action") == "open":
                 self.open_menu(msg.get("key"))
@@ -2456,6 +2712,10 @@ class App:
                 self.shell.focus()
             elif action[0] == "panel":
                 self.toggle_panel()
+            elif action[0] == "tab":
+                self.switch_tab(action[1])
+            elif action[0] == "tab_menu":
+                self.tab_menu()
             elif action[0] == "interrupt":
                 if not self.child.interrupt():
                     self.m.note("hoplon couldn't be sent Ctrl-C", R)
@@ -2476,6 +2736,7 @@ class App:
                 if ev.get("type") == "hello" and self.shell:
                     epn = (ev.get("endpoint") or {})
                     self.shell.title(f"hoplon · {epn.get('name', '?')}: {epn.get('model', '?')}")
+                    self.lay_out((ev.get("profile") or {}).get("layout"))
         for msg in self.m.outbox:
             self.child.send(msg)
         self.m.outbox = []
@@ -2496,6 +2757,14 @@ class App:
             if status != self.status:
                 self.status = status
                 self.shell.tmux("set", "-g", "@hoplon_sandbox", status)
+            header = self.m.tmux_header()
+            if header != self.header:
+                self.header = header
+                self.shell.tmux("set", "-g", "@hoplon_header", header)
+            title = self.m.shell_title()
+            if title != self.shell_title:
+                self.shell_title = title
+                self.shell.tmux("set", "-p", "-t", self.shell.pane, "@hoplon_title", title)
         self.publish()
 
 
@@ -2505,7 +2774,11 @@ def parse_args(argv):
         "an info panel beside it. The model only proposes; you approve, and you run commands in your own shell.")
     ap.add_argument("-p", "--profile", help="profile (persona) name")
     ap.add_argument("-e", "--endpoint", help="endpoint name (overrides the profile's)")
-    ap.add_argument("-S", "--session", help="keep the conversation in a named session (created or resumed)")
+    ap.add_argument("-S", "--session", help="the session to keep the conversation in, created or resumed "
+                                            "(default: a new one with a made-up name, shown when you quit)")
+    ap.add_argument("--no-save", action="store_true",
+                    help="keep nothing of this conversation on disk: no session, nothing to resume "
+                         "(\"save_sessions\": false in tui.json makes this the default)")
     ap.add_argument("-k", "--skill", action="append", default=[], help="use a blessed skill (repeatable)")
     ap.add_argument("--allow-session-endpoint-change", action="store_true",
                     help="allow sending saved context to a changed or unrecorded destination")
@@ -2527,6 +2800,8 @@ def parse_args(argv):
     for name, given in (("--dir", args.dir), ("--as", args.as_user), ("ssh options after --", ssh_opts)):
         if given and not args.remote:
             ap.error(f"{name} needs --remote")
+    if args.no_save and args.session:
+        ap.error("--no-save and -S can't go together: -S keeps the conversation in that session")
     if args.remote:
         if args.session:
             ap.error("--remote can't use -S yet: a saved session would stay on the host hoplon runs on")
@@ -2556,9 +2831,33 @@ def hoplon_args(a):
     return out
 
 
+def sessions_dir(environ=None):
+    """Where hoplon keeps saved sessions (its sessions/NAME.json)."""
+    envs = os.environ if environ is None else environ
+    base = envs.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "hoplon", "sessions")
+
+
+def fresh_session(where, pick=None):
+    """A session name nobody has used here yet: tui- and six letters or digits."""
+    import secrets
+    pick = pick or (lambda: "".join(secrets.choice("abcdefghijkmnpqrstuvwxyz23456789") for _ in range(6)))
+    while True:
+        name = "tui-" + pick()
+        if not os.path.exists(os.path.join(where, name + ".json")):
+            return name
+
+
 def main(argv):
     args = parse_args(argv)
     if args.check:
+        save = not args.no_save and (args.session or tui_setting("save_sessions", True, bool))
+        if not args.remote and save:  # a local conversation is kept in a session, so it can be resumed
+            where = sessions_dir()
+            if not args.session:
+                args.session = fresh_session(where)
+                print(f"new_session={args.session}")
+            print(f"session_file={os.path.join(where, args.session + '.json')}")
         if args.remote:           # what the launcher needs, one per line (values have no newlines: checked)
             for k, v in (("dest", args.remote), ("as", args.as_user), ("dir", args.dir), ("profile", args.profile),
                          ("endpoint", args.endpoint)):
@@ -2580,7 +2879,8 @@ def main(argv):
             return 2
     child = Child(hoplon_args(args), info)
     try:
-        curses.wrapper(lambda scr: App(scr, child, Shell.from_env()).run())
+        chosen = ["files"] * args.files + ["panel"] * args.no_panel
+        curses.wrapper(lambda scr: App(scr, child, Shell.from_env(), chosen).run())
     finally:
         child.close()
     return 0

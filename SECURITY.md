@@ -59,6 +59,10 @@ that the defence has to be deterministic controls around the model.
 - The ways untrusted text gets in are few and known: `read_file`, `list_dir` and `search_files`, `-f` and
   `:attach`, output you share from `:run` or `:sh`, and tool results from a wrapper. There is no
   web or URL tool.
+- What you share reaches the model fenced, after your words: a header hoplon writes says it is
+  shared data, not instructions, and a random tag made after the text exists closes the block, so
+  the text can't pass itself off as your message. That helps the model read it; it is not a
+  control. The audit log records each share's size and SHA-256.
 
 What remains: a hijacked model can still propose a harmful command or edit that looks
 reasonable. Your review is the control, so read proposals as if a stranger wrote them.
@@ -89,7 +93,10 @@ What remains: the endpoint receives every prompt, attachment and file the model 
 coding mode the model reads non-hidden files in the working directory without asking (hidden: a
 name starting with `.`, or one the sandbox hides as a secret, such as `id_rsa` or `*.key`; a file
 that looks like it holds secrets still asks), so treat the directory as shared with the
-endpoint.
+endpoint. When you allow such a read and say the file holds no secrets after all, hoplon
+remembers the sha256 of that text (`not-secret.json`, and a `not_secret` event in the audit log):
+that text no longer asks, is searched and is not hidden in the sandbox; any change asks again. A
+file holding the endpoint key is never excused.
 
 ### 3. Excessive agency and tool misuse
 
@@ -107,8 +114,10 @@ much permission and too much autonomy.
   other file there. The model can't make one, and Linux normally lets you hard-link only
   your own files, so only a hard link you made yourself does this. Files that look like
   secrets still ask, wherever they are linked from.
-- **Autonomy.** A turn ends when a command is proposed. A turn is capped at 10 model steps,
-  which also caps how many sandboxed runs one turn makes.
+- **Autonomy.** A turn ends when a command is proposed. A turn pauses after 50 model steps in a
+  row in which nobody decided anything (`max_steps` in config.json, 1 to 1000), which also caps
+  how many automatic sandboxed runs one turn makes. A step where you approve or decline something
+  starts the count again: you are the brake then.
   Reads are capped at 256 KiB, writes at 1 MiB, overwrite snapshots at 8 MiB, and directory scans at 500 entries plus a truncation check. Without a terminal and
   outside JSON mode, nothing is performed at all.
 
@@ -229,6 +238,13 @@ in between.
     limit, a 1 GB `/tmp`, and memory and process limits where cgroups are delegated.
   - The command's output is masked and clipped before the model sees it, and the user sees the
     same output. The audit log records each run by fingerprint, with its exit code and duration.
+  - Real samples (`/fixtures`) reach a run only through a folder outside the project, mounted
+    read-only at `/fixtures`, after the user approves exactly what is in it. Secret-looking names,
+    contents hoplon would redact, links and non-regular files block the approval. The approval is a
+    digest of names, sizes and contents, checked again before every run; any change drops it. The
+    model can only ask for samples (`request_samples` shows a card and ends its turn); it never
+    chooses or reads a host path. What a run prints still goes to the model, which the approval
+    question says. Adds, approvals, drops and clears are in the audit log.
 
 - **Work sessions** (`:work`, or the JSON `work` message) let the model edit, test and commit
   without asking, so the boundary moves from each edit to the branch you review at the end:
@@ -256,8 +272,9 @@ in between.
     on a throwaway overlay of the copy, so a test can't leave anything behind. The copy's git
     directory is beside its files, not among them, and the sandbox mounts only the files: the
     git directory holds every file of the commit, the ones the sandbox hides as secrets too.
-  - Edits and writes apply without asking only while an item of an approved plan is worked on;
-    before approval, and while the planner reviews an item, they ask, whatever the edits mode:
+  - Edits and writes apply without asking only while an item of an approved plan is worked on, or
+    the planner reviews a stuck item (held to the same step budget and time limit); before
+    approval they ask, whatever the edits mode:
     files you approved with `approved-files` count only outside the session. Hidden and
     secret-looking files always ask, and so does a `pyvenv.cfg` or anything under a directory of
     that name, as the sandbox's secret scan treats a virtual environment differently (it skips
@@ -418,6 +435,11 @@ shared filesystem; never an abstract socket, which has no permissions).
 - An answer names the question it answers. One meant for a question that has gone, or not yet
   appeared, is ignored, and keys typed within 0.3 s of a question appearing count as typing.
 - Messages are size-limited; a line that is too long or not JSON ends the connection.
+- `hoplon-share` in the shell pane connects as `pipe` and can only queue output for your next
+  message. It starts no turn and answers nothing: each share shows as a line in the conversation
+  and in `/shared`, where you can take it back, and it reaches the model fenced as data, masked.
+  The shell pane is told where the socket is (`HOPLON_TUI_STATE`), so a program you run there
+  can queue a share too, which it could already do by finding the socket (see below).
 - The file tree pane can only ask the conversation pane to list, view, attach or insert the path of a file.
   Listings and views go through hoplon's checks, and nothing goes to the model except an attachment you
   reviewed in your editor first.

@@ -114,7 +114,14 @@ class WorkTest(FakePodman):
         tools = [t["function"]["name"] for t in api.requests[0]["body"]["tools"]]
         self.assertIn("finish_item", tools)
         self.assertNotIn("propose_command", tools)
-        self.assertIn("# This is a work session", api.requests[0]["body"]["messages"][0]["content"])
+        system = api.requests[0]["body"]["messages"][0]["content"]
+        self.assertIn("# This is a work session", system)
+        self.assertNotIn("call propose_command", system)          # the tool isn't offered here
+        self.assertIn("there is no propose_command", system)
+        where = system.split("# Where things are", 1)[1]
+        self.assertIn("see only the copy of the project", where)
+        self.assertIn("throwaway copy of the copy: offline", where)
+        self.assertIn("out of reach for the whole session", where)
 
     def test_finish_needs_a_passing_test_and_a_change(self):
         turns = [call("propose_work_plan", goal="g", items=["one"]),
@@ -207,6 +214,7 @@ class WorkTest(FakePodman):
                 p = g.until("proposal")
             self.assertEqual(p["path"], ".env")                 # .git never became a proposal
             self.assertIsNone(p.get("auto"))                    # a hidden file asks
+            self.assertTrue(p.get("in_copy"))                   # and its card says it lands in the copy
             g.send({"type": "decision", "id": p["id"], "digest": p["digest"], "decision": "decline"})
             g.until("done")
             g.close()
@@ -309,6 +317,30 @@ class WorkTest(FakePodman):
         self.assertIn("work_retry", events)
         self.assertIn("work_item", events)
 
+    def test_the_planner_edits_without_asking_while_it_reviews_a_stuck_item(self):
+        turns = [call("propose_work_plan", goal="g", items=["one"]),
+                 call("write_file", path="b.txt", content="x\n", reason="r"),
+                 call("read_file", path="b.txt", reason="polish"),
+                 call("write_file", path="b.txt", content="y\n", reason="the planner fixes it"),
+                 call("finish_item", n=1, summary="b"),
+                 reply("done")]
+        self.repo()
+        with FakeAPI(turns) as api:
+            g = self.start(api, {"steps_per_item": 2})
+            g.send({"type": "work", "task": "t"})
+            self.approve(g)
+            try:
+                for reason in ("r", "the planner fixes it"):          # the item's write, then the planner's
+                    p = g.until("proposal")
+                    while p["kind"] == "read":
+                        p = g.until("proposal")
+                    self.assertEqual((p["kind"], p.get("reason")), ("write", reason))
+                    self.assertTrue(p.get("auto"), p)                   # applied without asking
+                self.assertEqual(g.until("done")["reason"], "reply")
+            finally:
+                g.close()
+        self.assertIn("used its budget of 2 model steps", api.requests[3]["body"]["messages"][-1]["content"])
+
     def test_old_output_is_dropped_as_the_context_fills(self):
         big = "x" * 4000 + "\n"
         turns = ([call("propose_work_plan", goal="g", items=["one"])]
@@ -329,7 +361,7 @@ class WorkTest(FakePodman):
     def test_an_item_that_fills_the_context_goes_on_in_a_fresh_one(self):
         big = "x" * 4000 + "\n"
         turns = ([call("propose_work_plan", goal="g", items=["one"])]
-                 + [call("read_file", path="big.txt", reason="r")] * 5 + [reply("NOTES: big.txt is all x"), reply("ok")])
+                 + [call("read_file", path="big.txt", reason="r")] * 4 + [reply("NOTES: big.txt is all x"), reply("ok")])
         self.repo({"big.txt": big})
         with FakeAPI(turns) as api:
             g = self.start(api, context_limit=8000)
@@ -916,13 +948,13 @@ class WorkTest(FakePodman):
     def test_a_stop_while_the_model_writes_rollover_notes_pauses_the_session(self):
         big = "x" * 4000 + "\n"
         turns = ([call("propose_work_plan", goal="g", items=["one"])]
-                 + [call("read_file", path="big.txt", reason="r")] * 5 + [slow(reply("NOTES: slow"), 3)])
+                 + [call("read_file", path="big.txt", reason="r")] * 4 + [slow(reply("NOTES: slow"), 3)])
         self.repo({"big.txt": big})
         with FakeAPI(turns) as api:
             g = self.start(api, context_limit=8000)
             g.send({"type": "work", "task": "t"})
             self.approve(g)
-            self.wait_requests(api, 7)
+            self.wait_requests(api, 6)
             time.sleep(0.5)
             g.send({"type": "stop"})
             self.assertEqual(g.until("done")["reason"], "stopped")
