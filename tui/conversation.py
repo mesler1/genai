@@ -2600,7 +2600,8 @@ def parse_args(argv):
         "an info panel beside it. The model only proposes; you approve, and you run commands in your own shell.")
     ap.add_argument("-p", "--profile", help="profile (persona) name")
     ap.add_argument("-e", "--endpoint", help="endpoint name (overrides the profile's)")
-    ap.add_argument("-S", "--session", help="keep the conversation in a named session (created or resumed)")
+    ap.add_argument("-S", "--session", help="the session to keep the conversation in, created or resumed "
+                                            "(default: a new one with a made-up name, shown when you quit)")
     ap.add_argument("-k", "--skill", action="append", default=[], help="use a blessed skill (repeatable)")
     ap.add_argument("--allow-session-endpoint-change", action="store_true",
                     help="allow sending saved context to a changed or unrecorded destination")
@@ -2651,9 +2652,32 @@ def hoplon_args(a):
     return out
 
 
+def sessions_dir(environ=None):
+    """Where hoplon keeps saved sessions (its sessions/NAME.json)."""
+    envs = os.environ if environ is None else environ
+    base = envs.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "hoplon", "sessions")
+
+
+def fresh_session(where, pick=None):
+    """A session name nobody has used here yet: tui- and six letters or digits."""
+    import secrets
+    pick = pick or (lambda: "".join(secrets.choice("abcdefghijkmnpqrstuvwxyz23456789") for _ in range(6)))
+    while True:
+        name = "tui-" + pick()
+        if not os.path.exists(os.path.join(where, name + ".json")):
+            return name
+
+
 def main(argv):
     args = parse_args(argv)
     if args.check:
+        if not args.remote:       # every local conversation is kept in a session, so it can be resumed
+            where = sessions_dir()
+            if not args.session:
+                args.session = fresh_session(where)
+                print(f"new_session={args.session}")
+            print(f"session_file={os.path.join(where, args.session + '.json')}")
         if args.remote:           # what the launcher needs, one per line (values have no newlines: checked)
             for k, v in (("dest", args.remote), ("as", args.as_user), ("dir", args.dir), ("profile", args.profile),
                          ("endpoint", args.endpoint)):

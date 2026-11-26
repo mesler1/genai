@@ -1,6 +1,8 @@
 """Tests for the TUI's conversation pane (tui/conversation.py). Run: python3 -m unittest discover -s tests"""
 
+import contextlib
 import importlib.machinery
+import io
 import importlib.util
 import json
 import os
@@ -1397,6 +1399,32 @@ class TestSamplesAndLeftovers(unittest.TestCase):
         self.assertEqual(m.outbox, [{"type": "leftovers", "action": "clean", "ids": ["temp:1"]}])
 
 
+class TestSessionName(unittest.TestCase):
+    def check(self, *argv, environ=None):
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, environ or {}), contextlib.redirect_stdout(out):
+            self.assertEqual(C.main(["--check", *argv]), 0)
+        return dict(ln.split("=", 1) for ln in out.getvalue().splitlines())
+
+    def test_a_name_is_made_up_unless_one_is_given(self):
+        home = tempfile.mkdtemp(prefix="hoplon-test-")
+        self.addCleanup(shutil.rmtree, home, True)
+        got = self.check("-e", "x", environ={"XDG_CONFIG_HOME": home})
+        self.assertRegex(got["new_session"], r"^tui-[a-z0-9]{6}$")
+        self.assertEqual(got["session_file"], os.path.join(home, "hoplon", "sessions", got["new_session"] + ".json"))
+        given = self.check("-S", "mine", environ={"XDG_CONFIG_HOME": home})
+        self.assertNotIn("new_session", given)
+        self.assertEqual(given["session_file"], os.path.join(home, "hoplon", "sessions", "mine.json"))
+        self.assertNotIn("session_file", self.check("--remote", "host.invalid"))     # remote has no sessions yet
+
+    def test_a_made_up_name_is_never_one_in_use(self):
+        where = tempfile.mkdtemp(prefix="hoplon-test-")
+        self.addCleanup(shutil.rmtree, where, True)
+        open(os.path.join(where, "tui-aaaaaa.json"), "w").close()
+        tries = iter(["aaaaaa", "bbbbbb"])
+        self.assertEqual(C.fresh_session(where, lambda: next(tries)), "tui-bbbbbb")
+
+
 class TestAlerts(unittest.TestCase):
     def setUp(self):
         self.home = tempfile.mkdtemp(prefix="hoplon-test-")
@@ -1889,8 +1917,9 @@ class TestInTmux(TmuxCase):
 class TestHoplonTui(TmuxCase):
     """tui/hoplon-tui itself: the conversation pane above a real bash pane, started through a pseudo-terminal."""
 
-    def start(self, api, editor="true", path=None, args="-e test", keep_home=False):
+    def start(self, api, editor="true", path=None, args="-e test", keep_home=False, out=None):
         home = self.home if keep_home else self.config(api)      # keep_home: the test made self.home with config()
+        self.home = home
         if not args:        # hoplon then finds the endpoint the way a bare `hoplon` does
             conf = dict(G.STARTER_CONFIG, default_endpoint="test")
             G.write_private(os.path.join(home, "config.json"), json.dumps(conf))
@@ -1913,7 +1942,7 @@ class TestHoplonTui(TmuxCase):
         env["HOPLON_TUI_SPLASH"] = "0"         # the splash holds the screen before tmux attaches
         self.proc = subprocess.Popen(["script", "-qfc", f"stty cols 110 rows 40; {REPO}/tui/hoplon-tui {args}",
                                       "/dev/null"], cwd=self.wd, env=env, stdin=subprocess.PIPE,
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                     stdout=out or subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.addCleanup(lambda: (self.tmux("kill-server"), self.proc.wait(10)))
         end = time.time() + 10
         while time.time() < end and not {"hoplon", "you", "shell"} <= set(self.panes()):
@@ -1963,6 +1992,20 @@ class TestHoplonTui(TmuxCase):
 
     def sent(self, api):
         return [m for m in api.requests[-1]["body"]["messages"] if m["role"] == "user"][-1]["content"]
+
+    def test_a_conversation_is_kept_in_a_session_and_the_way_back_is_shown(self):
+        out = open(os.path.join(self.tmp, "launcher.out"), "w+")
+        self.addCleanup(out.close)
+        with FakeAPI([reply("noted")]) as api:
+            self.start(api, out=out)
+            self.type("remember this")
+            self.wait_for("noted")
+            self.type("/quit")
+            self.proc.wait(15)
+        out.seek(0)
+        said = re.findall(r"Resume this conversation: hoplon-tui -e test -S (tui-[a-z0-9]{6})", out.read())
+        self.assertEqual(len(said), 1, out.read())
+        self.assertTrue(os.path.isfile(os.path.join(self.home, "sessions", said[0] + ".json")))
 
     def test_a_sandboxed_run_shows_it_is_running_and_ctrl_c_stops_it(self):
         from test_sandbox_runner import FAKE_PODMAN

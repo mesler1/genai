@@ -30,9 +30,10 @@ fi
 for a in "$@"; do
   case $a in -h|--help) exec "$py" "$here/conversation.py" --help ;; esac
 done
-# For --remote it prints what the launcher needs, one value per line (dest=, as=, dir=, profile=, endpoint=, skill=, ssh=).
+# It prints what the launcher needs, one value per line: locally the session (new_session= when it made a name up,
+# session_file=); for --remote dest=, as=, dir=, profile=, endpoint=, skill=, ssh=.
 chk=$("$py" "$here/conversation.py" --check "$@") || exit 2
-remote= r_as= r_dir= r_profile= r_endpoint=
+remote= r_as= r_dir= r_profile= r_endpoint= session_file=
 ssh_opts=() r_skills=()
 while IFS= read -r line; do
   case $line in
@@ -43,6 +44,8 @@ while IFS= read -r line; do
     endpoint=*) r_endpoint=${line#endpoint=} ;;
     skill=*) r_skills+=("${line#skill=}") ;;
     ssh=*) ssh_opts+=("${line#ssh=}") ;;
+    new_session=*) set -- "$@" -S "${line#new_session=}" ;;
+    session_file=*) session_file=${line#session_file=} ;;
   esac
 done <<<"$chk"
 panel=1
@@ -277,6 +280,10 @@ if t has-session 2>/dev/null; then
   else
     echo "hoplon-tui is still running in the background. Reattach: tmux -L $sock attach"
   fi
+fi
+if [ -n "$session_file" ] && [ -f "$session_file" ] && ! t has-session 2>/dev/null; then
+  again=$(printf '%q ' "$@")
+  echo "Resume this conversation: hoplon-tui ${again% }"
 fi
 # (Remote mode removes it in its exit trap, after it has closed the ssh master whose socket is in it.)
 [ -n "$remote" ] || t has-session 2>/dev/null || rm -rf "$state"

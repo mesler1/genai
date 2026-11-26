@@ -2,6 +2,19 @@
 
 hoplon-tui runs hoplon in tmux panes beside your own shell: the conversation, an info panel, and the shell (Ctrl-` shows or hides it). `/help` lists its commands.
 
+## Sessions
+
+Every conversation is kept in a saved session, so it can be picked up again. `-S NAME` starts or
+resumes the one you name; without it, hoplon-tui makes up a new name such as `tui-k7f3qa`. When you
+quit, it prints the command that resumes it:
+
+```
+Resume this conversation: hoplon-tui -S tui-k7f3qa
+```
+
+It prints that only once something was said, so there is a session to resume. `hoplon --list-sessions`
+lists them all. Not yet with `--remote`.
+
 ## Another host from hoplon-tui
 
 In hoplon-tui's shell pane, connect with `hoplon-ssh` instead of `ssh`:
