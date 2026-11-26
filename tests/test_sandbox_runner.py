@@ -179,7 +179,7 @@ class TestArgv(FakePodman):
     def test_offline(self):
         a = self.argv(self.box())
         for flag in ("--network=none", "--http-proxy=false", "--pull=never", "--read-only", "--cap-drop=all",
-                     "--userns=keep-id", "--security-opt=no-new-privileges", "--volume=/p:/work:O",
+                     "--userns=keep-id", f"--user={os.getuid()}:{os.getgid()}", "--security-opt=no-new-privileges", "--volume=/p:/work:O",
                      "--volume=/dev/null:/work/.env:ro", "--volume=/empty:/work/.aws:ro", "--env=HOPLON_CMD=make test",
                      "--env=HOME=/tmp", "--memory=4g", "--pids-limit=1024"):
             self.assertIn(flag, a)

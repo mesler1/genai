@@ -731,7 +731,7 @@ class Sandbox:
         mounts += [f"--volume={empty}:/work/{d}:ro" for d in dirs]
         mounts += [f"--volume={fixtures}:/fixtures:ro"] if fixtures else []
         return ([self.podman, "--log-level=error", "run", "--rm", f"--name={name}", "--pull=never", "--init",
-                 "--userns=keep-id", "--read-only", f"--tmpfs=/tmp:rw,size={SANDBOX_TMP},mode=1777",
+                 "--userns=keep-id", f"--user={os.getuid()}:{os.getgid()}", "--read-only", f"--tmpfs=/tmp:rw,size={SANDBOX_TMP},mode=1777",
                  "--cap-drop=all", "--security-opt=no-new-privileges", "--workdir=/work",
                  "--env=HOME=/tmp", f"--env=HOPLON_CMD={command}", f"--env=HOPLON_GUARD={guard}"]
                 + net + limits + mounts + [self.conf["image"], "/bin/sh", "-c", _GUARD, "hoplon-guard"]
