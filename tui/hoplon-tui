@@ -206,12 +206,14 @@ t set -g pane-border-lines single
 t set -g pane-border-style 'fg=brightblack'
 t set -g pane-active-border-style 'fg=blue,bold'
 t set -g status-style 'bg=default,fg=default'
-t set -g status-left ' hoplon │ '
+# The splash's colors: hoplon's name on a teal badge, the host in bronze, the key hints dimmed.
+t set -g status-left '#[fg=#0d1117,bg=#6ed6c0,bold] ◆ hoplon #[default] '
 t set -g status-left-length 20
+keys='#[fg=brightblack]│ Ctrl-` shell · Ctrl-b o other pane · Ctrl-b d detach '
 if [ -n "$remote" ]; then       # the host that matters is the one hoplon runs on
-  t set -g status-right "#{@hoplon_sandbox} hoplon on ${remote//#/##} │ Ctrl-\` shell │ Ctrl-b o: other pane │ Ctrl-b d: detach "
+  t set -g status-right "#{@hoplon_sandbox} #[fg=brightblack]hoplon on#[default] #[fg=#d6b26e,bold]${remote//#/##}#[default] $keys"
 else
-  t set -g status-right '#{@hoplon_sandbox} #H │ Ctrl-` shell │ Ctrl-b o: other pane │ Ctrl-b d: detach '
+  t set -g status-right "#{@hoplon_sandbox} #[fg=#d6b26e,bold]#H#[default] $keys"
 fi
 t set -g window-status-format ''          # hidden panes live in other windows; don't list them
 t set -g window-status-current-format ''

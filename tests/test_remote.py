@@ -567,7 +567,8 @@ class TestLauncher(test_tui.TmuxCase):
             self.wait_for("hello from afar")
             self.assertEqual(len(api.requests), 1)
             status = self.tmux("display", "-p", "-t", "t", "#{status-right}") or ""
-            self.assertIn("hoplon on me@127.0.0.1", self.tmux("show", "-gv", "status-right"), status)
+            right = self.tmux("show", "-gv", "status-right")
+            self.assertRegex(right, r"hoplon on(#\[[^]]*\])* *(#\[[^]]*\])*me@127\.0\.0\.1", status)
             self.wait_for("following the shell on the other host")              # the shell pane is a hoplon-ssh session
             self.shell("echo who-$(id -un)-in-$PWD")
             time.sleep(1)
