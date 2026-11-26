@@ -472,8 +472,9 @@ class Card(Block):
             out.append(("files its tests will read in /fixtures: " + ", ".join(one_row(str(f)) for f in files[:20]), D))
             if ev.get("suggest"):
                 out.append(("you could make them with:  " + one_row(str(ev["suggest"])), ""))
-            out.append(("Make them in your shell (scrub anything private), then /fixtures add FILE… and /fixtures "
-                        "use. The model never runs anything for this.", A))
+            out += [("Make them in your shell, scrubbing anything private,", A),
+                    ("then /fixtures add FILE… and /fixtures use.", A),
+                    ("The model never runs anything for this.", Q)]
         if k in ("command", "sandbox"):
             for i, ln in enumerate(command_text(ev.get("command", "")).split("\n")):
                 out.append((("$ " if i == 0 else "  ") + ln, ""))
@@ -632,6 +633,11 @@ class Model:
                         "question": clean(str(ev.get("ask") or "Use these samples for this job?"))}
         elif kind == "fixtures_clear":
             self.ask = {"kind": kind, "question": "Delete the samples folder and everything in it?"}
+        elif kind == "leftovers_clean" and isinstance(ev, dict) and isinstance(ev.get("ids"), list) and ev["ids"]:
+            n = len(ev["ids"])
+            self.ask = {"kind": kind, "ids": [i for i in ev["ids"] if isinstance(i, str)],
+                        "question": f"Remove the {n} stale leftover{'s' if n != 1 else ''} marked ✗ "
+                                    "(not those marked !)?"}
 
     def feature(self, name):
         return next((f for f in self.features if f.name == name), None)
@@ -1742,8 +1748,8 @@ class App:
                 lines.append([("  It doesn't all fit here: ", W), ("y", A), (" or ", ""), ("v", A),
                               (" view it in full first   ", ""), ("e", A), (" edit   ", ""), ("n", A), (" cancel", "")])
                 return lines, None, "y or v view the whole command first · e edit · n or Esc cancel"
-            if ask["kind"] in ("fixtures_use", "fixtures_clear"):
-                yes = "use them" if ask["kind"] == "fixtures_use" else "delete it"
+            if ask["kind"] in ("fixtures_use", "fixtures_clear", "leftovers_clean"):
+                yes = {"fixtures_use": "use them", "fixtures_clear": "delete it"}.get(ask["kind"], "remove them")
                 return ([[(ask["question"], A)], [("  y", A), (f" {yes}   ", ""), ("n", A), (" no", "")]], None,
                         f"y {yes} · n or Esc no")
             lines = [[(ask["question"], A)],
@@ -2210,6 +2216,15 @@ class App:
             elif k in ("n", "\x1b"):
                 m.ask = None
                 m.note(f"{card.id}: not run")
+        elif ask["kind"] == "leftovers_clean":
+            m.ask = None
+            if k == "y":
+                m.send({"type": "leftovers", "action": "clean", "ids": ask["ids"]})
+                lo = m.feature("leftovers")
+                if lo:
+                    lo.then = "show"
+            else:
+                m.note("leftovers: nothing removed")
         elif ask["kind"] in ("fixtures_use", "fixtures_clear"):
             m.ask = None
             fx = next((f for f in m.features if f.name == "fixtures"), None)

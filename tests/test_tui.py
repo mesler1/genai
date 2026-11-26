@@ -1328,6 +1328,75 @@ class TestRecorder(unittest.TestCase):
         self.assertTrue(m.busy)
 
 
+class TestSamplesAndLeftovers(unittest.TestCase):
+    """/fixtures and /leftovers: the feature lists and sends; only the core builds and answers the approval."""
+
+    def model(self):
+        m = C.Model()
+        m.handle({"type": "hello", "version": "1", "endpoint": {"name": "e", "model": "m", "base_url": "u"},
+                  "sandbox": None, "features": ["fixtures", "leftovers"]})
+        m.outbox.clear()
+        return m
+
+    def answer(self, m, key):
+        import types
+        C.App.answer(types.SimpleNamespace(m=m), key)
+
+    def test_fixtures_use_asks_for_exactly_the_listed_digest(self):
+        m = self.model()
+        m.submit("/fixtures use")
+        self.assertEqual(m.outbox, [{"type": "fixtures"}])
+        m.handle({"type": "fixtures", "dir": "/s/p/j", "files": [{"name": "app.log", "size": 9, "flag": None}],
+                  "digest": "d1", "approved": False, "problem": None, "ask": "Use these samples?"})
+        self.assertEqual((m.ask["kind"], m.ask["digest"]), ("fixtures_use", "d1"))
+        self.assertIn("app.log", "".join(text_of(b) for b in m.blocks))
+        m.outbox.clear()
+        self.answer(m, "y")
+        self.assertEqual(m.outbox, [{"type": "fixtures", "action": "use", "digest": "d1"}])
+        self.assertIsNone(m.ask)
+
+    def test_flagged_samples_are_never_offered(self):
+        m = self.model()
+        m.submit("/fixtures use")
+        m.handle({"type": "fixtures", "dir": "/s", "files": [{"name": "k", "size": 1, "flag": "secret"}],
+                  "digest": "d1", "approved": False, "problem": None})
+        self.assertIsNone(m.ask)
+        self.assertIn("scrub or replace", text_of(m.blocks[-1]))
+
+    def test_a_samples_card_is_shown_and_asks_nothing(self):
+        m = self.model()
+        m.submit("hi")
+        m.handle({"type": "proposal", "id": "p1", "kind": "samples", "what": "200 log lines", "files": ["app.log"],
+                  "suggest": "tail -n 200 x > app.log", "reason": "real lines", "folder": "/s"})
+        card = m.cards["p1"]
+        self.assertEqual((card.state, m.pending), ("shown", []))
+        body = text_of(card)
+        self.assertIn("▲→⊡", body)
+        self.assertIn("/fixtures add", body)
+
+    def test_leftovers_clean_asks_then_sends_the_listed_ids(self):
+        m = self.model()
+        m.submit("/leftovers clean")
+        self.assertEqual(m.outbox, [{"type": "leftovers"}])
+        items = [{"id": "temp:1", "kind": "temp", "what": "a captured :sh session", "path": "/t/hoplon-sh-a",
+                  "bytes": 1, "age": 7200, "stale": "left over, 2 h old", "safe": True, "remove": "rm -rf -- /t/a",
+                  "note": ""},
+                 {"id": "work:2", "kind": "work", "what": "work session copy", "path": "/w/x", "bytes": 9,
+                  "age": 9, "stale": "its work session has ended", "safe": False, "remove": "rm -rf -- /w/x",
+                  "note": "it may hold commits"}]
+        m.handle({"type": "leftovers", "items": items})
+        text = "".join(text_of(b) for b in m.blocks)
+        self.assertIn("left over: 2 (2 likely stale)", text)
+        self.assertIn("! it may hold commits", text)
+        self.assertEqual((m.ask["kind"], m.ask["ids"]), ("leftovers_clean", ["temp:1"]))
+        m.outbox.clear()
+        self.answer(m, "n")
+        self.assertEqual(m.outbox, [])
+        m.ask_approval("leftovers_clean", {"ids": ["temp:1"]})
+        self.answer(m, "y")
+        self.assertEqual(m.outbox, [{"type": "leftovers", "action": "clean", "ids": ["temp:1"]}])
+
+
 class TestFeatures(unittest.TestCase):
     """tui/features: the registry, and switching features off."""
 
@@ -1349,17 +1418,17 @@ class TestFeatures(unittest.TestCase):
 
     def test_all_built_in_features_load(self):
         on = F.load(core=C.CORE)
-        self.assertEqual([f.name for f in on], ["model", "copy", "decline", "raw", "ssh", "files", "sandbox", "edits", "plugins", "work", "fixtures"])
+        self.assertEqual([f.name for f in on], ["model", "copy", "decline", "raw", "ssh", "files", "sandbox", "edits", "plugins", "work", "fixtures", "leftovers"])
         m = C.Model()
         self.assertEqual([f.name for f in m.features], [f.name for f in on])
-        self.assertEqual(list(m.commands())[-11:], ["/model", "/copy", "/decline", "/raw", "/system", "/files", "/sandbox", "/edits", "/plugins", "/work", "/fixtures"])
+        self.assertEqual(list(m.commands())[-12:], ["/model", "/copy", "/decline", "/raw", "/system", "/files", "/sandbox", "/edits", "/plugins", "/work", "/fixtures", "/leftovers"])
         self.assertEqual(C.feature_requests(on), {"panel": {"models"}, "menu": {"model", "copy", "raw", "system"},
                           "files": {"list", "view", "attach", "insert"}})
 
     def test_environment_disables_a_feature(self):
         m, warning = self.model(self.environ(HOPLON_TUI_DISABLE="copy, model"))
         self.assertIsNone(warning)
-        self.assertEqual([f.name for f in m.features], ["decline", "raw", "ssh", "files", "sandbox", "edits", "plugins", "work", "fixtures"])
+        self.assertEqual([f.name for f in m.features], ["decline", "raw", "ssh", "files", "sandbox", "edits", "plugins", "work", "fixtures", "leftovers"])
         m.submit("/copy")
         self.assertIn("unknown command /copy (/help lists them)", text_of(m.blocks[-1]))
         m.submit("/help")
@@ -1375,7 +1444,7 @@ class TestFeatures(unittest.TestCase):
         self.write_config('{"disable": ["decline", "raw"]}')
         m, warning = self.model(self.environ())
         self.assertIsNone(warning)
-        self.assertEqual([f.name for f in m.features], ["model", "copy", "ssh", "files", "sandbox", "edits", "plugins", "work", "fixtures"])
+        self.assertEqual([f.name for f in m.features], ["model", "copy", "ssh", "files", "sandbox", "edits", "plugins", "work", "fixtures", "leftovers"])
         m.submit("/decline")
         self.assertIn("unknown command /decline", text_of(m.blocks[-1]))
 
@@ -1387,7 +1456,7 @@ class TestFeatures(unittest.TestCase):
         for text in ("{not json", '{"disable": "copy"}', '["copy"]', '{"disable": [1]}'):
             self.write_config(text)
             m, warning = self.model(self.environ())
-            self.assertEqual(len(m.features), 11, text)
+            self.assertEqual(len(m.features), 12, text)
             self.assertIn("was ignored, so every feature is on", warning)
 
     def test_the_hub_refuses_the_requests_of_a_disabled_feature(self):

@@ -55,6 +55,7 @@ model, default skills, sampling settings and coding mode:
 | See exactly what was sent | `:raw [N\|all]` and `:system` in the REPL, `/raw` and `/system` in hoplon-tui (in `$PAGER`, default `less`; your API key is never shown) |
 | Wrappers | `hoplon -p NAME --json` (JSON Lines over stdio) |
 | Lists | `hoplon --list-endpoints`, `--list-profiles`, `--list-skills`, `--list-plugins`, `--list-sessions` (each with `--json`) |
+| What is left over | `hoplon --leftovers` (with `--json`), `:leftovers` in the REPL, `/leftovers` in hoplon-tui: see [Leftovers](sandbox.md#leftovers); `hoplon --clean-stale` removes the stale ones after asking |
 
 Exit codes: 0 ok, 1 error, 2 usage, 3 endpoint or profile (none, unblessed, changed, key missing),
 4 endpoint request failed, 5 context full, 130 interrupted.

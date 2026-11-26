@@ -158,3 +158,31 @@ project's own directory.
 
 The image is used as it is (`--pull=never`); pull or build it yourself. Podman is the only engine
 so far (`"engine": "podman"` or `"auto"`).
+
+## Leftovers
+
+Isolation leaves things behind: samples folders, work session copies kept after a problem, the
+`hoplon/work-N` branches in your repositories, a sandbox container or temp file left by a crash,
+hoplon-tui's private folders and tmux servers. `hoplon --leftovers` (`:leftovers` in the REPL,
+`/leftovers` in hoplon-tui) lists everything of these that is still there, with its size and age,
+whether it is in use, why it is likely stale, and the exact command that removes it:
+
+| What | Where | Likely stale when |
+| --- | --- | --- |
+| samples folder | `fixtures_dir` (`~/.local/state/hoplon/fixtures`) | the hoplon that made it has exited |
+| work session copy | `~/.local/state/hoplon/work` | its session has ended |
+| `hoplon/work-N` branch | each repository a work session ran in, and the current one | it is merged into your current branch |
+| sandbox container | `podman ps -a`, named `hoplon-PID-…` | the hoplon that started it has exited |
+| temp file or folder | `$TMPDIR`, `hoplon-*` | it is over an hour old |
+| hoplon-tui folder, tmux server | `$XDG_RUNTIME_DIR/hoplon-tui.*`, `/tmp/tmux-UID/hoplon-tui-*` | nothing answers on its socket |
+
+Some temp files can hold what you saw or typed: editor buffers you reviewed a command or plan
+in, and `:sh` captures. Many alike (old tmux sockets, say) are listed as one entry with one
+command.
+
+`hoplon --clean-stale` (`:leftovers clean`, `/leftovers clean`) removes the stale ones it can
+remove safely, after showing them and asking, and logs each in the audit log. It never removes
+anything in use, a branch that isn't merged (that is your work to review, then merge or
+delete), or a work copy holding commits its branch doesn't have; those are marked `!` with what
+to do instead, such as the `git fetch` that keeps the commits. Everything is looked at again just
+before it is removed, so what changed since the listing is left alone.
