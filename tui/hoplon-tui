@@ -9,7 +9,7 @@
 # ["copy", "model"]} in ${XDG_CONFIG_HOME:-~/.config}/hoplon/tui.json, or HOPLON_TUI_DISABLE=copy,model.
 # /files shows or hides a file tree on the left (--files starts with it shown): browsing sends nothing to the model.
 # --remote [USER@]HOST [--dir PATH] [--as USER] [-- ssh options] keeps this screen and the API key here and runs hoplon
-# (and the shell pane) on that host over ssh; see "Remote mode" in the README.
+# (and the shell pane) on that host over ssh; see "Remote mode" in docs/hoplon-tui.md.
 # Usage: hoplon-tui [-h] [-p PROFILE] [-e ENDPOINT] [-S SESSION] [-k SKILL] [--coding] [--no-panel] [--files]
 #                  [--remote [USER@]HOST [--dir PATH] [--as USER] [-- SSH-OPTION...]]
 set -euo pipefail

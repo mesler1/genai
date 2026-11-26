@@ -391,7 +391,8 @@ class TestEndpoints(Tmp):
     def test_the_quick_start_endpoint_is_valid_once_filled_in(self):
         with open(os.path.join(os.path.dirname(HERE), "README.md")) as f:
             readme = f.read()
-        block = readme[readme.index("## Quick start"):readme.index("## Endpoints and profiles")]
+        start = readme.index("## Quick start")
+        block = readme[start:readme.index("\n## ", start + 1)]
         text = block[block.index("```json\n") + 8:]
         text = text[:text.index("```")]
         p = self.path("work-llm.json")

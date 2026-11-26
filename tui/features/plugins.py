@@ -87,7 +87,7 @@ class Plugins(Feature):
             m.note("asking hoplon for its plugins; /plugins again shows them")
             return
         if not self.rows:
-            m.note("no plugins found (see the README: Plugins)")
+            m.note("no plugins found (see docs/plugins.md)")
         for r in self.rows:
             if not isinstance(r, dict):
                 continue

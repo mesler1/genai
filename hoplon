@@ -5509,7 +5509,7 @@ class Repl:
                 print("  network: the endpoint's host does not resolve here, so the network looks off")
             print("  sandbox/run shell opens a shell in it (from the host)")
         else:
-            print("  sandbox/run hoplon runs hoplon in a podman sandbox instead (see the README)")
+            print("  sandbox/run hoplon runs hoplon in a podman sandbox instead (see docs/sandbox.md)")
         if self.e.box:
             print("  profile sandbox: " + self.box_line())
 
