@@ -162,9 +162,6 @@ for you`), coding mode or chat, a work session's item, and a context gauge that 
 and ember at 90%. On its right are the sandbox and the host, and tmux's keys when the terminal is
 wide enough.
 
-hoplon-tui shows a splash while tmux starts, for about a second, on a terminal of at least 60×24.
-`HOPLON_TUI_SPLASH=0` or `NO_COLOR` turns it off.
-
 The colours are "bronze on iron": bronze for hoplon's badge, the focused pane and key hints; brass
 for what waits on you and for anything live, outside the sandbox; patina for the sandbox and for
 what ran fine; ember for errors and risks. They need a 256-colour terminal and fall back to the
