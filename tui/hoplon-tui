@@ -213,11 +213,11 @@ if [ -z "${NO_COLOR:-}" ]; then
   bronze='#D4A05A' iron='#0E1113' dim='#7E858E' line='#2A3036'
   t set -g pane-border-style "fg=$line"
   t set -g pane-active-border-style "fg=$bronze,bold"
-  badge="#[fg=$iron,bg=$bronze,bold] ◆ hoplon #[default] " hint="#[fg=$dim]" host="#[fg=$bronze,bold]"
+  badge="#[fg=$iron,bg=$bronze,bold] (H) hoplon #[default] " hint="#[fg=$dim]" host="#[fg=$bronze,bold]"
 else
   t set -g pane-border-style 'default'
   t set -g pane-active-border-style 'bold'
-  badge='#[bold] ◆ hoplon #[default] ' hint='' host='#[bold]'
+  badge='#[bold] (H) hoplon #[default] ' hint='' host='#[bold]'
 fi
 # The header: tmux's status line, at the top. hoplon's badge, then what the conversation pane reports
 # (endpoint and model, profile, session, state, mode, context); on the right, what waits on you, the

@@ -52,11 +52,11 @@ def text_of(block, w=60):
 
 class TestPalette(unittest.TestCase):
     class Curses:
-        A_DIM, A_BOLD, COLOR_YELLOW, COLOR_RED, COLOR_CYAN, COLOR_WHITE, COLOR_BLACK = 1, 2, 3, 1, 6, 7, 0
+        A_DIM, A_BOLD, A_REVERSE, COLOR_YELLOW, COLOR_RED, COLOR_CYAN, COLOR_WHITE, COLOR_BLACK = 1, 2, 4, 3, 1, 6, 7, 0
         error = Exception
 
         def __init__(self, colors):
-            self.COLORS, self.pairs = colors, {}
+            self.COLORS, self.pairs, self.grounds = colors, {}, {}
 
         def use_default_colors(self):
             pass
@@ -65,7 +65,7 @@ class TestPalette(unittest.TestCase):
             return self.COLORS > 0
 
         def init_pair(self, i, fg, bg):
-            self.pairs[i] = fg
+            self.pairs[i], self.grounds[i] = fg, bg
 
         def color_pair(self, i):
             return 1000 + i
@@ -73,14 +73,24 @@ class TestPalette(unittest.TestCase):
     def test_256_colours_use_the_design_codes(self):
         c = self.Curses(256)
         roles = P.roles(c, environ={})
-        self.assertEqual(sorted(c.pairs.values()), sorted([245, 179, 178, 109, 167]))
+        self.assertEqual(sorted(c.pairs.values()), sorted([245, 179, 178, 109, 167, 179, 94, 230]))
         self.assertEqual(c.pairs[list(P.ROLES).index("risk") + 1], 167)
-        self.assertEqual(set(roles), {"", *P.ROLES})
+        self.assertEqual(set(roles), {"", *P.ROLES, *P.LOGO})
+        self.assertEqual([(c.pairs[i], c.grounds[i]) for i in (6, 7, 8)], [(179, -1), (94, 179), (230, 94)])
+        self.assertEqual(roles["mark"], c.color_pair(8) | c.A_BOLD)
+
+    def test_the_logo_is_a_centred_shield_and_an_outline_without_colour(self):
+        rows = P.logo("hoplon 1.0.0")
+        self.assertEqual(["".join(t for t, _ in r) for r in rows], ["▄▄▄▄▄", "█(H)█  hoplon 1.0.0", "▀▀▀▀▀"])
+        self.assertEqual([r for _, r in rows[0]], ["rim", "rim_field", "rim"])
+        roles = P.roles(self.Curses(256), environ={"NO_COLOR": "1"})
+        self.assertEqual((roles["rim"], roles["rim_field"], roles["mark"]), (0, 4, 2))   # reversed: ▄▀▀▀▄ … ▀▄▄▄▀
 
     def test_16_and_8_colours_fall_back(self):
         c = self.Curses(16)
         P.roles(c, environ={})
         self.assertEqual(c.pairs[1], 8)                                   # quiet: bright black
+        self.assertEqual((c.pairs[7], c.grounds[7]), (c.COLOR_BLACK, c.COLOR_YELLOW))   # the logo's field
         c = self.Curses(8)
         P.roles(c, environ={})
         self.assertEqual((c.pairs[1], c.pairs[2]), (c.COLOR_WHITE, c.COLOR_YELLOW))

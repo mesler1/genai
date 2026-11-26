@@ -319,8 +319,7 @@ class Banner(Block):
 
     def lines(self, w):
         h, ep = self.h, self.h.get("endpoint") or {}
-        rows = [(f"◆ hoplon {h.get('version', '?')}", A),
-                (f"{ep.get('name', '?')}: {ep.get('model', '?')} at {ep.get('base_url', '?')}", "")]
+        rows = [(f"{ep.get('name', '?')}: {ep.get('model', '?')} at {ep.get('base_url', '?')}", "")]
         where = hoplon_where(h)
         if where:
             rows.append(where)
@@ -349,7 +348,7 @@ class Banner(Block):
         if h.get("skills"):
             rows.append((f"skills: {', '.join(h['skills'])}", ""))
         rows.append(("Type a message and press Enter. /help lists commands.", Q))
-        out = []
+        out = [[("  ", "")] + row for row in palette.logo(f"hoplon {clean(str(h.get('version', '?')))}")] + [[]]
         for text, role in rows:
             out += para(clean(text), role, w, "  ", "  ")
         return out

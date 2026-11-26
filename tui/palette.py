@@ -17,7 +17,12 @@ TOKENS = {
     "ember":  ("#E8776A", 167, "RED"),       # failed, denied, risky
     "iron":   ("#0E1113", 233, "BLACK"),     # text on a bronze badge
     "plate":  ("#161B1F", 234, "BLACK"),     # the header's band
+    "field":  ("#6E4A24", 94, "BLACK"),      # the logo's field, inside the bronze rim
+    "ivory":  ("#F3EBDD", 230, "WHITE"),     # the logo's (H)
 }
+
+# The logo (logo()): its rim, the half-block cells where rim meets field, and the (H). As (fg, bg) tokens.
+LOGO = {"rim": ("bronze", None), "rim_field": ("field", "bronze"), "mark": ("ivory", "field")}
 
 # The screens' roles (conversation's Q, A, W, D, R) and the token each one uses.
 ROLES = {"quiet": "dim", "accent": "bronze", "waiting": "brass", "done": "patina", "risk": "ember"}
@@ -33,8 +38,8 @@ def enabled(environ=None):
 
 
 def roles(curses, environ=None):
-    """curses attributes for each role, plus "" (plain). Call after initscr; it sets up colour pairs 1 to 5."""
-    out = {"": 0, "quiet": curses.A_DIM}
+    """curses attributes for each role, the logo's and "" (plain). Call after initscr; it sets up colour pairs 1 to 8."""
+    out = {"": 0, "quiet": curses.A_DIM, "rim": 0, "rim_field": curses.A_REVERSE, "mark": curses.A_BOLD}
     try:
         curses.use_default_colors()
     except curses.error:
@@ -54,7 +59,23 @@ def roles(curses, environ=None):
             fg = getattr(curses, "COLOR_" + name)
         curses.init_pair(i, fg, -1)
         out[role] = curses.color_pair(i)
+    for i, (role, (fg, bg)) in enumerate(LOGO.items(), len(ROLES) + 1):
+        curses.init_pair(i, colour(curses, fg), colour(curses, bg) if bg else -1)
+        out[role] = curses.color_pair(i) | (curses.A_BOLD if role == "mark" else 0)
     return out
+
+
+def colour(curses, token):
+    _, code, name = TOKENS[token]
+    return code if curses.COLORS >= 256 else getattr(curses, "COLOR_" + name)
+
+
+def logo(text=""):
+    """The shield, 3 rows by 5 cells, with text beside its middle row: rows of (text, role) for the roles
+    above. Without colour, rim_field is reversed, which turns the shield into its outline: ▄▀▀▀▄ █(H)█ ▀▄▄▄▀."""
+    return [[("▄", "rim"), ("▄▄▄", "rim_field"), ("▄", "rim")],
+            [("█", "rim"), ("(H)", "mark"), ("█", "rim")] + ([("  " + text, "accent")] if text else []),
+            [("▀", "rim"), ("▀▀▀", "rim_field"), ("▀", "rim")]]
 
 
 def tmux(fg=None, bg=None, bold=False, environ=None):
