@@ -86,6 +86,17 @@ class TestRealisticPatterns(unittest.TestCase):
                 self.assertIn(kind, counts, text)
         self.assertEqual({k for k, _, w in self.CASES if w}, {k for k, _ in G._REDACTIONS})
 
+    def test_code_is_not_taken_for_a_secret(self):
+        for text in ("token = token.strip()", "if not token:\n    continue", "for token in args.user.split(','):",
+                     "self.api_key = api_key", "secret = get_secret(name)", "token: Optional[str] = None",
+                     "password = args.password", "    password=\n    other_value"):
+            self.assertEqual(G.redact(text), (text, {}), text)
+
+    def test_quoted_and_plain_values_still_count(self):
+        for text in ('token = "token.strip()"', "db_password = changeme", "password: hunter22",
+                     "export ACCESS_KEY=AbCd1234", "secret='get_secret(x)'"):
+            self.assertIn("secret assignment", G.redact(text)[1], text)
+
     def test_unterminated_private_key_header_is_left_alone(self):
         text = "-----BEGIN PRIVATE KEY-----\nabc"
         self.assertEqual(G.redact(text), (text, {}))

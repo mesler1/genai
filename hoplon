@@ -338,9 +338,21 @@ _REDACTIONS = [
     ("url password", re.compile(r"(\b[a-z][a-z0-9+.-]{0,31}://[^\s:/@]+:)[^\s@/]+(@)")),
     ("secret assignment", re.compile(
         r"(?i)((?:password|passwd|secret|token|api[_-]?key|access[_-]?key)" + _NAME % 2
-        + r"\s*[:=]\s*[\"']?)([^\s\"']{4,})")),
+        + r"[ \t]*[:=][ \t]*[\"']?)([^\s\"']{4,})")),       # on one line: "if not token:" ends there
 ]
 _KEY_END = re.compile(r"-----END [A-Z0-9 ]*PRIVATE KEY-----")
+
+
+def _code_not_secret(m):
+    """An unquoted value that is plainly code, not a secret: a call or an index (token.strip(), get_token()), or a
+    variable of the same name (token = token, self.api_key = api_key). A quoted value is never excused."""
+    prefix, value = m.group(1), m.group(3)
+    if prefix.endswith(("'", '"')):
+        return False
+    if any(c in value for c in "()[]{}") or m.string[m.end():m.end() + 1] in ("(", "["):
+        return True
+    name = re.match(r"[\w.-]*", prefix).group(0).lower()
+    return value.lower().rsplit(".", 1)[-1] == name.rsplit(".", 1)[-1]
 
 
 def redact(text, secrets=()):
@@ -353,6 +365,8 @@ def redact(text, secrets=()):
             text = text.replace(value, "[REDACTED endpoint key]")
     for kind, rx in _REDACTIONS:
         def sub(m, kind=kind):
+            if kind == "secret assignment" and _code_not_secret(m):
+                return m.group(0)
             counts[kind] = counts.get(kind, 0) + 1
             if kind in ("bearer token", "secret assignment"):
                 return m.group(1) + "[REDACTED]"
