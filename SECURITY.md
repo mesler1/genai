@@ -409,8 +409,13 @@ safe and prompts are rare enough to be read.
   wrapper that can read the digest can approve anything, and it runs as you anyway.
 - Every kind of proposal is one row of a table (`PROPOSAL_KINDS`), and `perform` runs a kind's
   handler only after an accept, except for commands (shown, never run) and kinds the wrapper
-  answers itself. `tests/test_invariants.py` checks this, and the audit and end-of-input rules
-  above, over every row.
+  answers itself. Each row names the request it makes of the gate (`GATE_REQUESTS`: a sandboxed
+  run, a scoped command, an edit, or what goes to the model), or none, and the only rules that may
+  approve it without asking (`AUTO_RULES`, such as `offline_run` or `approved_file`). One function,
+  `Engine.grant`, makes a proposal automatic, and refuses a rule its kind doesn't list; each approval
+  by a rule is logged as a `decision` with `by` naming the rule, the same record your own decisions
+  get. `tests/test_invariants.py` checks all of this, and the audit and end-of-input rules above,
+  over every row, and that nothing else in hoplon makes a proposal automatic.
 - An edit that cannot be previewed is not applied.
 - An overwrite that cannot be shown as a diff (the existing file is binary or too large) shows
   the whole new content instead, says the file is replaced entirely, and says when it will stay
@@ -428,8 +433,8 @@ safe and prompts are rare enough to be read.
     to `ask` empties it, and declining any edit to a file takes that file out.
   - New files, hidden files, a file or new text that looks like a secret (including the endpoint
     key), and a whole replacement of a file that can't be diffed always ask.
-  - Each one is still shown with its diff, written to the audit log (`auto_edit`, and `file_op`
-    with `approved_file`), and bound to the file's state when it was proposed, like any write.
+  - Each one is still shown with its diff, written to the audit log (a `decision` by
+    `approved_file`, and `file_op` with `approved_file`), and bound to the file's state when it was proposed, like any write.
     The model can't change a file's mode, so that can't happen behind it either.
   - It is independent of plans: approving a plan adds no files to the set (a planned edit you
     then approve counts like any other), and the set doesn't approve plan steps.
@@ -678,7 +683,7 @@ stall hoplon.
 ### 12. Logging and accountability
 
 *NCSC guidance; LLM06.* `~/.config/hoplon/audit.log` records, one JSON object per line: session
-start, every proposal and decision, every file operation and its outcome, each `:run` and its
+start, every proposal and decision (an automatic one with `by`, the rule that approved it), every file operation and its outcome, each `:run` and its
 exit status, each time output was shared, blessings, coding-mode changes, tool registrations
 and compactions. It records what was proposed and decided, not file contents or command text.
 

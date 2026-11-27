@@ -70,7 +70,8 @@ class TestApprovedFiles(Edits):
         kinds = [e["event"] for e in self.audit()]
         self.assertIn("edits", kinds)
         self.assertIn("edits_remember", kinds)
-        self.assertIn("auto_edit", kinds)
+        self.assertIn({"decision": "accept", "by": "approved_file"},
+                      [{k: e.get(k) for k in ("decision", "by")} for e in self.audit() if e["event"] == "decision"])
         ops = [e for e in self.audit() if e["event"] == "file_op"]
         self.assertEqual([bool(e.get("approved_file")) for e in ops], [False, True])
 

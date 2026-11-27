@@ -4040,6 +4040,7 @@ class Proposal:
         self.reply = None          # what the model is told instead of "error: ..." (the user still sees error)
         self.stopped = False       # the user pressed Ctrl-C while it ran: the turn ends
         self.digest = None         # set when a JSON front end is asked to decide it
+        self.rule = None           # the rule that approved it without asking (AUTO_RULES), set only by Engine.grant
 
     def event(self):
         ev = {"type": "proposal", "id": self.id, "kind": self.kind}
@@ -4049,15 +4050,41 @@ class Proposal:
         return ev
 
 
+# The gate: what crosses from the model's side to yours is one of four requests, and each is carried out by one
+# handler. Every proposal kind names the request it makes, or none: a kind with none acts on nothing outside hoplon
+# (it is only shown, the front end answers it, or it moves a work session along). See #44.
+GATE_REQUESTS = {
+    "run": ("a command in the model's sandbox, on a throwaway copy of the project", "Sandbox.run"),
+    "scoped": ("a command from a blessed command set, on the live system", "Engine.run_trusted"),
+    "edit": ("a change to a file in the project: an edit or a write", "Workdir.write"),
+    "model": ("what goes to the model endpoint, including what the file tools read for it", "Client.chat"),
+}
+
+# The only rules that may approve a proposal without asking. Each kind lists the ones that apply to it, and
+# Engine.grant refuses any other; every approval by a rule is logged as a decision "by" that rule.
+AUTO_RULES = {
+    "offline_run": "a sandboxed run with the network off",
+    "coding_read": "coding mode: a read, listing or search of what isn't hidden or secret-looking",
+    "plan_read": "a read or listing the approved plan names",
+    "plain_command": "a scoped command that says read, uses no network and runs as you",
+    "blessed_auto": "a scoped command you let run without asking when you blessed its set",
+    "work_copy": "an edit or write to a work session's copy, on its own branch",
+    "approved_file": "an edit or write to a file you already approved one for (edits: approved-files)",
+    "work_step": "finishing or retrying a work item, which only moves the work session along",
+}
+
+
 class Kind:
     """One kind of proposal: the tool that asks for it and the Engine methods that build it from a call and carry it
-    out once decided. bulk: its accepted result is bulky (compaction may drop it later). shown: only shown to the
-    user, never asked about or run, and it ends the turn. answered: the wrapper answers it (ok, declined or error),
-    so hoplon records no accept or decline and the handler runs whatever the answer. Every other kind runs only if
-    accepted, by the user or by a rule that made it automatic."""
+    out once decided. request: the gate request it makes (GATE_REQUESTS), or None. rules: the AUTO_RULES that may
+    approve it without asking. bulk: its accepted result is bulky (compaction may drop it later). shown: only shown
+    to the user, never asked about or run, and it ends the turn. answered: the wrapper answers it (ok, declined or
+    error), so hoplon records no accept or decline and the handler runs whatever the answer. Every other kind runs
+    only if accepted, by the user or by one of its rules."""
 
-    def __init__(self, name, tool, build, perform, bulk=False, shown=False, answered=False):
+    def __init__(self, name, tool, build, perform, request=None, rules=(), bulk=False, shown=False, answered=False):
         self.name, self.tool, self.build, self.perform = name, tool, build, perform
+        self.request, self.rules = request, tuple(rules)
         self.bulk, self.shown, self.answered = bulk, shown, answered
 
 
@@ -4065,18 +4092,18 @@ PROPOSAL_KINDS = {k.name: k for k in (       # every kind of proposal there is; 
     Kind("command", "propose_command", "build_command", "perform_command", shown=True),
     Kind("samples", "request_samples", "build_samples", "perform_samples", shown=True),
     Kind("skills", "suggest_skills", "build_skills", "perform_skills"),
-    Kind("sandbox", "run_in_sandbox", "build_sandbox", "run_sandboxed", bulk=True),
-    Kind("search", "search_files", "search_proposal", "perform_file", bulk=True),
-    Kind("read", "read_file", "build_read", "perform_file", bulk=True),
-    Kind("list", "list_dir", "build_read", "perform_file", bulk=True),
-    Kind("write", "write_file", "build_write", "perform_file"),
-    Kind("edit", "edit_file", "build_edit", "perform_file"),
+    Kind("sandbox", "run_in_sandbox", "build_sandbox", "run_sandboxed", "run", ("offline_run",), bulk=True),
+    Kind("search", "search_files", "search_proposal", "perform_file", "model", ("coding_read",), bulk=True),
+    Kind("read", "read_file", "build_read", "perform_file", "model", ("coding_read", "plan_read"), bulk=True),
+    Kind("list", "list_dir", "build_read", "perform_file", "model", ("coding_read", "plan_read"), bulk=True),
+    Kind("write", "write_file", "build_write", "perform_file", "edit", ("work_copy", "approved_file")),
+    Kind("edit", "edit_file", "build_edit", "perform_file", "edit", ("work_copy", "approved_file")),
     Kind("plan", "propose_plan", "build_plan", "perform_plan", answered=True),
     Kind("work_plan", "propose_work_plan", "build_work_plan", "perform_work_plan"),
-    Kind("finish", "finish_item", "build_finish", "perform_finish"),
-    Kind("retry", "retry_item", "build_retry", "perform_retry"),
+    Kind("finish", "finish_item", "build_finish", "perform_finish", rules=("work_step",)),
+    Kind("retry", "retry_item", "build_retry", "perform_retry", rules=("work_step",)),
     Kind("external", None, "build_external", "perform_external", bulk=True, answered=True),
-    Kind("trusted", None, "build_trusted", "perform_trusted", bulk=True),
+    Kind("trusted", None, "build_trusted", "perform_trusted", "scoped", ("plain_command", "blessed_auto"), bulk=True),
 )}
 BY_TOOL = {k.tool: k for k in PROPOSAL_KINDS.values() if k.tool}
 
@@ -5082,7 +5109,8 @@ class Engine:
             raise ValueError("command is required")
         p = Proposal(pid, "sandbox", call_id, command=cmd, reason=reason, network=self.box.network,
                      image=self.box.conf["image"])
-        p.auto = not self.box.network
+        if not self.box.network:
+            self.grant(p, "offline_run")
         return p
 
     def build_read(self, pid, call_id, args, reason, name):
@@ -5096,9 +5124,9 @@ class Engine:
             p.fields["size"] = st.st_size if st else None
         if self.read_allowed(parts):
             if kind == "read":
-                self.prepare_auto_read(p)
+                self.prepare_auto_read(p, "coding_read")
             else:
-                p.auto = True
+                self.grant(p, "coding_read")
         elif kind == "read" and any(secret_name(x) for x in parts):    # named like one: warned as content would be
             p.fields["secret"] = True
             p.fields["to"] = to = self.active()[0].base_url
@@ -5193,7 +5221,7 @@ class Engine:
             raise ValueError("n (the item's number) and summary are required")
         p = Proposal(pid, "finish", call_id, n=n, summary=one_line(summary)[0][:200], reason=summary,
                      test=self.work.test, notes=plain_text(notes or "").strip()[:WORK_NOTES_MAX])
-        p.auto = True
+        self.grant(p, "work_step")
         return p
 
     def build_retry(self, pid, call_id, args, reason, name):
@@ -5206,7 +5234,7 @@ class Engine:
         if n != w.current:
             raise ValueError(f"item {n} is not the one under review: that is item {w.current}")
         p = Proposal(pid, "retry", call_id, n=n, hint=plain_text(hint).strip()[:WORK_NOTES_MAX], reason=hint)
-        p.auto = True
+        self.grant(p, "work_step")
         return p
 
     def build_external(self, pid, call_id, args, reason, name):
@@ -5219,7 +5247,8 @@ class Engine:
                      argv=cmd.shown(values), access=cmd.access, reason=cmd.describe, _cmd=cmd,
                      **({"as_user": cmd.as_user} if cmd.as_user else {}),
                      **({"network": cmd.reaches()} if cmd.reaches() else {}))
-        p.auto = cmd.auto
+        if cmd.auto:
+            self.grant(p, "plain_command" if cmd.plain() else "blessed_auto")
         return p
 
     def search_proposal(self, pid, call_id, args, reason, name="search_files"):
@@ -5239,7 +5268,7 @@ class Engine:
         if args.get("ignore_case") is True:
             fields["ignore_case"] = True
         p = Proposal(pid, "search", call_id, **fields)
-        p.auto = True
+        self.grant(p, "coding_read")
         return p
 
     def search(self, p):
@@ -5315,15 +5344,22 @@ class Engine:
         self.audit.log("user_read", path=path, chars=len(text), secret=secret)
         return shown, len(text.encode()), secret, counts
 
-    def prepare_auto_read(self, proposal):
-        """Read the file now, so what is sent is exactly what was checked for secrets. A read that fails (a missing,
-        binary or oversized file) stays automatic and reports its error: there is nothing secret to ask about."""
+    def grant(self, p, rule):
+        """Approve p without asking, by one of the rules its kind allows (Kind.rules). decide() logs each one."""
+        if rule not in PROPOSAL_KINDS[p.kind].rules:
+            raise RuntimeError(f"rule {rule!r} may not approve a {p.kind} proposal")
+        p.auto, p.rule = True, rule
+
+    def prepare_auto_read(self, proposal, rule):
+        """Read the file now, so what is sent is exactly what was checked for secrets, and approve it by rule. A read
+        that fails (a missing, binary or oversized file) is approved too and reports its error: there is nothing secret
+        to ask about."""
         path = proposal.fields["path"]
         try:
             text = self.wd.read(path)
         except (ValueError, OSError) as e:
             proposal.fields["_read_error"] = e
-            proposal.auto = True
+            self.grant(proposal, rule)
             return
         if self.secret_text(text):
             proposal.fields["secret"] = True
@@ -5332,7 +5368,7 @@ class Engine:
                            f"to {to}")
             return
         proposal.fields["_read_text"] = text
-        proposal.auto = True
+        self.grant(proposal, rule)
 
     def remember_not_secret(self, path, text):
         """You said this file holds no secrets: don't ask about this exact text again. Not when it holds the endpoint
@@ -5372,11 +5408,14 @@ class Engine:
             if p.kind in ("edit", "write") and self.work:
                 p.fields["in_copy"] = True      # it lands in the copy, asked or not: the card says so
             if p.kind in ("edit", "write") and not p.auto and self.work_edit(p):
-                p.auto, p.fields["work"] = True, True
-                self.audit.log("auto_edit", id=p.id, kind=p.kind, path=p.fields["path"], work=True)
+                self.grant(p, "work_copy")
+                p.fields["work"] = True
             elif p.kind in ("edit", "write") and not p.auto and not self.work and self.auto_edit(p):
-                p.auto, p.fields["approved_file"] = True, True
-                self.audit.log("auto_edit", id=p.id, kind=p.kind, path=p.fields["path"])
+                self.grant(p, "approved_file")
+                p.fields["approved_file"] = True
+        for p in live:
+            if p.auto:          # every approval by a rule, in the same record a user's decision gets
+                self.audit.log("decision", id=p.id, decision="accept", by=p.rule)
         for p in live:
             if p.kind == "samples":
                 self.ui.show_samples(p)
@@ -5453,11 +5492,11 @@ class Engine:
                 return
             if p.kind == "read":
                 if not p.fields.get("secret"):
-                    self.prepare_auto_read(p)
+                    self.prepare_auto_read(p, "plan_read")
                 if not p.auto:
                     return
             else:
-                p.auto = True
+                self.grant(p, "plan_read")
         self.audit.log("plan_match", id=p.id, step=hit["n"], kind=p.kind)
         self.ui.plan(self.plan)
 

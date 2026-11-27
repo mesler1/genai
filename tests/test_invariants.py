@@ -5,6 +5,7 @@ must not depend on any one kind's code. Run: python3 -m unittest discover -s tes
 import io
 import json
 import os
+import re
 import sys
 import unittest
 from unittest import mock
@@ -18,7 +19,8 @@ def proposal(kind, n=1):
     """A proposal of this kind with the fields the gate itself reads; the handlers are not reached."""
     return G.Proposal(f"p{n}", kind, f"c{n}", command="true", path="a.txt", steps=[], tool="t", goal="g",
                       items=["i"], summary="s", reason="r",
-                      what="w", files=["f.log"], suggest="", folder="/f", names=["s"], about=[""])
+                      what="w", files=["f.log"], suggest="", folder="/f", names=["s"], about=[""],
+                      exists=False, lines=1, content="x\n", diff="", size=1, set="s", argv="true", access="read")
 
 
 class TestTable(unittest.TestCase):
@@ -33,6 +35,45 @@ class TestTable(unittest.TestCase):
             with self.subTest(kind=k.name):
                 self.assertTrue(callable(getattr(G.Engine, k.build, None)), k.build)
                 self.assertTrue(callable(getattr(G.Engine, k.perform, None)), k.perform)
+
+    def test_every_kind_names_the_request_it_makes_or_none(self):
+        # A kind that acts outside hoplon makes one of the four gate requests. The kinds that make none are listed
+        # here by name, so a new kind has to be placed on purpose.
+        none = {"command", "samples", "skills", "plan", "work_plan", "finish", "retry", "external"}
+        for k in G.PROPOSAL_KINDS.values():
+            with self.subTest(kind=k.name):
+                if k.name in none:
+                    self.assertIsNone(k.request)
+                else:
+                    self.assertIn(k.request, G.GATE_REQUESTS)
+        self.assertEqual(sorted({k.request for k in G.PROPOSAL_KINDS.values()} - {None}), sorted(G.GATE_REQUESTS))
+
+    def test_every_request_names_a_handler_that_exists(self):
+        for name, (what, handler) in G.GATE_REQUESTS.items():
+            with self.subTest(request=name):
+                cls, meth = handler.split(".")
+                self.assertTrue(callable(getattr(getattr(G, cls), meth, None)), handler)
+                self.assertTrue(what)
+
+    def test_every_rule_is_known_and_used(self):
+        used = [r for k in G.PROPOSAL_KINDS.values() for r in k.rules]
+        self.assertLessEqual(set(used), set(G.AUTO_RULES))
+        self.assertEqual(set(used), set(G.AUTO_RULES))      # a rule no kind lists is dead, or a kind forgot it
+        for k in G.PROPOSAL_KINDS.values():
+            if k.shown or k.answered:
+                with self.subTest(kind=k.name):
+                    self.assertEqual(k.rules, ())           # nothing to approve: shown, or the wrapper answers
+
+    def test_only_grant_makes_a_proposal_automatic(self):
+        # Anywhere else, setting .auto on a proposal would be an approval no rule accounts for and no record says.
+        with open(G.__file__) as f:
+            src = f.read()
+        grant = re.search(r"\n    def grant\(self, p, rule\):\n(?:        .*\n|\n)+", src).group(0)
+        rest = src.replace(grant, "")
+        hits = [m.group(0) for m in re.finditer(r"\b(\w+)\.auto\s*(?:,[^=\n]*)?=(?!=)[^\n]*", rest)
+                if m.group(1) not in ("c", "self")]   # TrustedCommand.auto (c, self) is what a set allows, not a grant
+        self.assertEqual(hits, [])
+        self.assertIn("self.auto = False", src)          # a Proposal starts asking
 
     def test_a_tool_not_in_the_table_is_invalid(self):
         eng = mock.Mock(external={}, counter=0)
@@ -76,23 +117,48 @@ class TestGate(Guard):
         eng.audit.log = lambda event, **f: records.append((event, f))
         return records
 
-    def test_every_automatic_approval_is_audited_before_it_is_accepted(self):
+    def test_every_automatic_approval_is_audited_with_its_rule_before_it_is_accepted(self):
         eng, ui = self.engine(self.proj, coding="--coding")
         records = self.logged(eng)
-        kinds = [k for k in G.PROPOSAL_KINDS.values() if not k.shown]
-        props = [proposal(k.name, n) for n, k in enumerate(kinds, 1)]
-        for p in props:
-            p.auto = True
+        props = [(proposal(k.name, n), rule) for n, (k, rule) in
+                 enumerate(((k, r) for k in G.PROPOSAL_KINDS.values() for r in k.rules), 1)]
+        for p, rule in props:
+            eng.grant(p, rule)
         seen = []
 
         def show_auto(p):
             self.assertIsNone(seen.append(p.id))
             self.assertIn(("proposal", p.id, True),
                           [(e, f.get("id"), f.get("auto")) for e, f in records if e == "proposal"])
+            self.assertIn(("decision", p.id, "accept", p.rule),
+                          [(e, f.get("id"), f.get("decision"), f.get("by")) for e, f in records])
         ui.show_auto = show_auto
-        eng.decide(props)
-        self.assertEqual(seen, [p.id for p in props])
-        self.assertTrue(all(p.decision == "accept" for p in props))
+        eng.decide([p for p, _ in props])
+        self.assertEqual(seen, [p.id for p, _ in props])
+        self.assertTrue(all(p.decision == "accept" and p.rule == rule for p, rule in props))
+
+    def test_a_rule_approves_only_the_kinds_that_list_it(self):
+        eng, _ = self.engine(self.proj, coding="--coding")
+        for k in G.PROPOSAL_KINDS.values():
+            for rule in set(G.AUTO_RULES) - set(k.rules):
+                with self.subTest(kind=k.name, rule=rule):
+                    p = proposal(k.name)
+                    with self.assertRaises(RuntimeError):
+                        eng.grant(p, rule)
+                    self.assertFalse(p.auto)
+
+    def test_end_of_input_at_the_terminal_declines_every_kind_that_asks(self):
+        eng, _ = self.engine(self.proj, coding="--coding")
+        self.logged(eng)
+        eng.ui = G.TtyUI(out=io.StringIO())
+        asking = [k for k in G.PROPOSAL_KINDS.values() if not k.shown and k.name != "external"]
+        props = [proposal(k.name, n) for n, k in enumerate(asking, 1)]
+        with mock.patch("sys.stdin", io.StringIO("")), mock.patch("sys.stdout", io.StringIO()), \
+                mock.patch("sys.stderr", io.StringIO()):
+            eng.decide(props)
+        for p in props:
+            with self.subTest(kind=p.kind):
+                self.assertEqual(p.decision, "decline")
 
     def test_every_proposal_is_audited_whether_or_not_it_asks(self):
         eng, ui = self.engine(self.proj, coding="--coding")
@@ -128,6 +194,8 @@ class TestGate(Guard):
                 rec = [f for e, f in records if e == "proposal" and f["id"] == p.id]
                 self.assertEqual(len(rec), 1)
                 self.assertTrue(rec[0]["auto"])
+                self.assertIn({"id": p.id, "decision": "accept", "by": "coding_read"},
+                              [f for e, f in records if e == "decision"])
 
 
 if __name__ == "__main__":
