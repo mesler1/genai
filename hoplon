@@ -2715,7 +2715,8 @@ def remote_config(line, audit):
     if not m or not 0 < int(m.group(1)) < 65536:
         raise bad("base_url must be http://127.0.0.1:PORT, optionally with a path")
     offered = {"skills": remote_items(msg.get("skills"), "skill", bad),
-               "command_sets": remote_items(msg.get("command_sets"), "command_set", bad)}
+               "command_sets": remote_items(msg.get("command_sets"), "command_set", bad),
+               "session": remote_session(msg.get("session"), bad)}
     endpoint.token = token
     digest = lambda o: hash_bytes(json.dumps(o, sort_keys=True).encode())
     audit.log("remote_config", endpoint=endpoint.name, model=endpoint.model, endpoint_sha256=digest(ep),
@@ -2723,6 +2724,32 @@ def remote_config(line, audit):
               skills={n: s.hash for n, s in offered["skills"].items()},
               command_sets={n: p.hash for n, p in offered["command_sets"].items()})
     return endpoint, persona, offered
+
+
+def remote_session(sess, bad):
+    """The session hoplon-tui keeps for this conversation on the user's machine, or None (not saved): {"name", "data"},
+    data None for a new one. Checked for shape; the user's machine checked that it was this host's."""
+    if sess is None:
+        return None
+    if not isinstance(sess, dict) or set(sess) - {"name", "data"} or not isinstance(sess.get("name"), str) \
+            or not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", sess["name"]):
+        raise bad("'session' must be {name, data}, with a session name")
+    data = sess.get("data")
+    if data is None:
+        return {"name": sess["name"], "data": None}
+    ok = (isinstance(data, dict) and isinstance(data.get("coding", False), bool)
+          and isinstance(data.get("cwd", ""), str)
+          and isinstance(data.get("skills", []), list) and all(isinstance(x, str) for x in data.get("skills", []))
+          and isinstance(data.get("created", ""), str)
+          and all(isinstance(data.get(k, []), list) and all(isinstance(m, dict) for m in data.get(k, []))
+                  for k in ("messages", "history")))
+    if not ok:
+        raise bad("'session.data' is not a saved session")
+    messages = data.get("messages", [])
+    return {"name": sess["name"], "data": {"coding": data.get("coding", False), "cwd": data.get("cwd") or os.getcwd(),
+                                           "skills": data.get("skills", []), "messages": messages,
+                                           "history": data.get("history", list(messages)),
+                                           "created": data.get("created") or now()}}
 
 
 # Endpoint fields that never travel to a remote host: where the key is, the proxy (the key proxy uses the endpoint's
@@ -2771,6 +2798,7 @@ def export_remote(cfg, profile_name, endpoint_name, skills=(), command_sets=()):
                   skills={s["name"]: s["hash"] for s in skills}, command_sets={p["name"]: p["hash"] for p in sets})
     return {"endpoint": {k: v for k, v in endpoint.data.items() if k not in REMOTE_STRIP},
             "profile": persona.data if persona else None, "endpoint_name": endpoint.name, "base_path": path,
+            "destination_id": endpoint.destination_id(),
             "skills": skills, "command_sets": sets}
 
 
@@ -3794,6 +3822,7 @@ class Session:
         self.resumed = False
         self.held = None     # during a work session: {"coding", "messages"} as they were, saved in place of the
                              # live ones, so a session resumed after a crash is the one from before it
+        self.relay = None    # remote mode: where a save goes instead of a file (to hoplon-tui, which keeps it)
 
     @classmethod
     def open(cls, cfg, sid):
@@ -3803,6 +3832,12 @@ class Session:
             raise HoplonError(f"bad session name '{sid}'", EXIT_USAGE)
         s = cls(cfg, sid)
         data = read_state_json(s.path)
+        if data and data.get("remote"):
+            where = data["remote"] if isinstance(data["remote"], dict) else {}
+            dest = one_line(str(where.get("dest", "?")))[0]
+            raise HoplonError(f"session '{sid}' ran on {dest}, through hoplon-tui: resume it there with "
+                             f"hoplon-tui --remote {dest} -S {sid}. Its conversation never runs here.",
+                             EXIT_USAGE, "remote_session")
         if data:
             s.resumed = True
             if "endpoint" in data:
@@ -3847,13 +3882,28 @@ class Session:
         self.messages.pop()
         self.history.pop()
 
+    def resume_from(self, name, data):
+        """Remote mode: the session hoplon-tui keeps on the user's machine, sent in the config line (data None: a new
+        one). Nothing of it is written on this host; every save goes back through relay."""
+        self.id = name
+        if data is None:
+            return
+        self.resumed = True
+        self.coding, self.cwd, self.skills = data["coding"], data["cwd"], list(data["skills"])
+        self.messages, self.history = data["messages"], data["history"]
+        self.created = data["created"]
+        self.close_dangling()
+
     def save(self):
-        if not self.path:
+        if not self.path and not self.relay:
             return
         held = self.held or {"coding": self.coding, "messages": self.messages}
         data = {"id": self.id, "endpoint": self.endpoint, "profile": self.profile, "coding": held["coding"],
                 "cwd": self.cwd, "destination_id": self.destination_id, "skills": self.skills, "created": self.created,
                 "updated": now(), "messages": held["messages"], "history": self.history}
+        if self.relay:
+            self.relay(data)
+            return
         write_private(self.path, json.dumps(data, ensure_ascii=False) + "\n")
 
 
@@ -3868,7 +3918,9 @@ def list_sessions(cfg):
             d = read_state_json(os.path.join(cfg.sessions, n), {}) or {}
             first = next((m.get("content") for m in d.get("history", []) if m.get("role") == "user"), "") or ""
             ep, prof = (d.get("endpoint"), d.get("profile")) if "endpoint" in d else (d.get("profile"), None)
+            remote = d.get("remote") if isinstance(d.get("remote"), dict) else None
             out.append({"id": n[:-5], "endpoint": ep, "profile": prof, "updated": d.get("updated"),
+                        "remote": str(remote.get("dest", "?")) if remote else None,
                         "coding": d.get("coding", False), "messages": len(d.get("history", [])),
                         "first": first.strip().splitlines()[0][:80] if first.strip() else ""})
     return out
@@ -8017,7 +8069,8 @@ def main(argv=None):
                 for r in rows:
                     print(f"{one_line(r['id'])[0]:28} {one_line(r['endpoint'] or '-')[0]:12} "
                           f"{one_line(r['profile'] or '-')[0]:12} {one_line(r['updated'] or '')[0]:26} "
-                          f"{one_line(r['first'])[0]}")
+                          + (f"[on {one_line(r['remote'])[0]}] " if r.get("remote") else "")
+                          + f"{one_line(r['first'])[0]}")
             return EXIT_OK
 
         session = Session.open(cfg, args.session)
@@ -8026,12 +8079,16 @@ def main(argv=None):
         offered = None
         if args.config_stdin:
             endpoint, persona, offered = remote_config(sys.stdin.readline(), cfg.audit)
+            if offered["session"]:
+                session.resume_from(offered["session"]["name"], offered["session"]["data"])
         else:
             pname = args.profile or (session.profile if session.resumed else cfg.default_profile)
             persona = select_named(cfg, "profile", pname) if pname else None
             endpoint = select_endpoint(cfg, args.endpoint or (persona.endpoint if persona else None)
                                        or session.endpoint or cfg.default_endpoint)
         destination_id = endpoint.destination_id()
+        if args.config_stdin:           # hoplon-tui checked the real endpoint against the session, on your machine
+            session.destination_id = destination_id
         if session.messages and session.destination_id != destination_id:
             reason = ("has a different destination" if session.destination_id else
                       "was saved before its destination was recorded")
@@ -8069,6 +8126,8 @@ def main(argv=None):
         prompt = " ".join(args.prompt) if args.prompt else None
         if args.json:
             ui = JsonUI()
+            if offered and offered["session"]:
+                session.relay = lambda data: ui.emit({"type": "session_save", "session": data})
         elif sys.stdin.isatty() and sys.stdout.isatty():
             ui = TtyUI()
         else:

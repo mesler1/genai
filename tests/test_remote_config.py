@@ -9,7 +9,7 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from fakeapi import FakeAPI  # noqa: E402
+from fakeapi import FakeAPI, reply  # noqa: E402
 from test_hoplon import G, SCRIPT, Proc, Tmp, bless_path, make_home  # noqa: E402
 
 
@@ -144,7 +144,7 @@ class TestRemoteConfigLine(Tmp):
         _, _, got = self.parse(command_sets=[dict(self.entry("w", wplug), auto=["x"])])
         self.assertEqual((got["command_sets"]["w"].commands["x"].auto, got["command_sets"]["w"].commands["y"].auto),
                          (True, False))
-        self.assertEqual(self.parse()[2], {"skills": {}, "command_sets": {}})
+        self.assertEqual(self.parse()[2], {"skills": {}, "command_sets": {}, "session": None})
         with open(self.path("audit.log")) as f:
             rec = json.loads(f.readline())
         self.assertEqual(rec["skills"], {"s": offered["skills"]["s"].hash})
@@ -167,6 +167,56 @@ class TestRemoteConfigLine(Tmp):
                 self.parse(**extra)
             self.assertIn(why, str(e.exception), extra)
             self.assertEqual(e.exception.kind, "bad_config")
+
+    def test_a_session_is_checked_for_shape(self):
+        self.assertIsNone(self.parse()[2].get("session"))
+        self.assertEqual(self.parse(session={"name": "tui-a"})[2]["session"], {"name": "tui-a", "data": None})
+        for bad in ({"name": "../x"}, {"name": "a", "extra": 1}, "tui-a", {"name": "a", "data": {"messages": "x"}},
+                    {"name": "a", "data": {"coding": "yes"}}, {"name": "a", "data": {"history": [1]}}):
+            with self.assertRaises(G.HoplonError, msg=bad) as e:
+                self.parse(session=bad)
+            self.assertEqual(e.exception.kind, "bad_config")
+
+    def test_a_remote_session_is_resumed_from_the_line_and_saved_back_not_here(self):
+        """Remote mode keeps the conversation on the user's machine: hoplon on the host gets it in the config line,
+        sends every save back as session_save, and writes no session file of its own."""
+        with FakeAPI([reply("second answer")]) as api:
+            home, path = make_home(self.tmp, api.url)
+            g = Proc(home, self.tmp, ["--config-stdin"])
+            earlier = [{"role": "user", "content": "EARLIER-QUESTION"}, {"role": "assistant", "content": "first answer"}]
+            g.send({"type": "config", "token": "ab" * 16, "profile": None,
+                    "endpoint": {"name": "e", "base_url": api.url, "model": "fake-model"},
+                    "session": {"name": "tui-abc123", "data": {"messages": earlier, "history": earlier,
+                                                               "coding": False, "cwd": self.tmp, "skills": [],
+                                                               "created": "2026-11-27T10:00:00"}}})
+            hello = g.until("hello")
+            self.assertEqual((hello["session"], hello["resumed"]), ("tui-abc123", True))
+            g.send({"type": "user", "text": "NEW-QUESTION"})
+            saved = g.until("session_save")["session"]
+            g.until("done")
+            g.close()
+            sent = json.dumps(api.requests[-1])
+            self.assertIn("EARLIER-QUESTION", sent)
+            saved = [e for e in g.events if e["type"] == "session_save"][-1]["session"]
+            self.assertEqual([m.get("content") for m in saved["history"]],
+                             ["EARLIER-QUESTION", "first answer", "NEW-QUESTION", "second answer"])
+            self.assertEqual(saved["id"], "tui-abc123")
+            self.assertFalse(os.path.exists(os.path.join(home, "sessions", "tui-abc123.json")))
+            self.assertEqual(os.listdir(os.path.join(home, "sessions")) if os.path.isdir(os.path.join(home, "sessions"))
+                             else [], [])
+
+    def test_a_remote_session_is_not_resumed_by_hoplon_here(self):
+        home, _ = make_home(self.tmp, "https://llm.example/v1")
+        os.makedirs(os.path.join(home, "sessions"), exist_ok=True)
+        with open(os.path.join(home, "sessions", "tui-r.json"), "w") as f:
+            json.dump({"id": "tui-r", "remote": {"dest": "me@devbox", "as": None, "dir": None}, "messages": []}, f)
+        r = subprocess.run([sys.executable, SCRIPT, "-e", "test", "-S", "tui-r", "hi"], cwd=self.tmp,
+                           env=dict(os.environ, XDG_CONFIG_HOME=os.path.dirname(home)), capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("ran on me@devbox, through hoplon-tui: resume it there with hoplon-tui --remote me@devbox -S tui-r",
+                      r.stderr)
+        rows = G.list_sessions(G.Config(home))
+        self.assertEqual([x["remote"] for x in rows], ["me@devbox"])
 
     def test_hello_names_the_audit_log(self):
         with FakeAPI([]) as api:

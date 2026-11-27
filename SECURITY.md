@@ -547,8 +547,11 @@ path, never `PATH`; owned by the user or root, not writable by others), so the S
 cluster. The program that runs is whatever is installed there, and a command whose program is missing there is
 left out. Root on the remote host can use the session's token while the
 tunnel is up, and can read that session's prompts, replies and files, which are on that host anyway. It cannot
-read the key, which was never sent. Everything else (coding-mode refusals, the sandbox, the audit log, sessions)
-works for the user hoplon runs as. As root, the REPL banner warns that proposed commands would run as root.
+read the key, which was never sent. Saved sessions stay on your machine: hoplon on the host keeps the conversation
+in memory and sends each save back to hoplon-tui, which writes it here, marked with the host and user. A session is
+only sent back to that host as that user, never a local one or another host's, and plain `hoplon -S` won't resume a
+remote session locally. Everything else (coding-mode refusals, the sandbox, the audit log) works for the user hoplon
+runs as. As root, the REPL banner warns that proposed commands would run as root.
 
 How hoplon-tui sets it up (`hoplon-tui --remote`), and what each part is for:
 

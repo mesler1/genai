@@ -1675,11 +1675,12 @@ class Shell:
 # hoplon as a child process
 
 class Child:
-    def __init__(self, args, remote_info=None):
+    def __init__(self, args, remote_info=None, keep=None):
         """hoplon --json ARGS, here, or (remote_info is remote.json) on the remote host over the ssh master. Remote,
         what hoplon reads first is its own source, then the config line, then the protocol (see remote.py); a
         thread writes it all so a slow or dead ssh can't freeze the screen."""
         self.writes = None
+        self.info, self.keep = remote_info, keep      # remote: where its saved session is kept, here
         if remote_info:
             with open(HOPLON, "rb") as f:
                 source = f.read()
@@ -1722,6 +1723,13 @@ class Child:
                 ev = json.loads(line)
             except ValueError:
                 ev = {"type": "error", "message": f"not JSON from hoplon: {line.strip()[:200]}"}
+            if isinstance(ev, dict) and ev.get("type") == "session_save":
+                if self.keep:             # remote: the host's save of this conversation, kept here
+                    try:
+                        remote.save_session(self.keep, self.info, ev.get("session"))
+                    except OSError as e:
+                        self.events.put({"type": "error", "message": f"could not save the session here: {e}"})
+                continue
             self.events.put(ev)
         self.events.put({"type": "_exit", "code": self.p.wait(), "err": "\n".join(self.err)})
 
@@ -2846,9 +2854,9 @@ def parse_args(argv):
             ap.error(f"{name} needs --remote")
     if args.no_save and args.session:
         ap.error("--no-save and -S can't go together: -S keeps the conversation in that session")
+    if args.session is not None and not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", args.session):
+        ap.error("-S needs a session name: letters, digits, '.', '_' and '-', at most 80")
     if args.remote:
-        if args.session:
-            ap.error("--remote can't use -S yet: a saved session would stay on the host hoplon runs on")
         if any(not k or re.search(r"[\x00-\x1f\x7f]", k) for k in args.skill):
             ap.error("-k needs a skill name without control characters")
         why = remote.check_destination(args.remote, args.as_user, args.dir)
@@ -2896,12 +2904,17 @@ def main(argv):
     args = parse_args(argv)
     if args.check:
         save = not args.no_save and (args.session or tui_setting("save_sessions", True, bool))
-        if not args.remote and save:  # a local conversation is kept in a session, so it can be resumed
+        if save:                  # the conversation is kept in a session here, so it can be resumed (remote too)
             where = sessions_dir()
             if not args.session:
                 args.session = fresh_session(where)
                 print(f"new_session={args.session}")
-            print(f"session_file={os.path.join(where, args.session + '.json')}")
+            path = os.path.join(where, args.session + ".json")
+            why = remote.session_problem(path, args.remote, args.as_user) if args.remote else None
+            if why:
+                print(f"hoplon-tui: {why}", file=sys.stderr)
+                return 2
+            print(f"session_file={path}")
         if args.remote:           # what the launcher needs, one per line (values have no newlines: checked)
             for k, v in (("dest", args.remote), ("as", args.as_user), ("dir", args.dir), ("profile", args.profile),
                          ("endpoint", args.endpoint)):
@@ -2921,7 +2934,15 @@ def main(argv):
             print(f"hoplon-tui: --remote needs the launcher (hoplon-tui) to set up the connection first: {e}",
                   file=sys.stderr)
             return 2
-    child = Child(hoplon_args(args), info)
+    keep = None
+    if info and args.session:     # kept here, never on the host: hoplon there gets it in the config line
+        keep = os.path.join(sessions_dir(), args.session + ".json")
+        sess, why = remote.session_for(keep, info, args.allow_session_endpoint_change)
+        if why:
+            print(f"hoplon-tui: {why}", file=sys.stderr)
+            return 2
+        info["config"]["session"] = sess
+    child = Child(hoplon_args(args), info, keep)
     try:
         chosen = ["files"] * args.files + ["panel"] * args.no_panel
         curses.wrapper(lambda scr: App(scr, child, Shell.from_env(), chosen).run())

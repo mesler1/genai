@@ -30,13 +30,20 @@ blessing are refused with the usual error and status 3), and the endpoint has no
 `headers` or `ca_bundle`: no key, and nothing that could carry a secret. The key proxy on your machine uses the
 endpoint's own proxy and headers.
 
-`--config-stdin` (with `--json` only; not with `-e`, `-p`, `-S` or `-k`) is for hoplon-tui's remote mode, where hoplon
+`--config-stdin` (with `--json` only; not with `-e`, `-p`, `-S` or `-k`; the session comes in the config line) is for hoplon-tui's remote mode, where hoplon
 runs on another host over ssh. hoplon first reads one line from stdin, before `hello`:
 
 ```
 {"type": "config", "endpoint": {...}, "profile": {...} or null, "token": "<32 to 128 hex characters>",
- "skills": [...], "command_sets": [...]}
+ "skills": [...], "command_sets": [...], "session": {"name": "tui-k7f3qa", "data": {...} or null}}
 ```
+
+`session` (optional) is the saved session the wrapper keeps on the user's machine: `data` is what an earlier
+`session_save` sent (`messages`, `history`, `coding`, `cwd`, `skills`, `created`), or null for a new one. hoplon
+resumes it in memory and writes no session file on this host; every save becomes a `session_save` event,
+`{"type": "session_save", "session": {...}}`, for the wrapper to keep. The wrapper checks, on its side, that the
+session ran on this host as this user and with the same endpoint; hoplon doesn't compare destinations, since it
+only sees the tunnel. Without `session`, nothing of the conversation is saved anywhere.
 
 The endpoint and profile are the fields of an endpoint file and a profile file, checked the same way. Here they
 come from the wrapper, which checked the user's blessed files on its side, so hoplon blesses nothing on this host

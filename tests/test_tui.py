@@ -1731,7 +1731,8 @@ class TestSessionName(unittest.TestCase):
         given = self.check("-S", "mine", environ={"XDG_CONFIG_HOME": home})
         self.assertNotIn("new_session", given)
         self.assertEqual(given["session_file"], os.path.join(home, "hoplon", "sessions", "mine.json"))
-        self.assertNotIn("session_file", self.check("--remote", "host.invalid"))     # remote has no sessions yet
+        remote = self.check("--remote", "host.invalid", environ={"XDG_CONFIG_HOME": home})   # kept here too
+        self.assertEqual(remote["session_file"], os.path.join(home, "hoplon", "sessions", remote["new_session"] + ".json"))
 
     def test_not_saved_with_no_save_or_save_sessions_false(self):
         home = tempfile.mkdtemp(prefix="hoplon-test-")

@@ -15,7 +15,14 @@ Resume this conversation: hoplon-tui -S tui-k7f3qa
 ```
 
 It prints that only once something was said, so there is a session to resume. `hoplon --list-sessions`
-lists them all. Not yet with `--remote`.
+lists them all.
+
+With `--remote` it works the same way, and the session is kept here, on your machine, not on the host: hoplon
+there gets the saved conversation when it starts and sends every save back, and hoplon-tui writes it here. The
+resume command it prints includes `--remote`. A remote session is marked with the host and user it ran as, and is
+only ever sent back to that host as that user: hoplon-tui refuses to resume a local session on a host, or one host's
+session on another, and plain `hoplon -S` refuses to resume a remote one here, so a conversation never reaches a
+machine it didn't come from. `hoplon --list-sessions` shows where each remote one ran.
 
 `--no-save` keeps nothing of the conversation on disk: no session is written, and nothing is printed
 to resume. `{"save_sessions": false}` in `~/.config/hoplon/tui.json` makes that the default; `-S NAME`
@@ -59,7 +66,7 @@ What happens, before tmux starts (so a password or second factor is asked for in
    `default_commands`, plus `-k`) go with their files, if they are blessed here; one that isn't is left out, with a
    message. On the host they are checked against the hashes blessed here, the command sets' programs are looked for there
    (a command whose program is missing there is left out, as locally), and nothing blessed only on the host can be
-   used. So the Slurm command set's commands run on the cluster. `-S` is not available with `--remote` yet.
+   used. So the Slurm command set's commands run on the cluster.
 2. An ssh master connection (`ssh -M -S STATE/cm -fN`, then the host's checks: Python 3.10 or newer as the target user,
    `sudo -n` for `--as`, the directory) whose control socket lives in hoplon-tui's private 0700 state directory.
 3. `tui/keyproxy.py` starts here on a Unix socket, with a random token on its stdin.
