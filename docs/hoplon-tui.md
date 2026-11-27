@@ -33,35 +33,36 @@ still saves to the session you name.
 `--coding` alone lets the model read and edit the project, but every build or test is only proposed: you
 run it. To let the model run them itself, in a container, give it a profile with a sandbox:
 
-1. **An image with the project's tools.** The sandbox is offline and never pulls, so the image must already
-   have the compiler, interpreter and dependencies the tests need (or the project a virtual environment).
-   For a plain Python project a stock image will do: `podman pull docker.io/library/python:3.12-slim`.
-   Otherwise build one from a `Containerfile` with `podman build -t localhost/myproject-dev .`.
-2. **A profile that names it**, in `~/.config/hoplon/profiles/coder-box.json`:
+You need rootless podman. No image: by default the runs use this host's own OS, with `/usr` and `/etc`
+read-only, so the tools you have installed are the ones the tests use.
+
+1. **A profile with a sandbox**, in `~/.config/hoplon/profiles/coder-box.json`:
 
    ```json
    {
      "name": "coder-box",
      "endpoint": "work-llm",
      "coding": true,
-     "sandbox": {"image": "docker.io/library/python:3.12-slim"}
+     "sandbox": {}
    }
    ```
 
-   `timeout`, `memory`, `pids` and `network` are optional; see [Sandboxed runs](sandbox.md#sandboxed-runs).
-3. **Bless it:** `hoplon --bless ~/.config/hoplon/profiles/coder-box.json`. It shows the coding grant and the
-   image.
-4. **Start it in the project's directory**, not your home directory (the sandbox is refused there):
+   `"image"` runs in a container image instead, for tools the host doesn't have; the runs are offline and
+   never pull, so pull or build it first. `timeout`, `memory`, `pids` and `network` are optional; see
+   [Sandboxed runs](sandbox.md#sandboxed-runs).
+2. **Bless it:** `hoplon --bless ~/.config/hoplon/profiles/coder-box.json`. It shows the coding grant and
+   what the sandbox runs on.
+3. **Start it in the project's directory**, not your home directory (the sandbox is refused there):
 
    ```bash
    cd ~/src/myproject
    hoplon-tui -p coder-box
    ```
 
-The info panel's WHERE section then says `model's runs ⊡ sandboxed · offline` with the image, and tmux's
+The info panel's WHERE section then says `model's runs ⊡ sandboxed · offline` with `this host's OS` (or the image), and tmux's
 status line says `⊡ model's runs sandboxed`. If it says `can't run:` instead, the rest of the line says
-why (no podman, an image that isn't there, or a directory where coding mode is refused). `/sandbox` shows
-the image, network and limits.
+why (no podman, or a directory where coding mode is refused); a missing image is reported on the first run.
+`/sandbox` shows what it runs on, the network and the limits.
 
 The model's runs then happen on a throwaway copy of the project, offline and without files that look
 like secrets, and don't ask: you see each command, its exit code and output. Edits to your files still

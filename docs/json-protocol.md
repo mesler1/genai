@@ -7,8 +7,8 @@ arrives as it is, so the wrapper must escape it before it displays it.
 
 hoplon's first line is `hello`. It has `protocol` (1), `version`, `features`, `endpoint` (`name`, `base_url`, `model`, and `alias`: the endpoint's name for that model, or `null`),
 `profile` (its `name` and `description`, and its `layout` when it sets one), `session`, `resumed`, `coding`, `coding_from`, `coding_override`, `cwd`, `sandbox`,
-`runner` (the profile's sandbox for `run_in_sandbox`: `engine`, `image`, `network`, `timeout`,
-`memory`, `pids` and `problem`, or `null`), the active `skills` and `command_sets`, and the model's `tools`. Check `features` before you use a message added
+`runner` (the profile's sandbox for `run_in_sandbox`: `engine`, `image` (`null` for this host's OS),
+`uses` (the image, or a description of the host OS), `network`, `timeout`, `memory`, `pids` and `problem`, or `null`), the active `skills` and `command_sets`, and the model's `tools`. Check `features` before you use a message added
 later. With the feature `interrupt`, a SIGINT to hoplon `--json` stops a sandboxed run as Ctrl-C does in
 the REPL (its result's `status` is `stopped`, and the turn's `done` reason is `stopped`); at any
 other time it is ignored. The feature `stop` is the same as a message, for when hoplon is out of reach

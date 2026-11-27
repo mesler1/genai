@@ -249,6 +249,9 @@ in between.
   - It never runs where coding mode is refused (section 7), and `--coding-anywhere` doesn't
     change that: the overlay would copy your whole home directory, or a credential directory,
     into a container that runs commands without asking.
+  - With no `image`, the root is an empty tree made for the run, with only the host's `/usr` and `/etc`
+    (and top-level `/bin`, `/lib` and the like) mounted read-only, as in `sandbox/run`: no home
+    directory, `/opt`, `/var` or `/run`. With an `image`, that image, never pulled.
   - The project is a copy-on-write overlay (`-v DIR:/work:O`). Whatever the command writes,
     including `.git`, build files and test configuration, is discarded with the container, so it
     can't leave behind something you later run on the host. Real changes are only the edits and
@@ -355,7 +358,8 @@ can read under `/usr` and `/etc`, and under anything a sandbox hook mounted.
 For sandboxed runs: a container shares the host's kernel, so it holds against a model that is
 wrong or has been steered by what it read, not against a kernel exploit. Detecting secrets by name
 and content is a heuristic; a secret in an unusual form in a non-hidden file can be read and sent
-to the endpoint, as it could by `read_file` in coding mode. Virtual environments and
+to the endpoint, as it could by `read_file` in coding mode. A run on the host's OS can read whatever your
+user can read under `/usr` and `/etc`. Virtual environments and
 `node_modules` are not scanned. Overlay writes go to podman's storage and are not size-limited
 until the run ends. Without delegated cgroups, only the time limit and `/tmp`'s size bound a run.
 

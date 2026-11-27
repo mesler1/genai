@@ -35,7 +35,7 @@ class SandboxInfo(Feature):
         elif r.get("problem"):
             note(f"the model's sandbox can't run here: {clean(r['problem'])}", c.R)
         else:
-            parts = [clean(r.get("engine") or "podman"), f"image {clean(r.get('image') or '?')}",
+            parts = [clean(r.get("engine") or "podman"), (f"image {clean(r['image'])}" if r.get("image") else "this host's OS (/usr and /etc, read-only)"),
                      "network ON (each run asks)" if r.get("network") else "offline"]
             for key, label in (("timeout", "s time limit"), ("memory", " memory"), ("pids", " processes")):
                 if r.get(key) is not None:

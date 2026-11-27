@@ -74,8 +74,8 @@ hoplon -e work-llm -p coder                  # REPL: a line with only '..' sends
 hoplon-tui -e work-llm -p coder              # the same in tmux panes, beside your shell (needs tmux)
 ```
 
-To let the model run its own builds and tests in an offline container, add a `"sandbox"` with an image to the
-profile: see [Sandboxed coding](docs/hoplon-tui.md#sandboxed-coding).
+To let the model run its own builds and tests in an offline container, on this host's OS or an image, add
+`"sandbox": {}` to the profile: see [Sandboxed coding](docs/hoplon-tui.md#sandboxed-coding).
 
 ## Documentation
 

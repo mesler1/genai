@@ -37,6 +37,7 @@ import remote  # noqa: E402
 
 HOPLON = os.environ.get("HOPLON_BIN") or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                                     "hoplon")
+HOST_OS = "this host's OS"     # what a sandbox with no image runs on
 CARD_BODY_LINES = 12
 OUTPUT_LINES = 8               # last lines of a sandboxed run's output shown in its card
 INPUT_MAX_LINES = 8
@@ -373,7 +374,7 @@ class Banner(Block):
                 rows.append((f"this is {h['coding_override']}; --coding-anywhere allowed it", R))
         run = h.get("runner")
         if run and h.get("coding") and not run.get("problem"):
-            rows.append((f"The model runs builds and tests itself in a podman sandbox ({run.get('image')}), on a "
+            rows.append((f"The model runs builds and tests itself in a podman sandbox ({run.get('image') or HOST_OS}), on a "
                          "throwaway copy of the project, " + ("WITH the network: each run asks first." if
                                                              run.get("network") else "offline."), W))
         elif run and run.get("problem"):

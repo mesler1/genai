@@ -101,7 +101,8 @@ class TestSandboxConfig(unittest.TestCase):
     def test_defaults_and_validation(self):
         c = conf()
         self.assertEqual((c["engine"], c["network"], c["timeout"]), ("auto", False, G.SANDBOX_TIMEOUT))
-        for bad in ({"image": None}, {"image": "-x"}, {"image": "a b"}, {"network": "yes"}, {"timeout": 0},
+        self.assertIsNone(conf(image=None)["image"])     # no image: this host's OS
+        for bad in ({"image": 3}, {"image": ""}, {"image": "-x"}, {"image": "a b"}, {"network": "yes"}, {"timeout": 0},
                     {"timeout": 7200}, {"timeout": True}, {"engine": "apptainer"}, {"memory": "lots"},
                     {"pids": 1}, {"mounts": []}):
             with self.assertRaises(G.HoplonError, msg=bad):
@@ -113,6 +114,8 @@ class TestSandboxConfig(unittest.TestCase):
         text, _ = G.Profile({"name": "p", "coding": True, "sandbox": {"image": "img:1"}}, "p.json").summary()
         self.assertIn("throwaway copy", text)
         self.assertNotIn("network ON", text)
+        text, _ = G.Profile({"name": "p", "coding": True, "sandbox": {}}, "p.json").summary()
+        self.assertIn("this host's OS (/usr and /etc, read-only)", text)
         text, _ = G.Profile({"name": "p", "sandbox": {"image": "img:1", "network": True}}, "p.json").summary()
         self.assertIn("[!] the sandbox starts with the network ON", text)
 
@@ -193,6 +196,28 @@ class TestArgv(FakePodman):
             self.assertIn(flag, a)
         self.assertEqual(a[-2:], ["/work/.env", "/work/.aws"])
         self.assertFalse(any(x.startswith("--volume=" + os.path.expanduser("~")) for x in a))
+
+    def test_no_image_runs_on_this_hosts_os(self):
+        box = self.box(image=None)
+        parent = self.path("hostroot")
+        os.makedirs(parent)
+        root, flags = G.host_root(parent)
+        a = box.argv("n", "make test", [".env"], [".aws"], "/empty", "g", host=(root, flags))
+        self.assertEqual(a[a.index("--rootfs") + 1], root)
+        self.assertEqual(a[a.index("--rootfs") + 2:a.index("--rootfs") + 4], ["/bin/sh", "-c"])
+        for flag in ("--volume=/usr:/usr:ro", "--volume=/etc:/etc:ro", "--network=none", "--read-only", "--volume=/p:/work:O"):
+            self.assertIn(flag, a)
+        self.assertNotIn("--pull=never", a)
+        self.assertEqual(sorted(x for x in os.listdir(root) if not os.path.islink(os.path.join(root, x))
+                                and x not in ("bin", "sbin", "lib", "lib32", "lib64", "libx32")),
+                         ["dev", "etc", "fixtures", "proc", "run", "sys", "tmp", "usr", "var", "work"])
+        for d in G.HOST_LINKS:      # each top-level link is the host's own, and a real directory is mounted
+            if os.path.islink(d):
+                self.assertEqual(os.readlink(root + d), os.readlink(d))
+            elif os.path.isdir(d):
+                self.assertIn(f"--volume={d}:{d}:ro", a)
+        self.assertFalse(any(x.startswith("--volume=" + os.path.expanduser("~")) for x in a))
+        self.assertEqual(box.info()["uses"], G.HOST_OS)
 
     def test_online_and_without_limits(self):
         box = self.box(network=True)
@@ -470,6 +495,28 @@ class TestRealPodman(Tmp):
                                   "ls -A $HOME | wc -l; (getent hosts example.com >/dev/null && echo NET) || echo NONET")
         self.assertTrue(ran, out)
         self.assertEqual((rc, out), (0, "hi\n0\nNONET\n"))
+        self.assertEqual(sorted(os.listdir(root)), [".aws", ".env", "a.txt"])     # writes were thrown away
+        with open(os.path.join(root, "a.txt")) as f:
+            self.assertEqual(f.read(), "hi\n")
+
+
+@unittest.skipUnless(shutil.which("podman"), "needs podman")
+class TestRealHostOS(Tmp):
+    def test_the_sandbox_holds_with_no_image(self):
+        root = self.path("wd")
+        for rel, text in {"a.txt": "hi\n", ".env": "API_KEY=sk-abcdefghijklmnopqrstuv\n",
+                          ".aws/credentials": "k\n"}.items():
+            os.makedirs(os.path.dirname(os.path.join(root, rel)), exist_ok=True)
+            with open(os.path.join(root, rel), "w") as f:
+                f.write(text)
+        box = G.Sandbox(conf(image=None, timeout=60), root, lambda m: None)
+        home = os.path.expanduser("~")
+        ran, rc, out, _ = box.run("cat a.txt; cat .env; ls -A .aws; echo new > b.txt; echo more >> a.txt; "
+                                  "test -x /usr/bin/env && echo USR; touch /usr/x 2>/dev/null || echo ROUSR; "
+                                  f"test -e {home} || echo NOHOME; "
+                                  "(getent hosts example.com >/dev/null && echo NET) || echo NONET")
+        self.assertTrue(ran, out)
+        self.assertEqual((rc, out), (0, "hi\nUSR\nROUSR\nNOHOME\nNONET\n"))
         self.assertEqual(sorted(os.listdir(root)), [".aws", ".env", "a.txt"])     # writes were thrown away
         with open(os.path.join(root, "a.txt")) as f:
             self.assertEqual(f.read(), "hi\n")

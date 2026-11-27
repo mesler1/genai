@@ -501,6 +501,33 @@ SECRET_SUFFIXES = (".key", ".p12", ".pfx", ".jks", ".keystore")
 # packages: a pyvenv.cfg written beside a secret can't hide it from the scan, only what is in these.
 VENV_PARTS = {"lib", "lib64", "Lib", "include", "Include", "bin", "Scripts", "share"}
 SCAN_SKIP = {"node_modules", "__pycache__", ".tox", ".nox", ".mypy_cache", ".pytest_cache", ".ruff_cache"}
+# With no image, a run uses this host's OS: an empty root holding only mount points, with these mounted read-only
+# from the host, and the top-level links (/bin -> usr/bin and the like) as the host has them.
+HOST_RO = ("/usr", "/etc")
+HOST_LINKS = ("/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32")
+HOST_OS = "this host's OS (/usr and /etc, read-only)"
+
+
+def host_root(parent):
+    """Make an empty root for a run on this host's OS in parent; returns (root, the podman flags that mount it)."""
+    root = os.path.join(parent, "root")
+    for d in ("proc", "sys", "dev", "run", "tmp", "var/tmp", "work", "fixtures") + tuple(p.lstrip("/") for p in HOST_RO):
+        os.makedirs(os.path.join(root, d), exist_ok=True)
+    flags = [f"--volume={d}:{d}:ro" for d in HOST_RO]
+    for d in HOST_LINKS:
+        if os.path.islink(d):
+            os.symlink(os.readlink(d), root + d)
+        elif os.path.isdir(d):
+            os.makedirs(root + d, exist_ok=True)
+            flags.append(f"--volume={d}:{d}:ro")
+    return root, flags
+
+
+def box_name(conf):
+    """What a sandbox's runs use: its image, or this host's OS."""
+    return conf["image"] or HOST_OS
+
+
 _GUARD_EXIT = 97
 # Runs first inside the container: every hidden path must really be empty, or the command doesn't run.
 _GUARD = ('for p in "$@"; do if [ -d "$p" ]; then [ -z "$(ls -A "$p")" ] || { echo "$HOPLON_GUARD $p"; exit 97; }; '
@@ -656,8 +683,8 @@ class Fixtures:
 
 
 def parse_sandbox(data, path):
-    """A profile's "sandbox" object, checked. The image is required: offline, the project's tools and
-    dependencies have to be in it already."""
+    """A profile's "sandbox" object, checked. Without an image, runs use this host's OS (HOST_RO); with one, the
+    project's tools and dependencies have to be in it already, since runs are offline."""
     if not isinstance(data, dict):
         raise HoplonError(f"{path}: 'sandbox' must be an object", EXIT_PROFILE)
     unknown = set(data) - SANDBOX_KEYS
@@ -669,8 +696,10 @@ def parse_sandbox(data, path):
     if box["engine"] not in ("auto", "podman"):
         raise HoplonError(f"{path}: sandbox 'engine' must be \"auto\" or \"podman\" (apptainer is not supported yet)",
                          EXIT_PROFILE)
-    if not isinstance(box["image"], str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/:@+-]{0,255}", box["image"]):
-        raise HoplonError(f"{path}: sandbox 'image' is required: the container image commands run in", EXIT_PROFILE)
+    if box["image"] is not None and (not isinstance(box["image"], str)
+                                     or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/:@+-]{0,255}", box["image"])):
+        raise HoplonError(f"{path}: sandbox 'image' must be a container image name, or left out to use this host's OS",
+                         EXIT_PROFILE)
     if not isinstance(box["network"], bool):
         raise HoplonError(f"{path}: sandbox 'network' must be true or false", EXIT_PROFILE)
     if type(box["timeout"]) is not int or not 1 <= box["timeout"] <= 3600:
@@ -723,7 +752,7 @@ class Sandbox:
         return None
 
     def info(self):
-        return {"engine": "podman", "image": self.conf["image"], "network": self.network,
+        return {"engine": "podman", "image": self.conf["image"], "uses": box_name(self.conf), "network": self.network,
                 "timeout": self.conf["timeout"], "memory": self.conf.get("memory"), "pids": self.conf.get("pids"),
                 "problem": self.problem()}
 
@@ -780,18 +809,23 @@ class Sandbox:
         except OSError:
             return False
 
-    def argv(self, name, command, files, dirs, empty, guard, fixtures=None):
+    def argv(self, name, command, files, dirs, empty, guard, fixtures=None, host=None):
+        """host: (root, mount flags) from host_root, for a sandbox with no image."""
         net = ["--network=none", "--http-proxy=false"] if not self.network else []
         limits = [f"--memory={self.conf['memory']}", f"--pids-limit={self.conf['pids']}"] if self.limits else []
         mounts = [f"--volume={self.root}:/work:O"]
         mounts += [f"--volume=/dev/null:/work/{f}:ro" for f in files]
         mounts += [f"--volume={empty}:/work/{d}:ro" for d in dirs]
         mounts += [f"--volume={fixtures}:/fixtures:ro"] if fixtures else []
-        return ([self.podman, "--log-level=error", "run", "--rm", f"--name={name}", "--pull=never", "--init",
+        if host:
+            mounts, base, pull = host[1] + mounts, ["--rootfs", host[0]], []
+        else:
+            base, pull = [self.conf["image"]], ["--pull=never"]
+        return ([self.podman, "--log-level=error", "run", "--rm", f"--name={name}"] + pull + ["--init",
                  "--userns=keep-id", f"--user={os.getuid()}:{os.getgid()}", "--read-only", f"--tmpfs=/tmp:rw,size={SANDBOX_TMP},mode=1777",
                  "--cap-drop=all", "--security-opt=no-new-privileges", "--workdir=/work",
                  "--env=HOME=/tmp", f"--env=HOPLON_CMD={command}", f"--env=HOPLON_GUARD={guard}"]
-                + net + limits + mounts + [self.conf["image"], "/bin/sh", "-c", _GUARD, "hoplon-guard"]
+                + net + limits + mounts + base + ["/bin/sh", "-c", _GUARD, "hoplon-guard"]
                 + [f"/work/{p}" for p in files + dirs])
 
     def run(self, command, values=(), cap=OUTPUT_CAP * 8, timeout=None, fixtures=None):
@@ -812,11 +846,13 @@ class Sandbox:
         self.counter += 1
         name = f"hoplon-{os.getpid()}-{self.counter}-{secrets.token_hex(6)}"
         guard = "hoplon-guard-" + secrets.token_hex(6)
-        with tempfile.TemporaryDirectory(prefix="hoplon-empty-") as empty:
+        with tempfile.TemporaryDirectory(prefix="hoplon-empty-") as empty, \
+                tempfile.TemporaryDirectory(prefix="hoplon-root-") as scratch:
+            host = None if self.conf["image"] else host_root(scratch)
             os.chmod(empty, 0o500)
             for attempt in (1, 2):
-                rc, out = self._podman(self.argv(name, command, files, dirs, empty, guard, fixtures), name, cap,
-                                       deadline)
+                rc, out = self._podman(self.argv(name, command, files, dirs, empty, guard, fixtures, host), name,
+                                       cap, deadline)
                 if attempt == 1 and self.limits and rc in (125, 126) and "cgroup" in out:
                     self.limits = False
                     self.notice("this host doesn't let podman limit memory or processes (cgroups aren't delegated "
@@ -832,7 +868,8 @@ class Sandbox:
         if rc == "late":
             return False, None, "", f"not run: the {limit} s time limit was used up before it could start"
         if rc in (125, 126, 127) and out.startswith("Error:"):
-            hint = f" (podman pull {self.conf['image']} first)" if "image not known" in out else ""
+            hint = (f" (podman pull {self.conf['image']} first)" if self.conf["image"] and "image not known" in out
+                    else "")
             return False, None, "", f"the sandbox could not start: {one_line(out.strip())[0]}{hint}"
         return True, rc, out, f"{hidden} secret-looking path{'s' if hidden != 1 else ''} hidden" if hidden else ""
 
@@ -2540,7 +2577,7 @@ class Profile:
                          "it apply without asking, for the rest of the session")
         if self.sandbox:
             b = self.sandbox
-            lines.append(f"  sandbox:  podman, image {one(b['image'])}, {b['timeout']} s limit: in coding mode the model "
+            lines.append(f"  sandbox:  podman, {'image ' + one(b['image']) if b['image'] else HOST_OS}, {b['timeout']} s limit: in coding mode the model "
                          "runs commands on a throwaway copy of the project, without asking")
             if b["network"]:
                 lines.append("  [!] the sandbox starts with the network ON: code the model writes could send your "
@@ -6773,7 +6810,7 @@ class Repl:
             return f"the profile's sandbox can't run here: {problem}"
         state = ("the model runs commands there itself, without asking" if self.e.can_run() else
                  "it is used in coding mode")
-        return (f"podman sandbox ({one_line(b.conf['image'])[0]}), network {'ON: each run asks' if b.network else 'off'}"
+        return (f"podman sandbox ({one_line(box_name(b.conf))[0]}), network {'ON: each run asks' if b.network else 'off'}"
                 f"; {state}")
 
     def run(self):

@@ -62,7 +62,7 @@ def view(st, w, sel):
     elif run:
         add([("model's runs  ", Q), ("⊡ sandboxed · ", D),
              (fit("ONLINE" if run.get("network") else "offline", V - 14), W if run.get("network") else D)])
-        add([(" " * L, ""), (fit(clean(run.get("image") or "?"), V), Q)])
+        add([(" " * L, ""), (fit(clean(run.get("image") or "this host's OS"), V), Q)])
         add([(" " * L, ""), (fit("each run asks · /network" if run.get("network") else "/network switches", V), Q)])
     else:
         add([("model's runs  ", Q), (fit("none: they're only proposed", V), Q)])
