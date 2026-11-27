@@ -84,6 +84,7 @@ skills/multi-user/          being safe and fair on a machine others share
 skills/parallel-fs/         Lustre, GPFS and the like: metadata, small files, striping
 skills/rust/                Rust: house rules and gotchas
 skills/security-review/     a checklist the model applies to its own proposals
+skills/agent-audit/         audit an agent platform against OWASP AISVS, step by step
 skills/hpc/                 a shared cluster: login nodes, modules, file systems (any scheduler)
 skills/slurm/               generic Slurm: srun/sbatch, batch scripts, job arrays, failed jobs
 commands/slurm/             scoped read-only Slurm commands: sinfo, squeue, scontrol show, sacct
