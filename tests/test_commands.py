@@ -160,7 +160,8 @@ class TestManifest(CommandSetBase):
               (["sudo", "-n", "--", "/usr/bin/id"], "root"),
               (["fakeq", "sudo"], None)]
         for argv, who in ok:
-            self.assertEqual(G.escalation(argv, ""), who, argv)
+            self.assertEqual(G.escalation(argv, "")[0], who, argv)
+        self.assertEqual(G.escalation(["sudo", "-n", "-u", "www", "/usr/bin/id", "-un"], ""), ("www", "/usr/bin/id"))
         for argv, why in [(["sudo", "/usr/bin/id"], "needs -n"), (["doas", "/usr/bin/id"], "needs -n"),
                           (["sudo", "-n", "-s"], "-s is not allowed"), (["sudo", "-ns", "/usr/bin/id"], "-ns"),
                           (["sudo", "-n", "-E", "/usr/bin/id"], "-E is not allowed"),
@@ -423,6 +424,46 @@ class TestBinary(CommandSetBase):
             self.load().resolve()
         self.assertIn("writable by group or others", str(cm.exception))
 
+    def test_every_directory_above_the_program_is_checked(self):
+        """Whoever can write a directory above the program can rename the one below and put their own in its
+        place. A sticky directory such as /tmp is fine: nobody else can rename what is yours in it."""
+        top = self.path("shared")
+        prog = os.path.join(top, "tools", "bin", "tool")
+        os.makedirs(os.path.dirname(prog))
+        for d in (top, os.path.dirname(os.path.dirname(prog)), os.path.dirname(prog)):
+            os.chmod(d, 0o755)
+        program(prog, "true\n")
+        self.manifest["commands"] = {"x": {"argv": [prog], "access": "read"}}
+        self.load().resolve()                                        # all 755: fine
+        os.chmod(top, 0o775)
+        with self.assertRaises(G.HoplonError) as cm:
+            self.load().resolve()
+        self.assertIn(f"{os.path.realpath(top)}, above {os.path.realpath(prog)}: writable by group or others",
+                      str(cm.exception))
+        os.chmod(top, 0o1777)                                        # sticky, like /tmp
+        self.load().resolve()
+        os.chmod(top, 0o755)
+
+    def test_the_program_sudo_runs_is_checked_too(self):
+        program(os.path.join(self.bin, "sudo"), "exit 0\n")
+        other = self.path("other")
+        os.mkdir(other)
+        os.chmod(other, 0o775)
+        program(os.path.join(other, "svc"), "exit 0\n")
+        self.manifest["commands"] = {"x": {"argv": ["sudo", "-n", os.path.join(other, "svc")], "access": "read"}}
+        with self.assertRaises(G.HoplonError) as cm:
+            self.load().resolve()
+        self.assertIn("writable by group or others", str(cm.exception))
+        os.chmod(other, 0o755)
+        pl = self.load()
+        pl.resolve()
+        self.assertEqual(pl.commands["x"].target, os.path.join(other, "svc"))
+        os.symlink(os.path.join(other, "svc"), os.path.join(self.bin, "link"))
+        self.manifest["commands"]["x"]["argv"][2] = os.path.join(self.bin, "link")
+        with self.assertRaises(G.HoplonError) as cm:
+            self.load().resolve()
+        self.assertIn("is a link to", str(cm.exception))
+
     def test_writable_program_is_refused(self):
         os.chmod(os.path.join(self.bin, "fakeq"), 0o775)
         with self.assertRaises(G.HoplonError):
@@ -542,6 +583,8 @@ class TestBlessing(CommandSetBase):
         self.assertIn("fakeq -u {user} --fmt={fmt}", text)
         self.assertIn("program: " + os.path.realpath(self.bin), text)
         self.assertIn("your PATH is never used", text)
+        self.assertIn("hoplon can't check that: make sure each one only looks", text)
+        self.assertIn("'read' and 'write' are the set's own labels", text)
         self.assertEqual(self.cfg.blessed()[self.dir]["kind"], "command_set")
         self.assertEqual(G.command_set_status(self.cfg, G.find_command_sets(self.cfg)["fake"]), "blessed")
 
@@ -550,7 +593,7 @@ class TestBlessing(CommandSetBase):
         with mock.patch.object(sys, "stdout", out):
             self.assertTrue(G.bless(self.cfg, self.dir, lambda q: asked.append(q) or True))
         text = out.getvalue()
-        reads, writes = text.index("read: these only look"), text.index("write: these change something")
+        reads, writes = text.index("read: the set says these only look"), text.index("write: these change something")
         self.assertLess(reads, text.index("command queue:"))
         self.assertLess(text.index("command queue:"), writes)
         self.assertLess(writes, text.index("command kill:"))
@@ -578,8 +621,10 @@ class TestBlessing(CommandSetBase):
     def sudo_set(self):
         program(os.path.join(self.bin, "sudo"), f'for a in "$@"; do printf "ARG:%s\\n" "$a"; done >> {self.log}\n'
                 f'echo "---" >> {self.log}\necho "as root: $*"\n')
+        self.svc = os.path.join(self.bin, "svc")
+        program(self.svc, "exit 0\n")
         self.manifest["commands"]["status"] = {"describe": "a service's state", "access": "read", "min_interval": 0,
-                                               "argv": ["sudo", "-n", "/usr/bin/systemctl", "status", "{unit}"],
+                                               "argv": ["sudo", "-n", self.svc, "status", "{unit}"],
                                                "params": {"unit": {"enum": ["nginx", "cron"]}}}
         write_json(os.path.join(self.dir, "commands.json"), self.manifest)
 
@@ -595,7 +640,7 @@ class TestBlessing(CommandSetBase):
         self.assertIn("[runs as root, read, asks every time]", text)
         self.assertIn("allow exactly these commands, with -n, in sudoers", text)
         self.assertEqual(len(asked), 3)
-        self.assertIn("Let the model run status (sudo -n /usr/bin/systemctl status {unit}) AS ROOT without asking",
+        self.assertIn(f"Let the model run status (sudo -n {self.svc} status {{unit}}) AS ROOT without asking",
                       asked[2])
         eng, _ = self.engine()
         status = eng.trusted["fake__status"]
@@ -620,7 +665,10 @@ class TestBlessing(CommandSetBase):
         self.assertIn("runs as root; runs without asking, as the user chose",
                       eng.trusted["fake__status"].schema("h")["function"]["description"])
         r = eng.run_user("fake", "status", {"unit": "cron"})
-        self.assertEqual(r["output"], "as root: -n /usr/bin/systemctl status cron\n")
+        self.assertEqual(r["output"], f"as root: -n {self.svc} status cron\n")
+        os.utime(self.svc, ns=(1, 1))                                # what sudo runs changed: refused
+        r = eng.run_user("fake", "status", {"unit": "nginx"})
+        self.assertIn(f"{self.svc} changed since hoplon started; restart hoplon", r["error"])
 
     def test_the_guide_goes_to_the_model_while_the_set_is_on(self):
         with open(os.path.join(self.dir, "GUIDE.md"), "w") as f:
@@ -737,8 +785,9 @@ class TestRunning(CommandSetBase):
 
     def test_a_read_run_as_root_asks_and_says_so(self):
         program(os.path.join(self.bin, "sudo"), 'echo "as root: $*"\n')
+        program(os.path.join(self.bin, "svc"), "exit 0\n")
         self.manifest["commands"]["status"] = {"describe": "a service's state", "access": "read", "min_interval": 0,
-                                               "argv": ["sudo", "-n", "/usr/bin/systemctl", "status", "{unit}"],
+                                               "argv": ["sudo", "-n", os.path.join(self.bin, "svc"), "status", "{unit}"],
                                                "params": {"unit": {"enum": ["nginx"]}}}
         write_json(os.path.join(self.home, "commands", "fake", "commands.json"), self.manifest)
         bless_set(self.home, os.path.join(self.home, "commands", "fake"))
@@ -749,7 +798,7 @@ class TestRunning(CommandSetBase):
         self.assertNotIn("as_user", self.model("fake__queue", user="a", fmt="short")[0].event())
         self.ui.answer = "accept"
         p, told = self.model("fake__status", unit="nginx")
-        self.assertIn("as root: -n /usr/bin/systemctl status nginx", told)
+        self.assertIn(f"as root: -n {self.bin}/svc status nginx", told)
 
     def test_plain_ui_offers_nothing(self):
         self.eng.ui = G.PlainUI()

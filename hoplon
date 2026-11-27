@@ -1585,14 +1585,15 @@ ESCALATE_NO = ("pkexec", "su", "sudoedit", "runuser")      # can't run without a
 
 
 def escalation(argv, where):
-    """Whom a scoped command's argv runs as, through sudo, doas or run0: "root", a user name, or "a user given per
-    call" (a placeholder); None for a plain command. ValueError for what can't run safely here."""
+    """Whom a scoped command's argv runs as, through sudo, doas or run0, and the program it runs: ("root", a user
+    name, or "a user given per call" (a placeholder), the program's absolute path); (None, None) for a plain
+    command. ValueError for what can't run safely here."""
     prog = os.path.basename(argv[0])
     if prog in ESCALATE_NO:
         raise ValueError(f"{where}argv[0]: {prog} can't run here; use sudo -n, with a sudoers rule for exactly this "
                          "command")
     if prog not in ESCALATE:
-        return None
+        return None, None
     opts, user, quiet, i = ESCALATE[prog], "root", False, 1
     while i < len(argv) and argv[i].startswith("-"):
         a = argv[i]
@@ -1619,7 +1620,7 @@ def escalation(argv, where):
     if i >= len(argv) or not argv[i].startswith("/") or "{" in argv[i]:
         raise ValueError(f"{where}argv: the program {prog} runs must follow its options as an absolute path, such as "
                          "/usr/bin/systemctl, so it matches your sudoers rule exactly")
-    return user
+    return user, argv[i]
 TEMPLATE = re.compile(r"\{\{|\}\}|\{([A-Za-z0-9_]+)\}|[{}]")
 DEFAULT_SEARCH = ("/usr/local/bin", "/usr/bin", "/bin")
 PARAM_CAP = 256                # characters of one parameter value
@@ -1814,7 +1815,9 @@ class TrustedParam:
 def trusted_binary(argv0, search):
     """Where a scoped command's program is: argv[0] if it is a path, else the first search directory that has it.
     The user's PATH is never used. The file and its directory must belong to you or root and not be writable
-    by group or others, or whoever can write there could swap the program. Returns (path, identity)."""
+    by group or others, or whoever can write there could swap the program. So must every directory above it, up
+    to /, except that one with the sticky bit (/tmp) may be writable: nobody else can rename what is yours or
+    root's in it. Returns (path, identity)."""
     paths = [argv0] if os.path.isabs(argv0) else [os.path.join(d, argv0) for d in search]
     path = next((p for p in paths if os.path.exists(p)), None)
     if path is None:
@@ -1828,6 +1831,13 @@ def trusted_binary(argv0, search):
         if s.st_mode & 0o022 or s.st_uid not in (0, os.geteuid()):
             raise HoplonError(f"{p}: writable by group or others, or owned by another user, so the program there "
                              "could be replaced; refused")
+    d = os.path.dirname(real)
+    while d != "/":
+        d = os.path.dirname(d)
+        s = os.stat(d)
+        if s.st_uid not in (0, os.geteuid()) or (s.st_mode & 0o022 and not s.st_mode & stat.S_ISVTX):
+            raise HoplonError(f"{d}, above {real}: writable by group or others, or owned by another user, so the "
+                             "directories below it could be swapped and the program with them; refused")
     return real, (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
 
 
@@ -1860,7 +1870,8 @@ class TrustedCommand:
         if not (re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", first) or (first.startswith("/") and "{" not in first)):
             raise ValueError(f"{w}argv[0] must be a program name without '/' or placeholders, or an absolute path")
         self.parts = [split_template(a, f"{w}argv[{i}]") for i, a in enumerate(self.argv)]
-        self.as_user = escalation(self.argv, w)     # None, or whom it runs as (sudo, doas, run0)
+        # None, or whom it runs as (sudo, doas, run0), and then the program it runs, checked like argv[0]
+        self.as_user, self.target = escalation(self.argv, w)
         # It runs without asking if it only reads as you; anything else only if you chose so when blessing (allow_auto).
         self.auto = self.read_only and not self.as_user
         used = {text for parts in self.parts[1:] for is_param, text in parts if is_param}
@@ -1869,10 +1880,15 @@ class TrustedCommand:
         if set(self.params) - used:
             raise ValueError(f"{w}params not used in argv: {', '.join(sorted(set(self.params) - used))}")
         self.tool = f"{cset.replace('-', '_')}__{name}"        # at most 31 + 2 + 31 characters
-        self.binary = self.identity = None
+        self.binary = self.identity = self.target_identity = None
 
     def resolve(self):
         self.binary, self.identity = trusted_binary(self.argv[0], self.search)
+        if self.target:                 # what sudo runs: your sudoers rule allows it, and hoplon checks it too
+            real, self.target_identity = trusted_binary(self.target, [])
+            if real != self.target:
+                raise HoplonError(f"{self.target} is a link to {real}: name the program itself, so the sudoers "
+                                 "rule and hoplon mean the same file")
 
     def changed(self):
         """Why the program may not run now, or None. It must be the very file found at load time."""
@@ -1882,6 +1898,13 @@ class TrustedCommand:
             return "the program is gone since hoplon started; restart hoplon"
         if (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns) != self.identity:
             return "the program changed since hoplon started; restart hoplon"
+        if self.target:
+            try:
+                st = os.stat(self.target)
+            except OSError:
+                return f"{self.target} is gone since hoplon started; restart hoplon"
+            if (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns) != self.target_identity:
+                return f"{self.target} changed since hoplon started; restart hoplon"
         return None
 
     def check(self, args):
@@ -2049,7 +2072,8 @@ class CommandSet:
         lines.append(f"  search:   {', '.join(one_line(d)[0] for d in c0.search)} (your PATH is never used)")
         lines.append(f"  env:      {', '.join(c0.env_names) or 'none'} passed on, besides PATH, LANG, HOME, USER "
                      "and LOGNAME")
-        groups = (("read: these only look, and run without asking",
+        groups = (("read: the set says these only look, and they run without asking (hoplon can't check that: "
+                   "make sure each one only looks)",
                    [c for c in self.commands.values() if c.read_only and not c.as_user]),
                   ("write: these change something, and ask every time unless you choose otherwise below",
                    self.writes()),
@@ -2065,6 +2089,9 @@ class CommandSet:
             lines += [f"    | {one_line(ln)[0]}" for ln in self.guide.splitlines()]
         lines.append("  [!] these commands run on this host as you, with no shell, and the read ones without "
                      "asking: their output goes to the model and the endpoint like any file the model reads")
+        lines.append("  [!] 'read' and 'write' are the set's own labels: hoplon checks which program runs and with "
+                     "what arguments, not what it does. A 'read' command that changes something runs without "
+                     "asking, live, whatever mode you are in")
         if self.escalated():
             lines.append("  [!] the ones marked AS ANOTHER USER run with that user's rights (root can read and change "
                          "anything); allow exactly these commands, with -n, in sudoers or doas.conf, and nothing more")
@@ -5929,7 +5956,7 @@ class TtyUI(PlainUI):
                         "It works on a throwaway copy of the project, but it could send what it reads anywhere.")
             elif p.kind == "trusted":
                 head = (f"Run {one_line(f['set'])[0]}.{one_line(f['command'])[0]} (a scoped command that "
-                        + ("only reads" if f.get("access") == "read" else "changes something")
+                        + ("its set says only reads" if f.get("access") == "read" else "changes something")
                         + (f", AS {one_line(f['as_user'])[0].upper()}" if f.get("as_user") else "")
                         + f"):\n    $ {show_exact(f['argv'])}")
             elif p.kind == "plan":

@@ -10,7 +10,9 @@ message from a wrapper turns it on.
 
 Each enabled command is a tool for the model, named `slurm__queue_user`. Every command says what it does:
 `"access": "read"` (it only looks) runs without asking, like an automatic read in coding mode: you see what ran
-and its output, and the audit log records it. `"access": "write"` (it changes something) asks every time, like a
+and its output, and the audit log records it. `read` is what the set says, not something hoplon can check: it
+controls which program runs with which arguments, not what that program does. Bless a set only when you know
+its read commands really only look (`squeue` does; a script you haven't read might not). `"access": "write"` (it changes something) asks every time, like a
 write, unless you let it run without asking: after you accept a set, blessing asks you about each write
 command, and the answer is kept with the blessing (`auto`), so a changed set asks again. Every run is logged as
 `trusted_run` either way. You (a hoplon-tui pane, through the `run` message)
@@ -60,7 +62,8 @@ commands with exactly these inputs.
 - `env`: names of environment variables passed on. The program otherwise gets only `PATH` (the `search`
   directories), `LANG=C.UTF-8`, `HOME`, `USER` and `LOGNAME`. `PATH` and `LD_*` can't be listed.
 - The program must be a regular executable file, and neither it nor its directory may be writable by group or
-  others or owned by another user than you or root. hoplon records which file it found at start and refuses to
+  others or owned by another user than you or root. Nor may any directory above it, up to `/`, except that a
+  sticky one such as `/tmp` may be writable, since nobody else can rename what is yours in it. hoplon records which file it found at start and refuses to
   run it if it changed ("restart hoplon").
 
 ### Commands that run as root
@@ -82,8 +85,9 @@ restarts a service on a remote host without a root shell: you allow exactly that
   `run0` needs `--no-ask-password`. Besides that, only `-u USER` (or `--user`) and sudo's `-H` are accepted, so
   nothing can start a shell (`-s`, `-i`), edit files (`-e`) or keep your environment (`-E`). The user may be a
   placeholder. `pkexec`, `su` and `sudoedit` are refused.
-- The program it runs comes next, as an absolute path, so it matches a rule exactly. hoplon checks `sudo`
-  itself like any program; what `sudo` then runs is checked by your rule, not by hoplon.
+- The program it runs comes next, as an absolute path to the file itself (not a link), so it matches a rule
+  exactly. hoplon checks both `sudo` and that program like any other, and refuses a run if either changed since
+  it started; your rule decides what `sudo` will run.
 - The host needs a rule that allows exactly that command without a password, for example in
   `/etc/sudoers.d/hoplon` (edit it with `visudo -f`):
 

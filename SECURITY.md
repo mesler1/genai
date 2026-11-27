@@ -139,14 +139,17 @@ whole of what the model and the user's panes can run.
   close that race, and only the sandbox does. Don't give a `path` under a directory that others can write to.
 - **Fixed programs.** The program is found only in the command set's `search` directories (or by an absolute path),
   never through your `PATH`. It must be a regular executable file that neither group nor others can write, as
-  must its directory, owned by you or root. hoplon records the file it found and refuses to run it if it was
+  must its directory and every directory above it (a sticky one like `/tmp` excepted), owned by you or root. hoplon records the file it found and refuses to run it if it was
   replaced afterwards.
 - **Minimal environment.** The program gets `PATH` (the search directories), `LANG`, `HOME`, `USER`, `LOGNAME`
   and the variables the command set lists; `PATH` and `LD_*` can't be listed. Standard input is empty.
 - **Limits.** A time limit (at most 120 s), an output cap (at most 1 MiB, then the program is killed), its own
   process group (killed whole), at least `min_interval` seconds between real runs of one command, a cache so a
   repeated question is answered from the last result, and 30 real runs a minute across all command sets.
-- **Auto-run versus asking.** Each command must say `"access": "read"` or `"write"`; there is no default. Read
+- **Auto-run versus asking.** Each command must say `"access": "read"` or `"write"`; there is no default. That
+  is the set author's claim, and hoplon can't check it: it checks which program runs and with what arguments,
+  never what the program does. A `read` command that changes something still runs without asking, live, as
+  you, whatever mode the session is in. Blessing is where you check the claim. Read
   commands run without asking, and the blessing screen lists them apart from the write commands. A write command
   asks, in the normal approval flow, each time, unless you let it run without asking: blessing asks about each
   one, after you accept the set, and the answer is kept with the blessing, so it lapses when the set changes. The
@@ -158,8 +161,8 @@ whole of what the model and the user's panes can run.
   screen lists it apart, every approval says AS ROOT, and a hoplon-tui pane never runs it. It must say it never asks for a password (`-n`, or `--no-ask-password`); only `-u` and sudo's
   `-H` are accepted besides, so no option can start a shell, edit a file or keep the environment; and the program
   it runs must follow as an absolute path. `pkexec`, `su` and `sudoedit` are refused. hoplon checks the escalating
-  program like any other; what it then runs is limited by your sudoers (or doas.conf) rule, which should allow
-  exactly those commands. Placeholders still can't start with `-`, so the model can't add options to sudo.
+  program and the program it runs like any other, by its real path; your sudoers (or doas.conf) rule should
+  allow exactly those commands. Placeholders still can't start with `-`, so the model can't add options to sudo.
 - **Audit.** Each run (or refusal) is logged as `trusted_run`: command set, command, the validated values, who asked
   (`model` or `user`), exit code, time, bytes, whether it was cached or rate limited, and the program's path.
   Output is masked for the endpoint key and secret patterns, cut, and escaped wherever it is shown.

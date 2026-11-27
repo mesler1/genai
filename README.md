@@ -9,8 +9,13 @@ adds tmux 3.2 or newer.
 
 - **Zero defaults.** No endpoint is built in, so nothing is sent anywhere until you name one and
   approve it.
-- **You run the commands.** The model proposes, and you decide. The only exception is opt-in: an
-  offline container on a throwaway copy of your project.
+- **You run the commands.** The model proposes, and you decide. The exceptions are opt-in: an offline
+  container on a throwaway copy of your project, and the commands of a command set you blessed that
+  run without asking.
+- **"Read-only" is a claim you check.** A command set marks each command `read` or `write`, and the read
+  ones run live without asking. hoplon can't tell what a program does, so `read` is the set author's
+  word: bless a set only when you know its read commands only look. hoplon checks the program file, not
+  its behavior.
 - **One way out.** No web access and no rendered links or images. The model reaches only the
   endpoint you approved.
 - **Secrets stay put.** Files that look like secrets ask first and are hidden from the sandbox, and
