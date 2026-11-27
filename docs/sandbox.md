@@ -59,7 +59,8 @@ profile can instead give it a sandbox, where it runs them itself and fixes what 
 }
 ```
 
-The model then has a `run_in_sandbox` tool. Each command runs in a rootless podman container:
+(Step by step, with hoplon-tui: [Sandboxed coding](hoplon-tui.md#sandboxed-coding).) The model then has a
+`run_in_sandbox` tool. Each command runs in a rootless podman container:
 
 - **On a throwaway copy of the project.** The working directory is mounted at `/work` as an
   overlay: the command can write anything, and every change is discarded when it ends. The only
