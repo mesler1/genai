@@ -38,7 +38,7 @@ hoplon -e work-llm "what does 'set -euo pipefail' do?"
 
 `--new-endpoint` asks for a name (`work-llm` above), your server's OpenAI-compatible address (usually
 ending in `/v1`), the environment variable that holds your API key (its name, never the key), the model
-(from the server's own list, when it can read it) and the model's context size, and optionally which
+(from the server's own list, if you let it ask the server: it asks first, since that sends your key) and the model's context size, and optionally which
 models are `low`, `medium` and `high` ([model aliases](docs/endpoints-and-profiles.md#model-aliases)).
 It writes the file with private permissions and stops: blessing it is your step. You can also write the
 file by hand:

@@ -44,7 +44,9 @@ class TestEndpointAliases(unittest.TestCase):
         self.assertIn("aliases", G.ENDPOINT_KEYS)        # in the endpoint file, so its hash changes with them
 
     def test_a_profile_may_name_a_model(self):
-        self.assertEqual(G.Profile({"name": "p", "model": "high"}, "p.json").model, "high")
+        p = G.Profile({"name": "p", "model": "high"}, "p.json")
+        self.assertEqual(p.model, "high")
+        self.assertIn("  model:    high (a model or alias of the endpoint", p.summary()[0])      # seen when blessed
         with self.assertRaises(G.HoplonError):
             G.Profile({"name": "p", "model": "has space"}, "p.json")
 
@@ -78,13 +80,41 @@ class TestAliasesInUse(Tmp):
             g.until("done")
             g.send({"type": "model", "model": "huge"})
             err = g.until("error")
+            g.send({"type": "model", "model": "flash-model"})        # listed with its size
+            limits = [g.until("model")["context"]["limit"]]
+            g.send({"type": "model", "model": "medium"})             # back by alias: the blessed size, not 8000
+            limits.append(g.until("model")["context"]["limit"])
             g.close()
+        self.assertEqual(limits, [8000, 100000])
         self.assertEqual(err["code"], "unknown_model")
         self.assertIn('add "aliases": {"huge": "MODEL"}', err["message"])
         self.assertIn("it has: high, low, medium", err["message"])
         self.assertEqual([r["body"]["model"] for r in api.requests if r.get("body")], ["fake-model", ALIASES["high"]])
         self.assertIn(("model", ALIASES["high"], "high"),
                       [(a["event"], a.get("model"), a.get("alias")) for a in self.audit(home)])
+
+    def test_an_alias_hides_a_server_model_of_its_name_and_survives_a_listing_error(self):
+        aliases = {"flash-model": "fake-model", "high": "pro-model"}
+        with FakeAPI([], models=self.MODELS) as api:
+            home, path = make_home(self.tmp, api.url, aliases=aliases)
+            bless_path(home, path)
+            g = Proc(home, self.tmp, ["-e", "test"])
+            g.until("hello")
+            g.send({"type": "models"})
+            ev = g.until("models")
+            g.close()
+        self.assertEqual([m["id"] for m in ev["models"]], ["fake-model"])     # "flash-model" chooses the alias
+        with FakeAPI([], models_status=500) as api:
+            home = os.path.join(self.tmp, "h3")
+            os.makedirs(home)
+            h, path = make_home(home, api.url, aliases=aliases)
+            bless_path(h, path)
+            g = Proc(h, self.tmp, ["-e", "test"])
+            g.until("hello")
+            g.send({"type": "models"})
+            ev, err = g.until("models"), g.until("error")
+            g.close()
+        self.assertEqual((ev["aliases"], ev["models"], err["code"]), (aliases, [], "models"))
 
     def test_a_profiles_model_is_used_and_one_the_endpoint_lacks_refuses_the_session(self):
         with FakeAPI([reply("hi")], models=self.MODELS) as api:

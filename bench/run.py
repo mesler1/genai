@@ -8,14 +8,14 @@ against real runs instead of guessing.
 A task is a directory under bench/tasks/: task.md (the task the model gets; its first line is a title), repo/ (the
 project's files, committed as the start), and check.sh (run afterwards on the session's branch, in the profile's
 sandbox, offline; it never reaches the model, so it may hold tests the model can't see). The profile must have a
-"sandbox", as any work session needs (and may have a "work" section), and you bless it as usual: the runner uses your own hoplon
-configuration and changes nothing in it.
+"sandbox", as any work session needs (and may have a "work" section), and you bless it as usual: the runner uses
+your own hoplon configuration and changes nothing in it.
 
 For each task the runner copies repo/ to a new git repository, starts `hoplon --json -p PROFILE` there, sends the
 task, approves the work plan (and any new plan), declines anything else that asks, and nudges the model to go on when
 a turn ends before the session does, up to --nudges times. It records, per task: whether the check passed, the
-session's end, items done, steps per item, retries, fresh contexts, model requests and generated tokens, wall time,
-and the diff size. Every run costs real model requests on the endpoint you name.
+session's end, items done, model requests per item (hoplon's steps), retries, fresh contexts, model requests and
+generated tokens, wall time, and the diff size. Every run costs real model requests on the endpoint you name.
 """
 
 import argparse
@@ -34,7 +34,9 @@ TASKS = os.path.join(HERE, "tasks")
 HOPLON = os.path.join(os.path.dirname(HERE), "hoplon")
 NUDGE = ("Go on with the approved plan on your own; nobody is here to answer questions. Decide for yourself, "
          "and finish the items.")
-GIT_ENV = {"GIT_AUTHOR_NAME": "bench", "GIT_AUTHOR_EMAIL": "bench@localhost", "GIT_COMMITTER_NAME": "bench",
+CHECK_OUTPUT = 20000          # bytes of a check's output kept (the end of it); the rest is read and dropped
+GRACE = 120                   # seconds to let hoplon finish the work (and say where the branch is) after stopping
+GIT_ENV = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_AUTHOR_NAME": "bench", "GIT_AUTHOR_EMAIL": "bench@localhost", "GIT_COMMITTER_NAME": "bench",
            "GIT_COMMITTER_EMAIL": "bench@localhost", "GIT_AUTHOR_DATE": "2026-01-01T00:00:00Z",
            "GIT_COMMITTER_DATE": "2026-01-01T00:00:00Z"}
 
@@ -55,6 +57,11 @@ def load_tasks(root=TASKS, names=None):
         missing = [f for f in ("task.md", "repo", "check.sh") if not os.path.exists(os.path.join(d, f))]
         if missing:
             raise BenchError(f"task {n}: missing {', '.join(missing)}")
+        for top, dirs, files in os.walk(os.path.join(d, "repo")):
+            bad = [x for x in dirs + files if x == ".git" or os.path.islink(os.path.join(top, x))]
+            if bad:     # a link could bring in files from outside the task; a .git, its own hooks and config
+                raise BenchError(f"task {n}: {os.path.join(top, bad[0])} is a link or a .git; a task's repo/ holds "
+                                 "plain files only")
         out[n] = d
     return out
 
@@ -62,13 +69,14 @@ def load_tasks(root=TASKS, names=None):
 def git(cwd, *args):
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     env.update(GIT_ENV)
-    return subprocess.run(["git", *args], cwd=cwd, env=env, capture_output=True, text=True, check=True).stdout
+    return subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", *args], cwd=cwd,
+                          env=env, capture_output=True, text=True, check=True).stdout
 
 
 def make_repo(task_dir, where):
     """The task's repo/ as a fresh git repository on main, with one start commit."""
     root = os.path.join(where, "repo")
-    shutil.copytree(os.path.join(task_dir, "repo"), root, symlinks=False)
+    shutil.copytree(os.path.join(task_dir, "repo"), root, symlinks=True)     # load_tasks refused any link
     git(root, "init", "-q", "-b", "main")
     git(root, "add", "-A")
     git(root, "commit", "-q", "--allow-empty", "-m", "start")
@@ -76,7 +84,7 @@ def make_repo(task_dir, where):
 
 
 def sandbox_of(profile, endpoint, hoplon, env):
-    """The profile's sandbox (engine and image), as hoplon itself resolves the profile."""
+    """The profile's sandbox, as hoplon itself resolves the profile: (podman, image, memory, pids)."""
     args = [sys.executable, hoplon, "--remote-config", "-p", profile] + (["-e", endpoint] if endpoint else [])
     r = subprocess.run(args, capture_output=True, text=True, env=env)
     if r.returncode != 0:
@@ -85,12 +93,10 @@ def sandbox_of(profile, endpoint, hoplon, env):
     if not prof.get("sandbox"):
         raise BenchError(f"profile {profile!r} needs a \"sandbox\": work sessions test in it")
     sb = prof["sandbox"]
-    engine = sb.get("engine", "auto")
-    if engine == "auto":
-        engine = next((e for e in ("podman", "docker") if shutil.which(e, path=env.get("PATH"))), None)
-        if not engine:
-            raise BenchError("neither podman nor docker is on PATH, for the checks")
-    return engine, sb["image"]
+    podman = shutil.which("podman", path=env.get("PATH"))
+    if not podman:
+        raise BenchError("podman is not on PATH, for the checks")
+    return podman, sb["image"], sb.get("memory") or "4g", sb.get("pids") or 1024
 
 
 class Session:
@@ -125,11 +131,15 @@ class Session:
         except queue.Empty:
             return "timeout"
 
-    def close(self):
+    def close_input(self):
+        """As the user leaving: hoplon ends the work and says so, then exits."""
         try:
             self.p.stdin.close()
         except OSError:
             pass
+
+    def close(self):
+        self.close_input()
         try:
             self.p.wait(timeout=60)
         except subprocess.TimeoutExpired:
@@ -137,80 +147,124 @@ class Session:
             self.p.wait()
 
 
-def drive(s, task_text, nudges, limit):
-    """Run one work session to its end, answering as an absent user would. Returns what it saw."""
+def drive(s, task_text, nudges, limit, grace=GRACE):
+    """Run one work session to its end, answering as an absent user would. Returns what it saw.
+
+    When the session can't go on (it gave up after the nudges, or the time ran out), the runner stops answering,
+    as a user who left would, and waits up to grace seconds for hoplon to end the work and name its branch."""
     r = {"end": None, "plans": 0, "items": [], "retries": 0, "fresh_contexts": 0, "requests": 0, "tokens": 0,
          "declined": [], "nudges": 0, "errors": [], "branch": None, "commits": []}
     deadline = time.monotonic() + limit
-    steps, ended, started = 0, False, False
+    requests, ended, started, leaving = 0, False, False, False
+
+    def leave(why):
+        nonlocal deadline, leaving
+        r["end"], leaving = why, True
+        deadline = time.monotonic() + grace
+        s.close_input()
+
+    def turn_over():
+        """A turn ended, with done or with an error (which sends no done). True: stop reading."""
+        if ended:
+            return True
+        if not started:
+            r["end"] = r["end"] or "not started"
+            return True
+        if r["nudges"] >= nudges:
+            leave("gave up")
+            return False
+        r["nudges"] += 1
+        s.send({"type": "user", "text": NUDGE})
+        return False
+
     while True:
-        ev = s.next(deadline)
+        ev = "timeout" if time.monotonic() >= deadline else s.next(deadline)
         if ev == "timeout":
-            r["end"] = "timeout"
-            break
+            if leaving:
+                break
+            leave("timeout")
+            continue
         if ev is None:
             r["end"] = r["end"] or "hoplon exited"
             break
         t = ev.get("type")
-        if t == "hello":
+        if t == "generated":
+            r["requests"] += 1
+            requests += 1
+            r["tokens"] += ev.get("tokens") or 0
+        elif t == "work":
+            state = ev.get("state")
+            started = started or state == "started"
+            if state == "plan":
+                requests = 0                    # planning isn't an item's
+            elif state == "item":
+                r["items"].append(requests)     # the model requests the item took: hoplon's steps
+                requests = 0
+            elif state == "context":            # review: the planner takes back a stuck item
+                r["retries" if ev.get("role") == "review" else "fresh_contexts"] += 1
+            elif state == "ended":
+                ended = True
+                r.update(branch=ev.get("branch"), commits=ev.get("commits") or [])
+                if leaving:                     # the branch of a session left behind: all there is to wait for
+                    break
+                r["end"] = ev.get("why")
+        elif leaving:
+            continue                            # nobody answers any more
+        elif t == "hello":
             s.send({"type": "work", "task": task_text})
         elif t == "proposal":
             if ev.get("kind") == "work_plan" and ev.get("digest"):
                 r["plans"] += 1
                 s.send({"type": "decision", "id": ev["id"], "digest": ev["digest"], "decision": "accept"})
-            else:
-                if ev.get("digest") and not ev.get("auto"):
-                    r["declined"].append(ev.get("kind"))
-                    s.send({"type": "decision", "id": ev["id"], "digest": ev["digest"], "decision": "decline"})
-                if ev.get("kind") not in ("finish", "retry"):
-                    steps += 1          # a step of the item: what the model proposed, done or declined
-        elif t == "generated":
-            r["requests"] += 1
-            r["tokens"] += ev.get("tokens") or 0
-        elif t == "work":
-            state = ev.get("state")
-            started = started or state == "started"
-            if state == "item":
-                r["items"].append(steps)
-                steps = 0
-            elif state == "context":
-                r["retries" if ev.get("role") == "review" else "fresh_contexts"] += 1
-            elif state == "ended":
-                ended = True
-                r.update(end=ev.get("why"), branch=ev.get("branch"), commits=ev.get("commits") or [])
+            elif ev.get("digest") and not ev.get("auto"):
+                r["declined"].append(ev.get("kind"))
+                s.send({"type": "decision", "id": ev["id"], "digest": ev["digest"], "decision": "decline"})
         elif t == "error":
             r["errors"].append(f"{ev.get('code')}: {ev.get('message')}"[:300])
             if ev.get("code") == "work_refused":
                 r["end"] = "refused"
                 break
+            if ev.get("code") not in ("bad_message", "not_running", "models") and turn_over():
+                break                           # a failed turn: as if it were done
         elif t == "done":
-            if ended:
+            if turn_over():
                 break
-            if not started:
-                r["end"] = "not started"
-                break
-            if r["nudges"] >= nudges:
-                r["end"] = "gave up"
-                break
-            r["nudges"] += 1
-            s.send({"type": "user", "text": NUDGE})
-    r["unfinished_steps"] = steps
+    r["unfinished_steps"] = requests
     return r
 
 
-def check(engine, image, task_dir, root, branch, env, timeout=600):
-    """Run the task's check.sh on the session's branch, in the sandbox image, offline. (passed, output tail)."""
+def check(sandbox, task_dir, root, branch, env, timeout=600):
+    """Run the task's check.sh on the session's branch, in the sandbox image, offline and confined as hoplon's own
+    sandbox is: the code it runs is the model's. (passed, the end of its output)."""
     if not branch:
         return False, "no branch: the session changed nothing"
+    podman, image, memory, pids = sandbox
     git(root, "checkout", "-q", branch)
-    args = [engine, "run", "--rm", "--network=none", "--env=BENCH=/bench", f"--volume={task_dir}:/bench:ro",
-            f"--volume={root}:/work:O", "--workdir=/work", image, "/bin/sh", "-c", 'sh "$BENCH/check.sh"',
-            "bench-check"]
+    name = f"hoplon-bench-check-{os.getpid()}-{int(time.monotonic() * 1000)}"
+    args = [podman, "--log-level=error", "run", "--rm", f"--name={name}", "--pull=never", "--init",
+            "--network=none", "--http-proxy=false", "--cap-drop=all", "--security-opt=no-new-privileges",
+            f"--memory={memory}", f"--pids-limit={pids}", "--read-only", "--tmpfs=/tmp:rw,size=1g,mode=1777",
+            "--env=HOME=/tmp", "--env=BENCH=/bench", f"--volume={task_dir}:/bench:ro", f"--volume={root}:/work:O",
+            "--workdir=/work", image, "/bin/sh", "-c", 'sh "$BENCH/check.sh" 2>&1', "bench-check"]
+    p = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
+    tail = bytearray()
+
+    def read():                 # only the end is kept, however much the model's code prints
+        for chunk in iter(lambda: p.stdout.read(65536), b""):
+            tail.extend(chunk)
+            del tail[:-CHECK_OUTPUT]
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
     try:
-        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout, env=env)
+        p.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
+        subprocess.run([podman, "--log-level=error", "rm", "-f", name], capture_output=True, env=env)
+        p.kill()
+        p.wait()
+        reader.join(5)
         return False, "the check timed out"
-    return r.returncode == 0, (r.stdout + r.stderr)[-1500:]
+    reader.join(5)
+    return p.returncode == 0, bytes(tail).decode("utf-8", "replace")[-1500:]
 
 
 def diff_size(root, branch):
@@ -237,7 +291,8 @@ def run_task(name, task_dir, opts, env, sandbox):
         finally:
             s.close()
         r["seconds"] = round(time.monotonic() - t0, 1)
-        passed, out = check(*sandbox, task_dir, root, r["branch"], env)
+        passed, out = check(sandbox, task_dir, root, r["branch"], env)
+        r["check_seconds"] = round(time.monotonic() - t0 - r["seconds"], 1)
         r.update(task=name, title=text.splitlines()[0].lstrip("# ").strip(), passed=passed, check_output=out,
                  diff=diff_size(root, r["branch"]))
         if not r["branch"] and s.stderr:
@@ -251,7 +306,7 @@ def run_task(name, task_dir, opts, env, sandbox):
 
 
 def table(results):
-    head = ("task", "check", "end", "items", "steps/item", "retries", "fresh", "requests", "tokens", "time", "diff")
+    head = ("task", "check", "end", "items", "requests/item", "retries", "fresh", "requests", "tokens", "time", "diff")
     rows = [head]
     for r in results:
         steps = "/".join(str(n) for n in r["items"]) or "-"
@@ -274,7 +329,7 @@ def compare(a, b):
             continue
 
         def f(r):
-            return (f"{'pass' if r['passed'] else 'FAIL'}, {len(r['items'])} items, {sum(r['items'])} steps, "
+            return (f"{'pass' if r['passed'] else 'FAIL'}, {len(r['items'])} items, {sum(r['items'])} requests in items, "
                     f"{r['retries']} retries, {r['tokens']} tokens, {r['seconds']:.0f}s")
         mark = "" if x["passed"] == y["passed"] else ("  <- now passes" if y["passed"] else "  <- now FAILS")
         lines += [f"{name}:{mark}", f"  before: {f(x)}", f"  after:  {f(y)}"]
@@ -295,7 +350,8 @@ def main(argv=None):
     r.add_argument("-o", "--out", help="write the results here as JSON, for compare")
     r.add_argument("--label", help="what this run is, for compare (default: the profile, endpoint and hoplon commit)")
     r.add_argument("--nudges", type=int, default=3, help="times to tell the model to go on (default 3)")
-    r.add_argument("--time-limit", type=int, default=3600, help="seconds per task before it is stopped (3600)")
+    r.add_argument("--time-limit", type=int, default=3600, help="seconds per task's session before it is stopped "
+                   "(3600); the check has 10 minutes of its own")
     r.add_argument("--hoplon", default=HOPLON, help="the hoplon to run (default: this repository's)")
     r.add_argument("--tasks", default=TASKS, help="the tasks directory")
     r.add_argument("--keep", action="store_true", help="keep each task's repository, to look at the branch")

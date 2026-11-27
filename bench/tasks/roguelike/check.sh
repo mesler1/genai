@@ -53,7 +53,10 @@ for seed in range(8):
     if hits < hp0:
         assert g.won and g.over, f"seed {seed}: walking to the exit should win"
         assert g.hp == hp0 - hits, f"seed {seed}: each monster costs 1 hit point"
-        assert game.render(game.move(g, 1, 0) or g) == game.render(g), "nothing moves once over"
+        frozen = game.render(g)
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            g = game.move(g, dx, dy) or g
+        assert game.render(g) == frozen and g.over, "nothing moves once over"
     # walls block
     g = game.new_game(seed)
     rows = game.render(g)
@@ -66,3 +69,7 @@ for seed in range(8):
 print("the game logic passes")
 PY
 [ -n "$(find . -name 'test*.py' -not -path './.git/*')" ] || { echo "no tests of its own"; exit 1; }
+# its own tests run, and there are some
+out=$(python3 -m unittest discover -s . -p 'test*.py' 2>&1) || { echo "$out" | tail -20; echo "its own tests fail"; exit 1; }
+echo "$out" | grep -qE "^Ran [1-9]" || { echo "its own tests test nothing"; exit 1; }
+grep -qiE "play\.py|python3? +play" README.md || { echo "README.md doesn't say how to play"; exit 1; }

@@ -33,13 +33,14 @@ class TestNewEndpoint(Tmp):
     def test_it_lists_the_models_offers_aliases_and_writes_a_private_file(self):
         with FakeAPI([], models=[{"id": "small", "max_model_len": 16000}, {"id": "big", "max_model_len": 128000}]) as api:
             with mock.patch.dict(os.environ, {"TEST_KEY_VAR": "sk-not-real"}):
-                path, out = self.run_with(["work", api.url, "TEST_KEY_VAR", "2", "", "y", "1", "", "2"])
+                path, out = self.run_with(["work", api.url, "TEST_KEY_VAR", "y", "2", "", "y", "1", "", "2"])
         self.assertEqual(path, os.path.join(self.home, "endpoints", "work.json"))
         data = json.load(open(path))
         self.assertEqual(data, {"name": "work", "base_url": api.url, "key_env": "TEST_KEY_VAR", "model": "big",
                                 "context_limit": 128000, "aliases": {"low": "small", "high": "big"}})
         self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
         self.assertIn(" 2. big  (128000 tokens)", out)
+        self.assertIn("That sends a request with your key ($TEST_KEY_VAR) there now, before you bless", out)
         self.assertIn(f"hoplon --bless {path}", out)
         self.assertNotIn("sk-not-real", out + open(path).read())
         self.assertNotIn(os.path.abspath(path), self.cfg.blessed())           # never blessed for you
@@ -49,7 +50,7 @@ class TestNewEndpoint(Tmp):
         def client(ep):
             raise G.HoplonError("cannot reach it")
         path, out = self.run_with(["bad name", "ok", "ftp://x", "https://llm.example/v1", "sk-abc-123-not-a-name",
-                                   "", "has space", "my-model", "12", "64000", ""], client)
+                                   "", "y", "has space", "my-model", "12", "64000", ""], client)
         self.assertIn("letters, digits", out)
         self.assertIn("an http(s) address", out)
         self.assertIn("never the key itself", out)
@@ -70,7 +71,18 @@ class TestNewEndpoint(Tmp):
     def test_stopping_writes_nothing(self):
         with self.assertRaisesRegex(G.HoplonError, "nothing was written"):
             self.run_with(["half"])
+        with self.assertRaisesRegex(G.HoplonError, "nothing was written"):      # Ctrl-D at the last question
+            self.run_with(["late", "https://llm.example/v1", "", "n", "m", ""])
         self.assertEqual(os.listdir(os.path.join(self.home, "endpoints")), [])
+
+    def test_nothing_is_sent_unless_you_say_so(self):
+        def client(ep):
+            raise AssertionError("asked the server")
+        with mock.patch.dict(os.environ, {"TEST_KEY_VAR": "sk-not-real"}):
+            path, out = self.run_with(["quiet", "http://[::1", "https://llm.example/v1", "TEST_KEY_VAR", "n",
+                                       "123", "", "n"], client)
+        self.assertIn("an http(s) address", out)         # a malformed address is asked again, not a crash
+        self.assertEqual(json.load(open(path))["model"], "123")     # with no list, a number is a name
 
 
 if __name__ == "__main__":

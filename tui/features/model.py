@@ -41,7 +41,8 @@ class ModelPicker(Feature):
             aliases = {k: v for k, v in sorted(aliases.items()) if isinstance(k, str) and ALIAS.fullmatch(k)
                        and isinstance(v, str) and MODEL_ID.fullmatch(v)}
             ids = [x["id"] for x in ev.get("models") or []
-                   if isinstance(x, dict) and isinstance(x.get("id"), str) and MODEL_ID.fullmatch(x["id"])]
+                   if isinstance(x, dict) and isinstance(x.get("id"), str) and MODEL_ID.fullmatch(x["id"])
+                   and x["id"] not in aliases]          # that name chooses the alias's model
             self.models = list(aliases) + ids
             self.labels = [shown_model(v, k) for k, v in aliases.items()] + ids
             ep = (m.hello or {}).get("endpoint", {})

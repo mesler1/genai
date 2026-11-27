@@ -4,6 +4,7 @@ import io
 import json
 import os
 import sys
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
@@ -75,7 +76,7 @@ class TestBench(FakePodman):
         self.assertEqual(code, 0, (r, err))
         self.assertEqual(res["label"], "test run")
         self.assertEqual((r["task"], r["title"], r["passed"], r["end"]), ("fix-a", "Fix a", True, "done"))
-        self.assertEqual((r["plans"], r["nudges"], r["items"], r["declined"]), (1, 1, [1], []))
+        self.assertEqual((r["plans"], r["nudges"], r["items"], r["declined"]), (1, 1, [2], []))
         self.assertEqual(r["diff"], {"files": 1, "added": 1, "removed": 1})
         self.assertEqual(r["requests"], 5)
         self.assertIn("fix-a", out)
@@ -89,35 +90,65 @@ class TestBench(FakePodman):
         self.assertEqual((code, r["passed"], r["end"], r["nudges"]), (1, False, "gave up", 2))
         self.assertIn("no branch", r["check_output"])
 
-    def test_whatever_else_asks_is_declined_and_counts_as_a_step(self):
+    def test_whatever_else_asks_is_declined_and_items_count_their_requests(self):
         class Fake:
             def __init__(self, events):
-                self.events, self.sent = list(events), []
+                self.events, self.sent, self.closed = list(events), [], False
 
             def next(self, deadline):
+                if self.events and self.events[0] == "wait":    # nothing comes until the deadline
+                    self.events.pop(0)
+                    time.sleep(max(0, deadline - time.monotonic()))
+                    return "timeout"
                 return self.events.pop(0) if self.events else None
 
             def send(self, obj):
+                assert not self.closed, obj
                 self.sent.append(obj)
-        s = Fake([{"type": "hello"}, {"type": "work", "state": "started"},
+
+            def close_input(self):
+                self.closed = True
+        gen = {"type": "generated", "tokens": 40}
+        s = Fake([{"type": "hello"}, {"type": "work", "state": "started"}, gen,
                   {"type": "proposal", "id": "p1", "kind": "work_plan", "digest": "d1"},
+                  {"type": "work", "state": "plan"}, gen,
                   {"type": "proposal", "id": "p2", "kind": "skills", "digest": "d2"},
-                  {"type": "proposal", "id": "p3", "kind": "write", "auto": True},
+                  {"type": "proposal", "id": "p3", "kind": "write", "auto": True}, gen,
                   {"type": "work", "state": "context", "role": "review"},
-                  {"type": "work", "state": "item"}, {"type": "generated", "tokens": 40},
+                  {"type": "work", "state": "item"}, gen,
                   {"type": "work", "state": "ended", "why": "done", "branch": "b", "commits": ["c 1. x"]},
                   {"type": "done", "reason": "reply"}])
         r = B.drive(s, "the task", 3, 60)
         self.assertEqual(s.sent[0], {"type": "work", "task": "the task"})
         self.assertEqual([m.get("decision") for m in s.sent[1:]], ["accept", "decline"])
-        self.assertEqual((r["declined"], r["items"], r["retries"], r["tokens"], r["end"], r["branch"]),
-                         (["skills"], [2], 1, 40, "done", "b"))
+        self.assertEqual((r["declined"], r["items"], r["retries"], r["requests"], r["end"], r["branch"]),
+                         (["skills"], [2], 1, 4, "done", "b"))
+        # a failed turn sends no done: it is nudged like one; giving up still waits for the branch
+        s = Fake([{"type": "hello"}, {"type": "work", "state": "started"},
+                  {"type": "error", "code": "api", "message": "500"}, {"type": "done", "reason": "reply"},
+                  {"type": "work", "state": "ended", "why": "ended", "branch": "b2", "commits": ["c 1. x"]}, None])
+        r = B.drive(s, "t", 1, 60)
+        self.assertEqual((r["end"], r["nudges"], r["branch"], s.closed), ("gave up", 1, "b2", True))
+        self.assertEqual([m["type"] for m in s.sent], ["work", "user"])
+        # the time limit: it stops answering, and waits a little for the branch
+        s = Fake([{"type": "hello"}, {"type": "work", "state": "started"}, "wait",
+                  {"type": "work", "state": "ended", "why": "ended", "branch": "b3"}])
+        r = B.drive(s, "t", 3, 0.2, grace=5)
+        self.assertEqual((r["end"], r["branch"], s.closed), ("timeout", "b3", True))
         s = Fake([{"type": "hello"}, {"type": "error", "code": "work_refused", "message": "not a git repository"}])
         self.assertEqual(B.drive(s, "t", 3, 60)["end"], "refused")
 
     def test_tasks_and_compare(self):
         with self.assertRaisesRegex(B.BenchError, "no task named 'nope'"):
             B.load_tasks(self.tasks, ["nope"])
+        os.symlink("/etc", os.path.join(self.tasks, "fix-a", "repo", "outside"))
+        with self.assertRaisesRegex(B.BenchError, "outside is a link or a .git"):
+            B.load_tasks(self.tasks)
+        os.remove(os.path.join(self.tasks, "fix-a", "repo", "outside"))
+        os.makedirs(os.path.join(self.tasks, "fix-a", "repo", "sub", ".git"))
+        with self.assertRaisesRegex(B.BenchError, "sub/.git is a link or a .git"):
+            B.load_tasks(self.tasks)
+        os.rmdir(os.path.join(self.tasks, "fix-a", "repo", "sub", ".git"))
         os.makedirs(os.path.join(self.tasks, "broken"))
         with self.assertRaisesRegex(B.BenchError, "broken: missing task.md, repo, check.sh"):
             B.load_tasks(self.tasks)
@@ -128,7 +159,7 @@ class TestBench(FakePodman):
         text = B.compare({"label": "a", "results": [row]},
                          {"label": "b", "results": [dict(row, passed=False, tokens=900)]})
         self.assertIn("t:  <- now FAILS", text)
-        self.assertIn("after:  FAIL, 2 items, 7 steps, 0 retries, 900 tokens, 61s", text)
+        self.assertIn("after:  FAIL, 2 items, 7 requests in items, 0 retries, 900 tokens, 61s", text)
         self.assertIn("before: 1/1 passed, 1200 tokens", text)
 
 
