@@ -155,8 +155,7 @@ whole of what the model and the user's panes can run.
   answers go with the set from your machine.
 - **Commands run as root.** A command whose program is `sudo`, `doas` or `run0` runs as root (or the user `-u`
   names). It asks every time, reads included, unless you let it run without asking when blessing; the blessing
-  screen lists it apart, every approval says AS ROOT, and a hoplon-tui pane can't run it unless you let it run
-  without asking. It must say it never asks for a password (`-n`, or `--no-ask-password`); only `-u` and sudo's
+  screen lists it apart, every approval says AS ROOT, and a hoplon-tui pane never runs it. It must say it never asks for a password (`-n`, or `--no-ask-password`); only `-u` and sudo's
   `-H` are accepted besides, so no option can start a shell, edit a file or keep the environment; and the program
   it runs must follow as an absolute path. `pkexec`, `su` and `sudoedit` are refused. hoplon checks the escalating
   program like any other; what it then runs is limited by your sudoers (or doas.conf) rule, which should allow

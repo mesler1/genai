@@ -77,7 +77,7 @@ restarts a service on a remote host without a root shell: you allow exactly that
 - It asks every time, even with `"access": "read"`, and the blessing screen lists it apart, under AS ANOTHER
   USER. When you bless the set you can let it run without asking, as with a write command.
 - Every approval says it runs AS ROOT (or as the user `-u` names), in the REPL and on hoplon-tui's card. A
-  hoplon-tui pane can't run it, unless you let it run without asking.
+  hoplon-tui pane never runs it.
 - It must never ask for a password, since scoped commands run with no terminal: `sudo` and `doas` need `-n`,
   `run0` needs `--no-ask-password`. Besides that, only `-u USER` (or `--user`) and sudo's `-H` are accepted, so
   nothing can start a shell (`-s`, `-i`), edit files (`-e`) or keep your environment (`-E`). The user may be a
