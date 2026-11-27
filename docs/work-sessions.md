@@ -71,7 +71,9 @@ reviewing a stuck item) to another model, such as a stronger one, while the item
 profile's own:
 
 - `"planner": {"model": "big-model"}`: another model on the same endpoint. hoplon checks the server
-  lists it before the session starts, and uses the context length the server gives for it.
+  lists it before the session starts, and uses the context length the server gives for it. An alias
+  of the endpoint (`{"model": "high"}`, see [model aliases](endpoints-and-profiles.md#model-aliases))
+  is taken as it is, without that check.
 - `"planner": {"endpoint": "other", "model": "big-model"}`: another blessed endpoint (without
   `model`, its own default). It reads files, so it sees the project too. In remote mode only the
   profile's endpoint can be reached, so it plans as well, with a notice.

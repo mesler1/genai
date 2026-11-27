@@ -27,7 +27,8 @@ Fields:
 | --- | --- | --- |
 | `name` | yes | Used with `hoplon -e NAME` and in a profile's `"endpoint"`. Letters, digits, `.`, `_`, `-`. Match the file name (`NAME.json`). |
 | `base_url` | yes | The OpenAI-compatible base URL, usually ending in `/v1`. hoplon calls `<base_url>/chat/completions`. |
-| `model` | yes | The model id the endpoint expects. |
+| `model` | yes | The model id the endpoint expects, or one of its `aliases`. |
+| `aliases` | no | Names of the user's own for the server's models, such as `{"low": "flash-model", "high": "pro-model"}`. A profile, a work session's planner and `:model` can then say `high`. Suggest the same names on every endpoint (`low`, `medium`, `high`), so profiles work with any of them. Ask which model should be each name; propose `curl <base_url>/models` for the user to run if they don't know the ids. |
 | `key_env` | one of | Name of an environment variable holding the key. |
 | `key_file` | one of | Path to a file holding the key. The file must be mode 0600 and owned by the user. |
 | `context_limit` | no | The model's context window in tokens (default 32000). hoplon warns at 80% and refuses to send at 100%. |

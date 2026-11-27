@@ -39,10 +39,10 @@ class WorkTest(FakePodman):
         return root
 
     def start(self, api, work=None, sandbox=None, context_limit=100000, planner_api=None, coding=True,
-              session=None, params=None, planner_model="big-model"):
+              session=None, params=None, planner_model="big-model", aliases=None):
         if os.path.exists(self.path("home")):
             subprocess.run(["rm", "-rf", self.path("home")], check=True)
-        home, ep = make_home(self.tmp, api.url, context_limit=context_limit)
+        home, ep = make_home(self.tmp, api.url, context_limit=context_limit, **({"aliases": aliases} if aliases else {}))
         bless_path(home, ep)
         if planner_api:
             bless_path(home, write_json(os.path.join(home, "endpoints", "big.json"),
@@ -415,6 +415,29 @@ class WorkTest(FakePodman):
             g.close()
         used = [r["body"]["model"] for r in api.requests if r.get("body")]
         self.assertEqual(used, ["big-model", "fake-model", "fake-model", "fake-model"])   # the plan, then the item
+
+    def test_a_planner_alias(self):
+        turns = [call("propose_work_plan", goal="g", items=["one"]),
+                 call("write_file", path="b.txt", content="x\n", reason="r"),
+                 call("finish_item", n=1, summary="b"), reply("done")]
+        self.repo()
+        with FakeAPI(turns) as api:        # the server lists nothing: a blessed alias is taken as it is
+            g = self.start(api, {"planner": {"model": "high"}}, aliases={"high": "big-model"})
+            g.send({"type": "work", "task": "t"})
+            self.assertEqual(g.until("work")["planner"], {"endpoint": "test", "model": "big-model"})
+            self.approve(g)
+            g.until("done")
+            g.close()
+        used = [r["body"]["model"] for r in api.requests if r.get("body")]
+        self.assertEqual(used[0], "big-model")
+        self.assertEqual(set(used[1:]), {"fake-model"})
+        with FakeAPI([]) as api:
+            g = self.start(api, {"planner": {"model": "huge"}}, aliases={"high": "big-model"})
+            g.send({"type": "work", "task": "t"})
+            err = g.until("error")
+            g.close()
+        self.assertEqual(err["code"], "work_refused")
+        self.assertIn('add "aliases": {"huge": "MODEL"}', err["message"])
 
     def test_a_planner_model_the_server_doesnt_list_refuses_the_session(self):
         self.repo()

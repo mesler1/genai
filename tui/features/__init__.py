@@ -81,6 +81,14 @@ class Feature:
         return []
 
 
+def shown_model(model, alias=None, n=32):
+    """A model as hoplon-tui shows it: "high (pro-model)" for an endpoint's alias, the server's name cut to its last
+    path part and n characters; the model as it is otherwise. The caller escapes it."""
+    tail = model.rsplit("/", 1)[-1] or model
+    tail = tail if len(tail) <= n else tail[:n - 1] + "…"
+    return f"{alias} ({tail})" if alias else model
+
+
 def disabled_names(environ=None):
     """The features switched off, and a warning to show once if the config file couldn't be used. No file is fine; a
     malformed one is ignored (every feature stays on), so a typo can't stop the program."""

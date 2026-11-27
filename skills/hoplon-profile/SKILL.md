@@ -23,6 +23,7 @@ One JSON file:
 | `name` | yes | Used with `hoplon -p NAME`. Letters, digits, `.`, `_`, `-`. Match the file name (`NAME.json`). |
 | `description` | no | One line, shown in `hoplon --list-profiles`, the REPL banner and when blessing. |
 | `endpoint` | no | Name of a blessed endpoint. `-e` on the command line overrides it; without either, `default_endpoint` in `config.json` is used. |
+| `model` | no | The model to use: one of the endpoint's `aliases` (such as `high`) or a model id the server lists. A model the endpoint doesn't have refuses the session. Prefer an alias, so the profile works with any endpoint that defines it. |
 | `persona` | no | Instructions sent to the model with every request, after hoplon's own rules. It shapes voice and focus; it cannot change hoplon's rules (the model still only proposes). |
 | `skills` | no | Skill names used by default with this profile. Leave it out to use `default_skills` from `config.json`; `[]` means none. `-k` adds more. |
 | `params` | no | Request fields such as `temperature`, layered over the endpoint's. May not set `model`, `messages` or `tools`. |

@@ -30,7 +30,7 @@ import unicodedata
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import palette  # noqa: E402
 from dock import Dock  # noqa: E402
-from features import disabled_names, load as load_features, tui_setting  # noqa: E402
+from features import disabled_names, load as load_features, shown_model, tui_setting  # noqa: E402
 from ipc import Hub  # noqa: E402
 from recorder import Recorder, ago, fifo_path, label, trim  # noqa: E402
 import remote  # noqa: E402
@@ -897,8 +897,12 @@ class Model:
         ep, prof = self.hello.get("endpoint") or {}, self.hello.get("profile") or {}
         dim = T("dim")
         # The model is a range of its own: a click on it opens the /model drop-down (hoplon-tui binds it).
+        model = safe(ep.get('model'), 200)
+        alias = safe(ep.get("alias"))
+        shown = (f"{alias} ({safe(shown_model(model, alias)[len(alias) + 2:-1])})" if alias
+                 else safe(model, 40)) or "?"
         parts = [f"{dim}{safe(ep.get('name')) or '?'}·#[fg=default]#[range=user|model]{T(bold=True)}"
-                 f"{safe(ep.get('model'), 40) or '?'} ▾#[nobold]#[norange]"]
+                 f"{shown} ▾#[nobold]#[norange]"]
         if prof.get("name"):
             parts.append(f"{T('bronze')}{safe(prof['name'])}#[fg=default]")
         if self.hello.get("session"):

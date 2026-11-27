@@ -456,6 +456,35 @@ class TestModel(unittest.TestCase):
         old.submit("/model")
         self.assertIn("can't list or switch models", text_of(old.blocks[-1]))
 
+    def test_aliases_come_first_and_show_their_model(self):
+        m = C.Model()
+        self.hello(m, features=["models"])
+        m.shell = object()
+        m.submit("/model")
+        m.handle({"type": "models", "current": "flash", "models": [{"id": "flash"}, {"id": "pro"}],
+                  "aliases": {"low": "flash", "high": "acme/pro-model", "bad name": "x", "evil": "x#{y}"}})
+        f = m.feature("model")
+        self.assertEqual(f.models, ["high", "low", "flash", "pro"])
+        self.assertEqual(f.labels[:2], ["high (pro-model)", "low (flash)"])
+        m.request({"type": "model", "n": 0})
+        self.assertEqual(m.outbox[-1], {"type": "model", "model": "high"})
+        m.handle({"type": "model", "endpoint": {"name": "e", "model": "acme/pro-model", "alias": "high",
+                                                "base_url": "u"}, "context": {"used": 5, "limit": 8000}})
+        self.assertIn("model: high (pro-model)", text_of(m.blocks[-1]))
+        sh = C.Shell("%1")
+        with mock.patch.object(C.subprocess, "Popen") as popen:
+            f.menu(sh, f.models, "high", f.labels)
+        argv = popen.call_args[0][0]
+        self.assertIn("• high  (pro-model)", argv)
+        self.assertIn("  flash", argv)
+
+    def test_the_header_shows_an_alias_and_its_model(self):
+        m = C.Model()
+        self.hello(m, endpoint={"name": "cloud", "model": "accounts/acme/models/pro-model", "alias": "high"})
+        self.assertIn("high (pro-model) ▾", m.tmux_header())
+        self.hello(m, endpoint={"name": "cloud", "model": "plain-model"})
+        self.assertIn("plain-model ▾", m.tmux_header())
+
     def test_model_menu_items_carry_only_positions(self):
         sh = C.Shell("%1")
         with mock.patch.object(C.subprocess, "Popen") as popen:
