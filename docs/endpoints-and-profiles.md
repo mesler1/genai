@@ -2,6 +2,9 @@
 
 An **endpoint** says where prompts go: URL, model, key source, context size. It is the
 security-relevant file, because it decides where your prompts, files and key are sent.
+`hoplon --new-endpoint` asks for these, lists the server's models if you let it (that request goes
+to the address you typed, with your key, before anything is blessed, so it asks first), writes the file
+with private permissions and tells you to bless it; it never blesses it for you.
 
 A **profile** is a persona. It can name an endpoint and add standing instructions for the
 model, default skills, sampling settings and coding mode:
@@ -17,6 +20,8 @@ model, default skills, sampling settings and coding mode:
 }
 ```
 
+- `"model"` in a profile picks the model: one of the endpoint's aliases (below) or a name the server
+  lists. A model the endpoint doesn't have refuses the session; there is no fallback.
 - `-p NAME` picks a profile and `-e NAME` picks an endpoint. `-e` overrides the profile's endpoint, and
   `hoplon -e NAME` works with no profile at all. A profile without an endpoint (like the bundled
   `coder`) uses `-e` or `default_endpoint`.
@@ -45,6 +50,27 @@ model, default skills, sampling settings and coding mode:
 - Endpoints, profiles and skills are each blessed with `hoplon --bless PATH`. A profile can only use an
   endpoint and skills that are blessed on their own. If any file changes, hoplon refuses it until you
   bless it again.
+
+## Model aliases
+
+An endpoint can give its models names of your own:
+
+```json
+{"name": "cloud", "base_url": "…", "model": "medium",
+ "aliases": {"low": "flash-model", "medium": "mid-model", "high": "pro-model"}}
+```
+
+Anywhere a model is named, an alias works: the endpoint's own `model`, a profile's `model`, a work
+session's `planner` (`{"model": "high"}`) and `:model high` (or `/model high` in hoplon-tui, whose
+drop-down lists the aliases first). An alias is looked up first; otherwise the name is the server's
+own, and must be one it lists. An alias needn't be listed by the server: it is in the endpoint file, so
+blessing shows which model each name sends your work to, and a changed alias needs blessing again.
+
+The names are yours (a letter, then letters, digits, `_` and `-`; not `auto`). Using the same names on
+every endpoint, such as `low`, `medium` and `high`, lets one profile work with any of them. A name an
+endpoint doesn't define refuses the session, with what to add to that endpoint. hoplon shows both
+names, as `high (pro-model)`, with a long server name cut to its last part; the audit log records the
+server's name.
 
 | Use | Command |
 | --- | --- |

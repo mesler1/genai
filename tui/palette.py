@@ -16,7 +16,9 @@ TOKENS = {
     "patina": ("#7FC1B8", 109, "CYAN"),      # ok, running, done
     "ember":  ("#E8776A", 167, "RED"),       # failed, denied, risky
     "iron":   ("#0E1113", 233, "BLACK"),     # text on a bronze badge
-    "plate":  ("#161B1F", 234, "BLACK"),     # the header's band
+    "umber":  ("#5B4120", 58, "BLACK"),      # quiet text on the bronze header
+    "verdigris": ("#1D4F49", 23, "BLACK"),   # ok on the bronze header
+    "oxblood": ("#8C2A1C", 88, "RED"),       # risk on the bronze header
     "field":  ("#6E4A24", 94, "BLACK"),      # the logo's field, inside the bronze rim
     "ivory":  ("#F3EBDD", 230, "WHITE"),     # the logo's (H)
 }
@@ -76,6 +78,17 @@ def logo(text=""):
     return [[("▄", "rim"), ("▄▄▄", "rim_field"), ("▄", "rim")],
             [("█", "rim"), ("(H)", "mark"), ("█", "rim")] + ([("  " + text, "accent")] if text else []),
             [("▀", "rim"), ("▀▀▀", "rim_field"), ("▀", "rim")]]
+
+
+# The header is a bronze band, so its text takes darker tones than the panes' (band()).
+BAND = {"dim": "umber", "muted": "umber", "bronze": "iron", "brass": "iron", "patina": "verdigris",
+        "ember": "oxblood", "iron": "iron"}
+
+
+def band(fg=None, bg=None, bold=False, environ=None):
+    """tmux() for text on the bronze header: each tone as it reads on bronze. With a bg of its own (a pill, such as
+    "waiting for you"), the colours are taken as they are."""
+    return tmux(fg if bg else BAND.get(fg, fg), bg, bold, environ)
 
 
 def tmux(fg=None, bg=None, bold=False, environ=None):

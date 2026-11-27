@@ -20,6 +20,8 @@ adds tmux 3.2 or newer.
 - **What you approve is what happens.** An approval is tied to the exact change you saw.
 - **Autonomy on a leash.** Work sessions run in a private copy, and you merge the result yourself.
 
+![hoplon-tui: the model proposes an edit to durations.py, shown as a diff, and waits for you to allow it](docs/images/tui-approval.png)
+
 Full threat model: [SECURITY.md](SECURITY.md). Design choices and known limits:
 [DECISIONS.md](DECISIONS.md).
 
@@ -30,16 +32,18 @@ From a clone of this repository:
 ```bash
 mkdir -p ~/.local/bin                       # any directory on your PATH will do
 ln -s "$PWD/hoplon" "$PWD/tui/hoplon-tui" ~/.local/bin/
-hoplon --list-endpoints                      # the first run creates ~/.config/hoplon (none yet)
-$EDITOR ~/.config/hoplon/endpoints/work-llm.json         # write your endpoint: see below
+export HOPLON_API_KEY=...                    # your key; the endpoint names the variable, never the key
+hoplon --new-endpoint                        # asks for the server, key variable, model and context size
 hoplon --bless ~/.config/hoplon/endpoints/work-llm.json   # shows URL, model, key source; asks you to confirm
-export HOPLON_API_KEY=...                    # the endpoint names the variable, never the key
 hoplon -e work-llm "what does 'set -euo pipefail' do?"
 ```
 
-The endpoint file says where your prompts go. Fill in your server's OpenAI-compatible API address
-(usually ending in `/v1`), its model name, the environment variable that will hold your API key (never
-the key itself) and the model's context size in tokens:
+`--new-endpoint` asks for a name (`work-llm` above), your server's OpenAI-compatible address (usually
+ending in `/v1`), the environment variable that holds your API key (its name, never the key), the model
+(from the server's own list, if you let it ask the server: it asks first, since that sends your key) and the model's context size, and optionally which
+models are `low`, `medium` and `high` ([model aliases](docs/endpoints-and-profiles.md#model-aliases)).
+It writes the file with private permissions and stops: blessing it is your step. You can also write the
+file by hand:
 
 ```json
 {
@@ -71,6 +75,7 @@ hoplon-tui -e work-llm -p coder              # the same in tmux panes, beside yo
   the live test
 - [hoplon-tui](docs/hoplon-tui.md): the terminal UI, another host over ssh, remote mode, the file tree
 - [Work sessions](docs/work-sessions.md): the model plans, codes, tests and commits on a branch of its own
+- [Benchmark tasks](bench/README.md): fixed work-session tasks, to check a prompt or model change against real runs
 - [Sandbox](docs/sandbox.md): running hoplon in a container, and the model's own sandboxed builds and tests
 - [Command sets and scoped commands](docs/commands.md): narrow commands you approve once
 - [Hooks](docs/hooks.md): your own programs at fixed points ([HOOKS.md](HOOKS.md) has the design)

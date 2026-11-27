@@ -198,13 +198,13 @@ t set -g pane-border-status top
 # The right column's active pane shows its tabs (tui/dock.py) instead of its title when there are two or more.
 t set -g pane-border-format ' #{?#{@hoplon_tabs},#{@hoplon_tabs},#{@hoplon_title}} '
 t set -g pane-border-lines single
-# The palette (tui/palette.py, "bronze on iron"): the brand badge and focused border in bronze, the host in
-# bronze, quiet hints and unfocused borders in grey. NO_COLOR keeps only bold.
+# The palette (tui/palette.py, "bronze on iron"): the header a bronze band with dark text (palette.band), the
+# focused border in bronze, unfocused borders in grey. NO_COLOR keeps only bold.
 if [ -z "${NO_COLOR:-}" ]; then
   bronze='#D4A05A' iron='#0E1113' dim='#7E858E' line='#2A3036'
   t set -g pane-border-style "fg=$line"
   t set -g pane-active-border-style "fg=$bronze,bold"
-  badge="#[fg=$iron,bg=$bronze,bold] (H) hoplon #[default] " hint="#[fg=$dim]" host="#[fg=$bronze,bold]"
+  badge="#[fg=$iron,bold] (H) hoplon #[default]│ " hint="#[fg=#5B4120]" host="#[fg=$iron,bold]"
 else
   t set -g pane-border-style 'default'
   t set -g pane-active-border-style 'bold'
@@ -214,7 +214,7 @@ fi
 # (endpoint and model, profile, session, state, mode, context); on the right, what waits on you, the
 # sandbox, the host, and the keys when the terminal is wide enough for them.
 t set -g status-position top
-if [ -z "${NO_COLOR:-}" ]; then t set -g status-style 'bg=#161B1F,fg=default'; else t set -g status-style 'bg=default,fg=default'; fi
+if [ -z "${NO_COLOR:-}" ]; then t set -g status-style "bg=$bronze,fg=$iron"; else t set -g status-style 'bg=default,fg=default'; fi
 t set -g status-left "$badge#{@hoplon_header}"
 t set -g status-left-length 120
 keys="#{?#{e|>:#{client_width},170},$hint│ Ctrl-\` shell · Ctrl-b o other pane · Ctrl-b d detach #[default],}"

@@ -198,6 +198,11 @@ class TestPalette(unittest.TestCase):
         self.assertEqual(P.tmux("bronze", bold=True, environ={"NO_COLOR": "1"}), "#[bold]")
         self.assertEqual(P.tmux("patina", environ={"NO_COLOR": "1"}), "")
         self.assertEqual(P.tmux("iron", "brass", bold=True, environ={}), "#[fg=#0E1113,bg=#E3B341,bold]")
+        # the header is a bronze band: its text takes the darker tones, and a pill keeps its own colours
+        self.assertEqual(P.band("dim", environ={}), "#[fg=#5B4120]")
+        self.assertEqual(P.band("patina", bold=True, environ={}), "#[fg=#1D4F49,bold]")
+        self.assertEqual(P.band("brass", "iron", environ={}), "#[fg=#E3B341,bg=#0E1113]")
+        self.assertEqual(P.band("ember", environ={"NO_COLOR": "1"}), "")
 
     def test_brass_bronze_and_ember_stay_apart_on_256_colours(self):
         codes = [P.TOKENS[t][1] for t in ("bronze", "brass", "ember", "patina", "dim")]
@@ -456,6 +461,35 @@ class TestModel(unittest.TestCase):
         old.submit("/model")
         self.assertIn("can't list or switch models", text_of(old.blocks[-1]))
 
+    def test_aliases_come_first_and_show_their_model(self):
+        m = C.Model()
+        self.hello(m, features=["models"])
+        m.shell = object()
+        m.submit("/model")
+        m.handle({"type": "models", "current": "flash", "models": [{"id": "flash"}, {"id": "pro"}],
+                  "aliases": {"low": "flash", "high": "acme/pro-model", "bad name": "x", "evil": "x#{y}"}})
+        f = m.feature("model")
+        self.assertEqual(f.models, ["high", "low", "flash", "pro"])
+        self.assertEqual(f.labels[:2], ["high (pro-model)", "low (flash)"])
+        m.request({"type": "model", "n": 0})
+        self.assertEqual(m.outbox[-1], {"type": "model", "model": "high"})
+        m.handle({"type": "model", "endpoint": {"name": "e", "model": "acme/pro-model", "alias": "high",
+                                                "base_url": "u"}, "context": {"used": 5, "limit": 8000}})
+        self.assertIn("model: high (pro-model)", text_of(m.blocks[-1]))
+        sh = C.Shell("%1")
+        with mock.patch.object(C.subprocess, "Popen") as popen:
+            f.menu(sh, f.models, "high", f.labels)
+        argv = popen.call_args[0][0]
+        self.assertIn("• high  (pro-model)", argv)
+        self.assertIn("  flash", argv)
+
+    def test_the_header_shows_an_alias_and_its_model(self):
+        m = C.Model()
+        self.hello(m, endpoint={"name": "cloud", "model": "accounts/acme/models/pro-model", "alias": "high"})
+        self.assertIn("high (pro-model) ▾", m.tmux_header())
+        self.hello(m, endpoint={"name": "cloud", "model": "plain-model"})
+        self.assertIn("plain-model ▾", m.tmux_header())
+
     def test_model_menu_items_carry_only_positions(self):
         sh = C.Shell("%1")
         with mock.patch.object(C.subprocess, "Popen") as popen:
@@ -686,11 +720,11 @@ class TestSandboxRuns(unittest.TestCase):
         m.handle({"type": "context", "used": 75000, "limit": 100000})
         m.handle({"type": "coding", "on": True})
         h = m.tmux_header()
-        self.assertIn("#[fg=#E3B341]━━━━━━", h)                    # 75%: brass, 6 of 8
+        self.assertIn("#[fg=#0E1113]━━━━━━", h)                    # 75%: dark on the bronze band, 6 of 8
         self.assertIn("75%", h)
         self.assertIn("◆ coding", h)
         m.handle({"type": "context", "used": 95000, "limit": 100000})
-        self.assertIn("#[fg=#E8776A]━━━━━━━━", m.tmux_header())    # 95%: ember
+        self.assertIn("#[fg=#8C2A1C]━━━━━━━━", m.tmux_header())    # 95%: ember
         m.submit("go")
         self.assertIn("● working", m.tmux_header())
 
@@ -842,7 +876,7 @@ class TestSandboxStatus(unittest.TestCase):
         waiting.submit("go")
         waiting.handle({"type": "proposal", "id": "p1", "kind": "write", "path": "a", "content": "x", "reason": "r",
                         "digest": "d"})
-        self.assertIn("#[fg=#0E1113,bg=#E3B341,bold] ⏸ waiting for you", waiting.tmux_header())
+        self.assertIn("#[fg=#E3B341,bg=#0E1113,bold] ⏸ waiting for you", waiting.tmux_header())    # a pill on the band
         self.assertNotIn("waiting", waiting.tmux_status())
         waiting.decide(False)                                   # answered: no longer waiting
         self.assertNotIn("waiting for you", waiting.tmux_header())

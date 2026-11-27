@@ -30,7 +30,7 @@ import unicodedata
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import palette  # noqa: E402
 from dock import Dock  # noqa: E402
-from features import disabled_names, load as load_features, tui_setting  # noqa: E402
+from features import disabled_names, load as load_features, shown_model, tui_setting  # noqa: E402
 from ipc import Hub  # noqa: E402
 from recorder import Recorder, ago, fifo_path, label, trim  # noqa: E402
 import remote  # noqa: E402
@@ -890,15 +890,19 @@ class Model:
         hold (no "#")."""
         if self.hello is None:
             return ""
-        T = palette.tmux
+        T = palette.band
 
         def safe(v, n=32):
             return re.sub(r"[^A-Za-z0-9._:@/+=-]", "", str(v or ""))[:n]
         ep, prof = self.hello.get("endpoint") or {}, self.hello.get("profile") or {}
         dim = T("dim")
         # The model is a range of its own: a click on it opens the /model drop-down (hoplon-tui binds it).
+        model = safe(ep.get('model'), 200)
+        alias = safe(ep.get("alias"))
+        shown = (f"{alias} ({safe(shown_model(model, alias)[len(alias) + 2:-1])})" if alias
+                 else safe(model, 40)) or "?"
         parts = [f"{dim}{safe(ep.get('name')) or '?'}·#[fg=default]#[range=user|model]{T(bold=True)}"
-                 f"{safe(ep.get('model'), 40) or '?'} ▾#[nobold]#[norange]"]
+                 f"{shown} ▾#[nobold]#[norange]"]
         if prof.get("name"):
             parts.append(f"{T('bronze')}{safe(prof['name'])}#[fg=default]")
         if self.hello.get("session"):
@@ -906,7 +910,7 @@ class Model:
         if self.exited is not None:
             parts.append(f"{T('ember', bold=True)}■ exited#[default]")
         elif self.pending:
-            parts.append(f"{T('iron', 'brass', bold=True)} ⏸ waiting for you #[default]")
+            parts.append(f"{T('brass', 'iron', bold=True)} ⏸ waiting for you #[default]")
         elif self.busy:
             parts.append(f"{T('brass', bold=True)}● working#[default]")
         else:
@@ -947,14 +951,14 @@ class Model:
     def sandbox_status(self):
         card = self.running_card()
         if card and PROPOSAL_ID.fullmatch(card.id):
-            return f" {palette.tmux('patina', bold=True)}⏵ sandbox {card.id} {card.elapsed()}s#[default] │"
+            return f" {palette.band('patina', bold=True)}⏵ sandbox {card.id} {card.elapsed()}s#[default] │"
         if card:
-            return f" {palette.tmux('patina', bold=True)}⏵ sandbox {card.elapsed()}s#[default] │"
+            return f" {palette.band('patina', bold=True)}⏵ sandbox {card.elapsed()}s#[default] │"
         if self.hello.get("sandbox"):
-            return f" {palette.tmux('patina')}⊡ sandbox#[default] │"
+            return f" {palette.band('patina')}⊡ sandbox#[default] │"
         if self.runner and not self.runner.get("problem"):
-            return f" {palette.tmux('patina')}⊡ model's runs sandboxed#[default] │"
-        return f" {palette.tmux('brass')}▲ no sandbox#[default] │"
+            return f" {palette.band('patina')}⊡ model's runs sandboxed#[default] │"
+        return f" {palette.band('ember', bold=True)}▲ no sandbox#[default] │"
 
     def network_text(self):
         r = self.runner

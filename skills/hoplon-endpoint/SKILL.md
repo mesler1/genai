@@ -27,7 +27,8 @@ Fields:
 | --- | --- | --- |
 | `name` | yes | Used with `hoplon -e NAME` and in a profile's `"endpoint"`. Letters, digits, `.`, `_`, `-`. Match the file name (`NAME.json`). |
 | `base_url` | yes | The OpenAI-compatible base URL, usually ending in `/v1`. hoplon calls `<base_url>/chat/completions`. |
-| `model` | yes | The model id the endpoint expects. |
+| `model` | yes | The model id the endpoint expects, or one of its `aliases`. |
+| `aliases` | no | Names of the user's own for the server's models, such as `{"low": "flash-model", "high": "pro-model"}`. A profile, a work session's planner and `:model` can then say `high`. Suggest the same names on every endpoint (`low`, `medium`, `high`), so profiles work with any of them. Ask which model should be each name; propose `curl <base_url>/models` for the user to run if they don't know the ids. |
 | `key_env` | one of | Name of an environment variable holding the key. |
 | `key_file` | one of | Path to a file holding the key. The file must be mode 0600 and owned by the user. |
 | `context_limit` | no | The model's context window in tokens (default 32000). hoplon warns at 80% and refuses to send at 100%. |
@@ -47,6 +48,8 @@ Unknown fields are an error, so don't invent any.
 - Redirects are not followed. If the endpoint redirects, the user needs the final URL.
 
 ## How to work
+
+The quickest way is often not you: `hoplon --new-endpoint`, run by the user in a terminal, asks the same questions, lists the server's models (after asking, as that sends the key to the address typed) and writes the file. Suggest it first; help by hand when they'd rather, or when it can't reach the server.
 
 1. Ask for what you don't know, one question at a time: the base URL, the model id, how the user keeps their key (an environment variable or a file), and the context window if they know it.
 2. If they don't know the model id, propose a command that lists models, with the key referenced by variable, never typed out:

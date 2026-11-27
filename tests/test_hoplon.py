@@ -2062,7 +2062,7 @@ class TestRemoteConfig(Tmp):
             self.assertEqual(g.events[0]["profile"]["name"], "ops")
 
     def test_root_banner_warns(self):
-        ep = types.SimpleNamespace(name="e", model="m", base_url="http://127.0.0.1:1")
+        ep = types.SimpleNamespace(name="e", model="m", base_url="http://127.0.0.1:1", shown_model=lambda: "m")
         e = types.SimpleNamespace(endpoint=ep, profile=None, session=types.SimpleNamespace(id=None, coding=False),
                                   sandbox=None, box=None, notifier=None)
         for uid, shown in ((0, True), (1000, False)):

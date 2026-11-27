@@ -40,7 +40,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 PROTOCOL = 1
 STEP_LIMIT = 50                # model steps in a row nobody decides anything in (max_steps)
 READ_CAP = 256 * 1024          # bytes per read_file
@@ -104,11 +104,12 @@ INTRINSICS = ("propose_command", "read_file", "list_dir", "write_file", "edit_fi
               "suggest_skills")
 PLAN_STEPS = 30                # steps one plan may have
 ENDPOINT_KEYS = {"name", "base_url", "model", "key_env", "key_file", "context_limit", "timeout",
-                 "ca_bundle", "headers", "params", "allow_http", "proxy", "description"}
+                 "ca_bundle", "headers", "params", "allow_http", "proxy", "description", "aliases"}
+ALIAS_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,31}")   # a name you give one of an endpoint's models
 REMOTE_URL = re.compile(r"http://127\.0\.0\.1:([0-9]{1,5})((?:/[A-Za-z0-9._~-]+)*)")
 TOKEN_RE = re.compile(r"[0-9A-Fa-f]{32,128}")
 TOKEN_HEADER = "X-Hoplon-Token"
-PROFILE_KEYS = {"name", "description", "endpoint", "persona", "skills", "commands", "params", "coding", "sandbox",
+PROFILE_KEYS = {"name", "description", "endpoint", "model", "persona", "skills", "commands", "params", "coding", "sandbox",
                 "edits", "work", "layout"}
 LAYOUT_PANES = ("files", "panel", "shell")   # hoplon-tui's panes a profile's "layout" may show or hide
 EDITS_MODES = ("ask", "approved-files")   # "approved-files": a further edit to a file you approved applies
@@ -2122,7 +2123,16 @@ class Endpoint:
         for k in ("name", "base_url", "model"):
             if not isinstance(data.get(k), str) or not data[k]:
                 raise HoplonError(f"{path}: '{k}' is required", EXIT_PROFILE)
-        self.name, self.base_url, self.model = data["name"], data["base_url"].rstrip("/"), data["model"]
+        self.name, self.base_url = data["name"], data["base_url"].rstrip("/")
+        self.aliases = data.get("aliases", {})
+        if not (isinstance(self.aliases, dict) and all(isinstance(k, str) and ALIAS_NAME.fullmatch(k)
+                                                       and isinstance(v, str) and MODEL_ID.fullmatch(v)
+                                                       for k, v in self.aliases.items())):
+            raise HoplonError(f"{path}: 'aliases' must map short names (a letter, then letters, digits, '_', '-') "
+                              "to the server's model names", EXIT_PROFILE)
+        if "auto" in self.aliases:
+            raise HoplonError(f"{path}: 'auto' can't be an alias; it means the server's first model", EXIT_PROFILE)
+        self.model = self.resolve(data["model"])        # "model" may name an alias too
         if "key_env" in data and "key_file" in data:
             raise HoplonError(f"{path}: give key_env or key_file, not both", EXIT_PROFILE)
         self.key_env, self.key_file = data.get("key_env"), data.get("key_file")
@@ -2130,6 +2140,7 @@ class Endpoint:
             raise HoplonError(f"{path}: 'key_env' must be a plain variable name (letters, digits, underscore)",
                              EXIT_PROFILE)
         self.context_limit = int(data.get("context_limit", 32000))
+        self.blessed_limit = self.context_limit     # for a model whose size the server doesn't say, an alias's too
         self.timeout = float(data.get("timeout", 120))
         self.ca_bundle = data.get("ca_bundle")
         self.headers = data.get("headers", {}) or {}
@@ -2164,6 +2175,21 @@ class Endpoint:
     @classmethod
     def parse(cls, raw, path):
         return cls(parse_json_bytes(raw, path), os.path.abspath(path))
+
+    def resolve(self, name):
+        """The server's model name for name: an alias of this endpoint is looked up first."""
+        return self.aliases.get(name, name)
+
+    def alias_of(self, model=None):
+        """This endpoint's alias for a model (the current one by default), or None."""
+        model = self.model if model is None else model
+        return next((k for k, v in self.aliases.items() if v == model), None)
+
+    def shown_model(self, model=None):
+        """The model as hoplon shows it: "high (pro-model)" for an alias, with a long server name shortened."""
+        model = self.model if model is None else model
+        alias = self.alias_of(model)
+        return f"{alias} ({short_model(model)})" if alias else model
 
     def destination_id(self):
         """Fingerprint where a conversation goes, without storing endpoint headers or proxy credentials: the server
@@ -2223,7 +2249,7 @@ class Endpoint:
             except UnicodeError:
                 url += "  (this host name cannot be converted to punycode)"
         key, kflag = self.key_source()
-        lines = [f"  endpoint: {one(self.name)}", f"  url:      {url}", f"  model:    {one(self.model)}",
+        lines = [f"  endpoint: {one(self.name)}", f"  url:      {url}", f"  model:    {one(self.shown_model())}",
                  f"  key from: {key}", f"  context:  {self.context_limit} tokens"]
         flags.append(kflag)
         if self.allow_http:
@@ -2236,10 +2262,26 @@ class Endpoint:
             lines.append(f"  headers:  {', '.join(one(k) for k in sorted(self.headers))}")
         if self.params:
             lines.append(f"  params:   {json.dumps(self.params, sort_keys=True)}")
+        for k in sorted(self.aliases):
+            lines.append(f"  alias:    {one(k)} sends to {one(self.aliases[k])}")
         return "\n".join(lines), any(flags)
 
     def info(self):
-        return {"name": self.name, "base_url": self.base_url, "model": self.model}
+        return {"name": self.name, "base_url": self.base_url, "model": self.model, "alias": self.alias_of()}
+
+
+def alias_hint(ep, name):
+    """What to add when a name that looks like an alias isn't one of this endpoint's."""
+    if not name or not ALIAS_NAME.fullmatch(name):
+        return ""
+    have = f" (it has: {', '.join(sorted(ep.aliases))})" if ep.aliases else ""
+    return f"{have}; add \"aliases\": {{\"{name}\": \"MODEL\"}} to the endpoint file and bless it again"
+
+
+def short_model(model, n=32):
+    """A server's model name, shortened for display: its last path part, cut to n characters."""
+    tail = model.rsplit("/", 1)[-1] or model
+    return tail if len(tail) <= n else tail[:n - 1] + "…"
 
 
 class Profile:
@@ -2259,6 +2301,9 @@ class Profile:
         self.name = data["name"]
         self.description = data.get("description", "")
         self.endpoint = data.get("endpoint")
+        self.model = data.get("model")            # an alias of the endpoint, or the server's model name
+        if self.model is not None and not (isinstance(self.model, str) and MODEL_ID.fullmatch(self.model)):
+            raise HoplonError(f"{path}: 'model' must be a model name or one of the endpoint's aliases", EXIT_PROFILE)
         self.persona = data.get("persona", "")
         self.skills = data.get("skills")          # None: the profile leaves skills to default_skills
         self.command_sets = data.get("commands")       # likewise for default_commands
@@ -2315,6 +2360,8 @@ class Profile:
         if self.description:
             lines.append(f"  about:    {one(self.description)}")
         lines.append(f"  endpoint: {one(self.endpoint) if self.endpoint else '(none; -e or default_endpoint decides)'}")
+        if self.model:
+            lines.append(f"  model:    {one(self.model)} (a model or alias of the endpoint, instead of its own model)")
         if self.skills is None:
             lines.append("  skills:   (not set; default_skills apply)")
         else:
@@ -3479,8 +3526,12 @@ class Client:
                 if msg.get("content"):
                     on_text(msg["content"])
                 done = completion_tokens(data.get("usage"))
-                if done is not None:
-                    self.generated = {"tokens": done, "estimated": False, "seconds": time.time() - started}
+                if done is None:        # no usage reported: estimated from the reply, so every request is counted
+                    calls = json.dumps(msg.get("tool_calls") or "")
+                    done, guessed = max(1, (len(msg.get("content") or "") + len(calls)) // 4), True
+                else:
+                    guessed = False
+                self.generated = {"tokens": done, "estimated": guessed, "seconds": time.time() - started}
                 return self._clean(msg.get("content"), msg.get("tool_calls") or []), data.get("usage")
             return self._stream(r, on_text, on_progress)
 
@@ -3886,7 +3937,9 @@ class Engine:
                 if not coding.startswith("profile"):
                     raise
                 ui.notice(f"{coding} asks for coding mode, but {e}; it is off")
-        if endpoint.model == "auto":
+        if profile and profile.model and endpoint.resolve(profile.model) != endpoint.model:
+            self.set_model(profile.model, "profile")    # no fallback: a model this endpoint lacks refuses the session
+        elif endpoint.model == "auto":
             self.set_model(None, "auto")
 
     def planner_for(self, want):
@@ -3901,6 +3954,8 @@ class Engine:
             ep = select_endpoint(self.cfg, name) if name and name != self.endpoint.name else self.endpoint
         except HoplonError as e:
             raise HoplonError(f"the planner endpoint: {e}", EXIT_USAGE, "work_refused") from None
+        alias = bool(model) and model in ep.aliases     # blessed with the endpoint: not looked up on the server
+        model = ep.resolve(model) if model else model
         if ep is self.endpoint and (not model or model == ep.model):
             return None
         same = ep is self.endpoint
@@ -3909,7 +3964,9 @@ class Engine:
             client = Client(ep, self.profile.params if same and self.profile else None)
         except HoplonError as e:
             raise HoplonError(f"the planner endpoint: {e}", EXIT_USAGE, "work_refused") from None
-        if (model and model != ep.model) or ep.model == "auto":     # checked as :model checks, or resolved
+        if alias:
+            ep.model, ep.context_limit = model, ep.blessed_limit
+        elif (model and model != ep.model) or ep.model == "auto":     # checked as :model checks, or resolved
             try:
                 listed = client.model_list()
             except HoplonError as e:
@@ -3919,7 +3976,8 @@ class Engine:
                 next((m for m in listed if m[0] == model), None)
             if hit is None:
                 raise HoplonError(f"the planner model '{one_line(model or 'auto')[0]}' is not one {ep.base_url} lists "
-                                 "(:models lists them)", EXIT_USAGE, "work_refused")
+                                 f"(:models lists them), nor an alias of endpoint '{ep.name}'{alias_hint(ep, model)}",
+                                 EXIT_USAGE, "work_refused")
             ep.model = hit[0]
             if hit[1]:
                 ep.context_limit = hit[1]
@@ -3928,21 +3986,25 @@ class Engine:
     def set_model(self, name, source):
         """Use another model on the same server: one it lists now, or with name None ("model": "auto") the first.
         The destination is the same, so the conversation needs no consent to go there (see destination_id)."""
-        listed = self.client.model_list()
-        if not listed:
-            raise HoplonError(f"{self.endpoint.base_url} lists no models hoplon can use; set 'model' in the endpoint",
-                             EXIT_API, "unknown_model")
-        hit = listed[0] if name is None else next((m for m in listed if m[0] == name), None)
-        if hit is None:
-            raise HoplonError(f"the server doesn't list a model named '{one_line(name)[0]}' (:models lists them)",
-                             EXIT_USAGE, "unknown_model")
+        if name is not None and name in self.endpoint.aliases:     # blessed with the endpoint: taken as it is
+            hit = (self.endpoint.aliases[name], None)
+        else:
+            listed = self.client.model_list()
+            if not listed:
+                raise HoplonError(f"{self.endpoint.base_url} lists no models hoplon can use; set 'model' in the "
+                                  "endpoint", EXIT_API, "unknown_model")
+            hit = listed[0] if name is None else next((m for m in listed if m[0] == name), None)
+            if hit is None:
+                raise HoplonError(f"the server doesn't list a model named '{one_line(name)[0]}' (:models lists them), "
+                                  f"and endpoint '{self.endpoint.name}' has no such alias"
+                                  f"{alias_hint(self.endpoint, name)}", EXIT_USAGE, "unknown_model")
         before = self.endpoint.model
         self.endpoint.model = hit[0]
-        if hit[1]:
-            self.endpoint.context_limit = hit[1]
+        self.endpoint.context_limit = hit[1] or self.endpoint.blessed_limit    # never the last model's
         self.session.usage = None
-        self.audit.log("model", model=hit[0], before=before, source=source, context_limit=self.endpoint.context_limit)
-        return hit[0]
+        self.audit.log("model", model=hit[0], alias=self.endpoint.alias_of(), before=before, source=source,
+                       context_limit=self.endpoint.context_limit)
+        return self.endpoint.shown_model()
 
     # -- setup
 
@@ -5865,6 +5927,127 @@ def pick_steps(p, steps):
     return ("accept", sorted(nums)) if nums and re.fullmatch(r"[0-9 ,]+", ans) else ("decline", None)
 
 
+def choosable_models(engine):
+    """The server's models that a name can choose: ([(id, context or None)], error text or None). A model named
+    like one of the endpoint's aliases is left out, as that name chooses the alias's model instead."""
+    try:
+        listed = engine.client.model_list()
+    except HoplonError as e:
+        return [], str(e)
+    return [m for m in listed if m[0] not in engine.endpoint.aliases], None
+
+
+def new_endpoint(cfg, ask=input, out=print, client=None):
+    """hoplon --new-endpoint: ask for an endpoint's name, address, key variable, model, context size and aliases,
+    check it as an endpoint, and write it to the config's endpoints/ with private permissions. It never blesses:
+    the user reads what it wrote and blesses it. client(endpoint) gives the server's model list (for tests).
+    Returns the path written, or None."""
+    def question(text, check, default=None):
+        while True:
+            try:
+                ans = ask(f"{text}{f' [{default}]' if default else ''}: ").strip()
+            except EOFError:
+                raise HoplonError("stopped: nothing was written", EXIT_USAGE) from None
+            ans = ans or (default or "")
+            why = check(ans)
+            if why is None:
+                return ans
+            out(f"  {why}")
+
+    def yes(text):
+        try:
+            return ask(f"{text} [y/N] ").strip().lower() in ("y", "yes")
+        except EOFError:        # Ctrl-D stops at every question, this one too
+            raise HoplonError("stopped: nothing was written", EXIT_USAGE) from None
+
+    folder = cfg.endpoint_dirs[0]
+    out("A new endpoint: where hoplon sends your prompts. Nothing is written until the end, and it is never blessed "
+        "for you. Ctrl-D stops.")
+    name = question("Name (used with -e NAME)", lambda v: "letters, digits, '.', '_' and '-'" if not NAME_RE.fullmatch(v)
+                    else f"{folder}/{v}.json already exists" if os.path.lexists(os.path.join(folder, v + ".json"))
+                    else None)
+
+    def url_ok(v):
+        try:
+            u = urllib.parse.urlsplit(v)
+            bad = u.scheme not in ("https", "http") or not u.hostname or u.username or u.password or u.port == 0
+        except ValueError:      # an unmatched '[' or a port that isn't a number
+            bad = True
+        return "an http(s) address without credentials, usually ending in /v1" if bad else None
+    data = {"name": name, "base_url": question("The server's address (the OpenAI-compatible base URL)", url_ok)}
+    host = urllib.parse.urlsplit(data["base_url"]).hostname
+    if data["base_url"].startswith("http:") and not _is_loopback(host):
+        if not yes(f"  [!] plain HTTP to {host}: prompts, files and the key would travel unencrypted. Allow it?"):
+            raise HoplonError("stopped: use an https address; nothing was written", EXIT_USAGE)
+        data["allow_http"] = True
+
+    def env_ok(v):
+        if not v:
+            return None
+        if not ENV_NAME_RE.fullmatch(v) or len(v) > 64:
+            return "the variable's name (letters, digits, underscore), never the key itself"
+        return None
+    key_env = question("The environment variable that holds the API key (its name, not the key; empty: no key)",
+                       env_ok)
+    sends = "a request"
+    if key_env:
+        data["key_env"] = key_env
+        if os.environ.get(key_env):
+            sends = f"a request with your key (${key_env})"
+        else:
+            out(f"  ${key_env} is not set in this shell, so the server's model list can't be read with it")
+    listed = []
+    # Nothing is sent before blessing unless you say so here: the address is the one you just typed.
+    if yes(f"List the models {data['base_url']} has? That sends {sends} there now, before you bless the endpoint"):
+        probe = Endpoint({**data, "model": "auto"}, os.path.join(folder, name + ".json"))
+        try:
+            listed = (client or Client)(probe).model_list()
+        except HoplonError as e:
+            out(f"  could not list the server's models: {one_line(str(e))[0]}")
+    for i, (mid, n) in enumerate(listed[:30], 1):
+        out(f"  {i:2}. {mid}" + (f"  ({n} tokens)" if n else ""))
+    if len(listed) > 30:
+        out(f"  ... and {len(listed) - 30} more, by name")
+
+    def pick(v, empty_ok=False):
+        if not v:
+            return None if empty_ok else "a model"
+        if v.isdigit() and listed:      # with no list, a number is a model name like any other
+            return None if 1 <= int(v) <= min(len(listed), 30) else "a number from the list"
+        return None if MODEL_ID.fullmatch(v) else "a model name, as the server lists it"
+
+    def chosen(v):
+        return listed[int(v) - 1][0] if v.isdigit() and listed else v
+    data["model"] = chosen(question("Model (a number from the list, or its name)" if listed else "Model name", pick))
+    found = dict(listed).get(data["model"])
+    limit = question("The model's context size in tokens",
+                     lambda v: None if v.isdigit() and 1000 <= int(v) <= 10_000_000 else "a whole number of tokens",
+                     str(found or 32000))
+    data["context_limit"] = int(limit)
+    if yes("Give its models short names (aliases such as low, medium, high), for profiles and :model?"):
+        aliases = {}
+        for alias in ("low", "medium", "high"):
+            v = question(f"  Model for '{alias}' (number or name; empty: none)", lambda v: pick(v, True))
+            if v:
+                aliases[alias] = chosen(v)
+        if aliases:
+            data["aliases"] = aliases
+    path = os.path.join(folder, name + ".json")
+    Endpoint(data, path)             # checked as hoplon will check it
+    text = json.dumps(data, indent=2) + "\n"
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except FileExistsError:
+        raise HoplonError(f"{path} appeared meanwhile; nothing was written", EXIT_USAGE) from None
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    out(f"Wrote {path}:\n{text}")
+    out(f"Read it, then bless it (only you can): hoplon --bless {path}")
+    out(f"Then try it: hoplon -e {name} \"hello\"")
+    return path
+
+
 def ask_yes(question):
     try:
         ans = input(f"{question} [y/N] ")
@@ -6295,7 +6478,7 @@ class Repl:
 
     def banner(self):
         p = self.e.endpoint
-        print(f"hoplon {VERSION} — {one_line(p.name)[0]}: {one_line(p.model)[0]} at {one_line(p.base_url)[0]}")
+        print(f"hoplon {VERSION} — {one_line(p.name)[0]}: {one_line(p.shown_model())[0]} at {one_line(p.base_url)[0]}")
         if self.in_sandbox():
             name = one_line(self.e.sandbox["name"])[0]
             host = sandbox_work_host()
@@ -6426,7 +6609,7 @@ class Repl:
     def do_system(self):
         page("\n".join(["hoplon: the system prompt and tools sent with every request",
                          "Your conversation follows the system prompt in each request.", "",
-                         f"model: {self.e.endpoint.model}",
+                         f"model: {self.e.endpoint.shown_model()}",
                          f"params: {json.dumps(getattr(self.e.client, 'params', {}))}", "",
                          "── System prompt " + "─" * 60, self.e.system()["content"], "",
                          "── Tools " + "─" * 68, json.dumps(self.e.tools(), indent=2, ensure_ascii=False)]))
@@ -6531,12 +6714,20 @@ class Repl:
                 print(f"context cleared: the model starts over ({n} messages dropped; "
                       f"{'the saved session keeps them' if self.e.session.path else 'they were not saved'})")
             elif cmd == "models":
-                for mid, n in self.e.client.model_list():
-                    mark = "*" if mid == self.e.endpoint.model else " "
+                ep = self.e.endpoint
+                for k in sorted(ep.aliases):
+                    mark = "*" if ep.aliases[k] == ep.model else " "
+                    print(f" {mark} {k}  ({ep.aliases[k]}, an alias)")
+                listed, err = choosable_models(self.e)
+                for mid, n in listed:
+                    mark = "*" if mid == ep.model and not ep.alias_of() else " "
                     print(f" {mark} {mid}" + (f"  ({n} tokens)" if n else ""))
+                if err:
+                    print(f"hoplon: could not list the server's models: {one_line(err)[0]}", file=sys.stderr)
             elif cmd == "model":
                 if not arg:
-                    print(f"model: {self.e.endpoint.model} (:models lists the others, :model NAME switches)")
+                    print(f"model: {one_line(self.e.endpoint.shown_model())[0]} (:models lists the others, "
+                          ":model NAME switches)")
                 else:
                     print(f"model: {self.e.set_model(arg, ':model')} from your next message")
             elif cmd == "raw":
@@ -6888,11 +7079,12 @@ def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()
             except HoplonError as err:
                 ui.error(str(err), err.kind)
         elif t == "models":
-            try:
-                ui.emit({"type": "models", "current": engine.endpoint.model,
-                         "models": [{"id": mid, "context": n} for mid, n in engine.client.model_list()]})
-            except HoplonError as err:
-                ui.error(str(err), "models")
+            listed, err = choosable_models(engine)
+            if listed or engine.endpoint.aliases or not err:    # the aliases, even when the server lists nothing
+                ui.emit({"type": "models", "current": engine.endpoint.model, "aliases": engine.endpoint.aliases,
+                         "models": [{"id": mid, "context": n} for mid, n in listed]})
+            if err:
+                ui.error(err, "models")
         elif t == "model":
             name = msg.get("model")
             if not isinstance(name, str):
@@ -7568,6 +7760,8 @@ def parse_args(argv):
                          "(for hoplon-tui's remote mode; takes -e, -p, -k and --commands)")
     ap.add_argument("--bless", metavar="PATH",
                     help="review and bless a skill or command set directory, endpoint or profile file")
+    ap.add_argument("--new-endpoint", action="store_true",
+                    help="ask for an endpoint's details and write it to your config, for you to bless")
     ap.add_argument("--list-skills", action="store_true", help="list skills (with --json: as JSON)")
     ap.add_argument("--list-commands", action="store_true", help="list command sets (with --json: as JSON)")
     ap.add_argument("--list-endpoints", action="store_true", help="list endpoints (with --json: as JSON)")
@@ -7596,6 +7790,10 @@ def main(argv=None):
             if not sys.stdin.isatty():
                 raise HoplonError("blessing needs a terminal: it asks you to confirm you have read it", EXIT_USAGE)
             return EXIT_OK if bless(cfg, args.bless, ask_yes) else EXIT_ERROR
+        if args.new_endpoint:
+            if not sys.stdin.isatty():
+                raise HoplonError("--new-endpoint needs a terminal: it asks you questions", EXIT_USAGE)
+            return EXIT_OK if new_endpoint(cfg) else EXIT_ERROR
         if args.remote_config:
             if args.session:
                 raise HoplonError("--remote-config takes only -e, -p, -k and --commands", EXIT_USAGE)

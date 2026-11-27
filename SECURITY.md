@@ -78,8 +78,9 @@ advice is to remove one of the three, or put a human in front of it.
   sequences are escaped like any other control sequence).
 - The only network destination is the blessed endpoint. Redirects are refused and nothing more
   is sent. `OPENAI_BASE_URL` and the proxy environment variables are ignored.
-- Switching models (`"model": "auto"`, `:model`, hoplon-tui's `/model`) stays on that server: only
-  a model it lists can be chosen, and every switch is in the audit log. The list comes from the
+- Switching models (`"model": "auto"`, `:model`, hoplon-tui's `/model`, a profile's `model`) stays on
+  that server: only a model it lists, or an alias in the blessed endpoint file, can be chosen, and every
+  switch is in the audit log. An alias's name hides a listed model of the same name. The list comes from the
   server, so it is treated as untrusted text. A name with anything outside letters, digits and
   `._:/@+=-` is left out rather than cleaned, the list is capped at 1 MB and 200 names, and
   hoplon-tui checks each name again before it shows it in a tmux menu (whose item names tmux
@@ -566,7 +567,9 @@ descriptions that changed after approval.
 
 - hoplon reads no configuration from the working directory. A cloned repository cannot change
   its endpoint, tools or behaviour. Configuration comes only from `~/.config/hoplon`.
-- Nothing is sent anywhere until an endpoint has been blessed. Blessing needs a terminal.
+- Nothing is sent anywhere until an endpoint has been blessed. Blessing needs a terminal. The one
+  exception is `hoplon --new-endpoint`, which lists the models at the address you just typed only if
+  you say yes, after it says whether your key goes with the request.
 - Blessing records a sha256 of exactly the bytes shown. Each use reads the file once and
   hashes and parses the same bytes. Skills are hashed across every file, with symlinks
   refused. Any change means refusal until you bless again.
