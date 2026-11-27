@@ -890,7 +890,7 @@ class Model:
         hold (no "#")."""
         if self.hello is None:
             return ""
-        T = palette.tmux
+        T = palette.band
 
         def safe(v, n=32):
             return re.sub(r"[^A-Za-z0-9._:@/+=-]", "", str(v or ""))[:n]
@@ -910,7 +910,7 @@ class Model:
         if self.exited is not None:
             parts.append(f"{T('ember', bold=True)}■ exited#[default]")
         elif self.pending:
-            parts.append(f"{T('iron', 'brass', bold=True)} ⏸ waiting for you #[default]")
+            parts.append(f"{T('brass', 'iron', bold=True)} ⏸ waiting for you #[default]")
         elif self.busy:
             parts.append(f"{T('brass', bold=True)}● working#[default]")
         else:
@@ -951,14 +951,14 @@ class Model:
     def sandbox_status(self):
         card = self.running_card()
         if card and PROPOSAL_ID.fullmatch(card.id):
-            return f" {palette.tmux('patina', bold=True)}⏵ sandbox {card.id} {card.elapsed()}s#[default] │"
+            return f" {palette.band('patina', bold=True)}⏵ sandbox {card.id} {card.elapsed()}s#[default] │"
         if card:
-            return f" {palette.tmux('patina', bold=True)}⏵ sandbox {card.elapsed()}s#[default] │"
+            return f" {palette.band('patina', bold=True)}⏵ sandbox {card.elapsed()}s#[default] │"
         if self.hello.get("sandbox"):
-            return f" {palette.tmux('patina')}⊡ sandbox#[default] │"
+            return f" {palette.band('patina')}⊡ sandbox#[default] │"
         if self.runner and not self.runner.get("problem"):
-            return f" {palette.tmux('patina')}⊡ model's runs sandboxed#[default] │"
-        return f" {palette.tmux('brass')}▲ no sandbox#[default] │"
+            return f" {palette.band('patina')}⊡ model's runs sandboxed#[default] │"
+        return f" {palette.band('ember', bold=True)}▲ no sandbox#[default] │"
 
     def network_text(self):
         r = self.runner

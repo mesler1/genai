@@ -158,10 +158,10 @@ turn the bell into an alert or a highlighted window. `/alerts off` silences the 
 the start, and `HOPLON_TUI_ALERTS=off` or `on` overrides that for one run. The header shows
 `⏸ waiting for you` either way. (hoplon's notify hook doesn't run under hoplon-tui.)
 
-The header, along the top, shows the endpoint and model (click the model, `▾`, to pick another, as
+The header, a bronze band along the top, shows the endpoint and model (click the model, `▾`, to pick another, as
 `/model` does), the profile and session, what hoplon is doing (`● ready`, `● working`, `⏸ waiting
-for you`), coding mode or chat, a work session's item, and a context gauge that turns brass at 70%
-and ember at 90%. On its right are the sandbox and the host, and tmux's keys when the terminal is
+for you`), coding mode or chat, a work session's item, and a context gauge that turns from green to black at 70%
+and red at 90%. On its right are the sandbox and the host, and tmux's keys when the terminal is
 wide enough.
 
 ![The model menu: the endpoint's aliases first, each with the model it sends to, then the server's models](images/tui-models.png)

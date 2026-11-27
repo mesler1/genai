@@ -198,6 +198,11 @@ class TestPalette(unittest.TestCase):
         self.assertEqual(P.tmux("bronze", bold=True, environ={"NO_COLOR": "1"}), "#[bold]")
         self.assertEqual(P.tmux("patina", environ={"NO_COLOR": "1"}), "")
         self.assertEqual(P.tmux("iron", "brass", bold=True, environ={}), "#[fg=#0E1113,bg=#E3B341,bold]")
+        # the header is a bronze band: its text takes the darker tones, and a pill keeps its own colours
+        self.assertEqual(P.band("dim", environ={}), "#[fg=#5B4120]")
+        self.assertEqual(P.band("patina", bold=True, environ={}), "#[fg=#1D4F49,bold]")
+        self.assertEqual(P.band("brass", "iron", environ={}), "#[fg=#E3B341,bg=#0E1113]")
+        self.assertEqual(P.band("ember", environ={"NO_COLOR": "1"}), "")
 
     def test_brass_bronze_and_ember_stay_apart_on_256_colours(self):
         codes = [P.TOKENS[t][1] for t in ("bronze", "brass", "ember", "patina", "dim")]
@@ -715,11 +720,11 @@ class TestSandboxRuns(unittest.TestCase):
         m.handle({"type": "context", "used": 75000, "limit": 100000})
         m.handle({"type": "coding", "on": True})
         h = m.tmux_header()
-        self.assertIn("#[fg=#E3B341]━━━━━━", h)                    # 75%: brass, 6 of 8
+        self.assertIn("#[fg=#0E1113]━━━━━━", h)                    # 75%: dark on the bronze band, 6 of 8
         self.assertIn("75%", h)
         self.assertIn("◆ coding", h)
         m.handle({"type": "context", "used": 95000, "limit": 100000})
-        self.assertIn("#[fg=#E8776A]━━━━━━━━", m.tmux_header())    # 95%: ember
+        self.assertIn("#[fg=#8C2A1C]━━━━━━━━", m.tmux_header())    # 95%: ember
         m.submit("go")
         self.assertIn("● working", m.tmux_header())
 
@@ -871,7 +876,7 @@ class TestSandboxStatus(unittest.TestCase):
         waiting.submit("go")
         waiting.handle({"type": "proposal", "id": "p1", "kind": "write", "path": "a", "content": "x", "reason": "r",
                         "digest": "d"})
-        self.assertIn("#[fg=#0E1113,bg=#E3B341,bold] ⏸ waiting for you", waiting.tmux_header())
+        self.assertIn("#[fg=#E3B341,bg=#0E1113,bold] ⏸ waiting for you", waiting.tmux_header())    # a pill on the band
         self.assertNotIn("waiting", waiting.tmux_status())
         waiting.decide(False)                                   # answered: no longer waiting
         self.assertNotIn("waiting for you", waiting.tmux_header())
