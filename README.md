@@ -20,6 +20,8 @@ adds tmux 3.2 or newer.
 - **What you approve is what happens.** An approval is tied to the exact change you saw.
 - **Autonomy on a leash.** Work sessions run in a private copy, and you merge the result yourself.
 
+![hoplon-tui: the model proposes an edit to durations.py, shown as a diff, and waits for you to allow it](docs/images/tui-approval.png)
+
 Full threat model: [SECURITY.md](SECURITY.md). Design choices and known limits:
 [DECISIONS.md](DECISIONS.md).
 

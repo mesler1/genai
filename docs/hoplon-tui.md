@@ -2,6 +2,8 @@
 
 hoplon-tui runs hoplon in tmux panes beside your own shell: the conversation, an info panel, and the shell (Ctrl-` shows or hides it). `/help` lists its commands.
 
+![The conversation on the left, with a read and an edit the model asked for, the info panel on the right, and the prompt pane below](images/tui-done.png)
+
 ## Sessions
 
 Every conversation is kept in a saved session, so it can be picked up again. `-S NAME` starts or
@@ -161,6 +163,8 @@ The header, along the top, shows the endpoint and model (click the model, `▾`,
 for you`), coding mode or chat, a work session's item, and a context gauge that turns brass at 70%
 and ember at 90%. On its right are the sandbox and the host, and tmux's keys when the terminal is
 wide enough.
+
+![The model menu: the endpoint's aliases first, each with the model it sends to, then the server's models](images/tui-models.png)
 
 While hoplon replies, the prompt pane's bottom line (and the info panel) says what is arriving:
 `thinking · ~3,200 tokens`, `writing game/index.html · 18 KB` as a tool call streams in, or
