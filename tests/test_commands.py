@@ -172,6 +172,75 @@ class TestManifest(CommandSetBase):
             p["user"] = spec
             self.refused(why)
 
+    def test_path_and_host_rules(self):
+        p = self.manifest["commands"]["queue"]["params"]
+        for spec, why in [({"path": {}}, "needs 'under'"), ({"path": {"under": ["rel/dir"]}}, "absolute"),
+                          ({"path": {"files": ["x"]}}, "absolute"), ({"path": {"under": ["/d"], "new": "yes"}}, "new"),
+                          ({"path": {"files": ["/f"], "new": True}}, "needs 'under'"),
+                          ({"path": {"under": ["/d"], "other": 1}}, "other"), ({"path": "/d"}, "path"),
+                          ({"host": ["ok", "bad host"]}, "host names"), ({"host": ["-x"]}, "host names"),
+                          ({"host": []}, "host")]:
+            with self.subTest(spec=spec):
+                self.setUp()
+                self.manifest["commands"]["queue"]["params"]["user"] = spec
+                self.refused(why)
+        self.setUp()
+        self.manifest["commands"]["queue"]["params"]["user"] = {"path": {"under": ["/tmp"], "new": True}}
+        self.refused('needs "access": "write"')                    # a read command may not create files
+
+    def test_a_path_is_resolved_then_checked(self):
+        top, out = self.path("data"), self.path("outside")
+        for d in (top, os.path.join(top, "sub"), os.path.join(top, ".hidden"), out):
+            os.makedirs(d, exist_ok=True)
+        for f in ("a.txt", "sub/b.txt", ".hidden/c", "id_rsa", "server.key"):
+            open(os.path.join(top, f), "w").close()
+        open(os.path.join(out, "secret.txt"), "w").close()
+        os.symlink(os.path.join(out, "secret.txt"), os.path.join(top, "link"))
+        os.symlink(os.path.join(top, "sub"), os.path.join(top, "sublink"))
+        rule = G.TrustedParam({"path": {"under": [top], "files": [os.path.join(top, "id_rsa")]}}, "p")
+        real = os.path.realpath
+        self.assertEqual(rule.check(os.path.join(top, "a.txt")), real(os.path.join(top, "a.txt")))
+        self.assertEqual(rule.check(os.path.join(top, "sublink", "b.txt")), real(os.path.join(top, "sub", "b.txt")))
+        self.assertEqual(rule.check(os.path.join(top, "id_rsa")), real(os.path.join(top, "id_rsa")))   # listed
+        with mock.patch("os.getcwd", return_value=top):
+            self.assertEqual(rule.check("sub/b.txt"), real(os.path.join(top, "sub", "b.txt")))      # relative
+        for value, why in ((os.path.join(top, "..", "outside", "secret.txt"), "must be inside"),
+                           (os.path.join(top, "link"), "must be inside"),                 # a symlink out
+                           ("/etc/passwd", "must be inside"), (os.path.join(top, ".hidden", "c"), "hidden"),
+                           (os.path.join(top, "server.key"), "secrets"), (os.path.join(top, "nope"), "does not exist"),
+                           (top + "x", "must be inside")):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError) as cm:
+                    rule.check(value)
+                self.assertIn(why, str(cm.exception))
+        new = G.TrustedParam({"path": {"under": [top], "new": True}}, "p")
+        self.assertEqual(new.check(os.path.join(top, "fresh.txt")), real(os.path.join(top, "fresh.txt")))
+        with self.assertRaises(ValueError) as cm:
+            new.check(os.path.join(top, "nodir", "fresh.txt"))
+        self.assertIn("directory must exist", str(cm.exception))
+        self.assertIn(f"a path under {top}", new.schema()["description"])
+
+    def test_a_host_is_one_of_the_list(self):
+        rule = G.TrustedParam({"host": ["login1", "login2.example.org"], "describe": "a login node"}, "p")
+        self.assertEqual(rule.check("login2.example.org"), "login2.example.org")
+        with self.assertRaises(ValueError):
+            rule.check("login3")
+        self.assertEqual(rule.schema(), {"type": "string", "enum": ["login1", "login2.example.org"],
+                                         "description": "a login node"})
+
+    def test_a_path_reaches_the_program_resolved(self):
+        top = self.path("logs")
+        os.makedirs(os.path.join(top, "real"))
+        open(os.path.join(top, "real", "x.log"), "w").close()
+        os.symlink(os.path.join(top, "real"), os.path.join(top, "alias"))
+        self.manifest["commands"]["tail"] = {"describe": "a log", "argv": ["fakeq", "tail", "{file}"], "access": "read",
+                                             "params": {"file": {"path": {"under": [top]}}}}
+        pl = self.load()
+        self.assertIsNone(pl.error)
+        cmd = pl.commands["tail"]
+        values = cmd.check({"file": os.path.join(top, "alias", "x.log")})
+        self.assertEqual(values, {"file": os.path.realpath(os.path.join(top, "real", "x.log"))})
+
     def test_option_like_values_are_refused_whatever_the_pattern(self):
         rule = G.TrustedParam({"pattern": "^[a-z]{1,9}$"}, "p")
         rule.rx = re.compile(".+")                     # as if a pattern had slipped through the load-time check

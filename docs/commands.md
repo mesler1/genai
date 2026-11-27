@@ -20,7 +20,9 @@ commands with exactly these inputs.
 ```json
 {"name": "slurm", "description": "Slurm cluster status", "search": ["/usr/bin", "/opt/slurm/bin"], "env": ["SLURM_CONF"],
  "commands": {"queue_user": {"describe": "jobs of one user", "argv": ["squeue", "-h", "-u", "{user}"],
-   "params": {"user": {"pattern": "^[a-z_][a-z0-9_-]{0,31}$"}}, "access": "read", "min_interval": 5, "cache": 15}}}
+   "params": {"user": {"pattern": "^[a-z_][a-z0-9_-]{0,31}$"}}, "access": "read", "min_interval": 5, "cache": 15},
+  "job_log": {"describe": "the end of a job's log", "argv": ["tail", "-n", "200", "{file}"], "access": "read",
+   "params": {"file": {"path": {"under": ["~/jobs"]}}}}}}
 ```
 
 - `name` is the directory's name (`a-z`, digits, `-`); commands are `a-z`, digits, `_`. Unknown fields anywhere
@@ -29,9 +31,22 @@ commands with exactly these inputs.
   your `PATH` is never used) or an absolute path, then arguments. `{param}` may be a whole argument or part of
   one (`--user={user}`); every placeholder needs a declared param and every param must be used. `{{` and `}}`
   are literal braces. A value never splits into several arguments and is never seen by a shell.
-- `params` (all required): `pattern` (a regular expression the whole value must match; one that matches the
-  empty string is refused), `enum` (a list), or `int` (`[min, max]`); optional `describe`. A value that doesn't
-  fit is refused, never cleaned. At most 256 characters, one line, whatever the pattern says.
+- `params` (all required), each one of these types, and optionally `describe`. Prefer the first ones:
+  - `path`: `{"under": [directories], "files": [exact files], "new": false}`, absolute paths or ones starting
+    with `~/`, at least one of `under` and `files`. hoplon resolves `..` and symlinks first (a relative value is
+    taken from hoplon's working directory), checks the real location, and passes that resolved absolute path to
+    the program. Inside `under`, hidden and secret-looking names (`.ssh`, `id_rsa`, `*.key` and the like) are
+    refused, as with the file tools, unless `files` lists them. The path must exist, unless `new` is true (only
+    for `write` commands, and only inside `under`, in a directory that exists).
+  - `host`: a list of host names; the value must be one of them.
+  - `int`: `[min, max]`, a whole number from 0 up.
+  - `enum`: a list of values.
+  - `pattern`: a regular expression the whole value must match, as the last resort; one that matches the empty
+    string, or a value starting with `-`, is refused.
+
+  A value that doesn't fit is refused, never cleaned. At most 256 characters, one line, and never starting with
+  `-`, whatever the type. One gap is left with paths: the program opens the file after hoplon checks it, so a
+  symlink swapped in between can still get past the check. Only the sandbox closes that completely.
 - Per command: `access` (required: `read` or `write`), `timeout` (seconds, 15, at most 120), `max_output` (bytes,
   65536, at most 1 MiB; more is dropped and the program is killed), `min_interval` (seconds, 2: a call of the
   same command sooner than this after its last real run is refused with "rate limited"), `cache` (seconds, 0:

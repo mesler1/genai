@@ -1566,7 +1566,9 @@ COMMAND_SET_KEYS = {"name", "description", "search", "env", "pane", "commands"}
 COMMAND_KEYS = {"describe", "usage", "argv", "params", "access", "timeout", "max_output", "min_interval", "cache"}
 USAGE_MAX = 1200            # characters of a scoped command's usage section, all lines together
 USAGE_LINES = 20
-PARAM_KEYS = {"pattern", "enum", "int", "describe"}
+PARAM_KEYS = {"pattern", "enum", "int", "path", "host", "describe"}
+PATH_RULE_KEYS = {"under", "files", "new"}
+HOST_NAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,62})(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}))*")
 SET_NAME = re.compile(r"[a-z][a-z0-9-]{0,30}")
 COMMAND_NAME = re.compile(r"[a-z][a-z0-9_]{0,30}")
 TEMPLATE = re.compile(r"\{\{|\}\}|\{([A-Za-z0-9_]+)\}|[{}]")
@@ -1642,15 +1644,16 @@ def split_template(text, where):
 
 
 class TrustedParam:
-    """What one placeholder accepts: a regular expression (the whole value must match), a list of values,
-    or a whole number from 0 up. A value that doesn't fit is refused, never cleaned. No value may start with '-':
-    one that did could be read by the program as an option (another cluster, an output file), not as data."""
+    """What one placeholder accepts: a path inside the directories or among the files the set names, a host from
+    its list, a whole number in a range, a list of values, or, as the last resort, a regular expression the whole
+    value must match. A value that doesn't fit is refused, never cleaned. No value may start with '-': one that
+    did could be read by the program as an option (another cluster, an output file), not as data."""
 
     def __init__(self, data, where):
         _object(data, PARAM_KEYS, where)
-        kinds = [k for k in ("pattern", "enum", "int") if k in data]
+        kinds = [k for k in ("path", "host", "int", "enum", "pattern") if k in data]
         if len(kinds) != 1:
-            raise ValueError(f"{where}: needs exactly one of pattern, enum, int")
+            raise ValueError(f"{where}: needs exactly one of path, host, int, enum, pattern")
         self.kind, self.rule = kinds[0], data[kinds[0]]
         self.describe = _text(data, "describe", where + ".")
         if self.kind == "pattern":
@@ -1666,6 +1669,23 @@ class TrustedParam:
             _strings(self.rule, where + ".enum")
             if any(v.startswith("-") for v in self.rule):
                 raise ValueError(f"{where}.enum has a value starting with '-', which a program reads as an option")
+        elif self.kind == "host":
+            _strings(self.rule, where + ".host")
+            if not all(len(h) <= 253 and HOST_NAME.fullmatch(h) for h in self.rule):
+                raise ValueError(f"{where}.host must be a list of host names (letters, digits, '-' and '.')")
+        elif self.kind == "path":
+            _object(self.rule, PATH_RULE_KEYS, where + ".path")
+            under, files = self.rule.get("under", []), self.rule.get("files", [])
+            for key, v in (("under", under), ("files", files)):
+                if v:
+                    _strings(v, f"{where}.path.{key}")
+                if v and not all((x.startswith("/") or x.startswith("~/")) and "\0" not in x and "\n" not in x
+                                 for x in v):
+                    raise ValueError(f"{where}.path.{key} must be absolute paths (or start with ~/)")
+            if not (under or files):
+                raise ValueError(f"{where}.path needs 'under' (directories) or 'files' (exact files), or both")
+            if not isinstance(self.rule.get("new", False), bool) or (self.rule.get("new") and not under):
+                raise ValueError(f"{where}.path.new must be true or false, and true needs 'under'")
         elif not (isinstance(self.rule, list) and len(self.rule) == 2 and all(type(n) is int for n in self.rule)
                   and 0 <= self.rule[0] <= self.rule[1]):
             raise ValueError(f"{where}.int must be [min, max], from 0 up")
@@ -1687,19 +1707,53 @@ class TrustedParam:
         if self.kind == "int" and not (re.fullmatch(r"[0-9]{1,18}", value)
                                        and self.rule[0] <= int(value) <= self.rule[1]):
             raise ValueError(f"must be a whole number from {self.rule[0]} to {self.rule[1]}")
+        if self.kind == "host" and value not in self.rule:
+            raise ValueError(f"must be one of the hosts: {', '.join(self.rule)}")
+        if self.kind == "path":
+            return self.check_path(value)
         return value
+
+    def check_path(self, value):
+        """The real, absolute location: '..' and symlinks resolved first, then checked against the directories and
+        files the set allows, with the file tools' rules (hidden and secret-looking names refused unless listed
+        in files). The program gets this resolved path. It opens the file after this check, so a symlink swapped
+        in between can still get past it: only the sandbox closes that."""
+        real = os.path.realpath(os.path.join(os.getcwd(), os.path.expanduser(value)))
+        if real in {os.path.realpath(os.path.expanduser(f)) for f in self.rule.get("files", [])}:
+            if not os.path.exists(real):
+                raise ValueError("does not exist")
+            return real
+        for d in self.rule.get("under", []):
+            top = os.path.realpath(os.path.expanduser(d))
+            if real != top and not real.startswith(top.rstrip("/") + "/"):
+                continue
+            if is_hidden(os.path.relpath(real, top).split("/")) and real != top:
+                raise ValueError("is hidden or looks like it holds secrets; the set must list it in 'files'")
+            if not os.path.exists(real):
+                if not self.rule.get("new"):
+                    raise ValueError("does not exist")
+                if not os.path.isdir(os.path.dirname(real)):
+                    raise ValueError("may be new, but its directory must exist")
+            return real
+        where = ", ".join(self.rule.get("under", []) + self.rule.get("files", []))
+        raise ValueError(f"must be inside {where}, after resolving '..' and symlinks")
 
     def schema(self):
         s = {"type": "string"}
         if self.kind == "pattern":
             s["pattern"] = self.rule
-        elif self.kind == "enum":
+        elif self.kind in ("enum", "host"):
             s["enum"] = self.rule
-        else:
+        elif self.kind == "int":
             s["pattern"] = "^[0-9]{1,18}$"
         text = self.describe
         if self.kind == "int":
             text = f"{text} (a whole number from {self.rule[0]} to {self.rule[1]})".strip()
+        elif self.kind == "path":
+            allowed = ([f"under {', '.join(self.rule['under'])}"] if self.rule.get("under") else []) + \
+                      ([f"one of {', '.join(self.rule['files'])}"] if self.rule.get("files") else [])
+            text = (f"{text} (a path {' or '.join(allowed)}; "
+                    + ("it may be new" if self.rule.get("new") else "it must exist") + ")").strip()
         if text:
             s["description"] = text
         return s
@@ -1752,6 +1806,8 @@ class TrustedCommand:
         if not isinstance(params, dict) or not all(COMMAND_NAME.fullmatch(k) for k in params):
             raise ValueError(f"{w}params must be an object named by parameter names (a-z, 0-9, _)")
         self.params = {k: TrustedParam(v, f"{w}params.{k}") for k, v in params.items()}
+        if self.read_only and any(p.kind == "path" and p.rule.get("new") for p in self.params.values()):
+            raise ValueError(f'{w}params: a path that may be new needs "access": "write"')
         first = self.argv[0]
         if not (re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", first) or (first.startswith("/") and "{" not in first)):
             raise ValueError(f"{w}argv[0] must be a program name without '/' or placeholders, or an absolute path")

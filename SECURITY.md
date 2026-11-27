@@ -125,12 +125,17 @@ much permission and too much autonomy.
 
 A command set is blessed as a directory, like a skill: its hash covers every file, and a changed command set is refused
 until you bless it again. What you bless is a list of commands, each a fixed argument list with named inputs
-and the rules for each input (a regular expression matched against the whole value, a list, or a number
-range). Together they are the whole of what the model and the user's panes can run.
+and the rules for each input (a path inside named directories or among named files, a host from a list, a
+number range, a list of values, or a regular expression matched against the whole value). Together they are the
+whole of what the model and the user's panes can run.
 
 - **No shell.** The program is started directly with an argument list. A value fills one argument and is
   never split, expanded or re-read, so `;`, `$(...)` and quotes in a value are only characters. Values that
   break the rules (or are over 256 characters, or have a NUL or a newline) are refused, never cleaned.
+- **Paths.** A `path` value is resolved (`..` and symlinks) before it is checked, and the program gets the
+  resolved path. Hidden and secret-looking names are refused unless the set lists them as exact files. The check
+  and the program's open are two steps, so a symlink swapped in between can get past it: a command set can't
+  close that race, and only the sandbox does. Don't give a `path` under a directory that others can write to.
 - **Fixed programs.** The program is found only in the command set's `search` directories (or by an absolute path),
   never through your `PATH`. It must be a regular executable file that neither group nor others can write, as
   must its directory, owned by you or root. hoplon records the file it found and refuses to run it if it was
