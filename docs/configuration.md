@@ -76,6 +76,7 @@ profiles/coder.json        example persona with coding mode
 skills/hoplon-endpoint/     helps you write an endpoint
 skills/hoplon-profile/      helps you write a profile (persona)
 skills/hoplon-skill/        helps you write a skill
+skills/hoplon-command/      helps you write a command set and its guide
 skills/bash/                Bash: house rules for scripts, and the gotchas that bite
 skills/c/                   C: house rules and gotchas
 skills/csh/                 C shell: csh and tcsh syntax, not Bash's

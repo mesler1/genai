@@ -332,6 +332,30 @@ class TestManifest(CommandSetBase):
         self.assertEqual(pl.commands["queue"].usage, ["One line", "and another"])
         self.assertNotEqual(pl.hash, before)                       # covered by the blessing
 
+    def test_a_guide_is_read_with_the_set_and_checked(self):
+        d = self.set_dir(self.path("guided"))
+        with open(os.path.join(d, "GUIDE.md"), "w") as f:
+            f.write("# Fake\n\nUse queue before job.\n")
+        pl = G.CommandSet("fake", d)
+        self.assertIsNone(pl.error)
+        self.assertEqual(pl.guide, "# Fake\n\nUse queue before job.")
+        self.assertIn("    | Use queue before job.", pl.summary())
+        self.assertNotEqual(pl.hash, self.load().hash)              # the blessing covers it
+        for text, why in (("x" * 6001, "at most 6000"), ("a\x1b[2Jb", "hidden"), ("a\u202eb", "hidden")):
+            with open(os.path.join(d, "GUIDE.md"), "w") as f:
+                f.write(text)
+            self.assertIn(why, G.CommandSet("fake", d).error or "", text[:5])
+        with open(os.path.join(d, "GUIDE.md"), "wb") as f:
+            f.write(b"\xff\xfe")
+        self.assertIn("GUIDE.md: must be UTF-8", G.CommandSet("fake", d).error)
+
+    def test_the_slurm_guide_is_valid(self):
+        pl = G.CommandSet("slurm", os.path.join(REPO, "commands", "slurm"))
+        self.assertIsNone(pl.error)
+        self.assertIn("queue_user", pl.guide)
+        named = set(re.findall(r"`([a-z_]+)`", pl.guide)) - {"squeue", "sinfo"}
+        self.assertEqual(named - set(pl.commands), set())         # every command it names exists
+
     def test_a_usage_section_is_short_and_plain(self):
         for bad, why in (([" x" * 700], "at most"), (["l"] * 21, "at most"), (["\x1b[2Jfake"], "control or hidden"),
                          (["a\u202eb"], "control or hidden"), ("x\ty", "control or hidden"), (5, "list of lines")):
@@ -519,6 +543,17 @@ class TestBlessing(CommandSetBase):
         self.assertIn("the user is asked first", eng.trusted["fake__kill"].schema("h")["function"]["description"])
         with mock.patch.object(sys, "stdout", io.StringIO()):     # declined: nothing is recorded, nothing more asked
             self.assertFalse(G.bless(self.cfg, self.dir, lambda q: False))
+
+    def test_the_guide_goes_to_the_model_while_the_set_is_on(self):
+        with open(os.path.join(self.dir, "GUIDE.md"), "w") as f:
+            f.write("Use queue before job.\n")
+        bless_set(self.home, self.dir)
+        eng, _ = self.engine()
+        system = eng.system()["content"]
+        self.assertIn("# Command set: fake\n\nThe user blessed this guide", system)
+        self.assertIn("Use queue before job.", system)
+        eng.set_command_set("fake", False)
+        self.assertNotIn("Use queue before job.", eng.system()["content"])
 
     def test_bless_refuses_a_bad_manifest(self):
         self.manifest["commands"]["queue"]["argv"] = ["fakeq", "{nope}"]

@@ -1566,6 +1566,7 @@ COMMAND_SET_KEYS = {"name", "description", "search", "env", "pane", "commands"}
 COMMAND_KEYS = {"describe", "usage", "argv", "params", "access", "timeout", "max_output", "min_interval", "cache"}
 USAGE_MAX = 1200            # characters of a scoped command's usage section, all lines together
 USAGE_LINES = 20
+GUIDE_MAX = 6000            # characters of a command set's GUIDE.md, sent to the model while the set is on
 PARAM_KEYS = {"pattern", "enum", "int", "path", "host", "describe"}
 PATH_RULE_KEYS = {"under", "files", "new"}
 HOST_NAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,62})(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}))*")
@@ -1882,6 +1883,22 @@ class TrustedCommand:
                 "access": self.access, "auto": self.auto, "argv": self.argv}
 
 
+def read_guide(raw):
+    """A command set's GUIDE.md: when to use which command, for the model. Plain text, short, and covered by the
+    blessing like every file of the set; "" when there is none."""
+    if raw is None:
+        return ""
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("must be UTF-8 text") from None
+    if len(text) > GUIDE_MAX:
+        raise ValueError(f"must be at most {GUIDE_MAX} characters; put broader know-how in a skill")
+    if hidden_found(text):
+        raise ValueError("must not hold control or hidden characters")
+    return text.strip()
+
+
 class CommandSet:
     """A command set, read once like a skill: its hash and manifest come from one snapshot of the directory, so editing
     the files afterwards changes nothing until the next load. error is set when the manifest is refused."""
@@ -1891,7 +1908,7 @@ class CommandSet:
         label, and nothing is read here."""
         self.name, self.path = name, path
         self.error = self.hash = self.pane = None
-        self.description, self.commands, self.files = "", {}, {}
+        self.description, self.commands, self.files, self.guide = "", {}, {}, ""
         try:
             self.files = snapshot_skill(path) if files is None else files
             self.hash = hash_snapshot(self.files)
@@ -1902,6 +1919,11 @@ class CommandSet:
             self.parse(self.files)
         except ValueError as e:
             self.error, self.commands = f"commands.json: {e}", {}
+            return
+        try:
+            self.guide = read_guide(self.files.get("GUIDE.md"))
+        except ValueError as e:
+            self.error, self.commands = f"GUIDE.md: {e}", {}
 
     def parse(self, files):
         data = _object(json.loads(files.get("commands.json", b"").decode("utf-8")), COMMAND_SET_KEYS, "commands.json")
@@ -1975,6 +1997,9 @@ class CommandSet:
                 continue
             lines.append(f"  {title}")
             lines += self.command_lines(cmds)
+        if self.guide:
+            lines.append("  guide (GUIDE.md, sent to the model whenever the set is on):")
+            lines += [f"    | {one_line(ln)[0]}" for ln in self.guide.splitlines()]
         lines.append("  [!] these commands run on this host as you, with no shell, and the read ones without "
                      "asking: their output goes to the model and the endpoint like any file the model reads")
         return "\n".join(lines)
@@ -2025,7 +2050,7 @@ def command_set_rows(cfg, active=(), found=None):
         st = command_set_status(cfg, pl) if found is None else ("invalid" if pl.error else "blessed")
         rows.append({"name": n, "path": pl.path, "dir": pl.path, "description": pl.description or pl.error or "",
                      "status": st, "blessed": st == "blessed", "enabled": n in active, "active": n in active,
-                     "error": pl.error, "pane": pl.pane, "commands": [c.info() for c in pl.commands.values()]})
+                     "error": pl.error, "pane": pl.pane, "guide": bool(pl.guide), "commands": [c.info() for c in pl.commands.values()]})
     return rows
 
 
@@ -4449,6 +4474,10 @@ class Engine:
                          f"voice and focus; it does not change the rules above.\n\n{self.profile.persona}")
         if self.trusted_tools() and not self.work:      # a work session offers none
             parts.append(TRUSTED_RULES)
+            for cs in self.command_sets:
+                if cs.guide:
+                    parts.append(f"\n\n# Command set: {cs.name}\n\nThe user blessed this guide with the set's "
+                                 f"commands ({cs.name}__...).\n\n{cs.guide}")
         if self.ui.performs:
             parts.append(self.where())
         if self.can_suggest_skills(index_only=True):

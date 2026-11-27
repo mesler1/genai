@@ -63,6 +63,13 @@ commands with exactly these inputs.
   others or owned by another user than you or root. hoplon records which file it found at start and refuses to
   run it if it changed ("restart hoplon").
 
+A set may also have a `GUIDE.md` (at most 6000 characters of plain text): when to use which command, what to
+ask the user first, how to read the output. Whenever the set is on, it goes into the model's instructions, under
+"# Command set: NAME", so the commands never arrive without it, and the blessing screen shows it in full. Keep
+know-how that isn't about these commands in a skill. A skill can never turn commands on: a skill is only text,
+and a profile (or you) chooses what is on. The `hoplon-command` skill helps you write a set and its guide; it
+writes the files and stops, and blessing them stays your step.
+
 The model's output from a command is redacted for your endpoint key and common secret patterns, cut like
 sandbox output, and escaped wherever it is shown. `commands/slurm/` has `sinfo`, `squeue`, `scontrol show` and
 `sacct` commands, all read-only; it is one example, and you can write your own. Over JSON, see the
