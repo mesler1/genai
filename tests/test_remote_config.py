@@ -73,7 +73,7 @@ class TestRemoteConfigExport(Tmp):
         self.assertEqual(self.run_export(home, ["-e", "test", "-S", "x"]).returncode, 2)
 
     def item(self, home, kind, name, files):
-        d = os.path.join(home, kind + "s", name)
+        d = os.path.join(home, {"skill": "skills", "command_set": "commands"}[kind], name)
         os.makedirs(d)
         for rel, text in files.items():
             with open(os.path.join(d, rel), "w") as f:
@@ -83,17 +83,17 @@ class TestRemoteConfigExport(Tmp):
     def bless_dir(self, home, kind, d):
         G.Config(home).set_blessed(d, {"kind": kind, "name": os.path.basename(d), "hash": G.hash_skill(d)[0]})
 
-    def test_skills_and_plugins_in_use_go_with_their_bytes(self):
+    def test_skills_and_command_sets_in_use_go_with_their_bytes(self):
         home, _ = self.setup_home()
         a = self.item(home, "skill", "a", {"SKILL.md": "# A\n", "notes.txt": "more"})
         self.item(home, "skill", "unblessed", {"SKILL.md": "# U\n"})
         b = self.item(home, "skill", "b", {"SKILL.md": "# B\n"})
-        pl = self.item(home, "plugin", "pl", {"plugin.json": json.dumps(
+        pl = self.item(home, "command_set", "pl", {"commands.json": json.dumps(
             {"name": "pl", "commands": {"x": {"describe": "x", "argv": ["true"], "read_only": True}}})})
-        for kind, d in (("skill", a), ("skill", b), ("plugin", pl)):
+        for kind, d in (("skill", a), ("skill", b), ("command_set", pl)):
             self.bless_dir(home, kind, d)
         with open(os.path.join(home, "config.json"), "w") as f:
-            json.dump({"default_skills": ["a", "unblessed", "missing"], "default_plugins": ["pl"]}, f)
+            json.dump({"default_skills": ["a", "unblessed", "missing"], "default_commands": ["pl"]}, f)
         r = self.run_export(home, ["-e", "test", "-k", "b"])
         self.assertEqual(r.returncode, 0, r.stderr)
         out = json.loads(r.stdout)
@@ -103,7 +103,7 @@ class TestRemoteConfigExport(Tmp):
         sa = out["skills"][0]
         self.assertEqual(base64.b64decode(sa["files"]["notes.txt"]), b"more")
         self.assertEqual(sa["hash"], G.hash_skill(a)[0])
-        self.assertEqual(out["plugins"][0]["hash"], G.hash_skill(pl)[0])
+        self.assertEqual(out["command_sets"][0]["hash"], G.hash_skill(pl)[0])
         with open(os.path.join(home, "audit.log")) as f:
             rec = [json.loads(x) for x in f if "remote_config_export" in x][-1]
         self.assertEqual(rec["skills"], {"a": sa["hash"], "b": out["skills"][1]["hash"]})
@@ -115,7 +115,7 @@ class TestRemoteConfigExport(Tmp):
 
 
 class TestRemoteConfigLine(Tmp):
-    """remote_config on the remote host: the skills and plugins are made from the bytes sent, hashed again."""
+    """remote_config on the remote host: the skills and command sets are made from the bytes sent, hashed again."""
 
     def line(self, **extra):
         msg = {"type": "config", "token": "ab" * 16,
@@ -133,11 +133,11 @@ class TestRemoteConfigLine(Tmp):
         return G.remote_config(self.line(**extra), G.Audit(self.path("audit.log")))
 
     def test_items_are_made_from_the_bytes_sent(self):
-        plug = {"plugin.json": json.dumps({"name": "pl", "commands": {"x": {"describe": "d", "argv": ["true"]}}})}
-        _, _, offered = self.parse(skills=[self.entry("s", {"SKILL.md": "# S\nbody"})], plugins=[self.entry("pl", plug)])
+        plug = {"commands.json": json.dumps({"name": "pl", "commands": {"x": {"describe": "d", "argv": ["true"]}}})}
+        _, _, offered = self.parse(skills=[self.entry("s", {"SKILL.md": "# S\nbody"})], command_sets=[self.entry("pl", plug)])
         self.assertEqual(offered["skills"]["s"].text(), "# S\nbody")
-        self.assertEqual(list(offered["plugins"]["pl"].commands), ["x"])
-        self.assertEqual(self.parse()[2], {"skills": {}, "plugins": {}})
+        self.assertEqual(list(offered["command_sets"]["pl"].commands), ["x"])
+        self.assertEqual(self.parse()[2], {"skills": {}, "command_sets": {}})
         with open(self.path("audit.log")) as f:
             rec = json.loads(f.readline())
         self.assertEqual(rec["skills"], {"s": offered["skills"]["s"].hash})
@@ -145,7 +145,7 @@ class TestRemoteConfigLine(Tmp):
     def test_refusals(self):
         good = self.entry("s", {"SKILL.md": "# S"})
         tampered = dict(good, files={"SKILL.md": base64.b64encode(b"# other").decode()})
-        badname = self.entry("pl", {"plugin.json": json.dumps({"name": "other", "commands": {}})})
+        badname = self.entry("pl", {"commands.json": json.dumps({"name": "other", "commands": {}})})
         for extra, why in (({"skills": [tampered]}, "don't match the hash"),
                            ({"skills": [good, good]}, "distinct"),
                            ({"skills": [dict(good, files={"../x": "eA=="})]}, "bad file"),
@@ -153,7 +153,7 @@ class TestRemoteConfigLine(Tmp):
                            ({"skills": [self.entry("s", {"README": "x"})]}, "no SKILL.md"),
                            ({"skills": [dict(good, extra=1)]}, "exactly"),
                            ({"skills": {"s": good}}, "must be a list"),
-                           ({"plugins": [badname]}, "plugin 'pl'")):
+                           ({"command_sets": [badname]}, "command set 'pl'")):
             with self.assertRaises(G.HoplonError) as e:
                 self.parse(**extra)
             self.assertIn(why, str(e.exception), extra)

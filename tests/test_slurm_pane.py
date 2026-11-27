@@ -1,6 +1,6 @@
-"""Tests for the Slurm console (plugins/slurm/slurm.py): parsing what the plugin's commands print, what is drawn, and
+"""Tests for the Slurm console (commands/slurm/slurm.py): parsing what the command set's commands print, what is drawn, and
 what the pane asks the conversation pane for. The commands' output here is what sinfo and squeue print with the
-formats in plugins/slurm/plugin.json."""
+formats in commands/slurm/commands.json."""
 
 import curses
 import json
@@ -12,7 +12,7 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(REPO, "tui"))
-sys.path.insert(0, os.path.join(REPO, "plugins", "slurm"))
+sys.path.insert(0, os.path.join(REPO, "commands", "slurm"))
 import slurm  # noqa: E402
 
 NODES = """c001|batch*|idle|0/32/0/32|192000|none
@@ -117,14 +117,14 @@ class TestConsole(unittest.TestCase):
         self.c.refresh()
         self.answer("nodes", "", exit=None, error="the program changed since hoplon started; restart hoplon")
         self.assertIn("nodes: the program changed", shown(slurm.view(self.c.st, 120, None, "")[0]))
-        self.c.handle({"type": "refused", "why": "this plugin is not on"})
-        self.assertEqual(self.c.msg, "this plugin is not on")
+        self.c.handle({"type": "refused", "why": "this command set is not on"})
+        self.assertEqual(self.c.msg, "this command set is not on")
         self.c.handle({"type": "ran", "id": "unknown", "output": "x"})       # not ours: ignored
 
 
 class TestManifest(unittest.TestCase):
-    def test_the_pane_is_in_the_plugin(self):
-        with open(os.path.join(REPO, "plugins", "slurm", "plugin.json")) as f:
+    def test_the_pane_is_in_the_command_set(self):
+        with open(os.path.join(REPO, "commands", "slurm", "commands.json")) as f:
             data = json.load(f)
         self.assertEqual(data["pane"], "slurm.py")
         for name in ("nodes", "partitions", "queue", "node", "job"):

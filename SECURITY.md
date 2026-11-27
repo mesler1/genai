@@ -105,7 +105,7 @@ much permission and too much autonomy.
 
 - **Functionality.** Six tools: propose a command, read a file, list a directory, write a
   file, edit a file, propose a plan. No delete, no fetch, no execute on your system. A seventh,
-  `run_in_sandbox`, exists only in coding mode with a profile's sandbox (section 5). Plugins you bless and enable add their trusted commands as tools (below).
+  `run_in_sandbox`, exists only in coding mode with a profile's sandbox (section 5). Command sets you bless and enable add their scoped commands as tools (below).
 - **Permission.** File tools take relative paths only. `..`, absolute paths and `~` are
   rejected, and each path is walked one component at a time with `O_NOFOLLOW`, so a symlink
   anywhere in it is refused. Reads refuse FIFOs, devices and binary files. New files are
@@ -121,9 +121,9 @@ much permission and too much autonomy.
   Reads are capped at 256 KiB, writes at 1 MiB, overwrite snapshots at 8 MiB, and directory scans at 500 entries plus a truncation check. Without a terminal and
   outside JSON mode, nothing is performed at all.
 
-#### Trusted commands (plugins)
+#### Scoped commands (command sets)
 
-A plugin is blessed as a directory, like a skill: its hash covers every file, and a changed plugin is refused
+A command set is blessed as a directory, like a skill: its hash covers every file, and a changed command set is refused
 until you bless it again. What you bless is a list of commands, each a fixed argument list with named inputs
 and the rules for each input (a regular expression matched against the whole value, a list, or a number
 range). Together they are the whole of what the model and the user's panes can run.
@@ -131,34 +131,34 @@ range). Together they are the whole of what the model and the user's panes can r
 - **No shell.** The program is started directly with an argument list. A value fills one argument and is
   never split, expanded or re-read, so `;`, `$(...)` and quotes in a value are only characters. Values that
   break the rules (or are over 256 characters, or have a NUL or a newline) are refused, never cleaned.
-- **Fixed programs.** The program is found only in the plugin's `search` directories (or by an absolute path),
+- **Fixed programs.** The program is found only in the command set's `search` directories (or by an absolute path),
   never through your `PATH`. It must be a regular executable file that neither group nor others can write, as
   must its directory, owned by you or root. hoplon records the file it found and refuses to run it if it was
   replaced afterwards.
 - **Minimal environment.** The program gets `PATH` (the search directories), `LANG`, `HOME`, `USER`, `LOGNAME`
-  and the variables the plugin lists; `PATH` and `LD_*` can't be listed. Standard input is empty.
+  and the variables the command set lists; `PATH` and `LD_*` can't be listed. Standard input is empty.
 - **Limits.** A time limit (at most 120 s), an output cap (at most 1 MiB, then the program is killed), its own
   process group (killed whole), at least `min_interval` seconds between real runs of one command, a cache so a
-  repeated question is answered from the last result, and 30 real runs a minute across all plugins.
-- **Auto-run versus asking.** Only commands the plugin marks `read_only` run without asking, and the blessing
+  repeated question is answered from the last result, and 30 real runs a minute across all command sets.
+- **Auto-run versus asking.** Only commands the command set marks `read_only` run without asking, and the blessing
   screen lists them separately; they work only where someone can see what runs (not in plain, non-interactive
   mode), like automatic reads. Every other command asks, in the normal approval flow, each time.
-- **Audit.** Each run (or refusal) is logged as `trusted_run`: plugin, command, the validated values, who asked
+- **Audit.** Each run (or refusal) is logged as `trusted_run`: command set, command, the validated values, who asked
   (`model` or `user`), exit code, time, bytes, whether it was cached or rate limited, and the program's path.
   Output is masked for the endpoint key and secret patterns, cut, and escaped wherever it is shown.
 - **No options.** No parameter value may start with `-`, whatever its pattern says, so the model can't pass the program an option
   (another cluster, an output file, a format). A pattern, enum value or number range that would allow one is
-  refused when the plugin loads.
+  refused when the command set loads.
 
 What remains: a read-only command's output goes to the endpoint like any file the model reads, and cluster
 data can be sensitive (other users' names, job names, node names, paths in job details). Read the commands
-before you bless them: a broad pattern still lets the model choose freely within it. Plugins are not available
+before you bless them: a broad pattern still lets the model choose freely within it. Command sets are not available
 through `--config-stdin` yet.
 
-A plugin's pane (hoplon-tui) is third-party code too, blessed with the plugin's directory and run as you. It runs
+A command set's pane (hoplon-tui) is third-party code too, blessed with the command set's directory and run as you. It runs
 out of process, in a tmux pane of its own: never inside the conversation pane, which holds the answers to hoplon
-(and, in remote mode, the ssh control socket and the key proxy's token). Its socket role, `plugin:NAME`, may only
-run its own plugin's read-only commands through hoplon (with hoplon's checks, cache and rate limits), put text in
+(and, in remote mode, the ssh control socket and the key proxy's token). Its socket role, `commands:NAME`, may only
+run its own command set's read-only commands through hoplon (with hoplon's checks, cache and rate limits), put text in
 the input box, where you see it before anything is sent, and offer text that opens in your editor before it can
 go with a message. It can't answer a question, approve anything, or run a command that would ask. As for every
 pane, the boundary is your user account: another program running as you could connect in that role, as it could
@@ -505,13 +505,13 @@ The config is trusted because it arrived over the user's own ssh channel: hoplon
 files before sending, and hoplon blesses nothing on the remote host for it. It logs a `remote_config` event with
 the hashes of what it received, never the token.
 
-Skills and plugins follow the same rule. The ones in use go in the config line with every file of their
+Skills and command sets follow the same rule. The ones in use go in the config line with every file of their
 directories, and only if they are blessed on the user's machine. hoplon on the host hashes those bytes again and
-refuses the whole config if a hash differs from the one blessed there. It builds the skill or plugin from those
+refuses the whole config if a hash differs from the one blessed there. It builds the skill or command set from those
 bytes in memory and never reads or writes this host's copies. Nothing blessed only on the remote host can be
-turned on, so whoever controls that host's `~/.config/hoplon` can't add a skill to the prompt or a trusted command
-to the model's tools. A plugin's programs are looked for on the host, with the usual checks (its fixed search
-path, never `PATH`; owned by the user or root, not writable by others), so the Slurm plugin's commands run on the
+turned on, so whoever controls that host's `~/.config/hoplon` can't add a skill to the prompt or a scoped command
+to the model's tools. A command set's programs are looked for on the host, with the usual checks (its fixed search
+path, never `PATH`; owned by the user or root, not writable by others), so the Slurm command set's commands run on the
 cluster. The program that runs is whatever is installed there, and a command whose program is missing there is
 left out. Root on the remote host can use the session's token while the
 tunnel is up, and can read that session's prompts, replies and files, which are on that host anyway. It cannot
@@ -520,7 +520,7 @@ works for the user hoplon runs as. As root, the REPL banner warns that proposed 
 
 How hoplon-tui sets it up (`hoplon-tui --remote`), and what each part is for:
 
-- The launcher runs `hoplon --remote-config` here: the endpoint, profile, skills and plugins are checked and blessed on your machine,
+- The launcher runs `hoplon --remote-config` here: the endpoint, profile, skills and command sets are checked and blessed on your machine,
   and exported without `key_env`, `key_file`, `proxy`, `headers` or `ca_bundle`, so neither the key nor a secret in a
   header goes over the connection. Only the remote half of the config lacks them: `tui/keyproxy.py`, here, uses the
   endpoint's own proxy and headers.

@@ -77,7 +77,7 @@ q() { printf '%q' "$1"; }
 
 # Remote mode. Everything that can ask you something (ssh's password or second factor) happens here, in your own
 # terminal, before tmux starts. What is set up, and why it keeps the API key on this machine (SECURITY.md):
-#   1. hoplon --remote-config: your endpoint and profile, and the skills and plugins in use, checked and blessed
+#   1. hoplon --remote-config: your endpoint and profile, and the skills and command sets in use, checked and blessed
 #      here, without any key.
 #   2. an ssh master connection, whose control socket lives in the private state directory.
 #   3. tui/keyproxy.py on a Unix socket there: it adds the key to requests that carry this session's token.
@@ -96,7 +96,7 @@ if [ -n "$remote" ]; then
   trap 'exit 130' INT TERM HUP
   sudo_as=
   [ -z "$r_as" ] || sudo_as="sudo -n -H -u $(q "$r_as") -- "
-  echo "hoplon-tui: checking your endpoint, profile, skills and plugins (hoplon --remote-config)" >&2
+  echo "hoplon-tui: checking your endpoint, profile, skills and command sets (hoplon --remote-config)" >&2
   gcmd=("$py" "$here/../hoplon")
   [ -z "${HOPLON_BIN:-}" ] || gcmd=("$HOPLON_BIN")
   gargs=(--remote-config)

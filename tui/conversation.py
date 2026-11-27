@@ -52,10 +52,10 @@ COMMANDS = {
     "/run": "[ID]: review and run a proposed command in the shell pane (the latest by default)",
     "/share": "[N|mark|all]: send shell output, reviewed first or as it is: the last command, command N, from the "
               "mark, or all",
-    "/commands": "list the commands run in the shell pane, numbered for /share N (also in the info panel)",
+    "/history": "list the commands run in the shell pane, numbered for /share N (also in the info panel)",
     "/mark": "shell context starts at the shell's current prompt (or right-click a line in the shell)",
     "/shell": "show the shell and move there (Ctrl-` hides it again)",
-    "/panel": "show or hide the right column (the info panel and any plugin panes, as tabs)",
+    "/panel": "show or hide the right column (the info panel and any command set panes, as tabs)",
     "/tab": "[NAME]: the next tab in the right column, or the one named",
     "/plan": "[clear]: show the approved plan, or drop it so everything asks again",
     "/stop": "stop the sandboxed run going on now, or hoplon's turn (Ctrl-C on an empty input does the same)",
@@ -480,7 +480,7 @@ class Card(Block):
                 "skills": "switch on skills: " + ", ".join(row(n) for n in (ev.get("names") or [])[:5]
                                                            if isinstance(ev.get("names"), list)),
                 "sandbox": f"sandbox · {'ONLINE' if ev.get('network') else 'offline'}",
-                "trusted": f"{row(ev.get('plugin', '?'))} · {row(ev.get('command', '?'))}"
+                "trusted": f"{row(ev.get('set', '?'))} · {row(ev.get('command', '?'))}"
                            + (" · read-only" if ev.get("read_only") else ""),
                 "plan": f"plan · {count(ev.get('steps'))} steps",
                 "work_plan": f"work plan · {count(ev.get('items'))} items",
@@ -524,7 +524,7 @@ class Card(Block):
         if k in ("command", "sandbox"):
             for i, ln in enumerate(command_text(ev.get("command", "")).split("\n")):
                 out.append((("$ " if i == 0 else "  ") + ln, ""))
-        elif k == "trusted":                             # a plugin's trusted command: what runs, as hoplon shows it
+        elif k == "trusted":                             # a command set's scoped command: what runs, as hoplon shows it
             out.append(("$ " + command_text(str(ev.get("argv", ""))).replace("\n", " "), ""))
         if k in RUNS and self.state == "running":
             self.shown_secs = self.elapsed()
@@ -1078,7 +1078,7 @@ class Model:
             feature.command(self, cmd, arg)
         elif cmd == "/compact":
             self.send({"type": "compact"})
-        elif cmd in ("/run", "/share", "/shell", "/mark", "/commands") and not self.shell:
+        elif cmd in ("/run", "/share", "/shell", "/mark", "/history") and not self.shell:
             self.note(f"{cmd} needs the shell pane: start hoplon with hoplon-tui", R)
         elif cmd == "/run":
             cards = [c for c in self.cards.values() if c.ev.get("kind") == "command"]
@@ -1094,7 +1094,7 @@ class Model:
                 self.note("usage: /share, /share N, /share mark or /share all", R)
             else:
                 self.actions.append(("share", arg or "last"))
-        elif cmd == "/commands":
+        elif cmd == "/history":
             self.actions.append(("commands",))
         elif cmd == "/mark":
             self.actions.append(("mark",))
@@ -1781,7 +1781,7 @@ class App:
         # the other panes connect here; a feature that is off has no requests, so the Hub refuses them
         self.hub = Hub(self.state_dir, feature_requests(on)) if self.state_dir else None
         if self.hub:
-            self.hub.plugins = any(f.name == "plugins" for f in on)
+            self.hub.command_sets = any(f.name == "commands" for f in on)
         fifo = fifo_path(self.state_dir) if self.state_dir else None
         self.rec = Recorder(fifo if fifo and os.path.exists(fifo) else None)   # each shell command and its output
         if shell:
@@ -2481,7 +2481,7 @@ class App:
         """/share, /share N, or a click in the info panel: one command from the shell pane and its output."""
         if c is None:
             self.m.note("nothing has run in the shell pane yet" if what == "last" else
-                        f"no command {what} in the shell pane (/commands lists them)", R)
+                        f"no command {what} in the shell pane (/history lists them)", R)
             return
         cmd = c.cmd if c.in_history else "(not shown: I kept it out of my shell history)"
         name = fit(clean(label(c)), 40)
@@ -2690,8 +2690,8 @@ class App:
                 self.from_prompt(msg)
             elif role in ("panel", "files", "pipe"):        # the Hub let through only what the role may send
                 self.m.request(msg, role)
-            elif role.startswith("plugin:") and self.m.feature("plugins"):
-                self.m.feature("plugins").request(self.m, role, msg)
+            elif role.startswith("commands:") and self.m.feature("commands"):
+                self.m.feature("commands").request(self.m, role, msg)
             elif role == "menu" and (msg.get("type") in ("share", "mark", "tabs", "tab") or self.m.takes(role, msg.get("type"))):
                 self.m.request(msg, role)
             elif role == "menu" and msg.get("type") == "menu" and msg.get("action") == "open":

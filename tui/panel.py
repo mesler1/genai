@@ -150,11 +150,11 @@ def view(st, w, sel):
              (" " + ("" if blessed else s.get("status", "")), R if s.get("status") == "changed" else Q)], i)
         if i == sel and not blessed:
             add([(fit(f"  bless: hoplon --bless {clean(s.get('path', ''))}", w), Q)], i)
-    plugins = st.get("plugins") or []
-    if plugins:
-        head("PLUGINS")
-        for pl in plugins[:8]:
-            add([(fit(clean(pl.get("name", "?")) + (" · /plugins %s pane" % clean(pl.get("name", "?"))
+    sets = st.get("command_sets") or []
+    if sets:
+        head("COMMANDS")
+        for pl in sets[:8]:
+            add([(fit(clean(pl.get("name", "?")) + (" · /commands %s pane" % clean(pl.get("name", "?"))
                                                     if pl.get("pane") else ""), w), D)])
             add([(fit("  " + ", ".join(clean(c) for c in pl.get("commands") or []), w), Q)])
     head("COMMANDS")

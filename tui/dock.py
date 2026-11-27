@@ -1,4 +1,4 @@
-"""The right column's tabs: the info panel and any plugin panes take turns in one spot.
+"""The right column's tabs: the info panel and any command set panes take turns in one spot.
 
 Only the active tab's pane is on screen; the others are parked in windows of their own, where they keep
 running and keep their scrollback. Switching swaps the chosen pane into the active one's place. With more
@@ -9,7 +9,7 @@ import re
 
 import palette
 
-NAME = re.compile(r"[a-z][a-z0-9-]{0,30}")    # "info", or a plugin's name: shown in tmux formats, so checked
+NAME = re.compile(r"[a-z][a-z0-9-]{0,30}")    # "info", or a command set's name: shown in tmux formats, so checked
 
 
 class Dock:
@@ -33,7 +33,7 @@ class Dock:
         return self.tmux("display", "-p", "-t", pane, "#{pane_id}").strip() == pane
 
     def prune(self):
-        """Forget tabs whose pane has gone (a plugin's pane program ended)."""
+        """Forget tabs whose pane has gone (a command set's pane program ended)."""
         self.tabs = [t for t in self.tabs if self.alive(t[1])]
         if self.active not in self.names():
             self.active = self.tabs[0][0] if self.tabs else None

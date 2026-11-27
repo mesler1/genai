@@ -72,7 +72,7 @@ def write(state, dest, as_user, directory, port, python, token, ssh_opts):
     endpoint["base_url"] = f"http://127.0.0.1:{int(port)}{export['base_path']}"
     info = {"dest": dest, "as": as_user, "dir": directory, "port": int(port), "python": python,
             "config": {"type": "config", "endpoint": endpoint, "profile": export["profile"], "token": token,
-                       "skills": export.get("skills", []), "plugins": export.get("plugins", [])},
+                       "skills": export.get("skills", []), "command_sets": export.get("command_sets", [])},
             "ssh": ["ssh", "-S", os.path.join(state, "cm"), *ssh_opts, dest]}
     path = os.path.join(state, "remote.json")
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)

@@ -50,7 +50,7 @@ model, default skills, sampling settings and coding mode:
 | --- | --- |
 | Attach files | `hoplon -p NAME -f app.log -f app.conf "why is it crashing?"` |
 | Skills | `hoplon -p NAME -k slurm` (skills must be blessed) |
-| Plugins (trusted commands) | `hoplon -p NAME --plugin slurm` (plugins must be blessed; [Plugins and trusted commands](plugins.md)) |
+| Command sets (scoped commands) | `hoplon -p NAME --commands slurm` (command sets must be blessed; [Command sets and scoped commands](commands.md)) |
 | Sessions | `hoplon -p NAME -S nightly "summarize" > out.txt` |
 | Coding mode | `hoplon -e NAME --coding` (reads stop asking, except files that look like secrets; writes still ask; the model can also search the files) |
 | Coding mode where it is refused | `hoplon -e NAME --coding-anywhere` (prints what that exposes) |
@@ -58,7 +58,7 @@ model, default skills, sampling settings and coding mode:
 | Start over, keeping the session | `:clear` in the REPL, `/clear` in hoplon-tui (the model forgets the conversation; the saved session keeps it) |
 | See exactly what was sent | `:raw [N\|all]` and `:system` in the REPL, `/raw` and `/system` in hoplon-tui (in `$PAGER`, default `less`; your API key is never shown) |
 | Wrappers | `hoplon -p NAME --json` (JSON Lines over stdio) |
-| Lists | `hoplon --list-endpoints`, `--list-profiles`, `--list-skills`, `--list-plugins`, `--list-sessions` (each with `--json`) |
+| Lists | `hoplon --list-endpoints`, `--list-profiles`, `--list-skills`, `--list-commands`, `--list-sessions` (each with `--json`) |
 | What is left over | `hoplon --leftovers` (with `--json`), `:leftovers` in the REPL, `/leftovers` in hoplon-tui: see [Leftovers](sandbox.md#leftovers); `hoplon --clean-stale` removes the stale ones after asking |
 
 Exit codes: 0 ok, 1 error, 2 usage, 3 endpoint or profile (none, unblessed, changed, key missing),

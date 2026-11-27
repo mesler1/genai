@@ -3,7 +3,7 @@
 ## Settings
 
 On first run hoplon creates `~/.config/hoplon` (or `$XDG_CONFIG_HOME/hoplon`), mode 0700, with
-`endpoints/`, `profiles/`, `skills/`, `plugins/`, `sessions/` and a `config.json` that lists every setting at its
+`endpoints/`, `profiles/`, `skills/`, `commands/`, `sessions/` and a `config.json` that lists every setting at its
 default. It says so once on stderr and never changes what is already there.
 
 | Setting | Default | Meaning |
@@ -11,11 +11,11 @@ default. It says so once on stderr and never changes what is already there.
 | `default_profile` | `null` | Profile used when `-p` is not given. |
 | `default_endpoint` | `null` | Endpoint used when neither `-e` nor the profile names one. |
 | `default_skills` | `[]` | Skills used when the profile doesn't list its own. |
-| `default_plugins` | `[]` | Plugins used when the profile doesn't list its own (`--plugin` adds more). |
+| `default_commands` | `[]` | Command sets used when the profile doesn't list its own (`--commands` adds more). |
 | `endpoint_dirs` | `[]` | Extra directories searched for endpoints, after `~/.config/hoplon/endpoints/`. |
 | `profile_dirs` | `[]` | Extra directories searched for profiles, after `~/.config/hoplon/profiles/`. |
 | `skill_dirs` | `[]` | Extra directories searched for skills, after `~/.config/hoplon/skills/`. |
-| `plugin_dirs` | `[]` | Extra directories searched for plugins, after `~/.config/hoplon/plugins/`. |
+| `command_dirs` | `[]` | Extra directories searched for command sets, after `~/.config/hoplon/commands/`. |
 | `max_steps` | `50` | Model steps in a row that run without you deciding anything (automatic reads, searches, offline sandboxed runs) before the turn pauses; send a message to go on. A step where you approve or decline something starts the count again, so a turn you steer has no limit. 1 to 1000. |
 | `alerts` | `true` | `false` keeps the notify hook quiet ([Hooks](hooks.md)); `:alerts on` or `off` switches it for a session. hoplon-tui's bell is set in `tui.json` (`/alerts`). |
 | `fixtures_dir` | `null` | Where `/fixtures` keeps real samples for sandboxed runs; `null` means `~/.local/state/hoplon/fixtures` (`$XDG_STATE_HOME/hoplon/fixtures`). It must be outside every project and must not be or hold your home directory. See [Sandbox](sandbox.md). |
@@ -85,7 +85,7 @@ skills/rust/                Rust: house rules and gotchas
 skills/security-review/     a checklist the model applies to its own proposals
 skills/hpc/                 a shared cluster: login nodes, modules, file systems (any scheduler)
 skills/slurm/               generic Slurm: srun/sbatch, batch scripts, job arrays, failed jobs
-plugins/slurm/             trusted read-only Slurm commands: sinfo, squeue, scontrol show, sacct
+commands/slurm/             scoped read-only Slurm commands: sinfo, squeue, scontrol show, sacct
 sandbox/run                podman sandbox for running hoplon and its tests, on this machine's OS
 sandbox/hooks/modules.sh   sandbox hook: makes loaded environment modules work inside the sandbox
 hooks/notify-desktop       example notify hook: a desktop notification when hoplon waits for you

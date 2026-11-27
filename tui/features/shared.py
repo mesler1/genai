@@ -1,4 +1,4 @@
-"""/shared: what you sent from the shell pane with hoplon-share (and /share context, and plugin text you attached),
+"""/shared: what you sent from the shell pane with hoplon-share (and /share context, and command set text you attached),
 waiting to go with your next message. Nothing here starts a turn: share several, then ask about them all.
 /shared lists them, /shared drop N takes one back, /shared clear takes them all back."""
 
