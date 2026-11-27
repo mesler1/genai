@@ -480,8 +480,8 @@ class TestModel(unittest.TestCase):
         m = C.Model()
         self.hello(m)
         m.submit("nodes?")
-        m.handle({"type": "proposal", "id": "p1", "kind": "trusted", "auto": True, "plugin": "slurm",
-                  "command": "down_nodes", "read_only": True, "argv": "sinfo -R -h", "reason": "down nodes"})
+        m.handle({"type": "proposal", "id": "p1", "kind": "trusted", "auto": True, "set": "slurm",
+                  "command": "down_nodes", "access": "read", "argv": "sinfo -R -h", "reason": "down nodes"})
         card = m.cards["p1"]
         self.assertEqual(card.state, "running")
         m.handle({"type": "result", "id": "p1", "status": "ok", "output": "cn042|down*\x1b[2J", "exit": 0})
@@ -644,7 +644,7 @@ class TestModel(unittest.TestCase):
     def test_share_and_mark_commands(self):
         m = C.Model()
         m.shell = True
-        for line in ("/share", "/share mark", "/share all", "/mark", "/share 12", "/share #3", "/commands",
+        for line in ("/share", "/share mark", "/share all", "/mark", "/share 12", "/share #3", "/history",
                      "/share bogus"):
             m.submit(line)
         self.assertEqual(m.actions, [("share", "last"), ("share", "mark"), ("share", "all"), ("mark",),
@@ -826,7 +826,7 @@ class TestSandboxStatus(unittest.TestCase):
         for pid, ev, want in (("p1", {"kind": "edit", "path": "a.py"}, "⊡→▲ your files · edit a.py"),
                               ("p2", {"kind": "edit", "path": "a.py", "work": True}, "⊡ the copy · edit a.py"),
                               ("p3", {"kind": "command", "command": "ls"}, "⊡→▲ your shell · command"),
-                              ("p4", {"kind": "trusted", "plugin": "slurm", "command": "jobs"}, "▲ runs live · slurm"),
+                              ("p4", {"kind": "trusted", "set": "slurm", "command": "jobs"}, "▲ runs live · slurm"),
                               ("p5", {"kind": "read", "path": "a.py"}, "─ p5 · read a.py"),
                               ("p6", {"kind": "write", "path": "b.py", "in_copy": True}, "⊡ the copy · create b.py")):
             m.handle(dict(ev, type="proposal", id=pid, reason="r"))
@@ -1221,19 +1221,19 @@ class TestWorkFeature(unittest.TestCase):
         self.assertEqual(sent, [{"type": "stop"}, {"type": "stop"}, {"type": "quit"}])
 
 
-class TestPluginsFeature(unittest.TestCase):
+class TestCommandsFeature(unittest.TestCase):
     ROWS = [{"name": "slurm", "description": "cluster", "enabled": True, "blessed": True, "status": "blessed",
-             "pane": "slurm.py", "dir": "/opt/hoplon/plugins/slurm",
-             "commands": [{"name": "queue", "describe": "the queue", "read_only": True, "params": {}},
-                          {"name": "cancel", "describe": "cancel a job", "read_only": False, "params": {}}]},
+             "pane": "slurm.py", "dir": "/opt/hoplon/commands/slurm",
+             "commands": [{"name": "queue", "describe": "the queue", "access": "read", "params": {}},
+                          {"name": "cancel", "describe": "cancel a job", "access": "write", "params": {}}]},
             {"name": "off", "description": "not on", "enabled": False, "blessed": True, "pane": None, "dir": "/x",
-             "commands": [{"name": "x", "read_only": True}]}]
+             "commands": [{"name": "x", "access": "read"}]}]
 
     def model(self, remote=False):
         m = C.Model()
         m.handle({"type": "hello", "version": "1", "endpoint": {"name": "e", "model": "m", "base_url": "u"},
-                  "sandbox": None, "features": ["plugins"], "remote": remote})
-        m.handle({"type": "plugins", "plugins": self.ROWS})
+                  "sandbox": None, "features": ["command_sets"], "remote": remote})
+        m.handle({"type": "command_sets", "command_sets": self.ROWS})
         m.outbox.clear()
         return m
 
@@ -1242,64 +1242,64 @@ class TestPluginsFeature(unittest.TestCase):
 
     def test_list_switch_and_pane(self):
         m = self.model()
-        m.submit("/plugins")
-        self.assertIn("[on ] slurm: cluster · pane: /plugins slurm pane", self.notes(m))
+        m.submit("/commands")
+        self.assertIn("[on ] slurm: cluster · pane: /commands slurm pane", self.notes(m))
         self.assertIn("[off] off: not on", self.notes(m))
-        m.submit("/plugins off on")
-        self.assertEqual(m.outbox[-1], {"type": "plugin", "name": "off", "on": True})
-        m.submit("/plugins slurm pane")
-        self.assertEqual(m.actions[-1], ("plugin_pane", "slurm", "/opt/hoplon/plugins/slurm/slurm.py"))
-        m.submit("/plugins off pane")
+        m.submit("/commands off on")
+        self.assertEqual(m.outbox[-1], {"type": "command_set", "name": "off", "on": True})
+        m.submit("/commands slurm pane")
+        self.assertEqual(m.actions[-1], ("set_pane", "slurm", "/opt/hoplon/commands/slurm/slurm.py"))
+        m.submit("/commands off pane")
         self.assertIn("switch it on first", self.notes(m, 1))
-        m.submit("/plugins nope on")
-        self.assertIn("no plugin named nope", self.notes(m, 1))
+        m.submit("/commands nope on")
+        self.assertIn("no command set named nope", self.notes(m, 1))
         m = self.model(remote=True)
-        m.submit("/plugins slurm pane")
+        m.submit("/commands slurm pane")
         self.assertIn("don't run in remote mode yet", self.notes(m, 1))
 
     def test_a_pane_runs_its_own_read_only_commands_and_hears_the_answer(self):
         m = self.model()
-        f = m.feature("plugins")
-        f.request(m, "plugin:slurm", {"type": "run", "id": "s1", "command": "queue", "params": {}})
-        self.assertEqual(m.outbox[-1], {"type": "run", "id": "pl1", "plugin": "slurm", "command": "queue",
+        f = m.feature("commands")
+        f.request(m, "commands:slurm", {"type": "run", "id": "s1", "command": "queue", "params": {}})
+        self.assertEqual(m.outbox[-1], {"type": "run", "id": "cs1", "set": "slurm", "command": "queue",
                                         "params": {}})
-        m.handle({"type": "ran", "id": "pl1", "exit": 0, "output": "1|a\n"})
-        self.assertEqual(m.panes[-1], ("plugin:slurm", {"type": "ran", "id": "s1", "exit": 0, "output": "1|a\n"}))
-        m.handle({"type": "ran", "id": "pl1", "exit": 0, "output": "again"})       # answered once only
+        m.handle({"type": "ran", "id": "cs1", "exit": 0, "output": "1|a\n"})
+        self.assertEqual(m.panes[-1], ("commands:slurm", {"type": "ran", "id": "s1", "exit": 0, "output": "1|a\n"}))
+        m.handle({"type": "ran", "id": "cs1", "exit": 0, "output": "again"})       # answered once only
         self.assertEqual(len(m.panes), 1)
         m.panes.clear()
-        for role, msg, why in (("plugin:slurm", {"type": "run", "id": 2, "command": "cancel"}, "only read-only"),
-                               ("plugin:slurm", {"type": "run", "id": 3, "command": "x"}, "no such command"),
-                               ("plugin:slurm", {"type": "run", "id": 4, "command": "queue", "params": {"a": 1}},
+        for role, msg, why in (("commands:slurm", {"type": "run", "id": 2, "command": "cancel"}, "only read-only"),
+                               ("commands:slurm", {"type": "run", "id": 3, "command": "x"}, "no such command"),
+                               ("commands:slurm", {"type": "run", "id": 4, "command": "queue", "params": {"a": 1}},
                                 "no such command")):
             f.request(m, role, msg)
             self.assertIn(why, m.panes[-1][1]["error"])
-        f.request(m, "plugin:off", {"type": "run", "id": 5, "command": "x"})
-        self.assertEqual(m.panes[-1], ("plugin:off", {"type": "refused", "why": "this plugin is not on"}))
+        f.request(m, "commands:off", {"type": "run", "id": 5, "command": "x"})
+        self.assertEqual(m.panes[-1], ("commands:off", {"type": "refused", "why": "this command set is not on"}))
         self.assertEqual(len([o for o in m.outbox if o["type"] == "run"]), 1)
 
     def test_insert_and_attach(self):
         m = self.model()
-        f = m.feature("plugins")
-        f.request(m, "plugin:slurm", {"type": "insert", "text": "12345\x1b[2J"})
+        f = m.feature("commands")
+        f.request(m, "commands:slurm", {"type": "insert", "text": "12345\x1b[2J"})
         self.assertEqual(m.panes[-1], ("prompt", {"type": "insert", "text": C.clean("12345\x1b[2J")}))
-        f.request(m, "plugin:slurm", {"type": "attach", "label": "job 7", "text": "JobId=7"})
-        self.assertEqual(m.actions[-1], ("plugin_attach", "slurm", "job 7", "JobId=7"))
-        f.request(m, "plugin:slurm", {"type": "attach", "text": "x" * 70000})
+        f.request(m, "commands:slurm", {"type": "attach", "label": "job 7", "text": "JobId=7"})
+        self.assertEqual(m.actions[-1], ("set_attach", "slurm", "job 7", "JobId=7"))
+        f.request(m, "commands:slurm", {"type": "attach", "text": "x" * 70000})
         self.assertEqual(len(m.actions), 1)
 
     def test_help_and_panel_list_the_tools(self):
         m = self.model()
         m.submit("/help")
         text = "\n".join(text_of(b, 200) for b in m.blocks)
-        self.assertIn("slurm: queue (read-only) the queue", text)
-        self.assertIn("slurm: cancel (asks) cancel a job", text)
+        self.assertIn("slurm: queue (read) the queue", text)
+        self.assertIn("slurm: cancel (write, asks) cancel a job", text)
         self.assertNotIn("off: x", text)
         PANEL = load("panel", os.path.join(REPO, "tui", "panel.py"))
         lines, _ = PANEL.view(m.snapshot(), 50, None)
         shown = "\n".join("".join(t for t, _ in ln) for ln in lines)
-        self.assertIn("PLUGINS", shown)
-        self.assertIn("slurm · /plugins slurm pane", shown)
+        self.assertIn("COMMANDS", shown)
+        self.assertIn("slurm · /commands slurm pane", shown)
         self.assertIn("  queue, cancel", shown)
 
 
@@ -1592,6 +1592,19 @@ class TestSamplesAndLeftovers(unittest.TestCase):
         self.assertIn("▲→⊡", body)
         self.assertIn("/fixtures add", body)
 
+    def test_a_skill_suggestion_asks_like_any_proposal(self):
+        m = self.model()
+        m.submit("plan a job")
+        m.handle({"type": "proposal", "id": "p1", "kind": "skills", "names": ["slurm", "c\x1b[2Jsh"],
+                  "about": ["Generic Slurm", "C shell\nrules"], "reason": "a batch job", "digest": "d"})
+        card = m.cards["p1"]
+        self.assertEqual(m.pending, [card])
+        self.assertIn("switch on skills: slurm, c\\x1b[2Jsh", card.title())
+        body = text_of(card)
+        self.assertIn("slurm: Generic Slurm", body)
+        self.assertIn("Only you switch skills on or off", body)
+        self.assertNotIn("\x1b", body)
+
     def test_leftovers_clean_asks_then_sends_the_listed_ids(self):
         m = self.model()
         m.submit("/leftovers clean")
@@ -1816,17 +1829,17 @@ class TestFeatures(unittest.TestCase):
 
     def test_all_built_in_features_load(self):
         on = F.load(core=C.CORE)
-        self.assertEqual([f.name for f in on], ["model", "copy", "decline", "raw", "ssh", "files", "sandbox", "edits", "plugins", "work", "fixtures", "leftovers", "alerts", "shared"])
+        self.assertEqual([f.name for f in on], ["model", "copy", "decline", "raw", "ssh", "files", "sandbox", "edits", "commands", "work", "fixtures", "leftovers", "alerts", "shared"])
         m = C.Model()
         self.assertEqual([f.name for f in m.features], [f.name for f in on])
-        self.assertEqual(list(m.commands())[-14:], ["/model", "/copy", "/decline", "/raw", "/system", "/files", "/sandbox", "/edits", "/plugins", "/work", "/fixtures", "/leftovers", "/alerts", "/shared"])
+        self.assertEqual(list(m.commands())[-14:], ["/model", "/copy", "/decline", "/raw", "/system", "/files", "/sandbox", "/edits", "/commands", "/work", "/fixtures", "/leftovers", "/alerts", "/shared"])
         self.assertEqual(C.feature_requests(on), {"menu": {"model", "models", "copy", "raw", "system"},
                           "files": {"list", "view", "attach", "insert"}, "pipe": {"piped"}})
 
     def test_environment_disables_a_feature(self):
         m, warning = self.model(self.environ(HOPLON_TUI_DISABLE="copy, model"))
         self.assertIsNone(warning)
-        self.assertEqual([f.name for f in m.features], ["decline", "raw", "ssh", "files", "sandbox", "edits", "plugins", "work", "fixtures", "leftovers", "alerts", "shared"])
+        self.assertEqual([f.name for f in m.features], ["decline", "raw", "ssh", "files", "sandbox", "edits", "commands", "work", "fixtures", "leftovers", "alerts", "shared"])
         m.submit("/copy")
         self.assertIn("unknown command /copy (/help lists them)", text_of(m.blocks[-1]))
         m.submit("/help")
@@ -1842,7 +1855,7 @@ class TestFeatures(unittest.TestCase):
         self.write_config('{"disable": ["decline", "raw"]}')
         m, warning = self.model(self.environ())
         self.assertIsNone(warning)
-        self.assertEqual([f.name for f in m.features], ["model", "copy", "ssh", "files", "sandbox", "edits", "plugins", "work", "fixtures", "leftovers", "alerts", "shared"])
+        self.assertEqual([f.name for f in m.features], ["model", "copy", "ssh", "files", "sandbox", "edits", "commands", "work", "fixtures", "leftovers", "alerts", "shared"])
         m.submit("/decline")
         self.assertIn("unknown command /decline", text_of(m.blocks[-1]))
 
@@ -2082,18 +2095,18 @@ class TestSocket(unittest.TestCase):
         self.assertEqual(self.received(2), [("hello", "panel"), ("panel", {"type": "coding", "on": True})])
         self.assertEqual(self.received(1, timeout=0.3), [])
 
-    def test_a_plugin_pane_may_only_run_insert_and_attach(self):
-        self.hub.plugins = True
-        pane = IPC.Client(self.dir, "plugin:slurm")
+    def test_a_command_set_pane_may_only_run_insert_and_attach(self):
+        self.hub.command_sets = True
+        pane = IPC.Client(self.dir, "commands:slurm")
         self.addCleanup(pane.close)
         for kind in ("input", "key", "decision", "coding", "skill", "share", "run"):
             pane.send({"type": kind})
-        self.assertEqual(self.received(2), [("hello", "plugin:slurm"), ("plugin:slurm", {"type": "run"})])
+        self.assertEqual(self.received(2), [("hello", "commands:slurm"), ("commands:slurm", {"type": "run"})])
         self.assertEqual(self.received(1, timeout=0.3), [])
 
-    def test_plugin_panes_need_the_plugins_feature(self):
-        for on, role in ((False, "plugin:slurm"), (True, "plugin:Bad"), (True, "plugin:")):
-            self.hub.plugins = on
+    def test_command_set_panes_need_the_command_sets_feature(self):
+        for on, role in ((False, "commands:slurm"), (True, "commands:Bad"), (True, "commands:")):
+            self.hub.command_sets = on
             c = IPC.Client(self.dir, role)
             self.addCleanup(c.close)
             c.send({"type": "run"})
@@ -2521,7 +2534,7 @@ class TestHoplonTui(TmuxCase):
             self.shell("echo first-out")
             self.shell("printf 'a\\nb\\n'; (exit 2)")
             self.wait_for("✗ printf", pane="info")
-            self.type("/commands")
+            self.type("/history")
             self.wait_for("/share N reviews one")
             self.assertIn("1 ✓ echo first-out", self.screen())
             self.click("echo first-out", pane="info")
@@ -2738,7 +2751,7 @@ class TestHoplonTui(TmuxCase):
             self.assertEqual([n for n in os.listdir(self.runtime_state()) if n.startswith("raw-")], [])
 
     def slurm_home(self, api):
-        """A config with the Slurm plugin on, blessed, over fake sinfo, squeue and scontrol."""
+        """A config with the Slurm command set on, blessed, over fake sinfo, squeue and scontrol."""
         home = self.config(api)
         fake = os.path.join(self.tmp, "slurm-bin")
         os.mkdir(fake, 0o755)
@@ -2749,23 +2762,23 @@ class TestHoplonTui(TmuxCase):
             with open(os.path.join(fake, prog), "w") as f:
                 f.write("#!/bin/sh\n" + body + "\n")
             os.chmod(os.path.join(fake, prog), 0o755)
-        pdir = os.path.join(home, "plugins", "slurm")
-        shutil.copytree(os.path.join(REPO, "plugins", "slurm"), pdir)
-        with open(os.path.join(pdir, "plugin.json")) as f:
+        pdir = os.path.join(home, "commands", "slurm")
+        shutil.copytree(os.path.join(REPO, "commands", "slurm"), pdir)
+        with open(os.path.join(pdir, "commands.json")) as f:
             manifest = json.load(f)
         manifest["search"] = [fake]
-        with open(os.path.join(pdir, "plugin.json"), "w") as f:
+        with open(os.path.join(pdir, "commands.json"), "w") as f:
             json.dump(manifest, f)
-        G.Config(home).set_blessed(pdir, {"kind": "plugin", "name": "slurm", "hash": G.hash_skill(pdir)[0]})
-        G.write_private(os.path.join(home, "config.json"), json.dumps(dict(G.STARTER_CONFIG, default_plugins=["slurm"])))
+        G.Config(home).set_blessed(pdir, {"kind": "command_set", "name": "slurm", "hash": G.hash_skill(pdir)[0]})
+        G.write_private(os.path.join(home, "config.json"), json.dumps(dict(G.STARTER_CONFIG, default_commands=["slurm"])))
         return home
 
-    def test_plugin_panes_are_tabs_in_the_right_column(self):
+    def test_command_set_panes_are_tabs_in_the_right_column(self):
         with FakeAPI([reply("ok")]) as api:
             self.home = self.slurm_home(api)
             self.start(api, args="-e test", keep_home=True)
             self.wait_beside("info")
-            self.type("/plugins slurm pane")
+            self.type("/commands slurm pane")
             self.wait_beside("slurm")
             self.wait_beside("info", shown=False)                      # it gave the slurm pane its place
             strip = self.tmux("show", "-pv", "-t", self.panes()["slurm"], "@hoplon_tabs")
@@ -2782,10 +2795,10 @@ class TestHoplonTui(TmuxCase):
             self.wait_beside("slurm", shown=False)
             self.type("/panel")
             self.wait_beside("slurm")                                   # back with the tab that was on screen
-            self.type("/plugins slurm pane")                            # on screen: it leaves the column
+            self.type("/commands slurm pane")                            # on screen: it leaves the column
             self.wait_beside("info")
             self.assertNotIn("@hoplon_tabs", self.tmux("show", "-p", "-t", self.panes()["info"]))
-            self.type("/plugins slurm pane")
+            self.type("/commands slurm pane")
             self.wait_beside("slurm")
             left, top = self.tmux("display", "-p", "-t", self.panes()["slurm"], "#{pane_left} #{pane_top}").split()
             x, y = int(left) + 5, int(top) + 1                          # 1-based: its top border, under the header
@@ -2800,7 +2813,7 @@ class TestHoplonTui(TmuxCase):
         with FakeAPI([reply("ok")]) as api:
             self.home = self.slurm_home(api)
             self.start(api, args="-e test --no-panel", keep_home=True)
-            self.type("/plugins slurm pane")
+            self.type("/commands slurm pane")
             end = time.time() + 15
             while time.time() < end and "slurm" not in self.panes():
                 time.sleep(0.2)

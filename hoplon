@@ -40,7 +40,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 PROTOCOL = 1
 STEP_LIMIT = 50                # model steps in a row nobody decides anything in (max_steps)
 READ_CAP = 256 * 1024          # bytes per read_file
@@ -49,6 +49,10 @@ SNAPSHOT_CAP = 8 * WRITE_CAP   # maximum existing file size for an approved over
 ATTACH_CAP = 256 * 1024        # bytes per -f file
 OUTPUT_CAP = 32 * 1024         # chars of command output before head/tail cut
 REPLY_CAP = 8 * 1024 * 1024    # bytes of one endpoint reply (and of one streamed line)
+SKILL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,47}")    # a usable skill's name; others are refused
+SKILL_NAME_RULE = "letters, digits, . _ and -, starting with a letter or digit, at most 48"
+SKILL_DESC_MAX = 160        # characters of a skill's description in the model's list
+SKILL_SUGGEST_MAX = 5       # skills in one suggestion
 PROGRESS_EVERY = 0.5        # seconds between progress reports while a reply streams
 PATH_ARG = re.compile(r'"path"\s*:\s*"((?:[^"\\]|\\.){1,240})"')
 
@@ -96,14 +100,15 @@ EXIT_OK, EXIT_ERROR, EXIT_USAGE, EXIT_PROFILE, EXIT_API, EXIT_CONTEXT = 0, 1, 2,
 EXIT_INTERRUPT = 130
 
 INTRINSICS = ("propose_command", "read_file", "list_dir", "write_file", "edit_file", "propose_plan", "run_in_sandbox",
-              "search_files", "propose_work_plan", "finish_item", "retry_item", "request_samples")
+              "search_files", "propose_work_plan", "finish_item", "retry_item", "request_samples",
+              "suggest_skills")
 PLAN_STEPS = 30                # steps one plan may have
 ENDPOINT_KEYS = {"name", "base_url", "model", "key_env", "key_file", "context_limit", "timeout",
                  "ca_bundle", "headers", "params", "allow_http", "proxy", "description"}
 REMOTE_URL = re.compile(r"http://127\.0\.0\.1:([0-9]{1,5})((?:/[A-Za-z0-9._~-]+)*)")
 TOKEN_RE = re.compile(r"[0-9A-Fa-f]{32,128}")
 TOKEN_HEADER = "X-Hoplon-Token"
-PROFILE_KEYS = {"name", "description", "endpoint", "persona", "skills", "plugins", "params", "coding", "sandbox",
+PROFILE_KEYS = {"name", "description", "endpoint", "persona", "skills", "commands", "params", "coding", "sandbox",
                 "edits", "work", "layout"}
 LAYOUT_PANES = ("files", "panel", "shell")   # hoplon-tui's panes a profile's "layout" may show or hide
 EDITS_MODES = ("ask", "approved-files")   # "approved-files": a further edit to a file you approved applies
@@ -1281,23 +1286,23 @@ STARTER_CONFIG = {
     "_help": "default_profile: profile (persona) used when -p is not given. "
              "default_endpoint: endpoint used when neither -e nor the profile names one. "
              "default_skills: skills used when the profile doesn't list its own (-k adds more). "
-             "default_plugins: plugins (trusted commands) used when the profile doesn't list its own "
-             "(--plugin adds more). "
-             "endpoint_dirs, profile_dirs, skill_dirs, plugin_dirs: extra directories to search, after the ones here. "
+             "default_commands: command sets (scoped commands) used when the profile doesn't list its own "
+             "(--commands adds more). "
+             "endpoint_dirs, profile_dirs, skill_dirs, command_dirs: extra directories to search, after the ones here. "
              "fixtures_dir: where /fixtures keeps real samples for the model's test runs (default: "
              "~/.local/state/hoplon/fixtures); outside any project. "
              "max_steps: model steps in a row that run without you deciding anything before the turn pauses "
              "(default 50; a step where you approve or decline something starts the count again). "
              "alerts: false keeps the notify hook quiet (:alerts on|off switches it for a session). "
-             "Endpoints, profiles, skills and plugins must be blessed: hoplon --bless PATH",
+             "Endpoints, profiles, skills and command sets must be blessed: hoplon --bless PATH",
     "default_profile": None,
     "default_endpoint": None,
     "default_skills": [],
-    "default_plugins": [],
+    "default_commands": [],
     "endpoint_dirs": [],
     "profile_dirs": [],
     "skill_dirs": [],
-    "plugin_dirs": [],
+    "command_dirs": [],
     "fixtures_dir": None,
     "max_steps": STEP_LIMIT,
     "alerts": True,
@@ -1318,7 +1323,7 @@ class Config:
             v = data.get(k)
             if v is not None and not (isinstance(v, str) and NAME_RE.fullmatch(v)):
                 raise HoplonError(f"config.json: {k} must be a name or null")
-        for k in ("default_skills", "default_plugins", "endpoint_dirs", "profile_dirs", "skill_dirs", "plugin_dirs"):
+        for k in ("default_skills", "default_commands", "endpoint_dirs", "profile_dirs", "skill_dirs", "command_dirs"):
             v = data.get(k, [])
             if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
                 raise HoplonError(f"config.json: {k} must be a list of strings")
@@ -1336,12 +1341,12 @@ class Config:
         self.default_profile = data.get("default_profile")
         self.default_endpoint = data.get("default_endpoint")
         self.default_skills = list(data.get("default_skills", []))
-        self.default_plugins = list(data.get("default_plugins", []))
+        self.default_commands = list(data.get("default_commands", []))
 
         def dirs(name):
             return [os.path.join(self.home, name)] + [os.path.expanduser(p) for p in data.get(name[:-1] + "_dirs", [])]
         self.endpoint_dirs, self.profile_dirs, self.skill_dirs = dirs("endpoints"), dirs("profiles"), dirs("skills")
-        self.plugin_dirs = dirs("plugins")
+        self.command_dirs = dirs("commands")
         self.blessed_path = os.path.join(self.home, "blessed.json")
         self.not_secret_path = os.path.join(self.home, "not-secret.json")
         self.sessions = os.path.join(self.home, "sessions")
@@ -1362,7 +1367,7 @@ class Config:
             for d in reversed(missing):                       # ~/.config too, whatever the umask
                 os.mkdir(d, 0o700)
             state_directory(self.home)
-            for d in (self.endpoint_dirs[0], self.profile_dirs[0], self.skill_dirs[0], self.plugin_dirs[0],
+            for d in (self.endpoint_dirs[0], self.profile_dirs[0], self.skill_dirs[0], self.command_dirs[0],
                       self.sessions):
                 if not os.path.isdir(d):
                     os.mkdir(d, 0o700)
@@ -1373,7 +1378,7 @@ class Config:
             eprint(f"hoplon: warning: cannot create {self.home}: {e}")
             return
         if fresh:
-            eprint(f"hoplon: created {self.home} (config.json, endpoints/, profiles/, skills/, plugins/, sessions/)")
+            eprint(f"hoplon: created {self.home} (config.json, endpoints/, profiles/, skills/, commands/, sessions/)")
 
     def blessed(self):
         b = read_state_json(self.blessed_path, {}) or {}
@@ -1493,13 +1498,30 @@ def skill_status(cfg, skill):
     return bless_status(cfg, "skill", skill.path, skill.hash)
 
 
+def shown_name(name):
+    """A skill's name as listings show it: as it is when it is a usable name, else escaped and cut short."""
+    if SKILL_NAME.fullmatch(name):
+        return name
+    text = one_line(name)[0]
+    return text[:48] + ("…" if len(text) > 48 else "")
+
+
+def shown_description(skill):
+    """A skill's description as listings show it: one line, escaped, at most SKILL_DESC_MAX characters."""
+    text = one_line(skill.description())[0]
+    return text[:SKILL_DESC_MAX] + ("…" if len(text) > SKILL_DESC_MAX else "")
+
+
 def skill_rows(cfg, active=None, found=None):
     """Every skill found, for listings. active: names in use, marked when given. found: the skills your own machine
-    sent (remote mode), which are the only ones there, and blessed by being sent."""
+    sent (remote mode), which are the only ones there, and blessed by being sent. A skill whose name isn't usable
+    is listed as "bad name", escaped; it can't be blessed or switched on. Every name and description here is escaped
+    and capped, so a listing can't be faked or broken by what a skill's files say."""
     rows = []
     for n, s in sorted((find_skills(cfg) if found is None else found).items()):
-        row = {"name": n, "path": s.path, "description": s.description(),
-               "status": skill_status(cfg, s) if found is None else "blessed"}
+        bad = not SKILL_NAME.fullmatch(n)
+        row = {"name": shown_name(n), "path": s.path, "description": shown_description(s),
+               "status": "bad name" if bad else skill_status(cfg, s) if found is None else "blessed"}
         if active is not None:
             row["active"] = n in active
         rows.append(row)
@@ -1514,6 +1536,9 @@ def skill_lines(rows, mark=False):
         lead = ("* " if r.get("active") else "  ") if mark else ""
         out.append(f"{lead}{one_line(r['name'])[0]:20} {r['status']:10} {one_line(r['description'])[0]}")
         path = one_line(shlex.quote(r["path"]))[0]
+        if r["status"] == "bad name":
+            out.append(f"{' ' * len(lead)}    {path}: rename the directory to use it ({SKILL_NAME_RULE})")
+            continue
         out.append(f"{' ' * len(lead)}    " + (path if r["status"] == "blessed" else f"to bless: hoplon --bless {path}"))
     return out
 
@@ -1522,9 +1547,9 @@ def load_skills(cfg, names, notice):
     """Return the usable skills among names; skip and report the rest."""
     found, out = find_skills(cfg), []
     for n in names:
-        s = found.get(n)
+        s = found.get(n) if SKILL_NAME.fullmatch(n) else None
         if not s:
-            notice(f"skill '{n}' not found; skipped")
+            notice(f"skill '{shown_name(n)}' not found; skipped")
             continue
         st = skill_status(cfg, s)
         if st != "blessed":
@@ -1535,17 +1560,22 @@ def load_skills(cfg, names, notice):
 
 
 # --------------------------------------------------------------------------
-# Plugins and trusted commands: programs you blessed once, with exactly the inputs they may take
+# Command sets and scoped commands: programs you blessed once, with exactly the inputs they may take
 
-PLUGIN_KEYS = {"name", "description", "search", "env", "pane", "commands"}
-COMMAND_KEYS = {"describe", "argv", "params", "read_only", "timeout", "max_output", "min_interval", "cache"}
-PARAM_KEYS = {"pattern", "enum", "int", "describe"}
-PLUGIN_NAME = re.compile(r"[a-z][a-z0-9-]{0,30}")
+COMMAND_SET_KEYS = {"name", "description", "search", "env", "pane", "commands"}
+COMMAND_KEYS = {"describe", "usage", "argv", "params", "access", "timeout", "max_output", "min_interval", "cache"}
+USAGE_MAX = 1200            # characters of a scoped command's usage section, all lines together
+USAGE_LINES = 20
+GUIDE_MAX = 6000            # characters of a command set's GUIDE.md, sent to the model while the set is on
+PARAM_KEYS = {"pattern", "enum", "int", "path", "host", "describe"}
+PATH_RULE_KEYS = {"under", "files", "new"}
+HOST_NAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,62})(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}))*")
+SET_NAME = re.compile(r"[a-z][a-z0-9-]{0,30}")
 COMMAND_NAME = re.compile(r"[a-z][a-z0-9_]{0,30}")
 TEMPLATE = re.compile(r"\{\{|\}\}|\{([A-Za-z0-9_]+)\}|[{}]")
 DEFAULT_SEARCH = ("/usr/local/bin", "/usr/bin", "/bin")
 PARAM_CAP = 256                # characters of one parameter value
-TRUSTED_PER_MINUTE = 30        # real runs across all plugins; more are refused until the minute is up
+TRUSTED_PER_MINUTE = 30        # real runs across all command sets; more are refused until the minute is up
 TRUSTED_CACHE = 256            # results kept for repeated calls
 
 
@@ -1559,6 +1589,20 @@ def _text(data, key, where, default=""):
     if not isinstance(v, str) or len(v) > 1000 or "\0" in v:
         raise ValueError(f"{where}{key} must be text of at most 1000 characters")
     return v
+
+
+def _usage(v, where):
+    """A command's usage section: a list of lines (or one string) of plain text, short enough to send with the
+    command every time. No control characters: it goes to the model, and to the blessing screen."""
+    lines = [v] if isinstance(v, str) else v
+    if not isinstance(lines, list) or not all(isinstance(ln, str) for ln in lines):
+        raise ValueError(f"{where} must be a list of lines of text")
+    lines = [ln for part in lines for ln in part.split("\n")]
+    if len(lines) > USAGE_LINES or sum(len(ln) for ln in lines) > USAGE_MAX:
+        raise ValueError(f"{where} must be at most {USAGE_LINES} lines and {USAGE_MAX} characters")
+    if any(exact(ln)[1] or one_line(ln)[1] for ln in lines):
+        raise ValueError(f"{where} must not hold control or hidden characters")
+    return [ln.rstrip() for ln in lines]
 
 
 def _number(data, key, where, default, lo, hi):
@@ -1601,15 +1645,16 @@ def split_template(text, where):
 
 
 class TrustedParam:
-    """What one placeholder accepts: a regular expression (the whole value must match), a list of values,
-    or a whole number from 0 up. A value that doesn't fit is refused, never cleaned. No value may start with '-':
-    one that did could be read by the program as an option (another cluster, an output file), not as data."""
+    """What one placeholder accepts: a path inside the directories or among the files the set names, a host from
+    its list, a whole number in a range, a list of values, or, as the last resort, a regular expression the whole
+    value must match. A value that doesn't fit is refused, never cleaned. No value may start with '-': one that
+    did could be read by the program as an option (another cluster, an output file), not as data."""
 
     def __init__(self, data, where):
         _object(data, PARAM_KEYS, where)
-        kinds = [k for k in ("pattern", "enum", "int") if k in data]
+        kinds = [k for k in ("path", "host", "int", "enum", "pattern") if k in data]
         if len(kinds) != 1:
-            raise ValueError(f"{where}: needs exactly one of pattern, enum, int")
+            raise ValueError(f"{where}: needs exactly one of path, host, int, enum, pattern")
         self.kind, self.rule = kinds[0], data[kinds[0]]
         self.describe = _text(data, "describe", where + ".")
         if self.kind == "pattern":
@@ -1625,6 +1670,23 @@ class TrustedParam:
             _strings(self.rule, where + ".enum")
             if any(v.startswith("-") for v in self.rule):
                 raise ValueError(f"{where}.enum has a value starting with '-', which a program reads as an option")
+        elif self.kind == "host":
+            _strings(self.rule, where + ".host")
+            if not all(len(h) <= 253 and HOST_NAME.fullmatch(h) for h in self.rule):
+                raise ValueError(f"{where}.host must be a list of host names (letters, digits, '-' and '.')")
+        elif self.kind == "path":
+            _object(self.rule, PATH_RULE_KEYS, where + ".path")
+            under, files = self.rule.get("under", []), self.rule.get("files", [])
+            for key, v in (("under", under), ("files", files)):
+                if v:
+                    _strings(v, f"{where}.path.{key}")
+                if v and not all((x.startswith("/") or x.startswith("~/")) and "\0" not in x and "\n" not in x
+                                 for x in v):
+                    raise ValueError(f"{where}.path.{key} must be absolute paths (or start with ~/)")
+            if not (under or files):
+                raise ValueError(f"{where}.path needs 'under' (directories) or 'files' (exact files), or both")
+            if not isinstance(self.rule.get("new", False), bool) or (self.rule.get("new") and not under):
+                raise ValueError(f"{where}.path.new must be true or false, and true needs 'under'")
         elif not (isinstance(self.rule, list) and len(self.rule) == 2 and all(type(n) is int for n in self.rule)
                   and 0 <= self.rule[0] <= self.rule[1]):
             raise ValueError(f"{where}.int must be [min, max], from 0 up")
@@ -1646,19 +1708,53 @@ class TrustedParam:
         if self.kind == "int" and not (re.fullmatch(r"[0-9]{1,18}", value)
                                        and self.rule[0] <= int(value) <= self.rule[1]):
             raise ValueError(f"must be a whole number from {self.rule[0]} to {self.rule[1]}")
+        if self.kind == "host" and value not in self.rule:
+            raise ValueError(f"must be one of the hosts: {', '.join(self.rule)}")
+        if self.kind == "path":
+            return self.check_path(value)
         return value
+
+    def check_path(self, value):
+        """The real, absolute location: '..' and symlinks resolved first, then checked against the directories and
+        files the set allows, with the file tools' rules (hidden and secret-looking names refused unless listed
+        in files). The program gets this resolved path. It opens the file after this check, so a symlink swapped
+        in between can still get past it: only the sandbox closes that."""
+        real = os.path.realpath(os.path.join(os.getcwd(), os.path.expanduser(value)))
+        if real in {os.path.realpath(os.path.expanduser(f)) for f in self.rule.get("files", [])}:
+            if not os.path.exists(real):
+                raise ValueError("does not exist")
+            return real
+        for d in self.rule.get("under", []):
+            top = os.path.realpath(os.path.expanduser(d))
+            if real != top and not real.startswith(top.rstrip("/") + "/"):
+                continue
+            if is_hidden(os.path.relpath(real, top).split("/")) and real != top:
+                raise ValueError("is hidden or looks like it holds secrets; the set must list it in 'files'")
+            if not os.path.exists(real):
+                if not self.rule.get("new"):
+                    raise ValueError("does not exist")
+                if not os.path.isdir(os.path.dirname(real)):
+                    raise ValueError("may be new, but its directory must exist")
+            return real
+        where = ", ".join(self.rule.get("under", []) + self.rule.get("files", []))
+        raise ValueError(f"must be inside {where}, after resolving '..' and symlinks")
 
     def schema(self):
         s = {"type": "string"}
         if self.kind == "pattern":
             s["pattern"] = self.rule
-        elif self.kind == "enum":
+        elif self.kind in ("enum", "host"):
             s["enum"] = self.rule
-        else:
+        elif self.kind == "int":
             s["pattern"] = "^[0-9]{1,18}$"
         text = self.describe
         if self.kind == "int":
             text = f"{text} (a whole number from {self.rule[0]} to {self.rule[1]})".strip()
+        elif self.kind == "path":
+            allowed = ([f"under {', '.join(self.rule['under'])}"] if self.rule.get("under") else []) + \
+                      ([f"one of {', '.join(self.rule['files'])}"] if self.rule.get("files") else [])
+            text = (f"{text} (a path {' or '.join(allowed)}; "
+                    + ("it may be new" if self.rule.get("new") else "it must exist") + ")").strip()
         if text:
             s["description"] = text
         return s
@@ -1668,7 +1764,7 @@ class TrustedParam:
 
 
 def trusted_binary(argv0, search):
-    """Where a trusted command's program is: argv[0] if it is a path, else the first search directory that has it.
+    """Where a scoped command's program is: argv[0] if it is a path, else the first search directory that has it.
     The user's PATH is never used. The file and its directory must belong to you or root and not be writable
     by group or others, or whoever can write there could swap the program. Returns (path, identity)."""
     paths = [argv0] if os.path.isabs(argv0) else [os.path.join(d, argv0) for d in search]
@@ -1688,18 +1784,21 @@ def trusted_binary(argv0, search):
 
 
 class TrustedCommand:
-    """One command of a plugin: a fixed argument list with named placeholders, and what each accepts."""
+    """One command of a command set: a fixed argument list with named placeholders, and what each accepts."""
 
-    def __init__(self, plugin, name, data, search, env):
+    def __init__(self, cset, name, data, search, env):
         where = f"commands.{name}"
         _object(data, COMMAND_KEYS, where)
-        self.plugin, self.name, self.search, self.env_names = plugin, name, search, env
+        self.set, self.name, self.search, self.env_names = cset, name, search, env
         w = where + "."
         self.describe = _text(data, "describe", w)
+        self.usage = _usage(data.get("usage", []), w + "usage")
         self.argv = _strings(data.get("argv"), w + "argv")
-        self.read_only = data.get("read_only", False)
-        if not isinstance(self.read_only, bool):
-            raise ValueError(f"{w}read_only must be true or false")
+        self.access = data.get("access")
+        if self.access not in ("read", "write"):
+            raise ValueError(f'{w}access must be "read" (it only looks) or "write" (it changes something)')
+        self.read_only = self.access == "read"
+        self.auto = self.read_only       # a write command too, if the user chose so when blessing (allow_auto)
         self.timeout = _number(data, "timeout", w, 15, 1, 120)
         self.max_output = _number(data, "max_output", w, 65536, 1, 1048576)
         self.min_interval = _number(data, "min_interval", w, 2, 0, 3600)
@@ -1708,6 +1807,8 @@ class TrustedCommand:
         if not isinstance(params, dict) or not all(COMMAND_NAME.fullmatch(k) for k in params):
             raise ValueError(f"{w}params must be an object named by parameter names (a-z, 0-9, _)")
         self.params = {k: TrustedParam(v, f"{w}params.{k}") for k, v in params.items()}
+        if self.read_only and any(p.kind == "path" and p.rule.get("new") for p in self.params.values()):
+            raise ValueError(f'{w}params: a path that may be new needs "access": "write"')
         first = self.argv[0]
         if not (re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", first) or (first.startswith("/") and "{" not in first)):
             raise ValueError(f"{w}argv[0] must be a program name without '/' or placeholders, or an absolute path")
@@ -1717,7 +1818,7 @@ class TrustedCommand:
             raise ValueError(f"{w}argv uses undeclared placeholder(s): {', '.join(sorted(used - set(self.params)))}")
         if set(self.params) - used:
             raise ValueError(f"{w}params not used in argv: {', '.join(sorted(set(self.params) - used))}")
-        self.tool = f"{plugin.replace('-', '_')}__{name}"        # at most 31 + 2 + 31 characters
+        self.tool = f"{cset.replace('-', '_')}__{name}"        # at most 31 + 2 + 31 characters
         self.binary = self.identity = None
 
     def resolve(self):
@@ -1768,26 +1869,46 @@ class TrustedCommand:
         return env
 
     def schema(self, host):
-        how = "read-only" if self.read_only else "the user is asked first"
+        how = ("read-only" if self.read_only else "changes something; runs without asking, as the user chose"
+               if self.auto else "changes something; the user is asked first")
         props = {k: p.schema() for k, p in self.params.items()}
-        return _tool(self.tool, f"{self.describe} (runs `{self.shown()}` on {host}; {how})".strip(), props,
-                     list(props))
+        text = f"{self.describe} (runs `{self.shown()}` on {host}; {how})".strip()
+        if self.usage:
+            text += "\n\nUsage:\n" + "\n".join(self.usage)
+        return _tool(self.tool, text, props, list(props))
 
     def info(self):
-        return {"name": self.name, "describe": self.describe, "params": {k: p.rules() for k, p in self.params.items()},
-                "read_only": self.read_only, "argv": self.argv}
+        return {"name": self.name, "describe": self.describe, "usage": self.usage,
+                "params": {k: p.rules() for k, p in self.params.items()},
+                "access": self.access, "auto": self.auto, "argv": self.argv}
 
 
-class Plugin:
-    """A plugin, read once like a skill: its hash and manifest come from one snapshot of the directory, so editing
+def read_guide(raw):
+    """A command set's GUIDE.md: when to use which command, for the model. Plain text, short, and covered by the
+    blessing like every file of the set; "" when there is none."""
+    if raw is None:
+        return ""
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("must be UTF-8 text") from None
+    if len(text) > GUIDE_MAX:
+        raise ValueError(f"must be at most {GUIDE_MAX} characters; put broader know-how in a skill")
+    if hidden_found(text):
+        raise ValueError("must not hold control or hidden characters")
+    return text.strip()
+
+
+class CommandSet:
+    """A command set, read once like a skill: its hash and manifest come from one snapshot of the directory, so editing
     the files afterwards changes nothing until the next load. error is set when the manifest is refused."""
 
     def __init__(self, name, path, files=None):
-        """files: the plugin's bytes as sent by hoplon-tui from your own machine (remote mode); path is then only a
+        """files: the command set's bytes as sent by hoplon-tui from your own machine (remote mode); path is then only a
         label, and nothing is read here."""
         self.name, self.path = name, path
         self.error = self.hash = self.pane = None
-        self.description, self.commands, self.files = "", {}, {}
+        self.description, self.commands, self.files, self.guide = "", {}, {}, ""
         try:
             self.files = snapshot_skill(path) if files is None else files
             self.hash = hash_snapshot(self.files)
@@ -1797,11 +1918,16 @@ class Plugin:
         try:
             self.parse(self.files)
         except ValueError as e:
-            self.error, self.commands = f"plugin.json: {e}", {}
+            self.error, self.commands = f"commands.json: {e}", {}
+            return
+        try:
+            self.guide = read_guide(self.files.get("GUIDE.md"))
+        except ValueError as e:
+            self.error, self.commands = f"GUIDE.md: {e}", {}
 
     def parse(self, files):
-        data = _object(json.loads(files.get("plugin.json", b"").decode("utf-8")), PLUGIN_KEYS, "plugin")
-        if data.get("name") != self.name or not PLUGIN_NAME.fullmatch(data.get("name", "")):
+        data = _object(json.loads(files.get("commands.json", b"").decode("utf-8")), COMMAND_SET_KEYS, "commands.json")
+        if data.get("name") != self.name or not SET_NAME.fullmatch(data.get("name", "")):
             raise ValueError("name must be lowercase letters, digits and '-', and the same as the directory's name")
         self.description = _text(data, "description", "")
         search = data.get("search", list(DEFAULT_SEARCH))
@@ -1816,7 +1942,7 @@ class Plugin:
                 raise ValueError(f"env: not allowed: {', '.join(bad)} (PATH and LD_* are never passed on)")
         pane = data.get("pane")
         if pane is not None and not (isinstance(pane, str) and NAME_RE.fullmatch(pane) and pane in files):
-            raise ValueError("pane must be the name of a file in the plugin directory")
+            raise ValueError("pane must be the name of a file in the command set directory")
         self.pane = pane
         cmds = data.get("commands")
         if not isinstance(cmds, dict) or not cmds or not all(COMMAND_NAME.fullmatch(k) for k in cmds):
@@ -1826,8 +1952,17 @@ class Plugin:
     def tools(self):
         return {c.tool: c for c in self.commands.values()}
 
+    def allow_auto(self, names):
+        """The write commands the user chose, when blessing, to run without asking; read commands always do."""
+        names = set(names) if isinstance(names, list) else set()
+        for c in self.commands.values():
+            c.auto = c.read_only or c.name in names
+
+    def writes(self):
+        return [c for c in self.commands.values() if not c.read_only]
+
     def resolve(self):
-        """Find every command's program now, refusing the plugin if one can't be trusted. A program that isn't
+        """Find every command's program now, refusing the command set if one can't be trusted. A program that isn't
         installed here (a cluster without accounting has no sacct) only leaves out its commands; the names of
         those are returned."""
         missing = []
@@ -1836,68 +1971,86 @@ class Plugin:
                 c.resolve()
             except HoplonError as e:
                 if e.kind != "not_found":
-                    raise HoplonError(f"plugin '{self.name}', command {c.name}: {e}", EXIT_USAGE, "bad_plugin") from None
+                    raise HoplonError(f"command set '{self.name}', command {c.name}: {e}", EXIT_USAGE, "bad_commands") from None
                 missing.append(c.name)
                 del self.commands[c.name]
             except OSError as e:
-                raise HoplonError(f"plugin '{self.name}', command {c.name}: {e}", EXIT_USAGE, "bad_plugin") from None
+                raise HoplonError(f"command set '{self.name}', command {c.name}: {e}", EXIT_USAGE, "bad_commands") from None
         if not self.commands:
-            raise HoplonError(f"plugin '{self.name}': none of its programs is installed here", EXIT_USAGE, "bad_plugin")
+            raise HoplonError(f"command set '{self.name}': none of its programs is installed here", EXIT_USAGE, "bad_commands")
         return missing
 
     def summary(self):
         """The review screen for blessing: every command with what it may run, and the programs it would use."""
         c0 = next(iter(self.commands.values()))
-        lines = [f"  plugin:   {one_line(self.name)[0]}", f"  about:    {one_line(self.description)[0]}"]
+        lines = [f"  set:      {one_line(self.name)[0]}", f"  about:    {one_line(self.description)[0]}"]
         if self.pane:
             lines.append(f"  pane:     {one_line(self.pane)[0]} (for hoplon-tui; hoplon does not run it)")
         lines.append(f"  search:   {', '.join(one_line(d)[0] for d in c0.search)} (your PATH is never used)")
         lines.append(f"  env:      {', '.join(c0.env_names) or 'none'} passed on, besides PATH, LANG, HOME, USER "
                      "and LOGNAME")
-        for c in self.commands.values():
-            flag = "read-only: runs without asking" if c.read_only else "[asks every time]"
+        groups = (("read: these only look, and run without asking", [c for c in self.commands.values() if c.read_only]),
+                  ("write: these change something, and ask every time unless you choose otherwise below",
+                   self.writes()))
+        for title, cmds in groups:
+            if not cmds:
+                continue
+            lines.append(f"  {title}")
+            lines += self.command_lines(cmds)
+        if self.guide:
+            lines.append("  guide (GUIDE.md, sent to the model whenever the set is on):")
+            lines += [f"    | {one_line(ln)[0]}" for ln in self.guide.splitlines()]
+        lines.append("  [!] these commands run on this host as you, with no shell, and the read ones without "
+                     "asking: their output goes to the model and the endpoint like any file the model reads")
+        return "\n".join(lines)
+
+    def command_lines(self, cmds):
+        lines = []
+        for c in cmds:
+            flag = "runs without asking" if c.read_only else "[asks every time]"
             lines.append(f"  command {one_line(c.name)[0]}: {one_line(c.describe)[0]}  ({flag})")
             lines.append(f"    runs:    {one_line(c.shown())[0]}")
             for k, p in c.params.items():
                 lines.append(f"    {k}: {p.kind} {one_line(json.dumps(p.rule))[0]}  {one_line(p.describe)[0]}".rstrip())
+            if c.usage:
+                lines.append("    usage (sent to the model with the command):")
+                lines += [f"      | {ln}" for ln in c.usage]
             lines.append(f"    limits:  {c.timeout} s, {c.max_output} bytes of output, at most one run per "
                          f"{c.min_interval} s, results kept {c.cache} s")
             try:
                 lines.append(f"    program: {one_line(trusted_binary(c.argv[0], c.search)[0])[0]}")
             except (HoplonError, OSError) as e:
-                lines.append(f"    program: [!] {one_line(str(e))[0]} (the plugin can't be used until this is fixed)")
-        lines.append("  [!] these commands run on this host as you, with no shell, and the read-only ones without "
-                     "asking: their output goes to the model and the endpoint like any file the model reads")
-        return "\n".join(lines)
+                lines.append(f"    program: [!] {one_line(str(e))[0]} (the command set can't be used until this is fixed)")
+        return lines
 
 
-def find_plugins(cfg):
+def find_command_sets(cfg):
     seen = {}
-    for d in cfg.plugin_dirs:
+    for d in cfg.command_dirs:
         try:
             names = sorted(os.listdir(d))
         except OSError:
             continue
         for n in names:
             p = os.path.join(d, n)
-            if n not in seen and os.path.isfile(os.path.join(p, "plugin.json")):
-                seen[n] = Plugin(n, os.path.abspath(p))
+            if n not in seen and os.path.isfile(os.path.join(p, "commands.json")):
+                seen[n] = CommandSet(n, os.path.abspath(p))
     return seen
 
 
-def plugin_status(cfg, plugin):
-    return "invalid" if plugin.hash is None else bless_status(cfg, "plugin", plugin.path, plugin.hash)
+def command_set_status(cfg, cset):
+    return "invalid" if cset.hash is None else bless_status(cfg, "command_set", cset.path, cset.hash)
 
 
-def plugin_rows(cfg, active=(), found=None):
-    """Every plugin found, for listings and the plugins message. found: the plugins your own machine sent (remote
+def command_set_rows(cfg, active=(), found=None):
+    """Every command set found, for listings and the command sets message. found: the command sets your own machine sent (remote
     mode), which are the only ones there, and blessed by being sent."""
     rows = []
-    for n, pl in sorted((find_plugins(cfg) if found is None else found).items()):
-        st = plugin_status(cfg, pl) if found is None else ("invalid" if pl.error else "blessed")
+    for n, pl in sorted((find_command_sets(cfg) if found is None else found).items()):
+        st = command_set_status(cfg, pl) if found is None else ("invalid" if pl.error else "blessed")
         rows.append({"name": n, "path": pl.path, "dir": pl.path, "description": pl.description or pl.error or "",
                      "status": st, "blessed": st == "blessed", "enabled": n in active, "active": n in active,
-                     "error": pl.error, "pane": pl.pane, "commands": [c.info() for c in pl.commands.values()]})
+                     "error": pl.error, "pane": pl.pane, "guide": bool(pl.guide), "commands": [c.info() for c in pl.commands.values()]})
     return rows
 
 
@@ -2108,7 +2261,7 @@ class Profile:
         self.endpoint = data.get("endpoint")
         self.persona = data.get("persona", "")
         self.skills = data.get("skills")          # None: the profile leaves skills to default_skills
-        self.plugins = data.get("plugins")        # likewise for default_plugins
+        self.command_sets = data.get("commands")       # likewise for default_commands
         self.params = data.get("params", {})
         self.coding = data.get("coding", False)
         if self.endpoint is not None and not (isinstance(self.endpoint, str) and NAME_RE.fullmatch(self.endpoint)):
@@ -2117,9 +2270,9 @@ class Profile:
             raise HoplonError(f"{path}: 'description' and 'persona' must be text", EXIT_PROFILE)
         if self.skills is not None and not (isinstance(self.skills, list) and all(isinstance(x, str) for x in self.skills)):
             raise HoplonError(f"{path}: 'skills' must be a list of skill names", EXIT_PROFILE)
-        if self.plugins is not None and not (isinstance(self.plugins, list)
-                                             and all(isinstance(x, str) for x in self.plugins)):
-            raise HoplonError(f"{path}: 'plugins' must be a list of plugin names", EXIT_PROFILE)
+        if self.command_sets is not None and not (isinstance(self.command_sets, list)
+                                             and all(isinstance(x, str) for x in self.command_sets)):
+            raise HoplonError(f"{path}: 'commands' must be a list of command set names", EXIT_PROFILE)
         if not isinstance(self.params, dict):
             raise HoplonError(f"{path}: 'params' must be an object", EXIT_PROFILE)
         for k in ("model", "messages", "tools"):
@@ -2166,8 +2319,8 @@ class Profile:
             lines.append("  skills:   (not set; default_skills apply)")
         else:
             lines.append(f"  skills:   {', '.join(one(k) for k in self.skills) or 'none'}")
-        if self.plugins:
-            lines.append(f"  plugins:  {', '.join(one(k) for k in self.plugins)} (trusted commands; each plugin "
+        if self.command_sets:
+            lines.append(f"  commands: {', '.join(one(k) for k in self.command_sets)} (scoped commands; each command set "
                          "must be blessed on its own)")
         if self.params:
             lines.append(f"  params:   {json.dumps(self.params, sort_keys=True)}")
@@ -2245,7 +2398,7 @@ def bless_status(cfg, kind, path, h=None):
         return "unblessed"
     try:
         if h is None:
-            h = hash_skill(path)[0] if kind in ("skill", "plugin") else hash_file(path)
+            h = hash_skill(path)[0] if kind in ("skill", "command_set") else hash_file(path)
     except (HoplonError, OSError):
         return "invalid"
     return "blessed" if h == entry.get("hash") else "changed"
@@ -2271,11 +2424,11 @@ def select_named(cfg, kind, name):
     return obj
 
 
-REMOTE_ITEM_CAP = 1 << 20      # bytes of one skill or plugin sent to a remote hoplon
+REMOTE_ITEM_CAP = 1 << 20      # bytes of one skill or command set sent to a remote hoplon
 
 
 def remote_items(raw, kind, bad):
-    """The skills or plugins in a config line: {name: Skill or Plugin}, made from the bytes your machine sent. Each
+    """The skills or command sets in a config line: {name: Skill or Command set}, made from the bytes your machine sent. Each
     one's hash is computed again here from those bytes and must be the one blessed there."""
     if raw is None:
         return {}
@@ -2283,11 +2436,17 @@ def remote_items(raw, kind, bad):
         raise bad(f"'{kind}s' must be a list")
     out = {}
     for item in raw:
-        if not isinstance(item, dict) or set(item) != {"name", "hash", "files"}:
-            raise bad(f"each {kind} must have exactly 'name', 'hash' and 'files'")
+        keys = {"name", "hash", "files"} | ({"auto"} if kind == "command_set" else set())
+        if not isinstance(item, dict) or not {"name", "hash", "files"} <= set(item) <= keys:
+            raise bad(f"each {kind} must have exactly 'name', 'hash' and 'files'"
+                      + (" (and optionally 'auto')" if kind == "command_set" else ""))
+        if not isinstance(item.get("auto", []), list) or not all(isinstance(x, str) for x in item.get("auto", [])):
+            raise bad(f"{kind} '{one_line(str(item['name']))[0]}': 'auto' must be a list of command names")
         name, files = item["name"], item["files"]
-        if not isinstance(name, str) or not NAME_RE.fullmatch(name) or name in out:
-            raise bad(f"{kind} names must be distinct names (letters, digits, . _ -)")
+        if (not isinstance(name, str) or not NAME_RE.fullmatch(name) or name in out
+                or (kind == "skill" and not SKILL_NAME.fullmatch(name))):
+            raise bad(f"{kind} names must be distinct names (letters, digits, . _ -)"
+                      + (f"; a skill's: {SKILL_NAME_RULE}" if kind == "skill" else ""))
         if not isinstance(files, dict) or not files:
             raise bad(f"{kind} '{name}': 'files' must be an object of relative paths")
         data, size = {}, 0
@@ -2310,18 +2469,19 @@ def remote_items(raw, kind, bad):
                 raise bad(f"skill '{name}' has no SKILL.md")
             out[name] = Skill(name, label, data)
         else:
-            out[name] = Plugin(name, label, data)
+            out[name] = CommandSet(name, label, data)
             if out[name].error:
-                raise bad(f"plugin '{name}': {out[name].error}")
+                raise bad(f"command set '{name}': {out[name].error}")
+            out[name].allow_auto(item.get("auto", []))
     return out
 
 
 def remote_config(line, audit):
     """Parse the config line hoplon-tui sends first with --config-stdin: an endpoint, a profile (or null), the
-    session token, and the skills and plugins to use. hoplon-tui checked the user's blessed files on their machine,
+    session token, and the skills and command sets to use. hoplon-tui checked the user's blessed files on their machine,
     so nothing here is looked up or blessed on this host; the audit log records what arrived, with hashes. The key
     stays on the user's machine: the endpoint is a loopback port that ssh forwards to a proxy there, which adds the
-    key when the token matches. Returns the endpoint, the profile and {"skills": {...}, "plugins": {...}}."""
+    key when the token matches. Returns the endpoint, the profile and {"skills": {...}, "command_sets": {...}}."""
     def bad(why):
         return HoplonError(f"bad config from the wrapper: {why}. Nothing was sent.", EXIT_PROFILE, "bad_config")
 
@@ -2347,13 +2507,13 @@ def remote_config(line, audit):
     if not m or not 0 < int(m.group(1)) < 65536:
         raise bad("base_url must be http://127.0.0.1:PORT, optionally with a path")
     offered = {"skills": remote_items(msg.get("skills"), "skill", bad),
-               "plugins": remote_items(msg.get("plugins"), "plugin", bad)}
+               "command_sets": remote_items(msg.get("command_sets"), "command_set", bad)}
     endpoint.token = token
     digest = lambda o: hash_bytes(json.dumps(o, sort_keys=True).encode())
     audit.log("remote_config", endpoint=endpoint.name, model=endpoint.model, endpoint_sha256=digest(ep),
               profile=persona.name if persona else None, profile_sha256=digest(prof) if persona else None,
               skills={n: s.hash for n, s in offered["skills"].items()},
-              plugins={n: p.hash for n, p in offered["plugins"].items()})
+              command_sets={n: p.hash for n, p in offered["command_sets"].items()})
     return endpoint, persona, offered
 
 
@@ -2364,12 +2524,12 @@ REMOTE_STRIP = ("key_env", "key_file", "proxy", "headers", "ca_bundle")
 
 
 def export_items(cfg, kind, names):
-    """The blessed skills or plugins among names, with their bytes (base64) and hash, for a remote hoplon. One that
+    """The blessed skills or command sets among names, with their bytes (base64) and hash, for a remote hoplon. One that
     is missing, not blessed, refused or too big is left out, and hoplon says so on stderr."""
-    found, out = (find_skills(cfg) if kind == "skill" else find_plugins(cfg)), []
+    found, out = (find_skills(cfg) if kind == "skill" else find_command_sets(cfg)), []
     for n in dict.fromkeys(names):
         item = found.get(n)
-        st = None if item is None else (skill_status(cfg, item) if kind == "skill" else plugin_status(cfg, item))
+        st = None if item is None else (skill_status(cfg, item) if kind == "skill" else command_set_status(cfg, item))
         why = ("not found" if item is None else f"{st} (hoplon --bless {item.path})" if st != "blessed" else
                getattr(item, "error", None) or
                (f"over {REMOTE_ITEM_CAP} bytes" if sum(map(len, item.files.values())) > REMOTE_ITEM_CAP else None))
@@ -2378,13 +2538,15 @@ def export_items(cfg, kind, names):
             continue
         out.append({"name": n, "hash": item.hash,
                     "files": {rel: base64.b64encode(b).decode() for rel, b in sorted(item.files.items())}})
+        if kind == "command_set":
+            out[-1]["auto"] = cfg.blessed().get(item.path, {}).get("auto", [])
     return out
 
 
-def export_remote(cfg, profile_name, endpoint_name, skills=(), plugins=()):
+def export_remote(cfg, profile_name, endpoint_name, skills=(), command_sets=()):
     """What hoplon-tui's remote mode needs from this machine's configuration, resolved and checked exactly as a
-    normal start would (default profile and endpoint, default skills and plugins, blessing, changed files), and
-    nothing secret: the skills and plugins in use go with their bytes, which the remote hoplon checks against the
+    normal start would (default profile and endpoint, default skills and command sets, blessing, changed files), and
+    nothing secret: the skills and command sets in use go with their bytes, which the remote hoplon checks against the
     hashes blessed here."""
     pname = profile_name or cfg.default_profile
     persona = select_named(cfg, "profile", pname) if pname else None
@@ -2395,13 +2557,13 @@ def export_remote(cfg, profile_name, endpoint_name, skills=(), plugins=()):
                          "(letters, digits and . _ ~ - only)", EXIT_PROFILE)
     skills = export_items(cfg, "skill", (persona.skills if persona and persona.skills is not None
                                          else cfg.default_skills) + list(skills))
-    plugins = export_items(cfg, "plugin", (persona.plugins if persona and persona.plugins is not None
-                                           else cfg.default_plugins) + list(plugins))
+    sets = export_items(cfg, "command_set", (persona.command_sets if persona and persona.command_sets is not None
+                                           else cfg.default_commands) + list(command_sets))
     cfg.audit.log("remote_config_export", endpoint=endpoint.name, profile=persona.name if persona else None,
-                  skills={s["name"]: s["hash"] for s in skills}, plugins={p["name"]: p["hash"] for p in plugins})
+                  skills={s["name"]: s["hash"] for s in skills}, command_sets={p["name"]: p["hash"] for p in sets})
     return {"endpoint": {k: v for k, v in endpoint.data.items() if k not in REMOTE_STRIP},
             "profile": persona.data if persona else None, "endpoint_name": endpoint.name, "base_path": path,
-            "skills": skills, "plugins": plugins}
+            "skills": skills, "command_sets": sets}
 
 
 def select_endpoint(cfg, name):
@@ -2447,13 +2609,16 @@ def bless(cfg, path, ask):
         return bless_hook(cfg, ask)
     if os.path.isdir(path):
         files = snapshot_skill(path)
-        plugin = Plugin(os.path.basename(path), path) if "plugin.json" in files else None
-        if plugin and plugin.error:
-            raise HoplonError(f"{path}: {plugin.error}")
-        if not plugin and "SKILL.md" not in files:
-            raise HoplonError(f"{path}: a skill needs a SKILL.md, and a plugin a plugin.json")
+        cset = CommandSet(os.path.basename(path), path) if "commands.json" in files else None
+        if cset and cset.error:
+            raise HoplonError(f"{path}: {cset.error}")
+        if not cset and "SKILL.md" not in files:
+            raise HoplonError(f"{path}: a skill needs a SKILL.md, and a command set a commands.json")
+        if not cset and not SKILL_NAME.fullmatch(os.path.basename(path)):
+            raise HoplonError(f"{one_line(path)[0]}: a skill's name (its directory's) must be {SKILL_NAME_RULE}; "
+                             "rename it, then bless it", EXIT_USAGE, "bad_name")
         h = hash_snapshot(files)
-        print(f"{'Plugin' if plugin else 'Skill'} {one_line(os.path.basename(path))[0]} at {one_line(path)[0]}")
+        print(f"{'Command set' if cset else 'Skill'} {one_line(os.path.basename(path))[0]} at {one_line(path)[0]}")
         for f in sorted(files):
             print(f"  {one_line(f)[0]} ({len(files[f])} bytes)")
         print(f"  hash: {h}")
@@ -2468,10 +2633,10 @@ def bless(cfg, path, ask):
                 print(f"  [!] {one_line(f)[0]} has hidden or control characters: {found}")
         if any(one_line(x)[1] for x in [path, *files]):
             print("  [!] the name or a file name above had characters that were escaped; read carefully")
-        if plugin:
-            print(plugin.summary())
-        entry = {"kind": "plugin" if plugin else "skill", "name": os.path.basename(path), "hash": h}
-        question = ("Have you read every command above, and may the model and you run them as shown?" if plugin
+        if cset:
+            print(cset.summary())
+        entry = {"kind": "command_set" if cset else "skill", "name": os.path.basename(path), "hash": h}
+        question = ("Have you read every command above, and may the model and you run them as shown?" if cset
                     else "Have you read every file above, and do you want to use this skill?")
     else:
         raw = read_regular(path)
@@ -2502,9 +2667,14 @@ def bless(cfg, path, ask):
     if not ask(question):
         print("Not blessed.")
         return False
+    if os.path.isdir(path) and cset and cset.writes():
+        print("Write commands ask you every time. You can let some of them run without asking; "
+              "every run is still logged as trusted_run.")
+        entry["auto"] = [c.name for c in cset.writes()
+                         if ask(f"Let the model run {one_line(c.name)[0]} ({one_line(c.shown())[0]}) without asking you?")]
     entry["blessed_at"] = now()
     cfg.set_blessed(path, entry)
-    cfg.audit.log("bless", path=path, kind=entry["kind"], hash=h)
+    cfg.audit.log("bless", path=path, kind=entry["kind"], hash=h, **({"auto": entry["auto"]} if "auto" in entry else {}))
     print("Blessed.")
     return True
 
@@ -3054,6 +3224,13 @@ SAMPLES_TOOL = _tool("request_samples", "Ask the user for real samples your test
                                   "them, such as tail -n 200 /var/log/app.log > app.log."},
                       "reason": _REASON}, ["what", "files", "reason"])
 
+SKILLS_TOOL = _tool("suggest_skills", "Ask the user to switch on skills from the list under 'Skills you can "
+                    "suggest'. They answer yes or no; on yes, each skill's text comes back in this call's result. "
+                    "You can't switch a skill off, and you can't switch one on without asking.",
+                    {"names": {"type": "array", "items": {"type": "string"},
+                               "description": "The skills to switch on, by name, from the list."},
+                     "reason": _REASON}, ["names", "reason"])
+
 # Offered only in a work session, in place of propose_plan and propose_command.
 WORK_PLAN_TOOL = _tool("propose_work_plan", "Propose the plan for this work session: the items, in order, each a "
                        "piece of the task you can finish and commit on its own. The user approves it before you start. "
@@ -3120,11 +3297,20 @@ WHERE_STANDINS_WORK = ("If a test needs data or a service that isn't in the copy
                        "the test starts on 127.0.0.1; if only real data will do, say so in a plain reply and stop: the "
                        "session waits for the user.")
 
-# Added to the system prompt while a plugin's trusted commands are offered.
+# Added to the system prompt while a blessed skill could be suggested.
+SKILL_RULES = """
+
+# Skills you can suggest
+Skills are instructions the user wrote or chose and blessed: house rules and know-how for a tool, a language or a site. A skill that is on appears in full under a "# Skill: NAME" heading, in this prompt or later in the conversation. These are the blessed skills; some may be on already:
+{index}
+
+Before you propose a plan or a work plan, and when a request clearly needs one, check this list against the request. If a skill that is not on looks needed, call suggest_skills first and wait for the answer; then plan. Don't ask when the skills that are on already look right, and never suggest a skill the user declined unless they ask for it."""
+
+# Added to the system prompt while a command set's scoped commands are offered.
 TRUSTED_RULES = """
 
-# Trusted commands
-- Some tools (named plugin__command, for example slurm__queue) run a fixed, read-only program on this host for the user and give you its output, for cluster status and the like. They run without asking and the user sees what ran. Use them rather than proposing an equivalent command with propose_command. A tool that says the user is asked first waits for their approval."""
+# Scoped commands
+- Some tools (named set__command, for example slurm__queue) run a fixed program on this host for the user and give you its output, for cluster status and the like. The read-only ones run without asking, and the user sees what ran. Use them rather than proposing an equivalent command with propose_command. A tool that changes something says so: it waits for the user's approval, unless its description says the user let it run without asking."""
 
 # Added to the system prompt while coding mode is on, so the model knows what that changes.
 CODING_RULES = """
@@ -3575,6 +3761,7 @@ class Kind:
 PROPOSAL_KINDS = {k.name: k for k in (       # every kind of proposal there is; a call for any other tool is invalid
     Kind("command", "propose_command", "build_command", "perform_command", shown=True),
     Kind("samples", "request_samples", "build_samples", "perform_samples", shown=True),
+    Kind("skills", "suggest_skills", "build_skills", "perform_skills"),
     Kind("sandbox", "run_in_sandbox", "build_sandbox", "run_sandboxed", bulk=True),
     Kind("search", "search_files", "search_proposal", "perform_file", bulk=True),
     Kind("read", "read_file", "build_read", "perform_file", bulk=True),
@@ -3628,7 +3815,9 @@ UNOFFERED = {"search_files": "is only available in coding mode",
              "finish_item": "is only available in a work session",
              "retry_item": "is only for reviewing an item that used its steps",
              "propose_command": "is not available in a work session: run_in_sandbox runs commands there",
-             "propose_plan": "is not available in a work session: propose_work_plan plans one"}
+             "propose_plan": "is not available in a work session: propose_work_plan plans one",
+             "suggest_skills": "is not available now: no skill is left to suggest (each one is on, or the user "
+                               "declined it), or nobody is there to answer"}
 
 
 class Halted(Exception):
@@ -3639,12 +3828,12 @@ class Engine:
     """The loop: send, turn tool calls into proposals, collect decisions, send again."""
 
     def __init__(self, cfg, endpoint, session, ui, client=None, coding=None, profile=None, anywhere=False,
-                 plugins=(), offered=None):
+                 command_sets=(), offered=None):
         """coding: None, or where the request for coding mode came from ("--coding", "profile NAME").
         anywhere: the user passed --coding-anywhere, which allows coding mode where it is normally refused.
-        plugins: names of the plugins to enable; one that is missing, unblessed or refused is skipped with a notice.
-        offered: remote mode's {"skills": {...}, "plugins": {...}}, what your own machine sent (remote_config): the
-        only skills and plugins there are, in place of those found on this host."""
+        command sets: names of the command sets to enable; one that is missing, unblessed or refused is skipped with a notice.
+        offered: remote mode's {"skills": {...}, "command_sets": {...}}, what your own machine sent (remote_config): the
+        only skills and command sets there are, in place of those found on this host."""
         self.cfg, self.endpoint, self.session, self.ui = cfg, endpoint, session, ui
         self.profile = profile
         self.client = client or Client(endpoint, profile.params if profile else None)
@@ -3663,17 +3852,20 @@ class Engine:
         self.commands = []       # command proposals shown in this process, newest last
         self.offered = offered
         self.skills = []
+        self.skill_index = []    # [(name, description)] of every blessed skill, for the model's list
+        self.queued_skills = []  # switched on mid-conversation: their text goes with the next user message
+        self.declined_skills = set()     # suggestions the user said no to; the model may not ask again
         self.reload_skills()
-        self.plugins = []        # enabled plugins; never saved with the session
-        self.trusted = {}        # tool name -> TrustedCommand, for the enabled plugins
-        self.cached = {}         # (plugin, command, params) -> (when, exit, output, note): the last real result
-        self.last_run = {}       # (plugin, command) -> when it last really ran
+        self.command_sets = []        # enabled command sets; never saved with the session
+        self.trusted = {}        # tool name -> TrustedCommand, for the enabled command sets
+        self.cached = {}         # (command set, command, params) -> (when, exit, output, note): the last real result
+        self.last_run = {}       # (command set, command) -> when it last really ran
         self.runs = collections.deque()      # when each real run started, for the per-minute cap
-        for name in plugins:
+        for name in command_sets:
             try:
-                self.set_plugin(name, True)
+                self.set_command_set(name, True)
             except HoplonError as e:
-                ui.notice(f"plugin '{name}' skipped: {e}")
+                ui.notice(f"command set '{name}' skipped: {e}")
         self.anywhere = anywhere
         self.coding_override = None     # the refused place coding mode is on in, when --coding-anywhere allowed it
         self.plan = None                # the plan the user approved, if any; never saved with the session
@@ -3757,16 +3949,36 @@ class Engine:
     def reload_skills(self):
         if self.offered is not None:
             self.skills = [self.offered["skills"][n] for n in self.session.skills if n in self.offered["skills"]]
-            return
-        self.skills = load_skills(self.cfg, self.session.skills, self.ui.notice)
+            found = {n: s for n, s in self.offered["skills"].items()}
+        else:
+            self.skills = load_skills(self.cfg, self.session.skills, self.ui.notice)
+            found = {n: s for n, s in find_skills(self.cfg).items() if skill_status(self.cfg, s) == "blessed"}
+        self.skill_index = [(n, shown_description(s)) for n, s in sorted(found.items())
+                            if SKILL_NAME.fullmatch(n)]
+        self.blessed_skills = found
+
+    def carried_skills(self):
+        """Skills whose text the conversation itself carries: switched on after it began, so the system prompt
+        stays as it was (and the server's cache with it). Pruned or summarized away, a skill is carried no more and
+        the system prompt has it again."""
+        return {n for m in self.session.messages if not m.get("_pruned") for n in (m.get("_skills") or {})}
+
+    def skill_block(self, s, why):
+        return (f"\n\n[skill {s.name}: {why}; its text follows]\n# Skill: {s.name}\n\n{s.text().rstrip()}\n"
+                f"[end of skill {s.name}]")
+
+    def skills_open(self):
+        """Blessed skills that are off and not declined: what suggest_skills may name."""
+        on = {s.name for s in self.skills}
+        return [n for n, _ in self.skill_index if n not in on and n not in self.declined_skills]
 
     def skill_rows(self):
         found = self.offered["skills"] if self.offered is not None else None
         return skill_rows(self.cfg, [s.name for s in self.skills], found)
 
-    def plugin_rows(self):
-        found = self.offered["plugins"] if self.offered is not None else None
-        return plugin_rows(self.cfg, [p.name for p in self.plugins], found)
+    def command_set_rows(self):
+        found = self.offered["command_sets"] if self.offered is not None else None
+        return command_set_rows(self.cfg, [p.name for p in self.command_sets], found)
 
     def set_coding(self, on, source=":coding"):
         if self.work and not on:
@@ -3788,50 +4000,66 @@ class Engine:
         self.coding_from = source if on else None
         self.audit.log("coding", on=on, source=source, cwd=os.getcwd(), override=self.coding_override)
 
-    def set_skill(self, name, on):
-        """Use a skill from the next request on, or stop using it. Only a blessed skill can be turned on."""
+    def set_skill(self, name, on, source="user", carry=True):
+        """Use a skill from the next request on, or stop using it. Only a blessed skill can be turned on. Once the
+        conversation has begun, a skill switched on goes with the next user message (carry), not into the system
+        prompt; one switched off has its text taken out of the conversation too."""
         if on:
             s = (find_skills(self.cfg) if self.offered is None else self.offered["skills"]).get(name)
-            if not s:
-                raise HoplonError(f"skill '{name}' not found", EXIT_USAGE, "unknown_skill")
+            if not s or not SKILL_NAME.fullmatch(name):
+                raise HoplonError(f"skill '{shown_name(name)}' not found" if not s else
+                                 f"skill '{shown_name(name)}' can't be used: its name must be {SKILL_NAME_RULE}",
+                                 EXIT_USAGE, "unknown_skill")
             st = skill_status(self.cfg, s) if self.offered is None else "blessed"
             if st != "blessed":
                 raise HoplonError(f"skill '{name}' is {st}; read it, then: hoplon --bless {s.path}", EXIT_USAGE,
                                  "not_blessed")
             if name not in self.session.skills:
                 self.session.skills.append(name)
-        elif name in self.session.skills:
-            self.session.skills.remove(name)
+                if carry and self.session.messages and name not in self.queued_skills:
+                    self.queued_skills.append(name)
+        else:
+            if name in self.session.skills:
+                self.session.skills.remove(name)
+            if name in self.queued_skills:
+                self.queued_skills.remove(name)
+            for m in self.session.messages:
+                block = (m.get("_skills") or {}).pop(name, None)
+                if block is not None and isinstance(m.get("content"), str):
+                    m["content"] = m["content"].replace(block, f"\n\n[skill {name}: switched off by the user; "
+                                                               "its text was removed]")
         self.reload_skills()
         self.session.usage = None   # the system prompt changed, so the last measured size no longer holds
-        self.audit.log("skill", name=name, on=on)
+        self.audit.log("skill", name=name, on=on, source=source)
 
-    def set_plugin(self, name, on):
-        """Offer a plugin's trusted commands to the model and the user from the next request on, or stop. Only a
-        blessed plugin whose programs can be trusted is turned on."""
+    def set_command_set(self, name, on):
+        """Offer a command set's scoped commands to the model and the user from the next request on, or stop. Only a
+        blessed command set whose programs can be trusted is turned on."""
         if on:
-            pl = (find_plugins(self.cfg) if self.offered is None else self.offered["plugins"]).get(name)
+            pl = (find_command_sets(self.cfg) if self.offered is None else self.offered["command_sets"]).get(name)
             if not pl:
-                raise HoplonError(f"plugin '{name}' not found", EXIT_USAGE, "unknown_plugin")
-            st = plugin_status(self.cfg, pl) if self.offered is None else "blessed"
+                raise HoplonError(f"command set '{name}' not found", EXIT_USAGE, "unknown_commands")
+            st = command_set_status(self.cfg, pl) if self.offered is None else "blessed"
             if st != "blessed":
-                raise HoplonError(f"plugin '{name}' is {st}; read it, then: hoplon --bless {pl.path}", EXIT_USAGE,
+                raise HoplonError(f"command set '{name}' is {st}; read it, then: hoplon --bless {pl.path}", EXIT_USAGE,
                                  "not_blessed")
             if pl.error:
-                raise HoplonError(f"plugin '{name}': {pl.error}", EXIT_USAGE, "bad_plugin")
+                raise HoplonError(f"command set '{name}': {pl.error}", EXIT_USAGE, "bad_commands")
             clash = sorted(set(pl.tools()) & set(self.external))
             if clash:
-                raise HoplonError(f"plugin '{name}': a registered tool already has the name {clash[0]}", EXIT_USAGE,
-                                 "bad_plugin")
+                raise HoplonError(f"command set '{name}': a registered tool already has the name {clash[0]}", EXIT_USAGE,
+                                 "bad_commands")
+            if self.offered is None:
+                pl.allow_auto(self.cfg.blessed().get(pl.path, {}).get("auto", []))
             missing = pl.resolve()
             if missing:
-                self.ui.notice(f"plugin '{name}': {', '.join(missing)} left out, as the program isn't installed here")
-            self.plugins = [p for p in self.plugins if p.name != name] + [pl]
+                self.ui.notice(f"command set '{name}': {', '.join(missing)} left out, as the program isn't installed here")
+            self.command_sets = [p for p in self.command_sets if p.name != name] + [pl]
         else:
-            self.plugins = [p for p in self.plugins if p.name != name]
-        self.trusted = {t: c for p in self.plugins for t, c in p.tools().items()}
+            self.command_sets = [p for p in self.command_sets if p.name != name]
+        self.trusted = {t: c for p in self.command_sets for t, c in p.tools().items()}
         self.session.usage = None   # the tools changed, so the last measured size no longer holds
-        self.audit.log("plugin", name=name, on=on)
+        self.audit.log("command_set", name=name, on=on)
 
     def register(self, tools):
         added = []
@@ -3842,7 +4070,7 @@ class Engine:
             if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name):
                 raise HoplonError(f"bad tool name {name!r}")
             if name in INTRINSICS or name in self.trusted:
-                raise HoplonError(f"tool '{name}' collides with an intrinsic or plugin tool")
+                raise HoplonError(f"tool '{name}' collides with an intrinsic or command set tool")
             if not isinstance(desc, str) or not isinstance(params, dict):
                 raise HoplonError(f"tool '{name}' needs a description and a parameters object")
             self.external[name] = {"type": "function",
@@ -4181,7 +4409,7 @@ class Engine:
         return self.read_allowed([])
 
     def trusted_tools(self):
-        """The trusted commands on offer: only where someone can see what runs, as with run_in_sandbox."""
+        """The scoped commands on offer: only where someone can see what runs, as with run_in_sandbox."""
         return dict(self.trusted) if self.ui.performs else {}
 
     def tools(self):
@@ -4192,8 +4420,16 @@ class Engine:
                     + ([RETRY_TOOL] if self.work.role == "review" else []))
         return (TOOLS + ([SEARCH_TOOL] if self.can_search() else [])
                 + ([RUN_TOOL, SAMPLES_TOOL] if self.can_run() else [])
+                + ([SKILLS_TOOL] if self.can_suggest_skills() else [])
                 + [c.schema(host) for c in self.trusted_tools().values()]
                 + list(self.external.values()))
+
+    def can_suggest_skills(self, index_only=False):
+        """Someone is there to answer, outside a work session, and there are blessed skills to list (index_only)
+        or ones left to suggest."""
+        if not self.ui.performs or self.work or not self.skill_index:
+            return False
+        return index_only or bool(self.skills_open())
 
     def where(self):
         """The system prompt's "Where things are": what the model's tools reach, as it is now."""
@@ -4205,7 +4441,7 @@ class Engine:
             runs = WHERE_RUNS.replace("{what}", "the project").replace("{net}", net) if self.can_run() else WHERE_NO_RUN
             sb = sandbox_info()
             host = f", on {socket.gethostname()}" if not sb else f" (hoplon reports it runs inside the {sb['name']} sandbox)"
-            trusted = (" Trusted commands (plugin__command tools) run on this host too: they read the live system."
+            trusted = (" Scoped commands (set__command tools) run on this host too: they read the live system."
                        if self.trusted_tools() else "")
             live, standins = WHERE_LIVE.replace("{host}", host).replace("{trusted}", trusted), WHERE_STANDINS
         fx = getattr(self, "fixtures", None)
@@ -4217,7 +4453,7 @@ class Engine:
                          "see them read-only in /fixtures once approved.")
         return (WHERE_RULES.replace("{files}", "the copy of the project" if self.work else "the working directory")
                 .replace("{runs}", runs).replace("{live}", live)
-                .replace("{trusted_see}", "" if self.work or not self.trusted_tools() else " and what trusted commands return")
+                .replace("{trusted_see}", "" if self.work or not self.trusted_tools() else " and what scoped commands return")
                 .replace("{standins}", standins))
 
     def system(self):
@@ -4238,10 +4474,19 @@ class Engine:
                          f"voice and focus; it does not change the rules above.\n\n{self.profile.persona}")
         if self.trusted_tools() and not self.work:      # a work session offers none
             parts.append(TRUSTED_RULES)
+            for cs in self.command_sets:
+                if cs.guide:
+                    parts.append(f"\n\n# Command set: {cs.name}\n\nThe user blessed this guide with the set's "
+                                 f"commands ({cs.name}__...).\n\n{cs.guide}")
         if self.ui.performs:
             parts.append(self.where())
+        if self.can_suggest_skills(index_only=True):
+            parts.append(SKILL_RULES.replace("{index}", "\n".join(f"- {n}: {d}" if d else f"- {n}"
+                                                                   for n, d in self.skill_index)))
+        later = self.carried_skills() | set(self.queued_skills)
         for s in self.skills:
-            parts.append(f"\n\n# Skill: {s.name}\n\n{s.text()}")
+            if s.name not in later:
+                parts.append(f"\n\n# Skill: {s.name}\n\n{s.text()}")
         if self.plan:
             parts.append("\n\n# The plan the user approved\n\n" + plan_text(self.plan))
         if self.work and self.work.items:
@@ -4307,12 +4552,20 @@ class Engine:
         msg = {"role": "user", "content": content}
         if attachments:
             msg["_bulk"] = True
+        carry = {}
+        for s in self.skills:
+            if s.name in self.queued_skills:
+                carry[s.name] = self.skill_block(s, "switched on by the user")
+        if carry:
+            msg["content"] += "".join(carry.values())
+            msg["_skills"] = carry
         self.session.add(msg)
         try:
             self.check_budget()
         except HoplonError:
             self.session.drop_last()
             raise
+        self.queued_skills = [n for n in self.queued_skills if n not in carry]
         try:
             ended = self.loop(checked=True)
             if self.work and self.work.done() and ended == "reply":
@@ -4392,6 +4645,8 @@ class Engine:
                             and mark != (self.work.current, self.work.swap, len(self.work.reports))):
                         moved = PROPOSAL_KINDS[p.kind].tool
                 tool_msg = {"role": "tool", "tool_call_id": p.call_id, "content": result}
+                if getattr(p, "carry", None):
+                    tool_msg["_skills"] = p.carry
                 kind = PROPOSAL_KINDS.get(p.kind)
                 if kind and kind.bulk and p.decision == "accept":
                     tool_msg["_bulk"] = True
@@ -4473,6 +4728,25 @@ class Engine:
         fx = self.fixtures_store()
         return Proposal(pid, "samples", call_id, what=what, files=files[:20], suggest=suggest or "", reason=reason,
                         folder=fx.dir)
+
+    def build_skills(self, pid, call_id, args, reason, name):
+        names = args.get("names")
+        if not self.can_suggest_skills(index_only=True):
+            raise ValueError("suggest_skills is not available now")
+        if not isinstance(names, list) or not names or not all(isinstance(n, str) for n in names):
+            raise ValueError("names must list skills from 'Skills you can suggest'")
+        names = list(dict.fromkeys(names))
+        if len(names) > SKILL_SUGGEST_MAX:
+            raise ValueError(f"suggest at most {SKILL_SUGGEST_MAX} skills at a time")
+        on, index = {s.name for s in self.skills}, dict(self.skill_index)
+        for n in names:
+            if n not in index:
+                raise ValueError(f"'{one_line(n)[0][:40]}' is not in the list of skills you can suggest")
+            if n in on:
+                raise ValueError(f"skill {n} is on already")
+            if n in self.declined_skills:
+                raise ValueError(f"the user declined skill {n}; don't suggest it again unless they ask")
+        return Proposal(pid, "skills", call_id, names=names, about=[index[n] for n in names], reason=reason)
 
     def build_sandbox(self, pid, call_id, args, reason, name):
         cmd = args.get("command")
@@ -4615,9 +4889,9 @@ class Engine:
     def build_trusted(self, pid, call_id, args, reason, name):
         cmd = self.trusted[name]
         values = cmd.check(args)
-        p = Proposal(pid, "trusted", call_id, plugin=cmd.plugin, command=cmd.name, params=values,
-                     argv=cmd.shown(values), read_only=cmd.read_only, reason=cmd.describe, _cmd=cmd)
-        p.auto = cmd.read_only
+        p = Proposal(pid, "trusted", call_id, set=cmd.set, command=cmd.name, params=values,
+                     argv=cmd.shown(values), access=cmd.access, reason=cmd.describe, _cmd=cmd)
+        p.auto = cmd.auto
         return p
 
     def search_proposal(self, pid, call_id, args, reason, name="search_files"):
@@ -4798,6 +5072,8 @@ class Engine:
             if p.kind != "external":    # the wrapper's answer (ok, declined, error) is its result, not a decision
                 p.decision = p.decision if p.decision in ("accept", "decline") else "decline"
                 self.audit.log("decision", id=p.id, decision=p.decision)
+                if p.kind == "skills" and p.decision != "accept":
+                    self.declined_skills.update(p.fields["names"])     # the model may not suggest them again
             if p.kind in ("edit", "write") and self.edits == "approved-files":
                 key = self.file_key(p.fields.get("path"))
                 if p.decision == "accept" and key and key not in self.approved_files:
@@ -4902,6 +5178,23 @@ class Engine:
 
     def perform_command(self, p):
         return "shown to the user, not run. If they run it, they may send you the output."
+
+    def perform_skills(self, p):
+        """Switch them on, carried by this call's result. A skill that can't be (its blessing changed since) is
+        reported, and the others still go on."""
+        p.carry, failed = {}, []
+        for n in p.fields["names"]:
+            try:
+                self.set_skill(n, True, source="suggestion", carry=False)
+            except HoplonError as e:
+                failed.append(f"{n} ({e})")
+                continue
+            s = next(s for s in self.skills if s.name == n)
+            p.carry[n] = self.skill_block(s, "switched on by the user at your suggestion")
+        self.ui.skills_changed(self.skill_rows())
+        head = (f"switched on: {', '.join(p.carry)}." if p.carry else "none was switched on.") + \
+            (f" Not switched on: {'; '.join(failed)}." if failed else "")
+        return head + "".join(p.carry.values())
 
     def perform_samples(self, p):
         return ("shown to the user, not run: nothing runs for a sample request. Wait for them: once they have put the samples in the folder and approved them, "
@@ -5136,7 +5429,7 @@ class Engine:
         return f"{head} (sandbox, {where}, {secs:.1f} s). Output:\n" + (out if out.strip() else "(none)")
 
     def perform_trusted(self, p):
-        """Run an accepted trusted command for the model: the exit code and the output, redacted and clipped."""
+        """Run an accepted scoped command for the model: the exit code and the output, redacted and clipped."""
         r = self.run_trusted(p.fields["_cmd"], p.fields["params"], "model")
         if r["error"]:
             self.ui.result(p, "error", f"not run: {r['error']}", output="", exit=None)
@@ -5153,13 +5446,13 @@ class Engine:
         return head + (f" ({'; '.join(extra)})" if extra else "") + ". Output:\n" \
             + (r["output"] if r["output"].strip() else "(none)")
 
-    def run_user(self, plugin, command, params):
-        """A trusted command the user asked for (a wrapper's run message): the same checks and limits as the
+    def run_user(self, cset, command, params):
+        """A scoped command the user asked for (a wrapper's run message): the same checks and limits as the
         model's. Raises HoplonError when it can't be asked for; otherwise returns run_trusted's result."""
-        cmd = next((c for p in self.plugins if p.name == plugin for c in p.commands.values() if c.name == command),
+        cmd = next((c for p in self.command_sets if p.name == cset for c in p.commands.values() if c.name == command),
                    None)
         if not cmd:
-            raise HoplonError(f"no command {one_line(str(plugin))[0]}.{one_line(str(command))[0]} in an enabled plugin",
+            raise HoplonError(f"no command {one_line(str(cset))[0]}.{one_line(str(command))[0]} in an enabled command set",
                              EXIT_USAGE, "unknown_command")
         try:
             values = cmd.check(params)
@@ -5168,7 +5461,7 @@ class Engine:
         return self.run_trusted(cmd, values, "user")
 
     def run_trusted(self, cmd, values, source):
-        """Run a trusted command whose parameters are already checked. Refused, not run, when the program changed,
+        """Run a scoped command whose parameters are already checked. Refused, not run, when the program changed,
         when the same command ran less than its min_interval ago, or after 30 real runs in a minute; a result
         younger than the command's cache time is returned again instead. Returns {error, exit, output, note,
         cached (seconds, or None), ms, redacted}."""
@@ -5176,13 +5469,13 @@ class Engine:
         limited = False
 
         def finish():
-            self.audit.log("trusted_run", plugin=cmd.plugin, command=cmd.name, params=values, source=source,
+            self.audit.log("trusted_run", set=cmd.set, command=cmd.name, params=values, source=source,
                            exit=res["exit"], ms=res["ms"], bytes=len(res["output"].encode()),
                            cached=res["cached"] is not None, rate_limited=limited, binary=cmd.binary,
                            error=res["error"], redacted=res["redacted"])
             return res
 
-        key, now_ = (cmd.plugin, cmd.name), time.monotonic()
+        key, now_ = (cmd.set, cmd.name), time.monotonic()
         ckey = key + (tuple(sorted(values.items())),)
         problem = cmd.changed()
         if problem:
@@ -5346,6 +5639,10 @@ class PlainUI:
     def generated(self, stats):
         pass
 
+    def skills_changed(self, rows):
+        on = [one_line(r["name"])[0] for r in rows if r.get("active")]
+        self.notice(f"skills on: {', '.join(on) or 'none'}")
+
     def context(self, used, limit):
         pass
 
@@ -5436,7 +5733,7 @@ class TtyUI(PlainUI):
         if p.kind == "trusted":
             f = p.fields
             args = ", ".join(f"{k}={v}" for k, v in f["params"].items())
-            eprint(f"  \u21b3 [{p.id}] {tagged(p.kind, f)}{one_line(f['plugin'])[0]}.{one_line(f['command'])[0]}({show_exact(args)}): "
+            eprint(f"  \u21b3 [{p.id}] {tagged(p.kind, f)}{one_line(f['set'])[0]}.{one_line(f['command'])[0]}({show_exact(args)}): "
                    f"{show_exact(f['argv'])}")
         elif p.kind == "sandbox":
             eprint(f"  [{p.id}] {tagged(p.kind, p.fields)}sandbox, offline: {one_line(p.fields['reason'])[0]}\n    $ {show_exact(p.fields['command'])}")
@@ -5485,8 +5782,8 @@ class TtyUI(PlainUI):
                 head = (f"Run in the sandbox, with the network ON:\n    $ {show_exact(f['command'])}\n"
                         "It works on a throwaway copy of the project, but it could send what it reads anywhere.")
             elif p.kind == "trusted":
-                head = (f"Run {one_line(f['plugin'])[0]}.{one_line(f['command'])[0]} (a trusted command that asks "
-                        f"every time):\n    $ {show_exact(f['argv'])}")
+                head = (f"Run {one_line(f['set'])[0]}.{one_line(f['command'])[0]} (a scoped command that "
+                        f"changes something):\n    $ {show_exact(f['argv'])}")
             elif p.kind == "plan":
                 self.out.write(f"\n\033[1m[{p.id}] plan\033[0m — {one_line(f['goal'])[0]}\n{margin(plan_steps(f['steps']))}\n"
                                "Planned reads won't ask again; a planned command proposed exactly as shown is "
@@ -5502,6 +5799,10 @@ class TtyUI(PlainUI):
                 self.out.flush()
                 p.decision = "accept" if ask_yes(f"Approve {p.id} and start?") else "decline"
                 continue
+            elif p.kind == "skills":
+                rows = "\n".join(f"{one_line(n)[0]}: {one_line(d)[0]}" if d else one_line(n)[0]
+                                 for n, d in zip(f["names"], f["about"]))
+                head = f"Switch on these skills?\n{margin(rows)}"
             else:
                 head = f"Call {p.kind}?"
             self.out.write(f"\n\033[1m[{p.id}] {tagged(p.kind, f)}{p.kind}\033[0m — {one_line(f.get('reason', ''))[0]}\n"
@@ -5636,6 +5937,9 @@ class JsonUI:
 
     def progress(self, report):
         self.emit(dict(report, type="progress"))
+
+    def skills_changed(self, rows):
+        self.emit({"type": "skills", "skills": rows})
 
     def generated(self, stats):
         self.emit({"type": "generated", "tokens": stats["tokens"], "estimated": stats["estimated"],
@@ -6492,7 +6796,7 @@ def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()
              "features": ["proposals", "decisions", "attach", "register_tools", "compact", "context", "coding",
                           "fixtures", "leftovers",
                           "set_coding", "skills", "files", "read", "trace", "system", "plan", "network", "clear",
-                          "models", "plugins", "interrupt", "edits", "stop", "digest", "work", "halt", "progress"],
+                          "models", "command_sets", "interrupt", "edits", "stop", "digest", "work", "halt", "progress"],
              "endpoint": engine.endpoint.info(),
              "profile": dict({"name": engine.profile.name, "description": engine.profile.description},
                              **({"layout": engine.profile.layout} if engine.profile.layout else {}))
@@ -6504,14 +6808,14 @@ def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()
              "sandbox": engine.sandbox, "audit": engine.audit.path,
              "runner": engine.box.info() if engine.box else None, "edits": engine.edits_info(),
              "skills": [s.name for s in engine.skills],
-             "plugins": [p.name for p in engine.plugins],
+             "command_sets": [p.name for p in engine.command_sets],
              "tools": list(INTRINSICS)})
     engine.audit.log("start", mode="json", endpoint=engine.endpoint.info(),
                      profile=engine.profile.name if engine.profile else None, session=engine.session.id,
                      sandbox=engine.sandbox)
     for n in after_hello:
         ui.notice(n)
-    ui.emit({"type": "plugins", "plugins": engine.plugin_rows()})
+    ui.emit({"type": "command_sets", "command_sets": engine.command_set_rows()})
 
     def turn(text, att, start=None):
         first = getattr(engine.client, "exchanges", 0) + 1
@@ -6684,30 +6988,30 @@ def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()
             except HoplonError as err:
                 ui.error(str(err), err.kind)
             ui.emit({"type": "skills", "skills": engine.skill_rows()})
-        elif t == "plugins":
-            ui.emit({"type": "plugins", "plugins": engine.plugin_rows()})
-        elif t == "plugin":
+        elif t == "command_sets":
+            ui.emit({"type": "command_sets", "command_sets": engine.command_set_rows()})
+        elif t == "command_set":
             name, on = msg.get("name"), msg.get("on")
             if not isinstance(name, str) or not isinstance(on, bool):
-                ui.error("plugin needs 'name' and 'on': true or false", "bad_message")
+                ui.error("command_set needs 'name' and 'on': true or false", "bad_message")
                 continue
-            if remote and name not in engine.offered["plugins"]:  # only what the user's own machine vouched for
-                ui.error(f"plugin '{one_line(name)[0]}' wasn't sent from your machine: in remote mode, only the "
-                         "plugins hoplon-tui sent (the profile's and default_plugins) can be used", "remote")
-                ui.emit({"type": "plugins", "plugins": engine.plugin_rows()})
+            if remote and name not in engine.offered["command_sets"]:  # only what the user's own machine vouched for
+                ui.error(f"command set '{one_line(name)[0]}' wasn't sent from your machine: in remote mode, only the "
+                         "command sets hoplon-tui sent (the profile's and default_commands) can be used", "remote")
+                ui.emit({"type": "command_sets", "command_sets": engine.command_set_rows()})
                 continue
             try:
-                engine.set_plugin(name, on)
+                engine.set_command_set(name, on)
             except HoplonError as err:
                 ui.error(str(err), err.kind)
-            ui.emit({"type": "plugins", "plugins": engine.plugin_rows()})
+            ui.emit({"type": "command_sets", "command_sets": engine.command_set_rows()})
         elif t == "run":
             rid = msg.get("id")
             if type(rid) not in (int, str):
                 ui.error("run needs 'id': a string or a number, which the answer repeats", "bad_message")
                 continue
             try:
-                r = engine.run_user(msg.get("plugin"), msg.get("command"), msg.get("params", {}))
+                r = engine.run_user(msg.get("set"), msg.get("command"), msg.get("params", {}))
             except HoplonError as err:
                 r = {"error": str(err)}
             if r["error"]:
@@ -7250,7 +7554,7 @@ def parse_args(argv):
     ap.add_argument("-S", "--session", help="keep the conversation in a named session (created or resumed)")
     ap.add_argument("--allow-session-endpoint-change", action="store_true",
                     help="allow this invocation to send saved context to a changed or unrecorded destination")
-    ap.add_argument("--plugin", action="append", default=[], help="use a blessed plugin (repeatable)")
+    ap.add_argument("--commands", action="append", default=[], help="use a blessed command set (repeatable)")
     ap.add_argument("--coding", action="store_true", help="let the model read and list files here without asking")
     ap.add_argument("--coding-anywhere", action="store_true",
                     help="--coding, also where it is normally refused (your home directory, credential "
@@ -7260,12 +7564,12 @@ def parse_args(argv):
                     help="with --json: read the endpoint, profile and session token from the first line of stdin "
                          "(for hoplon-tui's remote mode)")
     ap.add_argument("--remote-config", action="store_true",
-                    help="print the resolved endpoint, profile, skills and plugins as one JSON line, without any key "
-                         "(for hoplon-tui's remote mode; takes -e, -p, -k and --plugin)")
+                    help="print the resolved endpoint, profile, skills and command sets as one JSON line, without any key "
+                         "(for hoplon-tui's remote mode; takes -e, -p, -k and --commands)")
     ap.add_argument("--bless", metavar="PATH",
-                    help="review and bless a skill or plugin directory, endpoint or profile file")
+                    help="review and bless a skill or command set directory, endpoint or profile file")
     ap.add_argument("--list-skills", action="store_true", help="list skills (with --json: as JSON)")
-    ap.add_argument("--list-plugins", action="store_true", help="list plugins (with --json: as JSON)")
+    ap.add_argument("--list-commands", action="store_true", help="list command sets (with --json: as JSON)")
     ap.add_argument("--list-endpoints", action="store_true", help="list endpoints (with --json: as JSON)")
     ap.add_argument("--list-profiles", action="store_true", help="list profiles (with --json: as JSON)")
     ap.add_argument("--list-sessions", action="store_true", help="list saved sessions (with --json: as JSON)")
@@ -7294,8 +7598,8 @@ def main(argv=None):
             return EXIT_OK if bless(cfg, args.bless, ask_yes) else EXIT_ERROR
         if args.remote_config:
             if args.session:
-                raise HoplonError("--remote-config takes only -e, -p, -k and --plugin", EXIT_USAGE)
-            print(json.dumps(export_remote(cfg, args.profile, args.endpoint, args.skill, args.plugin)))
+                raise HoplonError("--remote-config takes only -e, -p, -k and --commands", EXIT_USAGE)
+            print(json.dumps(export_remote(cfg, args.profile, args.endpoint, args.skill, args.commands)))
             return EXIT_OK
         if args.list_skills:
             rows = skill_rows(cfg)
@@ -7304,10 +7608,10 @@ def main(argv=None):
             else:
                 print("\n".join(skill_lines(rows)))
             return EXIT_OK
-        if args.list_plugins:
-            rows = plugin_rows(cfg)
+        if args.list_commands:
+            rows = command_set_rows(cfg)
             if args.json:
-                print(json.dumps({"type": "plugins", "plugins": rows}))
+                print(json.dumps({"type": "command_sets", "command_sets": rows}))
             else:
                 print("\n".join(skill_lines(rows)))
             return EXIT_OK
@@ -7372,12 +7676,12 @@ def main(argv=None):
             if k not in session.skills:
                 session.skills.append(k)
         if args.config_stdin:
-            plugins = list(offered["plugins"])
-            if args.plugin:
-                notices.append("--plugin is ignored in remote mode: the plugins come from your machine")
+            command_sets = list(offered["command_sets"])
+            if args.commands:
+                notices.append("--commands is ignored in remote mode: the command sets come from your machine")
         else:
-            plugins = list(dict.fromkeys((persona.plugins if persona and persona.plugins is not None
-                                          else cfg.default_plugins) + args.plugin))
+            command_sets = list(dict.fromkeys((persona.command_sets if persona and persona.command_sets is not None
+                                          else cfg.default_commands) + args.commands))
 
         prompt = " ".join(args.prompt) if args.prompt else None
         if args.json:
@@ -7390,7 +7694,7 @@ def main(argv=None):
         coding = ("--coding-anywhere" if args.coding_anywhere else "--coding" if args.coding else
                   f"profile {persona.name}" if persona and persona.coding else None)
         engine = Engine(cfg, endpoint, session, ui, coding=coding, profile=persona, anywhere=args.coding_anywhere,
-                        plugins=plugins, offered=offered)
+                        command_sets=command_sets, offered=offered)
         if isinstance(ui, TtyUI):       # hooks only run for a person at the terminal, the UI chosen above
             engine.notifier = Notifier.start(engine)
         for n in notices:

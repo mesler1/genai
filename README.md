@@ -57,7 +57,7 @@ then bless both and start it in a project directory (coding mode is refused in y
 
 ```bash
 hoplon --bless profiles/coder.json           # a persona: shows its text, endpoint, skills, coding grant
-hoplon --bless skills/bash-scripts           # the skill it uses
+hoplon --bless skills/bash                   # the skill it uses
 cd ~/src/some-project
 hoplon -e work-llm -p coder                  # REPL: a line with only '..' sends; :help for commands
 hoplon-tui -e work-llm -p coder              # the same in tmux panes, beside your shell (needs tmux)
@@ -72,7 +72,7 @@ hoplon-tui -e work-llm -p coder              # the same in tmux panes, beside yo
 - [hoplon-tui](docs/hoplon-tui.md): the terminal UI, another host over ssh, remote mode, the file tree
 - [Work sessions](docs/work-sessions.md): the model plans, codes, tests and commits on a branch of its own
 - [Sandbox](docs/sandbox.md): running hoplon in a container, and the model's own sandboxed builds and tests
-- [Plugins and trusted commands](docs/plugins.md): narrow commands you approve once
+- [Command sets and scoped commands](docs/commands.md): narrow commands you approve once
 - [Hooks](docs/hooks.md): your own programs at fixed points ([HOOKS.md](HOOKS.md) has the design)
 - [JSON protocol](docs/json-protocol.md): driving hoplon from a wrapper
 

@@ -18,13 +18,13 @@ def proposal(kind, n=1):
     """A proposal of this kind with the fields the gate itself reads; the handlers are not reached."""
     return G.Proposal(f"p{n}", kind, f"c{n}", command="true", path="a.txt", steps=[], tool="t", goal="g",
                       items=["i"], summary="s", reason="r",
-                      what="w", files=["f.log"], suggest="", folder="/f")
+                      what="w", files=["f.log"], suggest="", folder="/f", names=["s"], about=[""])
 
 
 class TestTable(unittest.TestCase):
     def test_every_tool_hoplon_offers_has_a_kind(self):
         offered = [t["function"]["name"] for t in G.TOOLS + [G.SEARCH_TOOL, G.RUN_TOOL, G.WORK_PLAN_TOOL, G.FINISH_TOOL, G.RETRY_TOOL,
-                                                    G.SAMPLES_TOOL]]
+                                                    G.SAMPLES_TOOL, G.SKILLS_TOOL]]
         self.assertEqual(sorted(set(offered)), sorted(G.INTRINSICS))
         self.assertEqual(sorted(G.BY_TOOL), sorted(G.INTRINSICS))
 

@@ -31,10 +31,10 @@ ROLES = {
     "files": set(),          # the files feature adds what this pane may ask for
     "pipe": set(),           # hoplon-share in the shell pane; the shared feature adds what it may send
 }
-# A plugin's pane connects as "plugin:NAME". It may run its own plugin's read-only commands, put text in the input box
-# and offer text to attach after the user reviews it; the plugins feature checks each request (tui/features/plugins.py).
-PLUGIN_ROLE = re.compile(r"plugin:[a-z][a-z0-9-]{0,30}")
-PLUGIN_KINDS = {"run", "insert", "attach"}
+# A command set's pane connects as "commands:NAME". It may run its own command set's read-only commands, put text in the input box
+# and offer text to attach after the user reviews it; the commands feature checks each request (tui/features/commands.py).
+SET_ROLE = re.compile(r"commands:[a-z][a-z0-9-]{0,30}")
+SET_KINDS = {"run", "insert", "attach"}
 # What no feature may ever be given: answering a question or approving something is the prompt pane's alone.
 NEVER = {"hello", "input", "key", "scroll", "quit", "decision", "answer"}
 
@@ -115,7 +115,7 @@ class Hub:
         self.roles = {role: set(kinds) for role, kinds in ROLES.items()}     # extra: what the features that are on add
         for role, kinds in (extra or {}).items():
             allow(self.roles, role, kinds)
-        self.plugins = False       # whether plugin panes may connect (the plugins feature is on)
+        self.command_sets = False       # whether command set panes may connect (the commands feature is on)
         self.inbox = queue.Queue()
         self.clients = []          # (connection, role)
         self.connections = set()   # includes sockets still sending a handshake
@@ -155,8 +155,8 @@ class Hub:
             msgs = messages(conn, first_timeout=HELLO_TIMEOUT)
             hello = next(msgs, None)
             role = hello.get("role") if hello and hello.get("type") == "hello" else None
-            if isinstance(role, str) and PLUGIN_ROLE.fullmatch(role) and self.plugins:
-                kinds = PLUGIN_KINDS
+            if isinstance(role, str) and SET_ROLE.fullmatch(role) and self.command_sets:
+                kinds = SET_KINDS
             elif isinstance(role, str) and role in self.roles:
                 kinds = self.roles[role]
             else:

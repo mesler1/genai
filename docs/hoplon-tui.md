@@ -53,11 +53,11 @@ What happens, before tmux starts (so a password or second factor is asked for in
 
 1. `hoplon --remote-config` resolves `-e` and `-p` exactly as a normal start would (default endpoint and profile,
    blessing checks, a changed file is refused) and prints the endpoint and profile *without* `key_env`, `key_file`,
-   `proxy`, `headers` or `ca_bundle`. The skills and plugins in use (the profile's, or `default_skills` and
-   `default_plugins`, plus `-k`) go with their files, if they are blessed here; one that isn't is left out, with a
-   message. On the host they are checked against the hashes blessed here, the plugins' programs are looked for there
+   `proxy`, `headers` or `ca_bundle`. The skills and command sets in use (the profile's, or `default_skills` and
+   `default_commands`, plus `-k`) go with their files, if they are blessed here; one that isn't is left out, with a
+   message. On the host they are checked against the hashes blessed here, the command sets' programs are looked for there
    (a command whose program is missing there is left out, as locally), and nothing blessed only on the host can be
-   used. So the Slurm plugin's commands run on the cluster. `-S` is not available with `--remote` yet.
+   used. So the Slurm command set's commands run on the cluster. `-S` is not available with `--remote` yet.
 2. An ssh master connection (`ssh -M -S STATE/cm -fN`, then the host's checks: Python 3.10 or newer as the target user,
    `sudo -n` for `--as`, the directory) whose control socket lives in hoplon-tui's private 0700 state directory.
 3. `tui/keyproxy.py` starts here on a Unix socket, with a random token on its stdin.
@@ -94,10 +94,10 @@ key always asks. Remove an entry from that file, or the file, to be asked again.
 
 ## The right column
 
-The info panel sits on the right, and `/panel` shows or hides that column. A plugin's pane (`/plugins NAME pane`)
+The info panel sits on the right, and `/panel` shows or hides that column. A command set's pane (`/commands NAME pane`)
 opens there too, as a tab: with two or more, the column's top border shows them, the one on screen in bronze. `/tab`
 goes to the next tab, `/tab NAME` to that one, and a click on the border opens a menu of them. A tab that isn't on
-screen keeps running, with its scrollback. `/plugins NAME pane` on the tab that is on screen takes it out of the
+screen keeps running, with its scrollback. `/commands NAME pane` on the tab that is on screen takes it out of the
 column (it keeps running; the same command brings it back).
 
 ## File tree
@@ -136,7 +136,7 @@ remote mode, where the shell pane is on the other host.
 
 ## Features
 
-hoplon-tui's `/model`, `/copy`, `/decline`, `/raw`, `/system`, `/files`, `/sandbox`, `/edits`, `/plugins` and `/work`, and the `hoplon-ssh` handshake, are
+hoplon-tui's `/model`, `/copy`, `/decline`, `/raw`, `/system`, `/files`, `/sandbox`, `/edits`, `/commands` and `/work`, and the `hoplon-ssh` handshake, are
 features, each in its own module under `tui/features/`. To switch some off, list them in
 `~/.config/hoplon/tui.json` (`$XDG_CONFIG_HOME/hoplon/tui.json`):
 
@@ -145,7 +145,7 @@ features, each in its own module under `tui/features/`. To switch some off, list
 ```
 
 or set `HOPLON_TUI_DISABLE=copy,model` for one run. Names are `model`, `copy`, `decline`, `raw`,
-`ssh`, `files`, `sandbox`, `edits`, `plugins` (without it, no plugin pane can connect), `work`, `fixtures`, `leftovers`, `alerts` (without it, no bell) and `shared` (without it, hoplon-share sends nothing). A disabled feature has no command, help line or menu item, and hoplon-tui's socket
+`ssh`, `files`, `sandbox`, `edits`, `commands` (without it, no command set's pane can connect), `work`, `fixtures`, `leftovers`, `alerts` (without it, no bell) and `shared` (without it, hoplon-share sends nothing). A disabled feature has no command, help line or menu item, and hoplon-tui's socket
 refuses its requests. Without `ssh`, a hoplon-ssh session isn't followed. No file means
 everything is on; a file that can't be read is ignored, with a note in the conversation.
 

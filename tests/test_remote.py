@@ -248,8 +248,8 @@ class TestEndToEnd(RemoteCase):
         self.assertEqual(r.stdout.decode().strip(), "first line ['one', 'two']", r.stderr)
 
 
-class TestPluginsAndSkills(RemoteCase):
-    """A plugin and a skill blessed on this machine are sent in the config line; the plugin's commands run on the
+class TestCommandSetsAndSkills(RemoteCase):
+    """A command set and a skill blessed on this machine are sent in the config line; the command set's commands run on the
     remote host (here: the same machine, with a home of its own), and nothing blessed only there can be used."""
 
     turns = [call("rp__who", user="alice"), reply("done")]
@@ -261,27 +261,27 @@ class TestPluginsAndSkills(RemoteCase):
         with open(prog, "w") as f:
             f.write('#!/bin/sh\necho "ran on the remote host for $1 as HOME=$HOME"\n')
         os.chmod(prog, 0o755)
-        pdir = os.path.join(self.home, "plugins", "rp")
+        pdir = os.path.join(self.home, "commands", "rp")
         os.makedirs(pdir)
-        with open(os.path.join(pdir, "plugin.json"), "w") as f:
-            json.dump({"name": "rp", "description": "remote plugin", "search": [self.bin],
-                       "commands": {"who": {"describe": "who", "argv": ["whoq", "{user}"], "read_only": True,
+        with open(os.path.join(pdir, "commands.json"), "w") as f:
+            json.dump({"name": "rp", "description": "remote command set", "search": [self.bin],
+                       "commands": {"who": {"describe": "who", "argv": ["whoq", "{user}"], "access": "read",
                                             "params": {"user": {"pattern": "[a-z]+"}}, "min_interval": 0},
-                                    "gone": {"describe": "not installed", "argv": ["nosuchprogq"], "read_only": True}}},
+                                    "gone": {"describe": "not installed", "argv": ["nosuchprogq"], "access": "read"}}},
                       f)
         sdir = os.path.join(self.home, "skills", "rs")
         os.makedirs(sdir)
         with open(os.path.join(sdir, "SKILL.md"), "w") as f:
             f.write("# Remote skill\n\nSAY-PINEAPPLE\n")
         cfg = test_hoplon.G.Config(self.home)
-        for kind, d in (("plugin", pdir), ("skill", sdir)):
+        for kind, d in (("command_set", pdir), ("skill", sdir)):
             cfg.set_blessed(d, {"kind": kind, "name": os.path.basename(d), "hash": test_hoplon.G.hash_skill(d)[0]})
-        return ["--plugin", "rp", "-k", "rs"]
+        return ["--commands", "rp", "-k", "rs"]
 
-    def test_a_plugin_command_runs_remotely_and_the_skill_is_used(self):
+    def test_a_command_set_command_runs_remotely_and_the_skill_is_used(self):
         c = self.child(self.write_info())
         hello, seen = self.until(c, "hello")
-        self.assertEqual((hello["plugins"], hello["skills"]), (["rp"], ["rs"]), seen)
+        self.assertEqual((hello["command_sets"], hello["skills"]), (["rp"], ["rs"]), seen)
         self.assertTrue(any("gone left out" in e.get("message", "") for e in seen if e["type"] == "notice"), seen)
         c.send({"type": "user", "text": "who?"})
         res, seen = self.until(c, "result")
@@ -293,20 +293,20 @@ class TestPluginsAndSkills(RemoteCase):
         self.assertIn("SAY-PINEAPPLE", system)
         with open(os.path.join(self.remote_home, "hoplon", "audit.log")) as f:
             rec = next(json.loads(x) for x in f if '"remote_config"' in x)
-        self.assertEqual(set(rec["plugins"]), {"rp"})
+        self.assertEqual(set(rec["command_sets"]), {"rp"})
         self.assertTrue(rec["skills"]["rs"].startswith("sha256:"))
 
     def test_only_what_was_sent_can_be_switched_on(self):
         c = self.child(self.write_info())
         self.until(c, "hello")
-        c.send({"type": "plugin", "name": "rp", "on": False})
-        ev, seen = self.until(c, "plugins")
-        ev, seen = self.until(c, "plugins")         # the one after hello came first
-        self.assertFalse(ev["plugins"][0]["enabled"], seen)
-        c.send({"type": "plugin", "name": "rp", "on": True})
-        ev, _ = self.until(c, "plugins")
-        self.assertEqual([(r["name"], r["enabled"], r["status"]) for r in ev["plugins"]], [("rp", True, "blessed")])
-        for kind, name in (("plugin", "slurm"), ("skill", "hpc")):
+        c.send({"type": "command_set", "name": "rp", "on": False})
+        ev, seen = self.until(c, "command_sets")
+        ev, seen = self.until(c, "command_sets")         # the one after hello came first
+        self.assertFalse(ev["command_sets"][0]["enabled"], seen)
+        c.send({"type": "command_set", "name": "rp", "on": True})
+        ev, _ = self.until(c, "command_sets")
+        self.assertEqual([(r["name"], r["enabled"], r["status"]) for r in ev["command_sets"]], [("rp", True, "blessed")])
+        for kind, name in (("command_set", "slurm"), ("skill", "hpc")):
             c.send({"type": kind, "name": name, "on": True})
             ev, seen = self.until(c, "error")
             self.assertEqual(ev["code"], "remote", seen)
@@ -363,9 +363,9 @@ class TestOptions(unittest.TestCase):
             self.assertIn(why, err, args)
 
     def test_skills_go_to_the_launcher_not_to_the_remote_hoplon(self):
-        rc, out, _ = self.check("--remote", "h", "-k", "hpc", "-k", "bash-scripts")
+        rc, out, _ = self.check("--remote", "h", "-k", "hpc", "-k", "bash")
         self.assertEqual(rc, 0)
-        self.assertEqual([x for x in out.splitlines() if x.startswith("skill=")], ["skill=hpc", "skill=bash-scripts"])
+        self.assertEqual([x for x in out.splitlines() if x.startswith("skill=")], ["skill=hpc", "skill=bash"])
         self.assertEqual(C.hoplon_args(C.parse_args(["--remote", "h", "-k", "hpc"])), [])
         self.assertEqual(C.hoplon_args(C.parse_args(["-k", "hpc"])), ["-k", "hpc"])
 

@@ -1,4 +1,4 @@
-"""Tests for plugins and trusted commands: the manifest's rules, blessing, the programs they may run, the checks on
+"""Tests for command sets and scoped commands: the manifest's rules, blessing, the programs they may run, the checks on
 what is run, the limits, and the model's and the user's ways of running them."""
 
 import copy
@@ -21,16 +21,16 @@ CMDS = {
     "queue": {"describe": "jobs of one user", "argv": ["fakeq", "-u", "{user}", "--fmt={fmt}"],
               "params": {"user": {"pattern": "^[a-z_][a-z0-9_-]{0,31}$", "describe": "a user name"},
                          "fmt": {"enum": ["short", "long"]}},
-              "read_only": True, "min_interval": 0},
+              "access": "read", "min_interval": 0},
     "job": {"describe": "one job", "argv": ["fakeq", "job", "{id}"],
-            "params": {"id": {"int": [1, 99999]}}, "read_only": True, "min_interval": 0},
+            "params": {"id": {"int": [1, 99999]}}, "access": "read", "min_interval": 0},
     "kill": {"describe": "stops a job", "argv": ["fakeq", "kill", "{id}"],
-             "params": {"id": {"int": [1, 99999]}}, "min_interval": 0},
-    "slow": {"describe": "never ends", "argv": ["slowq"], "read_only": True, "timeout": 1, "min_interval": 0},
-    "big": {"describe": "too much output", "argv": ["bigq"], "read_only": True, "max_output": 1000, "min_interval": 0},
-    "leak": {"describe": "prints a secret", "argv": ["leakq"], "read_only": True, "min_interval": 0},
-    "cached": {"describe": "cached", "argv": ["fakeq", "cached"], "read_only": True, "cache": 60, "min_interval": 0},
-    "paced": {"describe": "paced", "argv": ["fakeq", "paced"], "read_only": True, "min_interval": 30},
+             "params": {"id": {"int": [1, 99999]}}, "access": "write", "min_interval": 0},
+    "slow": {"describe": "never ends", "argv": ["slowq"], "access": "read", "timeout": 1, "min_interval": 0},
+    "big": {"describe": "too much output", "argv": ["bigq"], "access": "read", "max_output": 1000, "min_interval": 0},
+    "leak": {"describe": "prints a secret", "argv": ["leakq"], "access": "read", "min_interval": 0},
+    "cached": {"describe": "cached", "argv": ["fakeq", "cached"], "access": "read", "cache": 60, "min_interval": 0},
+    "paced": {"describe": "paced", "argv": ["fakeq", "paced"], "access": "read", "min_interval": 30},
 }
 
 
@@ -40,8 +40,8 @@ def program(path, body):
     os.chmod(path, 0o755)
 
 
-class PluginBase(Tmp):
-    """A plugin called 'fake' whose programs are shell scripts in a private directory that log what they get."""
+class CommandSetBase(Tmp):
+    """A command set called 'fake' whose programs are shell scripts in a private directory that log what they get."""
 
     def setUp(self):
         super().setUp()
@@ -56,19 +56,19 @@ class PluginBase(Tmp):
         program(os.path.join(self.bin, "slowq"), "/bin/sleep 30\n")
         program(os.path.join(self.bin, "bigq"), "/usr/bin/yes aaaaaaaaaaaaaaaaaaaa | /usr/bin/head -c 5000000\n")
         program(os.path.join(self.bin, "leakq"), "echo 'TOKEN=abcdefghijklmnop1234'\n")
-        self.manifest = {"name": "fake", "description": "a fake plugin", "search": [self.bin], "env": ["FAKE_ALLOWED"],
+        self.manifest = {"name": "fake", "description": "a fake command set", "search": [self.bin], "env": ["FAKE_ALLOWED"],
                          "commands": copy.deepcopy(CMDS)}
 
-    def plugin_dir(self, parent=None, name="fake"):
-        d = os.path.join(parent or self.path("plugins"), name)
+    def set_dir(self, parent=None, name="fake"):
+        d = os.path.join(parent or self.path("commands"), name)
         os.makedirs(d, exist_ok=True)
-        write_json(os.path.join(d, "plugin.json"), self.manifest)
+        write_json(os.path.join(d, "commands.json"), self.manifest)
         return d
 
     def load(self, **top):
         saved, self.manifest = self.manifest, dict(self.manifest, **top)
         try:
-            return G.Plugin("fake", self.plugin_dir(self.path("loose")))
+            return G.CommandSet("fake", self.set_dir(self.path("loose")))
         finally:
             self.manifest = saved
 
@@ -85,14 +85,14 @@ class PluginBase(Tmp):
         return runs
 
 
-def bless_plugin(home, path):
-    G.Config(home).set_blessed(os.path.abspath(path), {"kind": "plugin", "name": os.path.basename(path),
+def bless_set(home, path):
+    G.Config(home).set_blessed(os.path.abspath(path), {"kind": "command_set", "name": os.path.basename(path),
                                                        "hash": G.hash_skill(path)[0]})
 
 
 # ---------------------------------------------------------------- the manifest
 
-class TestManifest(PluginBase):
+class TestManifest(CommandSetBase):
     def refused(self, why, **top):
         pl = self.load(**top)
         self.assertIsNotNone(pl.error, why)
@@ -106,10 +106,10 @@ class TestManifest(PluginBase):
         pl = self.load()
         self.assertIsNone(pl.error)
         self.assertEqual(pl.commands["queue"].tool, "fake__queue")
-        self.assertEqual(G.Plugin("fake", self.plugin_dir(self.path("again"))).hash, pl.hash)
+        self.assertEqual(G.CommandSet("fake", self.set_dir(self.path("again"))).hash, pl.hash)
 
-    def test_the_slurm_plugin_in_the_repo_is_valid(self):
-        pl = G.Plugin("slurm", os.path.join(REPO, "plugins", "slurm"))
+    def test_the_slurm_command_set_in_the_repo_is_valid(self):
+        pl = G.CommandSet("slurm", os.path.join(REPO, "commands", "slurm"))
         self.assertIsNone(pl.error)
         self.assertEqual(set(pl.commands), {"down_nodes", "nodes", "partitions", "queue", "queue_user",
                                             "queue_partition", "job", "node", "jobs_history_user"})
@@ -172,6 +172,75 @@ class TestManifest(PluginBase):
             p["user"] = spec
             self.refused(why)
 
+    def test_path_and_host_rules(self):
+        p = self.manifest["commands"]["queue"]["params"]
+        for spec, why in [({"path": {}}, "needs 'under'"), ({"path": {"under": ["rel/dir"]}}, "absolute"),
+                          ({"path": {"files": ["x"]}}, "absolute"), ({"path": {"under": ["/d"], "new": "yes"}}, "new"),
+                          ({"path": {"files": ["/f"], "new": True}}, "needs 'under'"),
+                          ({"path": {"under": ["/d"], "other": 1}}, "other"), ({"path": "/d"}, "path"),
+                          ({"host": ["ok", "bad host"]}, "host names"), ({"host": ["-x"]}, "host names"),
+                          ({"host": []}, "host")]:
+            with self.subTest(spec=spec):
+                self.setUp()
+                self.manifest["commands"]["queue"]["params"]["user"] = spec
+                self.refused(why)
+        self.setUp()
+        self.manifest["commands"]["queue"]["params"]["user"] = {"path": {"under": ["/tmp"], "new": True}}
+        self.refused('needs "access": "write"')                    # a read command may not create files
+
+    def test_a_path_is_resolved_then_checked(self):
+        top, out = self.path("data"), self.path("outside")
+        for d in (top, os.path.join(top, "sub"), os.path.join(top, ".hidden"), out):
+            os.makedirs(d, exist_ok=True)
+        for f in ("a.txt", "sub/b.txt", ".hidden/c", "id_rsa", "server.key"):
+            open(os.path.join(top, f), "w").close()
+        open(os.path.join(out, "secret.txt"), "w").close()
+        os.symlink(os.path.join(out, "secret.txt"), os.path.join(top, "link"))
+        os.symlink(os.path.join(top, "sub"), os.path.join(top, "sublink"))
+        rule = G.TrustedParam({"path": {"under": [top], "files": [os.path.join(top, "id_rsa")]}}, "p")
+        real = os.path.realpath
+        self.assertEqual(rule.check(os.path.join(top, "a.txt")), real(os.path.join(top, "a.txt")))
+        self.assertEqual(rule.check(os.path.join(top, "sublink", "b.txt")), real(os.path.join(top, "sub", "b.txt")))
+        self.assertEqual(rule.check(os.path.join(top, "id_rsa")), real(os.path.join(top, "id_rsa")))   # listed
+        with mock.patch("os.getcwd", return_value=top):
+            self.assertEqual(rule.check("sub/b.txt"), real(os.path.join(top, "sub", "b.txt")))      # relative
+        for value, why in ((os.path.join(top, "..", "outside", "secret.txt"), "must be inside"),
+                           (os.path.join(top, "link"), "must be inside"),                 # a symlink out
+                           ("/etc/passwd", "must be inside"), (os.path.join(top, ".hidden", "c"), "hidden"),
+                           (os.path.join(top, "server.key"), "secrets"), (os.path.join(top, "nope"), "does not exist"),
+                           (top + "x", "must be inside")):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError) as cm:
+                    rule.check(value)
+                self.assertIn(why, str(cm.exception))
+        new = G.TrustedParam({"path": {"under": [top], "new": True}}, "p")
+        self.assertEqual(new.check(os.path.join(top, "fresh.txt")), real(os.path.join(top, "fresh.txt")))
+        with self.assertRaises(ValueError) as cm:
+            new.check(os.path.join(top, "nodir", "fresh.txt"))
+        self.assertIn("directory must exist", str(cm.exception))
+        self.assertIn(f"a path under {top}", new.schema()["description"])
+
+    def test_a_host_is_one_of_the_list(self):
+        rule = G.TrustedParam({"host": ["login1", "login2.example.org"], "describe": "a login node"}, "p")
+        self.assertEqual(rule.check("login2.example.org"), "login2.example.org")
+        with self.assertRaises(ValueError):
+            rule.check("login3")
+        self.assertEqual(rule.schema(), {"type": "string", "enum": ["login1", "login2.example.org"],
+                                         "description": "a login node"})
+
+    def test_a_path_reaches_the_program_resolved(self):
+        top = self.path("logs")
+        os.makedirs(os.path.join(top, "real"))
+        open(os.path.join(top, "real", "x.log"), "w").close()
+        os.symlink(os.path.join(top, "real"), os.path.join(top, "alias"))
+        self.manifest["commands"]["tail"] = {"describe": "a log", "argv": ["fakeq", "tail", "{file}"], "access": "read",
+                                             "params": {"file": {"path": {"under": [top]}}}}
+        pl = self.load()
+        self.assertIsNone(pl.error)
+        cmd = pl.commands["tail"]
+        values = cmd.check({"file": os.path.join(top, "alias", "x.log")})
+        self.assertEqual(values, {"file": os.path.realpath(os.path.join(top, "real", "x.log"))})
+
     def test_option_like_values_are_refused_whatever_the_pattern(self):
         rule = G.TrustedParam({"pattern": "^[a-z]{1,9}$"}, "p")
         rule.rx = re.compile(".+")                     # as if a pattern had slipped through the load-time check
@@ -187,8 +256,11 @@ class TestManifest(PluginBase):
             self.manifest["commands"]["queue"][key] = bad
             self.refused(key)
         self.setUp()
-        self.manifest["commands"]["queue"]["read_only"] = "yes"
-        self.refused("read_only")
+        self.manifest["commands"]["queue"]["access"] = "yes"
+        self.refused("access must be")
+        self.setUp()
+        del self.manifest["commands"]["queue"]["access"]
+        self.refused("access must be")
         self.setUp()
         self.refused("search", search=["relative/dir"])
         self.refused("search", search=[])
@@ -200,17 +272,17 @@ class TestManifest(PluginBase):
 
     def test_defaults(self):
         c = self.load().commands["slow"]
-        self.manifest["commands"]["x"] = {"argv": ["fakeq"]}
+        self.manifest["commands"]["x"] = {"argv": ["fakeq"], "access": "write"}
         x = self.load().commands["x"]
-        self.assertEqual((x.read_only, x.timeout, x.max_output, x.min_interval, x.cache), (False, 15, 65536, 2, 0))
+        self.assertEqual((x.auto, x.timeout, x.max_output, x.min_interval, x.cache), (False, 15, 65536, 2, 0))
         self.assertEqual(c.timeout, 1)
 
     def test_pane_is_reported(self):
-        d = self.plugin_dir(self.path("with-pane"))
+        d = self.set_dir(self.path("with-pane"))
         self.manifest["pane"] = "pane.py"
-        write_json(os.path.join(d, "plugin.json"), self.manifest)
+        write_json(os.path.join(d, "commands.json"), self.manifest)
         open(os.path.join(d, "pane.py"), "w").write("print(1)\n")
-        pl = G.Plugin("fake", d)
+        pl = G.CommandSet("fake", d)
         self.assertEqual((pl.error, pl.pane), (None, "pane.py"))
 
     def test_values_are_checked_whatever_the_pattern(self):
@@ -234,7 +306,7 @@ class TestManifest(PluginBase):
 
     def test_tool_name_and_schema(self):
         self.manifest["name"] = "my-plug"
-        pl = G.Plugin("my-plug", self.plugin_dir(self.path("x"), "my-plug"))
+        pl = G.CommandSet("my-plug", self.set_dir(self.path("x"), "my-plug"))
         self.assertIsNone(pl.error)
         self.assertEqual(pl.commands["queue"].tool, "my_plug__queue")
         schema = pl.commands["queue"].schema("node1")["function"]
@@ -246,9 +318,55 @@ class TestManifest(PluginBase):
         self.assertIn("the user is asked first", pl.commands["kill"].schema("h")["function"]["description"])
 
 
+    def test_a_usage_section_goes_to_the_model_and_the_blessing_screen(self):
+        self.cmd(usage=["ExitCode is code:signal.", "An empty answer is not an error."])
+        pl = self.load()
+        self.assertIsNone(pl.error)
+        desc = pl.commands["queue"].schema("h")["function"]["description"]
+        self.assertTrue(desc.endswith("\n\nUsage:\nExitCode is code:signal.\nAn empty answer is not an error."))
+        self.assertIn("      | An empty answer is not an error.", pl.summary())
+        self.assertNotIn("Usage:", pl.commands["kill"].schema("h")["function"]["description"])
+        before = pl.hash
+        self.cmd(usage="One line\nand another")                  # a string, split into lines
+        pl = self.load()
+        self.assertEqual(pl.commands["queue"].usage, ["One line", "and another"])
+        self.assertNotEqual(pl.hash, before)                       # covered by the blessing
+
+    def test_a_guide_is_read_with_the_set_and_checked(self):
+        d = self.set_dir(self.path("guided"))
+        with open(os.path.join(d, "GUIDE.md"), "w") as f:
+            f.write("# Fake\n\nUse queue before job.\n")
+        pl = G.CommandSet("fake", d)
+        self.assertIsNone(pl.error)
+        self.assertEqual(pl.guide, "# Fake\n\nUse queue before job.")
+        self.assertIn("    | Use queue before job.", pl.summary())
+        self.assertNotEqual(pl.hash, self.load().hash)              # the blessing covers it
+        for text, why in (("x" * 6001, "at most 6000"), ("a\x1b[2Jb", "hidden"), ("a\u202eb", "hidden")):
+            with open(os.path.join(d, "GUIDE.md"), "w") as f:
+                f.write(text)
+            self.assertIn(why, G.CommandSet("fake", d).error or "", text[:5])
+        with open(os.path.join(d, "GUIDE.md"), "wb") as f:
+            f.write(b"\xff\xfe")
+        self.assertIn("GUIDE.md: must be UTF-8", G.CommandSet("fake", d).error)
+
+    def test_the_slurm_guide_is_valid(self):
+        pl = G.CommandSet("slurm", os.path.join(REPO, "commands", "slurm"))
+        self.assertIsNone(pl.error)
+        self.assertIn("queue_user", pl.guide)
+        named = set(re.findall(r"`([a-z_]+)`", pl.guide)) - {"squeue", "sinfo"}
+        self.assertEqual(named - set(pl.commands), set())         # every command it names exists
+
+    def test_a_usage_section_is_short_and_plain(self):
+        for bad, why in (([" x" * 700], "at most"), (["l"] * 21, "at most"), (["\x1b[2Jfake"], "control or hidden"),
+                         (["a\u202eb"], "control or hidden"), ("x\ty", "control or hidden"), (5, "list of lines")):
+            with self.subTest(bad=bad):
+                self.cmd(usage=bad)
+                self.refused(why)
+
+
 # ---------------------------------------------------------------- the program
 
-class TestBinary(PluginBase):
+class TestBinary(CommandSetBase):
     def test_resolved_from_search_never_from_path(self):
         pl = self.load()
         with mock.patch.dict(os.environ, {"PATH": "/nonexistent"}):
@@ -257,13 +375,13 @@ class TestBinary(PluginBase):
         other = self.path("elsewhere")
         os.mkdir(other, 0o755)
         program(os.path.join(other, "nothere"), "true\n")
-        self.manifest["commands"]["x"] = {"argv": ["nothere"]}
+        self.manifest["commands"]["x"] = {"argv": ["nothere"], "access": "read"}
         pl = self.load()
         with mock.patch.dict(os.environ, {"PATH": other}):
             self.assertEqual(pl.resolve(), ["x"])          # not installed here: only its command is left out
         self.assertNotIn("x", pl.commands)
         self.assertIn("queue", pl.commands)
-        self.manifest["commands"] = {"x": {"argv": ["nothere"]}}
+        self.manifest["commands"] = {"x": {"argv": ["nothere"], "access": "read"}}
         with self.assertRaises(G.HoplonError) as cm:
             self.load().resolve()
         self.assertIn("none of its programs", str(cm.exception))
@@ -286,7 +404,7 @@ class TestBinary(PluginBase):
         self.assertIn("not an executable", str(cm.exception))
 
     def test_absolute_argv0(self):
-        self.manifest["commands"] = {"x": {"argv": [os.path.join(self.bin, "fakeq")], "read_only": True}}
+        self.manifest["commands"] = {"x": {"argv": [os.path.join(self.bin, "fakeq")], "access": "read"}}
         pl = self.load()
         pl.resolve()
         self.assertTrue(pl.commands["x"].binary.endswith("/fakeq"))
@@ -303,12 +421,12 @@ class TestBinary(PluginBase):
 
 # ---------------------------------------------------------------- blessing and enabling
 
-class TestBlessing(PluginBase):
+class TestBlessing(CommandSetBase):
     def setUp(self):
         super().setUp()
         self.home, _ = make_home(self.tmp, "http://127.0.0.1:1/v1")
         self.cfg = G.Config(self.home)
-        self.dir = self.plugin_dir(os.path.join(self.home, "plugins"))
+        self.dir = self.set_dir(os.path.join(self.home, "commands"))
 
     def engine(self, names=("fake",)):
         notes = []
@@ -318,7 +436,7 @@ class TestBlessing(PluginBase):
             notice = notes.append
 
         ep = G.Endpoint({"name": "t", "base_url": "http://127.0.0.1:1/v1", "model": "m"}, "t.json")
-        return G.Engine(self.cfg, ep, G.Session(self.cfg), Ui(), client=object(), plugins=names), notes
+        return G.Engine(self.cfg, ep, G.Session(self.cfg), Ui(), client=object(), command_sets=names), notes
 
     def test_unblessed_is_not_enabled(self):
         eng, notes = self.engine()
@@ -327,40 +445,40 @@ class TestBlessing(PluginBase):
         self.assertEqual([t["function"]["name"] for t in eng.tools()], [t["function"]["name"] for t in G.TOOLS])
 
     def test_blessed_is_enabled_and_changes_are_refused(self):
-        bless_plugin(self.home, self.dir)
+        bless_set(self.home, self.dir)
         eng, notes = self.engine()
         self.assertEqual((notes, sorted(eng.trusted)[:2]), ([], ["fake__big", "fake__cached"]))
         names = [t["function"]["name"] for t in eng.tools()]
         self.assertIn("fake__queue", names)
-        self.assertIn("# Trusted commands", eng.system()["content"])
+        self.assertIn("# Scoped commands", eng.system()["content"])
         self.manifest["commands"]["queue"]["argv"] = ["fakeq", "-x", "{user}", "--fmt={fmt}"]
-        write_json(os.path.join(self.dir, "plugin.json"), self.manifest)
+        write_json(os.path.join(self.dir, "commands.json"), self.manifest)
         eng2, notes = self.engine()
         self.assertEqual(eng2.trusted, {})
         self.assertIn("changed", notes[0])
-        self.manifest = json.load(open(os.path.join(self.dir, "plugin.json")))
+        self.manifest = json.load(open(os.path.join(self.dir, "commands.json")))
         open(os.path.join(self.dir, "extra.txt"), "w").write("x")          # any file of the directory counts
         self.assertIn("changed", self.engine()[1][0])
 
     def test_nothing_enabled_no_tools_no_prompt(self):
-        bless_plugin(self.home, self.dir)
+        bless_set(self.home, self.dir)
         eng, _ = self.engine(())
         self.assertEqual(eng.trusted, {})
-        self.assertNotIn("Trusted commands", eng.system()["content"])
+        self.assertNotIn("Scoped commands", eng.system()["content"])
 
-    def test_a_program_in_a_group_writable_directory_refuses_the_plugin(self):
-        bless_plugin(self.home, self.dir)
+    def test_a_program_in_a_group_writable_directory_refuses_the_command_set(self):
+        bless_set(self.home, self.dir)
         os.chmod(self.bin, 0o770)
         eng, notes = self.engine()
         self.assertEqual(eng.trusted, {})
         self.assertIn("writable by group or others", notes[0])
 
     def test_tool_name_collisions(self):
-        bless_plugin(self.home, self.dir)
+        bless_set(self.home, self.dir)
         eng, _ = self.engine(())
         eng.register([{"name": "fake__queue", "description": "mine"}])
         with self.assertRaises(G.HoplonError) as cm:
-            eng.set_plugin("fake", True)
+            eng.set_command_set("fake", True)
         self.assertIn("already has the name fake__queue", str(cm.exception))
         eng2, _ = self.engine()
         with self.assertRaises(G.HoplonError):
@@ -368,17 +486,17 @@ class TestBlessing(PluginBase):
         self.assertEqual(eng2.register([{"name": "other", "description": "x"}]), ["other"])
 
     def test_config_profile_and_listing(self):
-        bless_plugin(self.home, self.dir)
+        bless_set(self.home, self.dir)
         write_json(os.path.join(self.home, "config.json"),
-                   {"default_plugins": ["fake"], "plugin_dirs": [self.path("more")]})
+                   {"default_commands": ["fake"], "command_dirs": [self.path("more")]})
         cfg = G.Config(self.home)
-        self.assertEqual((cfg.default_plugins, cfg.plugin_dirs[1]), (["fake"], self.path("more")))
-        prof = G.Profile({"name": "p", "plugins": ["fake"]}, "p.json")
-        self.assertEqual(prof.plugins, ["fake"])
-        self.assertIn("plugins:  fake", prof.summary()[0])
+        self.assertEqual((cfg.default_commands, cfg.command_dirs[1]), (["fake"], self.path("more")))
+        prof = G.Profile({"name": "p", "commands": ["fake"]}, "p.json")
+        self.assertEqual(prof.command_sets, ["fake"])
+        self.assertIn("commands: fake", prof.summary()[0])
         with self.assertRaises(G.HoplonError):
-            G.Profile({"name": "p", "plugins": "fake"}, "p.json")
-        rows = G.plugin_rows(self.cfg, ["fake"])
+            G.Profile({"name": "p", "commands": "fake"}, "p.json")
+        rows = G.command_set_rows(self.cfg, ["fake"])
         self.assertEqual((rows[0]["name"], rows[0]["status"], rows[0]["enabled"], rows[0]["blessed"]),
                          ("fake", "blessed", True, True))
         self.assertEqual(rows[0]["commands"][0]["name"], "queue")
@@ -388,17 +506,58 @@ class TestBlessing(PluginBase):
         with mock.patch.object(sys, "stdout", out):
             self.assertTrue(G.bless(self.cfg, self.dir, lambda q: True))
         text = out.getvalue()
-        self.assertIn("Plugin fake", text)
+        self.assertIn("Command set fake", text)
         self.assertIn("[asks every time]", text)
         self.assertIn("fakeq -u {user} --fmt={fmt}", text)
         self.assertIn("program: " + os.path.realpath(self.bin), text)
         self.assertIn("your PATH is never used", text)
-        self.assertEqual(self.cfg.blessed()[self.dir]["kind"], "plugin")
-        self.assertEqual(G.plugin_status(self.cfg, G.find_plugins(self.cfg)["fake"]), "blessed")
+        self.assertEqual(self.cfg.blessed()[self.dir]["kind"], "command_set")
+        self.assertEqual(G.command_set_status(self.cfg, G.find_command_sets(self.cfg)["fake"]), "blessed")
+
+    def test_reads_and_writes_are_listed_apart_and_a_write_may_be_let_run(self):
+        asked, out = [], io.StringIO()
+        with mock.patch.object(sys, "stdout", out):
+            self.assertTrue(G.bless(self.cfg, self.dir, lambda q: asked.append(q) or True))
+        text = out.getvalue()
+        reads, writes = text.index("read: these only look"), text.index("write: these change something")
+        self.assertLess(reads, text.index("command queue:"))
+        self.assertLess(text.index("command queue:"), writes)
+        self.assertLess(writes, text.index("command kill:"))
+        self.assertEqual(len(asked), 2)                       # the set, then its one write command
+        self.assertIn("Let the model run kill (fakeq kill {id}) without asking you?", asked[1])
+        self.assertEqual(self.cfg.blessed()[self.dir]["auto"], ["kill"])
+        eng, _ = self.engine()
+        kill = eng.trusted["fake__kill"]
+        self.assertTrue(kill.auto)
+        self.assertIn("runs without asking, as the user chose", kill.schema("h")["function"]["description"])
+        self.assertEqual(G.command_set_rows(self.cfg, ["fake"])[0]["commands"][2]["name"], "kill")
+
+    def test_a_write_asks_unless_the_user_said_otherwise(self):
+        answers = iter([True, False])
+        with mock.patch.object(sys, "stdout", io.StringIO()):
+            G.bless(self.cfg, self.dir, lambda q: next(answers))
+        self.assertEqual(self.cfg.blessed()[self.dir]["auto"], [])
+        eng, _ = self.engine()
+        self.assertFalse(eng.trusted["fake__kill"].auto)
+        self.assertTrue(eng.trusted["fake__queue"].auto)
+        self.assertIn("the user is asked first", eng.trusted["fake__kill"].schema("h")["function"]["description"])
+        with mock.patch.object(sys, "stdout", io.StringIO()):     # declined: nothing is recorded, nothing more asked
+            self.assertFalse(G.bless(self.cfg, self.dir, lambda q: False))
+
+    def test_the_guide_goes_to_the_model_while_the_set_is_on(self):
+        with open(os.path.join(self.dir, "GUIDE.md"), "w") as f:
+            f.write("Use queue before job.\n")
+        bless_set(self.home, self.dir)
+        eng, _ = self.engine()
+        system = eng.system()["content"]
+        self.assertIn("# Command set: fake\n\nThe user blessed this guide", system)
+        self.assertIn("Use queue before job.", system)
+        eng.set_command_set("fake", False)
+        self.assertNotIn("Use queue before job.", eng.system()["content"])
 
     def test_bless_refuses_a_bad_manifest(self):
         self.manifest["commands"]["queue"]["argv"] = ["fakeq", "{nope}"]
-        write_json(os.path.join(self.dir, "plugin.json"), self.manifest)
+        write_json(os.path.join(self.dir, "commands.json"), self.manifest)
         with self.assertRaises(G.HoplonError) as cm:
             G.bless(self.cfg, self.dir, lambda q: True)
         self.assertIn("undeclared", str(cm.exception))
@@ -428,15 +587,15 @@ class Ui(G.PlainUI):
         self.results.append((p.id, status, note, extra))
 
 
-class TestRunning(PluginBase):
+class TestRunning(CommandSetBase):
     def setUp(self):
         super().setUp()
         self.home, _ = make_home(self.tmp, "http://127.0.0.1:1/v1")
         self.cfg = G.Config(self.home)
-        bless_plugin(self.home, self.plugin_dir(os.path.join(self.home, "plugins")))
+        bless_set(self.home, self.set_dir(os.path.join(self.home, "commands")))
         self.ui = Ui()
         ep = G.Endpoint({"name": "t", "base_url": "http://127.0.0.1:1/v1", "model": "m"}, "t.json")
-        self.eng = G.Engine(self.cfg, ep, G.Session(self.cfg), self.ui, client=object(), plugins=["fake"])
+        self.eng = G.Engine(self.cfg, ep, G.Session(self.cfg), self.ui, client=object(), command_sets=["fake"])
         self.assertEqual(self.ui.results, [])
         self.assertTrue(self.eng.trusted)
 
@@ -455,15 +614,15 @@ class TestRunning(PluginBase):
         self.assertEqual((p.kind, p.auto, p.decision), ("trusted", True, "accept"))
         self.assertEqual(self.ui.autos, [p])
         self.assertEqual(p.event()["argv"], "fakeq -u alice --fmt=long")
-        self.assertEqual({k: v for k, v in p.event().items() if k in ("plugin", "command", "params", "read_only")},
-                         {"plugin": "fake", "command": "queue", "params": {"user": "alice", "fmt": "long"},
-                          "read_only": True})
+        self.assertEqual({k: v for k, v in p.event().items() if k in ("set", "command", "params", "access")},
+                         {"set": "fake", "command": "queue", "params": {"user": "alice", "fmt": "long"},
+                          "access": "read"})
         self.assertTrue(told.startswith("exit 3. Output:\nresult -u alice --fmt=long\n[stderr]\nwarning"), told)
         self.assertEqual(self.calls()[0]["args"], ["-u", "alice", "--fmt=long"])
         self.assertEqual(self.ui.results[0][1:3][0], "error")          # exit 3
         self.assertEqual(self.ui.results[0][3]["exit"], 3)
         rec = self.audit()[0]
-        self.assertEqual([rec[k] for k in ("plugin", "command", "source", "exit", "cached", "rate_limited")],
+        self.assertEqual([rec[k] for k in ("set", "command", "source", "exit", "cached", "rate_limited")],
                          ["fake", "queue", "model", 3, False, False])
         self.assertEqual(rec["params"], {"user": "alice", "fmt": "long"})
         self.assertTrue(rec["binary"].endswith("/fakeq"))
@@ -482,9 +641,9 @@ class TestRunning(PluginBase):
 
     def test_a_loose_value_stays_one_argument(self):
         self.manifest["commands"]["queue"]["params"]["user"] = {"pattern": "[ -,.-~][ -~]{0,39}"}   # no leading '-'
-        write_json(os.path.join(self.home, "plugins", "fake", "plugin.json"), self.manifest)
-        bless_plugin(self.home, os.path.join(self.home, "plugins", "fake"))
-        self.eng.set_plugin("fake", True)
+        write_json(os.path.join(self.home, "commands", "fake", "commands.json"), self.manifest)
+        bless_set(self.home, os.path.join(self.home, "commands", "fake"))
+        self.eng.set_command_set("fake", True)
         evil = "a b; touch /tmp/x $(id) 'q' \"d\" *"
         self.model("fake__queue", user=evil, fmt="short")
         self.assertEqual(self.calls()[0]["args"], ["-u", evil, "--fmt=short"])
@@ -578,7 +737,7 @@ class TestRunning(PluginBase):
         # the program changed since hoplon started, so it is refused; a fresh engine reads the new identity
         ep = G.Endpoint({"name": "t", "base_url": "http://127.0.0.1:1/v1", "model": "m"}, "t.json")
         eng = G.Engine(self.cfg, ep, G.Session(self.cfg), self.ui, client=mock.Mock(_key="supersecretendpointkey"),
-                       plugins=["fake"])
+                       command_sets=["fake"])
         self.assertEqual(eng.run_user("fake", "leak", {})["output"].strip(), "key is [REDACTED endpoint key]")
 
     def test_a_program_that_changed_is_refused(self):
@@ -603,7 +762,7 @@ class TestRunning(PluginBase):
         with self.assertRaises(G.HoplonError) as cm:
             self.eng.run_user("fake", "nope", {})
         self.assertEqual(cm.exception.kind, "unknown_command")
-        self.eng.set_plugin("fake", False)
+        self.eng.set_command_set("fake", False)
         with self.assertRaises(G.HoplonError):
             self.eng.run_user("fake", "job", {"id": 1})
 
@@ -623,13 +782,13 @@ class TestRunning(PluginBase):
 
 # ---------------------------------------------------------------- over JSON
 
-class TestJson(PluginBase):
-    def start(self, api, args=("--plugin", "fake"), bless=True):
+class TestJson(CommandSetBase):
+    def start(self, api, args=("--commands", "fake"), bless=True):
         home, ep = make_home(self.tmp, api.url)
         bless_path(home, ep)
-        d = self.plugin_dir(os.path.join(home, "plugins"))
+        d = self.set_dir(os.path.join(home, "commands"))
         if bless:
-            bless_plugin(home, d)
+            bless_set(home, d)
         os.makedirs(self.path("wd"), exist_ok=True)
         self.home = home
         return Proc(home, self.path("wd"), ["-e", "test"] + list(args))
@@ -644,27 +803,27 @@ class TestJson(PluginBase):
             g.send({"type": "system"})
             system = g.until("system")["system"]
             g.close()
-        self.assertIn("# Trusted commands", system)
+        self.assertIn("# Scoped commands", system)
         where = system.split("# Where things are", 1)[1]
-        self.assertIn("Trusted commands (plugin__command tools) run on this host too", where)
-        self.assertIn("what the user shares with you and what trusted commands return", where)
+        self.assertIn("Scoped commands (set__command tools) run on this host too", where)
+        self.assertIn("what the user shares with you and what scoped commands return", where)
 
-    def test_hello_and_plugins_event(self):
+    def test_hello_and_command_sets_event(self):
         with FakeAPI([]) as api:
             g = self.start(api)
             hello = g.until("hello")
-            self.assertIn("plugins", hello["features"])
-            self.assertEqual(hello["plugins"], ["fake"])
-            ev = g.until("plugins")
-            (row,) = ev["plugins"]
+            self.assertIn("command_sets", hello["features"])
+            self.assertEqual(hello["command_sets"], ["fake"])
+            ev = g.until("command_sets")
+            (row,) = ev["command_sets"]
             self.assertEqual((row["name"], row["enabled"], row["blessed"], row["pane"], row["dir"]),
-                             ("fake", True, True, None, os.path.join(self.home, "plugins", "fake")))
+                             ("fake", True, True, None, os.path.join(self.home, "commands", "fake")))
             queue = next(c for c in row["commands"] if c["name"] == "queue")
-            self.assertEqual(queue["read_only"], True)
+            self.assertEqual((queue["access"], queue["auto"]), ("read", True))
             self.assertEqual(queue["argv"], ["fakeq", "-u", "{user}", "--fmt={fmt}"])
             self.assertEqual(queue["params"]["fmt"], {"enum": ["short", "long"], "describe": ""})
-            g.send({"type": "plugins"})
-            self.assertEqual(g.until("plugins")["plugins"][0]["name"], "fake")
+            g.send({"type": "command_sets"})
+            self.assertEqual(g.until("command_sets")["command_sets"][0]["name"], "fake")
             g.close()
 
     def test_model_calls_a_read_only_tool(self):
@@ -682,7 +841,7 @@ class TestJson(PluginBase):
         first = api.requests[0]["body"]
         names = [t["function"]["name"] for t in first["tools"]]
         self.assertIn("fake__queue", names)
-        self.assertIn("# Trusted commands", first["messages"][0]["content"])
+        self.assertIn("# Scoped commands", first["messages"][0]["content"])
         self.assertTrue(api.requests[-1]["body"]["messages"][-1]["content"].startswith("exit 3."))
         self.assertEqual(self.calls()[0]["env"]["PATH"], self.bin)
 
@@ -696,12 +855,12 @@ class TestJson(PluginBase):
         self.assertIn("unknown tool", api.requests[-1]["body"]["messages"][-1]["content"])
         self.assertEqual(self.calls(), [])
 
-    def test_unblessed_plugin_is_refused_with_a_notice(self):
+    def test_unblessed_command_set_is_refused_with_a_notice(self):
         with FakeAPI([]) as api:
             g = self.start(api, bless=False)
             n = g.until("notice")
             self.assertIn("unblessed", n["message"])
-            self.assertEqual(g.until("hello")["plugins"], [])
+            self.assertEqual(g.until("hello")["command_sets"], [])
             g.close()
 
     def test_not_read_only_asks_through_a_decision(self):
@@ -709,7 +868,7 @@ class TestJson(PluginBase):
             g = self.start(api)
             g.send({"type": "user", "text": "stop it"})
             p = g.until("proposal")
-            self.assertEqual((p["kind"], p.get("auto"), p["read_only"]), ("trusted", None, False))
+            self.assertEqual((p["kind"], p.get("auto"), p["access"]), ("trusted", None, "write"))
             self.assertEqual(self.calls(), [])
             g.send({"type": "decision", "id": p["id"], "digest": p["digest"], "decision": "accept"})
             self.assertEqual(g.until("result")["exit"], 3)
@@ -731,39 +890,39 @@ class TestJson(PluginBase):
     def test_the_user_runs_a_command(self):
         with FakeAPI([]) as api:
             g = self.start(api)
-            g.send({"type": "run", "id": "r1", "plugin": "fake", "command": "job", "params": {"id": "42"}})
+            g.send({"type": "run", "id": "r1", "set": "fake", "command": "job", "params": {"id": "42"}})
             ran = g.until("ran")
             self.assertEqual((ran["id"], ran["exit"], ran["cached"]), ("r1", 3, False))
             self.assertIn("result job 42", ran["output"])
             self.assertIsInstance(ran["ms"], int)
-            g.send({"type": "run", "id": 2, "plugin": "fake", "command": "job", "params": {"id": "4;2"}})
+            g.send({"type": "run", "id": 2, "set": "fake", "command": "job", "params": {"id": "4;2"}})
             bad = g.until("ran")
             self.assertEqual(bad["id"], 2)
             self.assertIn("parameter 'id'", bad["error"])
             self.assertNotIn("output", bad)
-            g.send({"type": "run", "id": 3, "plugin": "nope", "command": "job", "params": {}})
+            g.send({"type": "run", "id": 3, "set": "nope", "command": "job", "params": {}})
             self.assertIn("no command", g.until("ran")["error"])
-            g.send({"type": "run", "plugin": "fake", "command": "job", "params": {"id": "1"}})
+            g.send({"type": "run", "set": "fake", "command": "job", "params": {"id": "1"}})
             self.assertEqual(g.until("error")["code"], "bad_message")
             g.close()
         runs = [e for e in self.audit() if e["event"] == "trusted_run"]
         self.assertEqual([r["source"] for r in runs], ["user"])
         self.assertEqual(len(self.calls()), 1)
 
-    def test_run_needs_an_enabled_plugin_and_can_be_switched(self):
+    def test_run_needs_an_enabled_command_set_and_can_be_switched(self):
         with FakeAPI([]) as api:
             g = self.start(api, args=())
-            g.send({"type": "run", "id": 1, "plugin": "fake", "command": "job", "params": {"id": "1"}})
+            g.send({"type": "run", "id": 1, "set": "fake", "command": "job", "params": {"id": "1"}})
             self.assertIn("no command", g.until("ran")["error"])
-            g.send({"type": "plugin", "name": "fake", "on": True})
-            self.assertTrue(next(r for r in g.until("plugins")["plugins"] if r["name"] == "fake")["enabled"])
-            g.send({"type": "run", "id": 2, "plugin": "fake", "command": "job", "params": {"id": "1"}})
+            g.send({"type": "command_set", "name": "fake", "on": True})
+            self.assertTrue(next(r for r in g.until("command_sets")["command_sets"] if r["name"] == "fake")["enabled"])
+            g.send({"type": "run", "id": 2, "set": "fake", "command": "job", "params": {"id": "1"}})
             self.assertEqual(g.until("ran")["exit"], 3)
-            g.send({"type": "plugin", "name": "nope", "on": True})
-            self.assertEqual(g.until("error")["code"], "unknown_plugin")
-            g.send({"type": "plugin", "name": "fake", "on": False})
-            g.until("plugins")
-            g.send({"type": "plugin", "name": "fake"})
+            g.send({"type": "command_set", "name": "nope", "on": True})
+            self.assertEqual(g.until("error")["code"], "unknown_commands")
+            g.send({"type": "command_set", "name": "fake", "on": False})
+            g.until("command_sets")
+            g.send({"type": "command_set", "name": "fake"})
             self.assertEqual(g.until("error")["code"], "bad_message")
             g.close()
 
@@ -772,7 +931,7 @@ class TestJson(PluginBase):
             g = self.start(api)
             g.send({"type": "user", "text": "stop it"})
             p = g.until("proposal")
-            g.send({"type": "run", "id": 9, "plugin": "fake", "command": "job", "params": {"id": "1"}})
+            g.send({"type": "run", "id": 9, "set": "fake", "command": "job", "params": {"id": "1"}})
             self.assertEqual(g.until("error")["code"], "busy")
             g.send({"type": "decision", "id": p["id"], "digest": p["digest"], "decision": "decline"})
             g.until("done")
