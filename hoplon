@@ -1563,7 +1563,9 @@ def load_skills(cfg, names, notice):
 # Plugins and trusted commands: programs you blessed once, with exactly the inputs they may take
 
 PLUGIN_KEYS = {"name", "description", "search", "env", "pane", "commands"}
-COMMAND_KEYS = {"describe", "argv", "params", "read_only", "timeout", "max_output", "min_interval", "cache"}
+COMMAND_KEYS = {"describe", "usage", "argv", "params", "read_only", "timeout", "max_output", "min_interval", "cache"}
+USAGE_MAX = 1200            # characters of a trusted command's usage section, all lines together
+USAGE_LINES = 20
 PARAM_KEYS = {"pattern", "enum", "int", "describe"}
 PLUGIN_NAME = re.compile(r"[a-z][a-z0-9-]{0,30}")
 COMMAND_NAME = re.compile(r"[a-z][a-z0-9_]{0,30}")
@@ -1584,6 +1586,20 @@ def _text(data, key, where, default=""):
     if not isinstance(v, str) or len(v) > 1000 or "\0" in v:
         raise ValueError(f"{where}{key} must be text of at most 1000 characters")
     return v
+
+
+def _usage(v, where):
+    """A command's usage section: a list of lines (or one string) of plain text, short enough to send with the
+    command every time. No control characters: it goes to the model, and to the blessing screen."""
+    lines = [v] if isinstance(v, str) else v
+    if not isinstance(lines, list) or not all(isinstance(ln, str) for ln in lines):
+        raise ValueError(f"{where} must be a list of lines of text")
+    lines = [ln for part in lines for ln in part.split("\n")]
+    if len(lines) > USAGE_LINES or sum(len(ln) for ln in lines) > USAGE_MAX:
+        raise ValueError(f"{where} must be at most {USAGE_LINES} lines and {USAGE_MAX} characters")
+    if any(exact(ln)[1] or one_line(ln)[1] for ln in lines):
+        raise ValueError(f"{where} must not hold control or hidden characters")
+    return [ln.rstrip() for ln in lines]
 
 
 def _number(data, key, where, default, lo, hi):
@@ -1721,6 +1737,7 @@ class TrustedCommand:
         self.plugin, self.name, self.search, self.env_names = plugin, name, search, env
         w = where + "."
         self.describe = _text(data, "describe", w)
+        self.usage = _usage(data.get("usage", []), w + "usage")
         self.argv = _strings(data.get("argv"), w + "argv")
         self.read_only = data.get("read_only", False)
         if not isinstance(self.read_only, bool):
@@ -1795,11 +1812,14 @@ class TrustedCommand:
     def schema(self, host):
         how = "read-only" if self.read_only else "the user is asked first"
         props = {k: p.schema() for k, p in self.params.items()}
-        return _tool(self.tool, f"{self.describe} (runs `{self.shown()}` on {host}; {how})".strip(), props,
-                     list(props))
+        text = f"{self.describe} (runs `{self.shown()}` on {host}; {how})".strip()
+        if self.usage:
+            text += "\n\nUsage:\n" + "\n".join(self.usage)
+        return _tool(self.tool, text, props, list(props))
 
     def info(self):
-        return {"name": self.name, "describe": self.describe, "params": {k: p.rules() for k, p in self.params.items()},
+        return {"name": self.name, "describe": self.describe, "usage": self.usage,
+                "params": {k: p.rules() for k, p in self.params.items()},
                 "read_only": self.read_only, "argv": self.argv}
 
 
@@ -1885,6 +1905,9 @@ class Plugin:
             lines.append(f"    runs:    {one_line(c.shown())[0]}")
             for k, p in c.params.items():
                 lines.append(f"    {k}: {p.kind} {one_line(json.dumps(p.rule))[0]}  {one_line(p.describe)[0]}".rstrip())
+            if c.usage:
+                lines.append("    usage (sent to the model with the command):")
+                lines += [f"      | {ln}" for ln in c.usage]
             lines.append(f"    limits:  {c.timeout} s, {c.max_output} bytes of output, at most one run per "
                          f"{c.min_interval} s, results kept {c.cache} s")
             try:

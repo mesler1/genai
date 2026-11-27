@@ -33,6 +33,11 @@ commands with exactly these inputs.
   same command sooner than this after its last real run is refused with "rate limited"), `cache` (seconds, 0:
   the same command with the same values returns its last result, marked cached). hoplon also allows 30 real
   runs a minute across all plugins.
+- `usage` (optional): a short section the model gets with the command every time, as a list of lines (or
+  one string): what each argument means, the gotchas, what the output looks like. At most 20 lines and 1200
+  characters, with no control or hidden characters. It is in `plugin.json`, so the blessing covers it, and the
+  blessing screen shows it. Broader know-how (reading job states, choosing between commands) belongs in a
+  skill, so it isn't sent with every request.
 - `env`: names of environment variables passed on. The program otherwise gets only `PATH` (the `search`
   directories), `LANG=C.UTF-8`, `HOME`, `USER` and `LOGNAME`. `PATH` and `LD_*` can't be listed.
 - The program must be a regular executable file, and neither it nor its directory may be writable by group or

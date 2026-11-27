@@ -246,6 +246,28 @@ class TestManifest(PluginBase):
         self.assertIn("the user is asked first", pl.commands["kill"].schema("h")["function"]["description"])
 
 
+    def test_a_usage_section_goes_to_the_model_and_the_blessing_screen(self):
+        self.cmd(usage=["ExitCode is code:signal.", "An empty answer is not an error."])
+        pl = self.load()
+        self.assertIsNone(pl.error)
+        desc = pl.commands["queue"].schema("h")["function"]["description"]
+        self.assertTrue(desc.endswith("\n\nUsage:\nExitCode is code:signal.\nAn empty answer is not an error."))
+        self.assertIn("      | An empty answer is not an error.", pl.summary())
+        self.assertNotIn("Usage:", pl.commands["kill"].schema("h")["function"]["description"])
+        before = pl.hash
+        self.cmd(usage="One line\nand another")                  # a string, split into lines
+        pl = self.load()
+        self.assertEqual(pl.commands["queue"].usage, ["One line", "and another"])
+        self.assertNotEqual(pl.hash, before)                       # covered by the blessing
+
+    def test_a_usage_section_is_short_and_plain(self):
+        for bad, why in (([" x" * 700], "at most"), (["l"] * 21, "at most"), (["\x1b[2Jfake"], "control or hidden"),
+                         (["a\u202eb"], "control or hidden"), ("x\ty", "control or hidden"), (5, "list of lines")):
+            with self.subTest(bad=bad):
+                self.cmd(usage=bad)
+                self.refused(why)
+
+
 # ---------------------------------------------------------------- the program
 
 class TestBinary(PluginBase):

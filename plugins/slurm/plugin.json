@@ -39,6 +39,9 @@
     },
     "job": {
       "describe": "details of one job (scontrol show job)",
+      "usage": ["Only for jobs still known to the controller (pending, running, or ended in the last few minutes); for older ones, use jobs_history_user.",
+                "Read JobState and Reason first; for a pending job, Reason says why it waits (Priority and Resources: wait; a *Limit reason: waiting won't help).",
+                "TimeLimit, NumCPUs, MinMemoryNode or MinMemoryCPU, and StdOut give what was asked for and where its log is."],
       "argv": ["scontrol", "show", "job", "{id}"],
       "params": {"id": {"pattern": "^[0-9]{1,10}(_[0-9]{1,6})?$", "describe": "a job id, or array_task"}},
       "read_only": true
@@ -51,6 +54,9 @@
     },
     "jobs_history_user": {
       "describe": "jobs of one user in the last day, from accounting: job|name|partition|state|exit code|elapsed|start|end|nodes",
+      "usage": ["One line per job (-X: the job, not its steps), fields separated by |.",
+                "ExitCode is code:signal; 0:0 is success. State OUT_OF_MEMORY, TIMEOUT and NODE_FAIL each need a different fix (more memory, more time, a resubmit).",
+                "An empty answer means no jobs in the last day, or an unknown user: it is not an error."],
       "argv": ["sacct", "-u", "{user}", "-X", "-S", "now-1day", "-P", "--format=JobID,JobName,Partition,State,ExitCode,Elapsed,Start,End,NodeList"],
       "params": {"user": {"pattern": "^[a-z_][a-z0-9_-]{0,31}$", "describe": "a user name"}},
       "read_only": true, "min_interval": 5, "cache": 30
