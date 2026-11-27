@@ -117,7 +117,11 @@ class CommandSets(Feature):
         for r in on:
             for cmd in r.get("commands") or []:
                 if isinstance(cmd, dict):
-                    how = "read" if cmd.get("access") == "read" else "write, runs without asking" if cmd.get("auto") else "write, asks"
+                    net = cmd.get("network")
+                    how = ("read" if cmd.get("access") == "read" else "write") \
+                        + (f", as {self.core.clean(str(cmd['as']))}" if cmd.get("as") else "") \
+                        + ("" if net in (None, "none") else ", uses the network") \
+                        + (", runs without asking" if cmd.get("auto") else ", asks")
                     m.note(f"  {self.core.clean(str(r.get('name')))}: {self.core.clean(str(cmd.get('name')))} "
                            f"({how}) {self.core.clean(str(cmd.get('describe', '')))}")
 

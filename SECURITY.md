@@ -18,7 +18,10 @@ recognised agent-security concerns to those choices.
   one opt-in exception is a profile's sandbox: in coding mode the model may run commands in an
   offline container, on a throwaway copy of the project, with secret files hidden (section 5).
 - **The model has no way out of the machine by itself.** There is no fetch tool, no rendered
-  links or images, and one network destination: the endpoint you reviewed.
+  links or images, and one network destination: the endpoint you reviewed. That is the baseline, with
+  no command set on. A command set you enable adds what its scoped commands reach (section 4): each
+  declares where it connects, the blessing screen shows it, and a command that uses the network asks
+  every time unless you let it run without asking.
 - **What you see is what runs.** Model text is escaped before it reaches the terminal, and an
   approval is bound to the state of the file you looked at.
 - **Nothing is trusted because of where it sits.** Endpoints, personas and skills are used only
@@ -76,7 +79,7 @@ advice is to remove one of the three, or put a human in front of it.
 - hoplon removes the third leg from the model's reach. The model cannot make a request, and
   nothing it writes is rendered: no Markdown, no images, no clickable links (OSC 8 hyperlink
   sequences are escaped like any other control sequence).
-- The only network destination is the blessed endpoint. Redirects are refused and nothing more
+- hoplon's own only network destination is the blessed endpoint. Redirects are refused and nothing more
   is sent. `OPENAI_BASE_URL` and the proxy environment variables are ignored.
 - Switching models (`"model": "auto"`, `:model`, hoplon-tui's `/model`, a profile's `model`) stays on
   that server: only a model it lists, or an alias in the blessed endpoint file, can be chosen, and every
@@ -85,7 +88,8 @@ advice is to remove one of the three, or put a human in front of it.
   `._:/@+=-` is left out rather than cleaned, the list is capped at 1 MB and 200 names, and
   hoplon-tui checks each name again before it shows it in a tmux menu (whose item names tmux
   expands as formats). Each menu item sends back only its position, never the name.
-- Anything else that leaves the machine goes through a command you chose to run.
+- Anything else that leaves the machine goes through a command you chose to run, or a scoped command
+  of a set you enabled, whose network you saw when you blessed it (section 4).
 - A sandboxed run (section 5) has no network unless you switch it on for the session, and then
   each run asks first. Its output goes to the endpoint, like a file the model reads, after the
   same masking; files that look like secrets are hidden from it.
@@ -156,6 +160,14 @@ whole of what the model and the user's panes can run.
   model never sets this: it can write a command set, but not bless one. Commands that run without asking work only
   where someone can see what runs (not in plain, non-interactive mode), like automatic reads. In remote mode the
   answers go with the set from your machine.
+- **Network.** Each command must also say `"network"`: `"none"`, a list of where it connects (hosts, or a
+  short description such as "the Slurm controller"), or `"any"`; there is no default. A command with a `host`
+  parameter can't say `"none"`, and a list must include every host the parameter allows. Like `read`, it is
+  the set author's claim: the command runs on this host with your network, and hoplon doesn't confine it.
+  What it sends goes straight from this machine, not through the endpoint. So a command that uses the
+  network asks every time, reads too, unless you let it run without asking when blessing; the blessing
+  screen lists it apart, under NETWORK, with its destinations, and every approval says where it connects.
+  Enforcing `"none"` (a network namespace, where the host allows one) is a possible later step.
 - **Commands run as root.** A command whose program is `sudo`, `doas` or `run0` runs as root (or the user `-u`
   names). It asks every time, reads included, unless you let it run without asking when blessing; the blessing
   screen lists it apart, every approval says AS ROOT, and a hoplon-tui pane never runs it. It must say it never asks for a password (`-n`, or `--no-ask-password`); only `-u` and sudo's

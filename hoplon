@@ -20,6 +20,7 @@ import fnmatch
 import hashlib
 import ipaddress
 import json
+import math
 import os
 import queue
 import re
@@ -105,6 +106,8 @@ INTRINSICS = ("propose_command", "read_file", "list_dir", "write_file", "edit_fi
 PLAN_STEPS = 30                # steps one plan may have
 ENDPOINT_KEYS = {"name", "base_url", "model", "key_env", "key_file", "context_limit", "timeout",
                  "ca_bundle", "headers", "params", "allow_http", "proxy", "description", "aliases"}
+CONTEXT_LIMIT_MAX = 10_000_000    # tokens: an endpoint's context_limit, from 1
+TIMEOUT_RANGE = (1, 3600)         # seconds: an endpoint's timeout for one request
 ALIAS_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,31}")   # a name you give one of an endpoint's models
 REMOTE_URL = re.compile(r"http://127\.0\.0\.1:([0-9]{1,5})((?:/[A-Za-z0-9._~-]+)*)")
 TOKEN_RE = re.compile(r"[0-9A-Fa-f]{32,128}")
@@ -1564,7 +1567,10 @@ def load_skills(cfg, names, notice):
 # Command sets and scoped commands: programs you blessed once, with exactly the inputs they may take
 
 COMMAND_SET_KEYS = {"name", "description", "search", "env", "pane", "commands"}
-COMMAND_KEYS = {"describe", "usage", "argv", "params", "access", "timeout", "max_output", "min_interval", "cache"}
+COMMAND_KEYS = {"describe", "usage", "argv", "params", "access", "network", "timeout", "max_output", "min_interval",
+                "cache"}
+NETWORK_MAX = 16             # destinations one command may declare
+DESTINATION_MAX = 100        # characters of one
 USAGE_MAX = 1200            # characters of a scoped command's usage section, all lines together
 USAGE_LINES = 20
 GUIDE_MAX = 6000            # characters of a command set's GUIDE.md, sent to the model while the set is on
@@ -1856,6 +1862,15 @@ class TrustedCommand:
         if self.access not in ("read", "write"):
             raise ValueError(f'{w}access must be "read" (it only looks) or "write" (it changes something)')
         self.read_only = self.access == "read"
+        # Where it reaches over the network: "none", "any", or a list of destinations. Like "read", it is the set's
+        # own claim: hoplon shows it at blessing and asks before a command that uses the network, but can't check it.
+        self.network = data.get("network")
+        if not (self.network in ("none", "any") or (
+                isinstance(self.network, list) and 1 <= len(self.network) <= NETWORK_MAX
+                and all(isinstance(d, str) and d.strip() and len(d) <= DESTINATION_MAX and not hidden_found(d)
+                        for d in self.network))):
+            raise ValueError(f'{w}network must be "none" (it never uses the network), a list of where it connects '
+                             f'(hosts, or a short description such as "the Slurm controller"), or "any"')
         self.timeout = _number(data, "timeout", w, 15, 1, 120)
         self.max_output = _number(data, "max_output", w, 65536, 1, 1048576)
         self.min_interval = _number(data, "min_interval", w, 2, 0, 3600)
@@ -1864,6 +1879,14 @@ class TrustedCommand:
         if not isinstance(params, dict) or not all(COMMAND_NAME.fullmatch(k) for k in params):
             raise ValueError(f"{w}params must be an object named by parameter names (a-z, 0-9, _)")
         self.params = {k: TrustedParam(v, f"{w}params.{k}") for k, v in params.items()}
+        for k, p in self.params.items():
+            if p.kind != "host":
+                continue
+            if self.network == "none":
+                raise ValueError(f'{w}network: params.{k} is a host, so it can\'t be "none"')
+            if isinstance(self.network, list) and set(p.rule) - set(self.network):
+                raise ValueError(f"{w}network must list every host params.{k} allows: "
+                                 f"{', '.join(sorted(set(p.rule) - set(self.network)))}")
         if self.read_only and any(p.kind == "path" and p.rule.get("new") for p in self.params.values()):
             raise ValueError(f'{w}params: a path that may be new needs "access": "write"')
         first = self.argv[0]
@@ -1872,8 +1895,9 @@ class TrustedCommand:
         self.parts = [split_template(a, f"{w}argv[{i}]") for i, a in enumerate(self.argv)]
         # None, or whom it runs as (sudo, doas, run0), and then the program it runs, checked like argv[0]
         self.as_user, self.target = escalation(self.argv, w)
-        # It runs without asking if it only reads as you; anything else only if you chose so when blessing (allow_auto).
-        self.auto = self.read_only and not self.as_user
+        # It runs without asking if it only reads, as you, with no network; anything else only if you chose so when
+        # blessing (allow_auto).
+        self.auto = self.plain()
         used = {text for parts in self.parts[1:] for is_param, text in parts if is_param}
         if used - set(self.params):
             raise ValueError(f"{w}argv uses undeclared placeholder(s): {', '.join(sorted(used - set(self.params)))}")
@@ -1881,6 +1905,15 @@ class TrustedCommand:
             raise ValueError(f"{w}params not used in argv: {', '.join(sorted(set(self.params) - used))}")
         self.tool = f"{cset.replace('-', '_')}__{name}"        # at most 31 + 2 + 31 characters
         self.binary = self.identity = self.target_identity = None
+
+    def plain(self):
+        """Does it run without asking unless you choose otherwise: a read, as you, that uses no network?"""
+        return self.read_only and not self.as_user and self.network == "none"
+
+    def reaches(self):
+        """Where it connects, as shown to people: "", "ANY host", or the destinations."""
+        return ("" if self.network == "none" else "ANY host" if self.network == "any" else
+                ", ".join(one_line(d)[0] for d in self.network))
 
     def resolve(self):
         self.binary, self.identity = trusted_binary(self.argv[0], self.search)
@@ -1944,7 +1977,8 @@ class TrustedCommand:
     def schema(self, host):
         how = ("read-only" if self.read_only else "changes something") + \
             (f"; runs as {self.as_user}" if self.as_user else "") + \
-            ("" if self.auto and self.read_only and not self.as_user else
+            (f"; connects to {self.reaches()}" if self.reaches() else "") + \
+            ("" if self.auto and self.plain() else
              "; runs without asking, as the user chose" if self.auto else "; the user is asked first")
         props = {k: p.schema() for k, p in self.params.items()}
         text = f"{self.describe} (runs `{self.shown()}` on {host}; {how})".strip()
@@ -1955,7 +1989,8 @@ class TrustedCommand:
     def info(self):
         return {"name": self.name, "describe": self.describe, "usage": self.usage,
                 "params": {k: p.rules() for k, p in self.params.items()},
-                "access": self.access, "auto": self.auto, "argv": self.argv, "as": self.as_user}
+                "access": self.access, "auto": self.auto, "argv": self.argv, "as": self.as_user,
+                "network": self.network}
 
 
 def read_guide(raw):
@@ -2028,21 +2063,24 @@ class CommandSet:
         return {c.tool: c for c in self.commands.values()}
 
     def allow_auto(self, names):
-        """The commands the user chose, when blessing, to run without asking (writes, and any run as another user);
-        read commands that run as you always do."""
+        """The commands the user chose, when blessing, to run without asking (writes, any that use the network, and any
+        run as another user); reads that run as you with no network always do."""
         names = set(names) if isinstance(names, list) else set()
         for c in self.commands.values():
-            c.auto = (c.read_only and not c.as_user) or c.name in names
+            c.auto = c.plain() or c.name in names
 
     def writes(self):
-        return [c for c in self.commands.values() if not c.read_only and not c.as_user]
+        return [c for c in self.commands.values() if not c.read_only and not c.as_user and c.network == "none"]
+
+    def networked(self):
+        return [c for c in self.commands.values() if c.network != "none" and not c.as_user]
 
     def escalated(self):
         return [c for c in self.commands.values() if c.as_user]
 
     def askers(self):
         """The commands that ask every time unless the user chooses otherwise when blessing."""
-        return [c for c in self.commands.values() if not c.read_only or c.as_user]
+        return [c for c in self.commands.values() if not c.plain()]
 
     def resolve(self):
         """Find every command's program now, refusing the command set if one can't be trusted. A program that isn't
@@ -2074,9 +2112,11 @@ class CommandSet:
                      "and LOGNAME")
         groups = (("read: the set says these only look, and they run without asking (hoplon can't check that: "
                    "make sure each one only looks)",
-                   [c for c in self.commands.values() if c.read_only and not c.as_user]),
+                   [c for c in self.commands.values() if c.plain()]),
                   ("write: these change something, and ask every time unless you choose otherwise below",
                    self.writes()),
+                  ("[!] NETWORK: these connect to other machines, and ask every time, reads too, unless you choose "
+                   "otherwise below", self.networked()),
                   ("[!] AS ANOTHER USER (sudo, doas, run0): these ask every time, reads too, unless you choose "
                    "otherwise below", self.escalated()))
         for title, cmds in groups:
@@ -2087,11 +2127,15 @@ class CommandSet:
         if self.guide:
             lines.append("  guide (GUIDE.md, sent to the model whenever the set is on):")
             lines += [f"    | {one_line(ln)[0]}" for ln in self.guide.splitlines()]
-        lines.append("  [!] these commands run on this host as you, with no shell, and the read ones without "
-                     "asking: their output goes to the model and the endpoint like any file the model reads")
+        lines.append("  [!] these commands run on this host as you, with no shell, and the read ones that use no "
+                     "network without asking: their output goes to the model and the endpoint like any file the model reads")
         lines.append("  [!] 'read' and 'write' are the set's own labels: hoplon checks which program runs and with "
                      "what arguments, not what it does. A 'read' command that changes something runs without "
                      "asking, live, whatever mode you are in")
+        if self.networked() or any(c.network != "none" for c in self.escalated()):
+            lines.append("  [!] the network a command declares is the set's own claim too: a command runs on this host "
+                         "with your network, so it can reach anything you can. What it sends there leaves "
+                         "this machine without going through the endpoint you blessed")
         if self.escalated():
             lines.append("  [!] the ones marked AS ANOTHER USER run with that user's rights (root can read and change "
                          "anything); allow exactly these commands, with -n, in sudoers or doas.conf, and nothing more")
@@ -2101,9 +2145,11 @@ class CommandSet:
         lines = []
         for c in cmds:
             flag = (f"[runs as {c.as_user}, {c.access}, asks every time]" if c.as_user else
+                    f"[{c.access}, asks every time]" if c.network != "none" else
                     "runs without asking" if c.read_only else "[asks every time]")
             lines.append(f"  command {one_line(c.name)[0]}: {one_line(c.describe)[0]}  ({flag})")
             lines.append(f"    runs:    {one_line(c.shown())[0]}")
+            lines.append(f"    network: {'[!] ' + c.reaches() if c.reaches() else 'none (the set says)'}")
             for k, p in c.params.items():
                 lines.append(f"    {k}: {p.kind} {one_line(json.dumps(p.rule))[0]}  {one_line(p.describe)[0]}".rstrip())
             if c.usage:
@@ -2229,16 +2275,34 @@ class Endpoint:
         if "key_env" in data and "key_file" in data:
             raise HoplonError(f"{path}: give key_env or key_file, not both", EXIT_PROFILE)
         self.key_env, self.key_file = data.get("key_env"), data.get("key_file")
+        for k in ("key_file", "ca_bundle", "proxy"):
+            if k in data and not (isinstance(data[k], str) and data[k]):
+                raise HoplonError(f"{path}: '{k}' must be a non-empty string", EXIT_PROFILE)
+        if not isinstance(data.get("description", ""), str):
+            raise HoplonError(f"{path}: 'description' must be a string", EXIT_PROFILE)
         if self.key_env is not None and not (isinstance(self.key_env, str) and ENV_NAME_RE.fullmatch(self.key_env)):
             raise HoplonError(f"{path}: 'key_env' must be a plain variable name (letters, digits, underscore)",
                              EXIT_PROFILE)
-        self.context_limit = int(data.get("context_limit", 32000))
+        self.context_limit = data.get("context_limit", 32000)
+        if type(self.context_limit) is not int or not 1 <= self.context_limit <= CONTEXT_LIMIT_MAX:
+            raise HoplonError(f"{path}: 'context_limit' must be a whole number of tokens from 1 to "
+                             f"{CONTEXT_LIMIT_MAX:,}", EXIT_PROFILE)
         self.blessed_limit = self.context_limit     # for a model whose size the server doesn't say, an alias's too
-        self.timeout = float(data.get("timeout", 120))
+        self.timeout = data.get("timeout", 120)
+        if type(self.timeout) not in (int, float) or not (math.isfinite(self.timeout) and
+                                                          TIMEOUT_RANGE[0] <= self.timeout <= TIMEOUT_RANGE[1]):
+            raise HoplonError(f"{path}: 'timeout' must be a number of seconds from {TIMEOUT_RANGE[0]} to "
+                             f"{TIMEOUT_RANGE[1]}", EXIT_PROFILE)
+        self.timeout = float(self.timeout)
         self.ca_bundle = data.get("ca_bundle")
-        self.headers = data.get("headers", {}) or {}
-        self.params = dict(data.get("params", {}) or {})
-        self.allow_http = bool(data.get("allow_http", False))
+        self.headers = data.get("headers", {})
+        self.params = data.get("params", {})
+        if not isinstance(self.params, dict):
+            raise HoplonError(f"{path}: 'params' must be an object of request settings", EXIT_PROFILE)
+        self.params = dict(self.params)
+        self.allow_http = data.get("allow_http", False)
+        if type(self.allow_http) is not bool:
+            raise HoplonError(f"{path}: 'allow_http' must be true or false", EXIT_PROFILE)
         self.proxy = data.get("proxy")
         self.token = None       # remote mode: the session token the key proxy requires (see remote_config)
         if not isinstance(self.headers, dict) or not all(isinstance(v, str) for v in self.headers.values()):
@@ -2249,6 +2313,8 @@ class Endpoint:
         for k in ("model", "messages", "tools"):
             if k in self.params:
                 raise HoplonError(f"{path}: params may not set '{k}'", EXIT_PROFILE)
+        if type(self.params.get("stream", True)) is not bool:
+            raise HoplonError(f"{path}: params' 'stream' must be true or false", EXIT_PROFILE)
         u = urllib.parse.urlsplit(self.base_url)
         if u.scheme not in ("https", "http") or not u.hostname:
             raise HoplonError(f"{path}: base_url must be an http(s) URL", EXIT_PROFILE)
@@ -2416,6 +2482,8 @@ class Profile:
         for k in ("model", "messages", "tools"):
             if k in self.params:
                 raise HoplonError(f"{path}: params may not set '{k}'", EXIT_PROFILE)
+        if type(self.params.get("stream", True)) is not bool:
+            raise HoplonError(f"{path}: params' 'stream' must be true or false", EXIT_PROFILE)
         if not isinstance(self.coding, bool):
             raise HoplonError(f"{path}: 'coding' must be true or false", EXIT_PROFILE)
         self.edits = data.get("edits", "ask")
@@ -2808,11 +2876,12 @@ def bless(cfg, path, ask):
         print("Not blessed.")
         return False
     if os.path.isdir(path) and cset and cset.askers():
-        print("Write commands, and commands that run as another user, ask you every time. You can let some of them "
-              "run without asking; every run is still logged as trusted_run.")
+        print("Write commands, commands that use the network, and commands that run as another user ask you every "
+              "time. You can let some of them run without asking; every run is still logged as trusted_run.")
         entry["auto"] = [c.name for c in cset.askers()
                          if ask(f"Let the model run {one_line(c.name)[0]} ({one_line(c.shown())[0]})"
-                                + (f" AS {one_line(c.as_user)[0].upper()}" if c.as_user else "") + " without asking you?")]
+                                + (f" AS {one_line(c.as_user)[0].upper()}" if c.as_user else "")
+                                + (f", CONNECTING TO {c.reaches()}," if c.reaches() else "") + " without asking you?")]
     entry["blessed_at"] = now()
     cfg.set_blessed(path, entry)
     cfg.audit.log("bless", path=path, kind=entry["kind"], hash=h, **({"auto": entry["auto"]} if "auto" in entry else {}))
@@ -5059,7 +5128,8 @@ class Engine:
         values = cmd.check(args)
         p = Proposal(pid, "trusted", call_id, set=cmd.set, command=cmd.name, params=values,
                      argv=cmd.shown(values), access=cmd.access, reason=cmd.describe, _cmd=cmd,
-                     **({"as_user": cmd.as_user} if cmd.as_user else {}))
+                     **({"as_user": cmd.as_user} if cmd.as_user else {}),
+                     **({"network": cmd.reaches()} if cmd.reaches() else {}))
         p.auto = cmd.auto
         return p
 
@@ -5905,7 +5975,8 @@ class TtyUI(PlainUI):
         if p.kind == "trusted":
             f = p.fields
             args = ", ".join(f"{k}={v}" for k, v in f["params"].items())
-            who = f" AS {one_line(f['as_user'])[0].upper()}" if f.get("as_user") else ""
+            who = (f" AS {one_line(f['as_user'])[0].upper()}" if f.get("as_user") else "") + \
+                (f", connecting to {one_line(f['network'])[0]}" if f.get("network") else "")
             eprint(f"  \u21b3 [{p.id}] {tagged(p.kind, f)}{one_line(f['set'])[0]}.{one_line(f['command'])[0]}({show_exact(args)}){who}: "
                    f"{show_exact(f['argv'])}")
         elif p.kind == "sandbox":
@@ -5958,6 +6029,7 @@ class TtyUI(PlainUI):
                 head = (f"Run {one_line(f['set'])[0]}.{one_line(f['command'])[0]} (a scoped command that "
                         + ("its set says only reads" if f.get("access") == "read" else "changes something")
                         + (f", AS {one_line(f['as_user'])[0].upper()}" if f.get("as_user") else "")
+                        + (f", CONNECTING TO {one_line(f['network'])[0]}" if f.get("network") else "")
                         + f"):\n    $ {show_exact(f['argv'])}")
             elif p.kind == "plan":
                 self.out.write(f"\n\033[1m[{p.id}] plan\033[0m — {one_line(f['goal'])[0]}\n{margin(plan_steps(f['steps']))}\n"

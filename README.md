@@ -12,12 +12,14 @@ adds tmux 3.2 or newer.
 - **You run the commands.** The model proposes, and you decide. The exceptions are opt-in: an offline
   container on a throwaway copy of your project, and the commands of a command set you blessed that
   run without asking.
-- **"Read-only" is a claim you check.** A command set marks each command `read` or `write`, and the read
-  ones run live without asking. hoplon can't tell what a program does, so `read` is the set author's
-  word: bless a set only when you know its read commands only look. hoplon checks the program file, not
-  its behavior.
-- **One way out.** No web access and no rendered links or images. The model reaches only the
-  endpoint you approved.
+- **"Read-only" is a claim you check.** A command set marks each command `read` or `write`, and says where
+  it connects over the network. Reads that use no network run live without asking. hoplon can't tell what a
+  program does, so both are the set author's word: bless a set only when you know its read commands only
+  look and connect only where they say. hoplon checks the program file, not its behavior.
+- **One way out.** No web access and no rendered links or images. With no command set on, the model
+  reaches only the endpoint you approved. A command set you enable adds what its commands reach: each
+  one declares it (`none`, named destinations, or `any`), the blessing screen shows it, and a command that
+  uses the network asks every time unless you let it run without asking.
 - **Secrets stay put.** Files that look like secrets ask first and are hidden from the sandbox, and
   keys are masked in output.
 - **Your project can't configure the agent.** Nothing is read from the folder you work in, and every

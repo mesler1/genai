@@ -530,6 +530,8 @@ class Card(Block):
             out.append(("$ " + command_text(str(ev.get("argv", ""))).replace("\n", " "), ""))
             if ev.get("as_user"):                       # sudo, doas or run0: it runs with that user's rights
                 out.append((f"▲ runs AS {one_row(str(ev['as_user'])).upper()}, with its rights", R))
+            if ev.get("network"):                       # where its set says it connects: data leaves this machine
+                out.append((f"▲ connects to {one_row(str(ev['network']))}", R))
         if k in RUNS and self.state == "running":
             self.shown_secs = self.elapsed()
             out.append((f"running {self.shown_secs}s · " + ("Ctrl-C (or /stop) stops it" if self.stoppable else

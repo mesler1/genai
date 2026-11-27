@@ -9,22 +9,30 @@ refuses it again if any file in it changes. Then `--commands slurm`, `default_co
 message from a wrapper turns it on.
 
 Each enabled command is a tool for the model, named `slurm__queue_user`. Every command says what it does:
-`"access": "read"` (it only looks) runs without asking, like an automatic read in coding mode: you see what ran
+`"access": "read"` (it only looks) runs without asking if it also uses no network (below), like an automatic read in coding mode: you see what ran
 and its output, and the audit log records it. `read` is what the set says, not something hoplon can check: it
 controls which program runs with which arguments, not what that program does. Bless a set only when you know
 its read commands really only look (`squeue` does; a script you haven't read might not). `"access": "write"` (it changes something) asks every time, like a
 write, unless you let it run without asking: after you accept a set, blessing asks you about each write
-command, and the answer is kept with the blessing (`auto`), so a changed set asks again. Every run is logged as
+command (and each one that uses the network or runs as another user), and the answer is kept with the blessing (`auto`), so a changed set asks again. Every run is logged as
 `trusted_run` either way. You (a hoplon-tui pane, through the `run` message)
 can run the same commands with the same checks and limits. You decided once, at blessing time, exactly these
 commands with exactly these inputs.
 
+Every command also says where it connects over the network: `"network": "none"`, a list of destinations
+(`["the Slurm controller, slurmctld"]`, `["db.example.org:5432"]`), or `"any"`. There is no default. A read
+command that uses the network asks every time, as a write does, because what it sends leaves this machine
+directly, not through the endpoint you blessed; blessing lists it under NETWORK with its destinations, and
+you can let it run without asking there. Like `read`, the declaration is the set's word: hoplon shows it and
+asks, but doesn't stop the program connecting elsewhere. A command with a `host` parameter can't say `"none"`,
+and a list must include every host the parameter allows.
+
 ```json
 {"name": "slurm", "description": "Slurm cluster status", "search": ["/usr/bin", "/opt/slurm/bin"], "env": ["SLURM_CONF"],
  "commands": {"queue_user": {"describe": "jobs of one user", "argv": ["squeue", "-h", "-u", "{user}"],
-   "params": {"user": {"pattern": "^[a-z_][a-z0-9_-]{0,31}$"}}, "access": "read", "min_interval": 5, "cache": 15},
+   "params": {"user": {"pattern": "^[a-z_][a-z0-9_-]{0,31}$"}}, "access": "read", "network": ["the Slurm controller, slurmctld"], "min_interval": 5, "cache": 15},
   "job_log": {"describe": "the end of a job's log", "argv": ["tail", "-n", "200", "{file}"], "access": "read",
-   "params": {"file": {"path": {"under": ["~/jobs"]}}}}}}
+   "network": "none", "params": {"file": {"path": {"under": ["~/jobs"]}}}}}}
 ```
 
 - `name` is the directory's name (`a-z`, digits, `-`); commands are `a-z`, digits, `_`. Unknown fields anywhere
@@ -49,7 +57,8 @@ commands with exactly these inputs.
   A value that doesn't fit is refused, never cleaned. At most 256 characters, one line, and never starting with
   `-`, whatever the type. One gap is left with paths: the program opens the file after hoplon checks it, so a
   symlink swapped in between can still get past the check. Only the sandbox closes that completely.
-- Per command: `access` (required: `read` or `write`), `timeout` (seconds, 15, at most 120), `max_output` (bytes,
+- Per command: `access` (required: `read` or `write`), `network` (required: `"none"`, a list of at most 16
+  destinations of at most 100 characters each, or `"any"`), `timeout` (seconds, 15, at most 120), `max_output` (bytes,
   65536, at most 1 MiB; more is dropped and the program is killed), `min_interval` (seconds, 2: a call of the
   same command sooner than this after its last real run is refused with "rate limited"), `cache` (seconds, 0:
   the same command with the same values returns its last result, marked cached). hoplon also allows 30 real
@@ -72,7 +81,7 @@ A command can run as root (or another user) through `sudo`, `doas` or `run0`. Th
 restarts a service on a remote host without a root shell: you allow exactly that command, and nothing else.
 
 ```json
-  "restart": {"describe": "restart one web service", "access": "write",
+  "restart": {"describe": "restart one web service", "access": "write", "network": "none",
               "argv": ["sudo", "-n", "/usr/bin/systemctl", "restart", "{unit}"],
               "params": {"unit": {"enum": ["nginx", "php-fpm"]}}}
 ```

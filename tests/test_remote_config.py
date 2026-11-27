@@ -89,7 +89,7 @@ class TestRemoteConfigExport(Tmp):
         self.item(home, "skill", "unblessed", {"SKILL.md": "# U\n"})
         b = self.item(home, "skill", "b", {"SKILL.md": "# B\n"})
         pl = self.item(home, "command_set", "pl", {"commands.json": json.dumps(
-            {"name": "pl", "commands": {"x": {"describe": "x", "argv": ["true"], "access": "read"}}})})
+            {"name": "pl", "commands": {"x": {"describe": "x", "argv": ["true"], "access": "read", "network": "none"}}})})
         for kind, d in (("skill", a), ("skill", b), ("command_set", pl)):
             self.bless_dir(home, kind, d)
         with open(os.path.join(home, "config.json"), "w") as f:
@@ -134,13 +134,13 @@ class TestRemoteConfigLine(Tmp):
         return G.remote_config(self.line(**extra), G.Audit(self.path("audit.log")))
 
     def test_items_are_made_from_the_bytes_sent(self):
-        plug = {"commands.json": json.dumps({"name": "pl", "commands": {"x": {"describe": "d", "argv": ["true"], "access": "read"}}})}
+        plug = {"commands.json": json.dumps({"name": "pl", "commands": {"x": {"describe": "d", "argv": ["true"], "access": "read", "network": "none"}}})}
         _, _, offered = self.parse(skills=[self.entry("s", {"SKILL.md": "# S\nbody"})], command_sets=[self.entry("pl", plug)])
         self.assertEqual(offered["skills"]["s"].text(), "# S\nbody")
         self.assertEqual(list(offered["command_sets"]["pl"].commands), ["x"])
         wplug = {"commands.json": json.dumps({"name": "w", "commands": {
-            "x": {"describe": "d", "argv": ["true"], "access": "write"},
-            "y": {"describe": "d", "argv": ["true"], "access": "write"}}})}
+            "x": {"describe": "d", "argv": ["true"], "access": "write", "network": "none"},
+            "y": {"describe": "d", "argv": ["true"], "access": "write", "network": "none"}}})}
         _, _, got = self.parse(command_sets=[dict(self.entry("w", wplug), auto=["x"])])
         self.assertEqual((got["command_sets"]["w"].commands["x"].auto, got["command_sets"]["w"].commands["y"].auto),
                          (True, False))

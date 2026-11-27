@@ -21,16 +21,16 @@ CMDS = {
     "queue": {"describe": "jobs of one user", "argv": ["fakeq", "-u", "{user}", "--fmt={fmt}"],
               "params": {"user": {"pattern": "^[a-z_][a-z0-9_-]{0,31}$", "describe": "a user name"},
                          "fmt": {"enum": ["short", "long"]}},
-              "access": "read", "min_interval": 0},
+              "access": "read", "network": "none", "min_interval": 0},
     "job": {"describe": "one job", "argv": ["fakeq", "job", "{id}"],
-            "params": {"id": {"int": [1, 99999]}}, "access": "read", "min_interval": 0},
+            "params": {"id": {"int": [1, 99999]}}, "access": "read", "network": "none", "min_interval": 0},
     "kill": {"describe": "stops a job", "argv": ["fakeq", "kill", "{id}"],
-             "params": {"id": {"int": [1, 99999]}}, "access": "write", "min_interval": 0},
-    "slow": {"describe": "never ends", "argv": ["slowq"], "access": "read", "timeout": 1, "min_interval": 0},
-    "big": {"describe": "too much output", "argv": ["bigq"], "access": "read", "max_output": 1000, "min_interval": 0},
-    "leak": {"describe": "prints a secret", "argv": ["leakq"], "access": "read", "min_interval": 0},
-    "cached": {"describe": "cached", "argv": ["fakeq", "cached"], "access": "read", "cache": 60, "min_interval": 0},
-    "paced": {"describe": "paced", "argv": ["fakeq", "paced"], "access": "read", "min_interval": 30},
+             "params": {"id": {"int": [1, 99999]}}, "access": "write", "network": "none", "min_interval": 0},
+    "slow": {"describe": "never ends", "argv": ["slowq"], "access": "read", "network": "none", "timeout": 1, "min_interval": 0},
+    "big": {"describe": "too much output", "argv": ["bigq"], "access": "read", "network": "none", "max_output": 1000, "min_interval": 0},
+    "leak": {"describe": "prints a secret", "argv": ["leakq"], "access": "read", "network": "none", "min_interval": 0},
+    "cached": {"describe": "cached", "argv": ["fakeq", "cached"], "access": "read", "network": "none", "cache": 60, "min_interval": 0},
+    "paced": {"describe": "paced", "argv": ["fakeq", "paced"], "access": "read", "network": "none", "min_interval": 30},
 }
 
 
@@ -174,8 +174,29 @@ class TestManifest(CommandSetBase):
                 G.escalation(argv, "")
             self.assertIn(why, str(e.exception))
 
+    def test_network_must_be_declared_and_a_host_parameter_needs_it(self):
+        for bad in [None, "some", [], [""], ["x" * 101], ["a\u200bb"], [1], ["h"] * 17, True]:
+            self.setUp()
+            if bad is None:
+                del self.manifest["commands"]["queue"]["network"]
+            else:
+                self.manifest["commands"]["queue"]["network"] = bad
+            self.refused("network must be")
+        host = {"describe": "ping", "argv": ["fakeq", "{h}"], "access": "read", "network": "none",
+                "params": {"h": {"host": ["a.example", "b.example"]}}}
+        self.setUp()
+        self.manifest["commands"]["ping"] = dict(host)
+        self.refused("params.h is a host, so it can't be \"none\"")
+        self.setUp()
+        self.manifest["commands"]["ping"] = dict(host, network=["a.example"])
+        self.refused("must list every host params.h allows: b.example")
+        for ok in (["a.example", "b.example", "c.example"], "any"):
+            self.setUp()
+            self.manifest["commands"]["ping"] = dict(host, network=ok)
+            self.assertIsNone(self.load().error)
+
     def test_a_sudo_command_without_n_refuses_the_set(self):
-        self.manifest["commands"]["queue"] = {"describe": "who", "argv": ["fakeq", "/usr/bin/id"], "access": "read"}
+        self.manifest["commands"]["queue"] = {"describe": "who", "argv": ["fakeq", "/usr/bin/id"], "access": "read", "network": "none"}
         self.manifest["commands"]["queue"]["argv"][0] = "sudo"
         program(os.path.join(self.bin, "sudo"), "exit 0\n")
         self.refused("needs -n")
@@ -265,7 +286,7 @@ class TestManifest(CommandSetBase):
         os.makedirs(os.path.join(top, "real"))
         open(os.path.join(top, "real", "x.log"), "w").close()
         os.symlink(os.path.join(top, "real"), os.path.join(top, "alias"))
-        self.manifest["commands"]["tail"] = {"describe": "a log", "argv": ["fakeq", "tail", "{file}"], "access": "read",
+        self.manifest["commands"]["tail"] = {"describe": "a log", "argv": ["fakeq", "tail", "{file}"], "access": "read", "network": "none",
                                              "params": {"file": {"path": {"under": [top]}}}}
         pl = self.load()
         self.assertIsNone(pl.error)
@@ -304,7 +325,7 @@ class TestManifest(CommandSetBase):
 
     def test_defaults(self):
         c = self.load().commands["slow"]
-        self.manifest["commands"]["x"] = {"argv": ["fakeq"], "access": "write"}
+        self.manifest["commands"]["x"] = {"argv": ["fakeq"], "access": "write", "network": "none"}
         x = self.load().commands["x"]
         self.assertEqual((x.auto, x.timeout, x.max_output, x.min_interval, x.cache), (False, 15, 65536, 2, 0))
         self.assertEqual(c.timeout, 1)
@@ -407,13 +428,13 @@ class TestBinary(CommandSetBase):
         other = self.path("elsewhere")
         os.mkdir(other, 0o755)
         program(os.path.join(other, "nothere"), "true\n")
-        self.manifest["commands"]["x"] = {"argv": ["nothere"], "access": "read"}
+        self.manifest["commands"]["x"] = {"argv": ["nothere"], "access": "read", "network": "none"}
         pl = self.load()
         with mock.patch.dict(os.environ, {"PATH": other}):
             self.assertEqual(pl.resolve(), ["x"])          # not installed here: only its command is left out
         self.assertNotIn("x", pl.commands)
         self.assertIn("queue", pl.commands)
-        self.manifest["commands"] = {"x": {"argv": ["nothere"], "access": "read"}}
+        self.manifest["commands"] = {"x": {"argv": ["nothere"], "access": "read", "network": "none"}}
         with self.assertRaises(G.HoplonError) as cm:
             self.load().resolve()
         self.assertIn("none of its programs", str(cm.exception))
@@ -433,7 +454,7 @@ class TestBinary(CommandSetBase):
         for d in (top, os.path.dirname(os.path.dirname(prog)), os.path.dirname(prog)):
             os.chmod(d, 0o755)
         program(prog, "true\n")
-        self.manifest["commands"] = {"x": {"argv": [prog], "access": "read"}}
+        self.manifest["commands"] = {"x": {"argv": [prog], "access": "read", "network": "none"}}
         self.load().resolve()                                        # all 755: fine
         os.chmod(top, 0o775)
         with self.assertRaises(G.HoplonError) as cm:
@@ -450,7 +471,7 @@ class TestBinary(CommandSetBase):
         os.mkdir(other)
         os.chmod(other, 0o775)
         program(os.path.join(other, "svc"), "exit 0\n")
-        self.manifest["commands"] = {"x": {"argv": ["sudo", "-n", os.path.join(other, "svc")], "access": "read"}}
+        self.manifest["commands"] = {"x": {"argv": ["sudo", "-n", os.path.join(other, "svc")], "access": "read", "network": "none"}}
         with self.assertRaises(G.HoplonError) as cm:
             self.load().resolve()
         self.assertIn("writable by group or others", str(cm.exception))
@@ -476,7 +497,7 @@ class TestBinary(CommandSetBase):
         self.assertIn("not an executable", str(cm.exception))
 
     def test_absolute_argv0(self):
-        self.manifest["commands"] = {"x": {"argv": [os.path.join(self.bin, "fakeq")], "access": "read"}}
+        self.manifest["commands"] = {"x": {"argv": [os.path.join(self.bin, "fakeq")], "access": "read", "network": "none"}}
         pl = self.load()
         pl.resolve()
         self.assertTrue(pl.commands["x"].binary.endswith("/fakeq"))
@@ -623,7 +644,7 @@ class TestBlessing(CommandSetBase):
                 f'echo "---" >> {self.log}\necho "as root: $*"\n')
         self.svc = os.path.join(self.bin, "svc")
         program(self.svc, "exit 0\n")
-        self.manifest["commands"]["status"] = {"describe": "a service's state", "access": "read", "min_interval": 0,
+        self.manifest["commands"]["status"] = {"describe": "a service's state", "access": "read", "network": "none", "min_interval": 0,
                                                "argv": ["sudo", "-n", self.svc, "status", "{unit}"],
                                                "params": {"unit": {"enum": ["nginx", "cron"]}}}
         write_json(os.path.join(self.dir, "commands.json"), self.manifest)
@@ -669,6 +690,43 @@ class TestBlessing(CommandSetBase):
         os.utime(self.svc, ns=(1, 1))                                # what sudo runs changed: refused
         r = eng.run_user("fake", "status", {"unit": "nginx"})
         self.assertIn(f"{self.svc} changed since hoplon started; restart hoplon", r["error"])
+
+    def test_a_command_that_uses_the_network_asks_even_to_read(self):
+        self.manifest["commands"]["net"] = {"describe": "the controller's view", "access": "read",
+                                            "network": ["ctl.example:6817"], "argv": ["fakeq", "net"],
+                                            "min_interval": 0}
+        self.manifest["commands"]["anywhere"] = {"describe": "fetch", "access": "read", "network": "any",
+                                                 "argv": ["fakeq", "any"], "min_interval": 0}
+        write_json(os.path.join(self.dir, "commands.json"), self.manifest)
+        asked, out = [], io.StringIO()
+        answers = iter([True, False, True, False])           # the set; then kill, net, anywhere
+        with mock.patch.object(sys, "stdout", out):
+            self.assertTrue(G.bless(self.cfg, self.dir, lambda q: asked.append(q) or next(answers)))
+        text = out.getvalue()
+        self.assertIn("[!] NETWORK: these connect to other machines, and ask every time, reads too", text)
+        self.assertLess(text.index("[!] NETWORK"), text.index("command net:"))
+        self.assertIn("    network: [!] ctl.example:6817", text)
+        self.assertIn("    network: [!] ANY host", text)
+        self.assertIn("    network: none (the set says)", text)
+        self.assertIn("the network a command declares is the set's own claim too", text)
+        self.assertIn("commands that use the network", text)
+        self.assertEqual(len(asked), 4)
+        self.assertIn("Let the model run net (fakeq net), CONNECTING TO ctl.example:6817, without asking", asked[2])
+        self.assertIn("CONNECTING TO ANY host", asked[3])
+        self.assertEqual(self.cfg.blessed()[self.dir]["auto"], ["net"])
+        eng, _ = self.engine()
+        net, anywhere, queue = (eng.trusted[f"fake__{n}"] for n in ("net", "anywhere", "queue"))
+        self.assertEqual((net.auto, anywhere.auto, queue.auto), (True, False, True))
+        self.assertIn("read-only; connects to ANY host; the user is asked first",
+                      anywhere.schema("h")["function"]["description"])
+        self.assertIn("connects to ctl.example:6817; runs without asking, as the user chose",
+                      net.schema("h")["function"]["description"])
+        p = eng.build_trusted("p1", "c1", {}, "", "fake__anywhere")
+        self.assertEqual((p.auto, p.fields["network"]), (False, "ANY host"))
+        self.assertNotIn("network", eng.build_trusted("p2", "c2", {"user": "alice", "fmt": "long"}, "",
+                                                      "fake__queue").fields)
+        row = [c for c in G.command_set_rows(self.cfg, ["fake"])[0]["commands"] if c["name"] == "net"][0]
+        self.assertEqual(row["network"], ["ctl.example:6817"])
 
     def test_the_guide_goes_to_the_model_while_the_set_is_on(self):
         with open(os.path.join(self.dir, "GUIDE.md"), "w") as f:
@@ -786,7 +844,7 @@ class TestRunning(CommandSetBase):
     def test_a_read_run_as_root_asks_and_says_so(self):
         program(os.path.join(self.bin, "sudo"), 'echo "as root: $*"\n')
         program(os.path.join(self.bin, "svc"), "exit 0\n")
-        self.manifest["commands"]["status"] = {"describe": "a service's state", "access": "read", "min_interval": 0,
+        self.manifest["commands"]["status"] = {"describe": "a service's state", "access": "read", "network": "none", "min_interval": 0,
                                                "argv": ["sudo", "-n", os.path.join(self.bin, "svc"), "status", "{unit}"],
                                                "params": {"unit": {"enum": ["nginx"]}}}
         write_json(os.path.join(self.home, "commands", "fake", "commands.json"), self.manifest)

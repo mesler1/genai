@@ -561,6 +561,14 @@ class TestModel(unittest.TestCase):
         self.assertIn("$ sudo -n /usr/bin/systemctl status nginx", text)
         self.assertIn("▲ runs AS ROOT\\X1B[2J, with its rights", text)
 
+    def test_a_scoped_command_that_uses_the_network_says_where_on_its_card(self):
+        m = C.Model()
+        self.hello(m)
+        m.submit("queue?")
+        m.handle({"type": "proposal", "id": "p1", "kind": "trusted", "set": "slurm", "command": "queue",
+                  "access": "read", "argv": "squeue -h", "network": "the Slurm controller\x1b[2J"})
+        self.assertIn("▲ connects to the Slurm controller\\x1b[2J", text_of(m.cards["p1"], 80))
+
     def test_messages_typed_while_busy_are_queued(self):
         m = C.Model()
         m.submit("one")
@@ -1295,7 +1303,10 @@ class TestWorkFeature(unittest.TestCase):
 class TestCommandsFeature(unittest.TestCase):
     ROWS = [{"name": "slurm", "description": "cluster", "enabled": True, "blessed": True, "status": "blessed",
              "pane": "slurm.py", "dir": "/opt/hoplon/commands/slurm",
-             "commands": [{"name": "queue", "describe": "the queue", "access": "read", "params": {}},
+             "commands": [{"name": "queue", "describe": "the queue", "access": "read", "auto": True, "params": {},
+                           "network": "none"},
+                          {"name": "jobs", "describe": "via ctld", "access": "read", "auto": False, "params": {},
+                           "network": ["ctld"]},
                           {"name": "cancel", "describe": "cancel a job", "access": "write", "params": {}},
                           {"name": "drain", "describe": "nodes, as root", "access": "read", "as": "root",
                            "params": {}}]},
@@ -1366,15 +1377,17 @@ class TestCommandsFeature(unittest.TestCase):
         m = self.model()
         m.submit("/help")
         text = "\n".join(text_of(b, 200) for b in m.blocks)
-        self.assertIn("slurm: queue (read) the queue", text)
+        self.assertIn("slurm: queue (read, runs without asking) the queue", text)
+        self.assertIn("slurm: jobs (read, uses the network, asks) via ctld", text)
         self.assertIn("slurm: cancel (write, asks) cancel a job", text)
+        self.assertIn("slurm: drain (read, as root, asks) nodes, as root", text)
         self.assertNotIn("off: x", text)
         PANEL = load("panel", os.path.join(REPO, "tui", "panel.py"))
         lines, _ = PANEL.view(m.snapshot(), 50, None)
         shown = "\n".join("".join(t for t, _ in ln) for ln in lines)
         self.assertIn("COMMANDS", shown)
         self.assertIn("slurm · /commands slurm pane", shown)
-        self.assertIn("  queue, cancel", shown)
+        self.assertIn("  queue, jobs, cancel", shown)
 
 
 class TestPlan(unittest.TestCase):
