@@ -49,6 +49,8 @@ Unknown fields are an error, so don't invent any.
 
 ## How to work
 
+The quickest way is often not you: `hoplon --new-endpoint`, run by the user in a terminal, asks the same questions, lists the server's models and writes the file. Suggest it first; help by hand when they'd rather, or when it can't reach the server.
+
 1. Ask for what you don't know, one question at a time: the base URL, the model id, how the user keeps their key (an environment variable or a file), and the context window if they know it.
 2. If they don't know the model id, propose a command that lists models, with the key referenced by variable, never typed out:
    `curl -sS -H "Authorization: Bearer $HPC_LLM_KEY" "$BASE_URL/models"`, with `BASE_URL` set to the address they gave you

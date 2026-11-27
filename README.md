@@ -30,16 +30,18 @@ From a clone of this repository:
 ```bash
 mkdir -p ~/.local/bin                       # any directory on your PATH will do
 ln -s "$PWD/hoplon" "$PWD/tui/hoplon-tui" ~/.local/bin/
-hoplon --list-endpoints                      # the first run creates ~/.config/hoplon (none yet)
-$EDITOR ~/.config/hoplon/endpoints/work-llm.json         # write your endpoint: see below
+export HOPLON_API_KEY=...                    # your key; the endpoint names the variable, never the key
+hoplon --new-endpoint                        # asks for the server, key variable, model and context size
 hoplon --bless ~/.config/hoplon/endpoints/work-llm.json   # shows URL, model, key source; asks you to confirm
-export HOPLON_API_KEY=...                    # the endpoint names the variable, never the key
 hoplon -e work-llm "what does 'set -euo pipefail' do?"
 ```
 
-The endpoint file says where your prompts go. Fill in your server's OpenAI-compatible API address
-(usually ending in `/v1`), its model name, the environment variable that will hold your API key (never
-the key itself) and the model's context size in tokens:
+`--new-endpoint` asks for a name (`work-llm` above), your server's OpenAI-compatible address (usually
+ending in `/v1`), the environment variable that holds your API key (its name, never the key), the model
+(from the server's own list, when it can read it) and the model's context size, and optionally which
+models are `low`, `medium` and `high` ([model aliases](docs/endpoints-and-profiles.md#model-aliases)).
+It writes the file with private permissions and stops: blessing it is your step. You can also write the
+file by hand:
 
 ```json
 {

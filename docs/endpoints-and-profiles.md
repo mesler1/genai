@@ -2,6 +2,8 @@
 
 An **endpoint** says where prompts go: URL, model, key source, context size. It is the
 security-relevant file, because it decides where your prompts, files and key are sent.
+`hoplon --new-endpoint` asks for these, lists the server's models, writes the file with private
+permissions and tells you to bless it; it never blesses it for you.
 
 A **profile** is a persona. It can name an endpoint and add standing instructions for the
 model, default skills, sampling settings and coding mode:

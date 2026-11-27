@@ -5921,6 +5921,110 @@ def pick_steps(p, steps):
     return ("accept", sorted(nums)) if nums and re.fullmatch(r"[0-9 ,]+", ans) else ("decline", None)
 
 
+def new_endpoint(cfg, ask=input, out=print, client=None):
+    """hoplon --new-endpoint: ask for an endpoint's name, address, key variable, model, context size and aliases,
+    check it as an endpoint, and write it to the config's endpoints/ with private permissions. It never blesses:
+    the user reads what it wrote and blesses it. client(endpoint) gives the server's model list (for tests).
+    Returns the path written, or None."""
+    def question(text, check, default=None):
+        while True:
+            try:
+                ans = ask(f"{text}{f' [{default}]' if default else ''}: ").strip()
+            except EOFError:
+                raise HoplonError("stopped: nothing was written", EXIT_USAGE) from None
+            ans = ans or (default or "")
+            why = check(ans)
+            if why is None:
+                return ans
+            out(f"  {why}")
+
+    def yes(text):
+        try:
+            return ask(f"{text} [y/N] ").strip().lower() in ("y", "yes")
+        except EOFError:
+            return False
+
+    folder = cfg.endpoint_dirs[0]
+    out("A new endpoint: where hoplon sends your prompts. Nothing is written until the end, and it is never blessed "
+        "for you. Ctrl-D stops.")
+    name = question("Name (used with -e NAME)", lambda v: "letters, digits, '.', '_' and '-'" if not NAME_RE.fullmatch(v)
+                    else f"{folder}/{v}.json already exists" if os.path.lexists(os.path.join(folder, v + ".json"))
+                    else None)
+
+    def url_ok(v):
+        u = urllib.parse.urlsplit(v)
+        if u.scheme not in ("https", "http") or not u.hostname or u.username or u.password:
+            return "an http(s) address without credentials, usually ending in /v1"
+        return None
+    data = {"name": name, "base_url": question("The server's address (the OpenAI-compatible base URL)", url_ok)}
+    host = urllib.parse.urlsplit(data["base_url"]).hostname
+    if data["base_url"].startswith("http:") and not _is_loopback(host):
+        if not yes(f"  [!] plain HTTP to {host}: prompts, files and the key would travel unencrypted. Allow it?"):
+            raise HoplonError("stopped: use an https address; nothing was written", EXIT_USAGE)
+        data["allow_http"] = True
+
+    def env_ok(v):
+        if not v:
+            return None
+        if not ENV_NAME_RE.fullmatch(v) or len(v) > 64:
+            return "the variable's name (letters, digits, underscore), never the key itself"
+        return None
+    key_env = question("The environment variable that holds the API key (its name, not the key; empty: no key)",
+                       env_ok)
+    if key_env:
+        data["key_env"] = key_env
+        if not os.environ.get(key_env):
+            out(f"  ${key_env} is not set in this shell, so the server's model list can't be read with it")
+    probe = Endpoint({**data, "model": "auto"}, os.path.join(folder, name + ".json"))
+    listed = []
+    try:
+        listed = (client or Client)(probe).model_list()
+    except HoplonError as e:
+        out(f"  could not list the server's models: {one_line(str(e))[0]}")
+    for i, (mid, n) in enumerate(listed[:30], 1):
+        out(f"  {i:2}. {mid}" + (f"  ({n} tokens)" if n else ""))
+    if len(listed) > 30:
+        out(f"  ... and {len(listed) - 30} more, by name")
+
+    def pick(v, empty_ok=False):
+        if not v:
+            return None if empty_ok else "a model"
+        if v.isdigit():
+            return None if 1 <= int(v) <= min(len(listed), 30) else "a number from the list"
+        return None if MODEL_ID.fullmatch(v) else "a model name, as the server lists it"
+
+    def chosen(v):
+        return listed[int(v) - 1][0] if v.isdigit() else v
+    data["model"] = chosen(question("Model (a number from the list, or its name)" if listed else "Model name", pick))
+    found = dict(listed).get(data["model"])
+    limit = question("The model's context size in tokens",
+                     lambda v: None if v.isdigit() and 1000 <= int(v) <= 10_000_000 else "a whole number of tokens",
+                     str(found or 32000))
+    data["context_limit"] = int(limit)
+    if yes("Give its models short names (aliases such as low, medium, high), for profiles and :model?"):
+        aliases = {}
+        for alias in ("low", "medium", "high"):
+            v = question(f"  Model for '{alias}' (number or name; empty: none)", lambda v: pick(v, True))
+            if v:
+                aliases[alias] = chosen(v)
+        if aliases:
+            data["aliases"] = aliases
+    path = os.path.join(folder, name + ".json")
+    Endpoint(data, path)             # checked as hoplon will check it
+    text = json.dumps(data, indent=2) + "\n"
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except FileExistsError:
+        raise HoplonError(f"{path} appeared meanwhile; nothing was written", EXIT_USAGE) from None
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    out(f"Wrote {path}:\n{text}")
+    out(f"Read it, then bless it (only you can): hoplon --bless {path}")
+    out(f"Then try it: hoplon -e {name} \"hello\"")
+    return path
+
+
 def ask_yes(question):
     try:
         ans = input(f"{question} [y/N] ")
@@ -7629,6 +7733,8 @@ def parse_args(argv):
                          "(for hoplon-tui's remote mode; takes -e, -p, -k and --commands)")
     ap.add_argument("--bless", metavar="PATH",
                     help="review and bless a skill or command set directory, endpoint or profile file")
+    ap.add_argument("--new-endpoint", action="store_true",
+                    help="ask for an endpoint's details and write it to your config, for you to bless")
     ap.add_argument("--list-skills", action="store_true", help="list skills (with --json: as JSON)")
     ap.add_argument("--list-commands", action="store_true", help="list command sets (with --json: as JSON)")
     ap.add_argument("--list-endpoints", action="store_true", help="list endpoints (with --json: as JSON)")
@@ -7657,6 +7763,10 @@ def main(argv=None):
             if not sys.stdin.isatty():
                 raise HoplonError("blessing needs a terminal: it asks you to confirm you have read it", EXIT_USAGE)
             return EXIT_OK if bless(cfg, args.bless, ask_yes) else EXIT_ERROR
+        if args.new_endpoint:
+            if not sys.stdin.isatty():
+                raise HoplonError("--new-endpoint needs a terminal: it asks you questions", EXIT_USAGE)
+            return EXIT_OK if new_endpoint(cfg) else EXIT_ERROR
         if args.remote_config:
             if args.session:
                 raise HoplonError("--remote-config takes only -e, -p, -k and --commands", EXIT_USAGE)
