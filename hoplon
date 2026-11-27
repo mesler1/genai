@@ -4243,6 +4243,16 @@ class Engine:
         except ValueError:
             return None
 
+    def own_place(self, path):
+        """Is this file where an edit must always ask: hoplon's own config or state (whatever it says about
+        approved files), or a place coding mode is refused, such as ~/.ssh or your home directory itself?"""
+        real = os.path.realpath(path)
+        for root in (self.cfg.home, config_home(), os.path.join(state_home(), "hoplon")):
+            root = os.path.realpath(root)
+            if real == root or real.startswith(root.rstrip("/") + "/"):
+                return True
+        return coding_refusal(os.path.dirname(real)) is not None
+
     def auto_edit(self, p):
         """Would this edit or write apply without asking? Only with edits "approved-files", for a file already in the
         approved set, and never for a new file, a hidden or secret-looking one, or a whole replacement."""
@@ -4250,6 +4260,8 @@ class Engine:
             return False
         key = self.file_key(p.fields.get("path"))
         if key is None or key not in self.approved_files or is_hidden(key.split("/")):
+            return False
+        if self.own_place(os.path.join(self.wd.root, key)):
             return False
         f = p.fields
         if p.kind == "write" and (not f.get("exists") or f.get("undiffable")):

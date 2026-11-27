@@ -450,6 +450,8 @@ class Card(Block):
         self.ev, self.state, self.detail = ev, "waiting", ""
         self.output = None         # a sandboxed run's output, as the model got it
         self.key = None            # N when Alt+N opens this command's menu
+        self.cut = False           # its last drawing left something out: more lines, or a line too wide
+        self.seen = False          # you viewed it in full; until then, y on a cut card views it instead of accepting
         self.started = None        # time.monotonic() when a sandboxed run started
         self.stoppable = True      # /stop can stop it (in remote mode, only a hoplon that takes the stop message)
         self.shown_secs = None     # the elapsed seconds last drawn
@@ -599,6 +601,7 @@ class Card(Block):
         body = self.body()
         shown = body if len(body) <= CARD_BODY_LINES + 1 else body[:CARD_BODY_LINES]
         rows = [(fit(t, inner), r) for t, r in shown]
+        self.cut = len(shown) < len(body) or any(width(t) > inner for t, _ in shown)
         if len(shown) < len(body):
             rows.append((f"… {len(body) - len(shown)} more lines (v views it all)", Q))
         if self.ev.get("kind") == "command" and self.state == "shown":
@@ -1230,9 +1233,12 @@ class Model:
 
     def decide(self, accept, not_secret=False):
         """not_secret: you allowed a secret-looking read and said it holds none, so hoplon won't ask about it again
-        until the file changes."""
+        until the file changes. An accept of a card whose drawing left something out, which you haven't viewed in
+        full, is refused (False): approving what you couldn't see isn't a review."""
         if not self.pending:
-            return
+            return False
+        if accept and self.pending[0].cut and not self.pending[0].seen:
+            return False
         card = self.pending.pop(0)
         if accept and card.ev.get("kind") == "sandbox":
             card.start(self.can_stop())            # hoplon runs it as soon as it has the answer
@@ -1241,6 +1247,7 @@ class Model:
         card.changed()
         extra = {"not_secret": True} if accept and not_secret and card.ev.get("secret") else {}
         self.send(answer(card, "decision", decision="accept" if accept else "decline", **extra))
+        return True
 
 
 def answer(card, kind, **fields):
@@ -1886,6 +1893,8 @@ class App:
                       ("v", A), (" view it all", "")]]
             if self.plan_review and self.plan_review[0] == c.id:
                 lines[1][-1] = (" press a again to approve automatic runs", "")
+            if c.cut and not c.seen:
+                lines[1][0:2] = [("  It doesn't all fit: ", W), ("y", A), (" views it in full first   ", "")]
             if cmds and "OUTSIDE" in self.where():
                 lines.append([(f"  Commands run {self.where()}, in your shell, as you.", R)])
             return lines, None, "y approve · a review automatic runs · e edit · n or Esc no · v view"
@@ -1901,6 +1910,10 @@ class App:
             if c.ev.get("kind") == "work_plan":
                 lines.append([("  Once approved, each item is coded, tested and committed on the session's branch "
                                "without asking.", Q)])
+            if c.cut and not c.seen:
+                lines.append([("  It doesn't all fit here: ", W), ("y", A), (" or ", ""), ("v", A),
+                              (" views it in full first   ", ""), ("n", A), (" no", "")])
+                return lines, None, "y or v view it in full first · n or Esc decline"
             if c.ev.get("secret"):
                 ep = (self.m.hello or {}).get("endpoint") or {}
                 to = c.ev.get("to") if isinstance(c.ev.get("to"), str) else ep.get("base_url", "the endpoint")
@@ -2009,7 +2022,8 @@ class App:
             return
         if m.pending and m.pending[0].ev.get("kind") == "plan":
             if k in ("y", "Y"):
-                m.decide_plan()
+                if self.ready(m.pending[0]):
+                    m.decide_plan()
             elif k in ("a", "A"):
                 self.review_auto_plan(m.pending[0])
             elif k in ("e", "E"):
@@ -2023,9 +2037,11 @@ class App:
             return
         if m.pending:
             if k in ("y", "Y"):
-                m.decide(True)
+                if self.ready(m.pending[0]):
+                    m.decide(True)
             elif k in ("a", "A") and m.pending[0].ev.get("secret"):
-                m.decide(True, not_secret=True)
+                if self.ready(m.pending[0]):
+                    m.decide(True, not_secret=True)
             elif k in ("n", "N"):
                 m.decide(False)
             elif k in ("v", "V"):
@@ -2634,7 +2650,18 @@ class App:
 
     def view(self, card):
         """Show a proposal in full in a pager: cleaned text, so nothing in it reaches the terminal raw."""
-        return self.view_text(f"{card.id}: {card.title()}\n\n{card.full_text()}\n")
+        ok = self.view_text(f"{card.id}: {card.title()}\n\n{card.full_text()}\n")
+        if ok:
+            card.seen = True
+        return ok
+
+    def ready(self, card):
+        """May y accept this card now? Not while its drawing leaves something out that you haven't viewed: then y
+        views it in full instead, and the next y accepts."""
+        if card.cut and not card.seen:
+            self.view(card)
+            return False
+        return True
 
     def view_text(self, text):
         fd, path = tempfile.mkstemp(prefix="hoplon-preview-", suffix=".txt", dir=self.state_dir)

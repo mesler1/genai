@@ -699,6 +699,28 @@ Still open:
 - The audit log is not tamper-evident. Anything running as you can edit it.
 - Files you attach with `-f` and files the model reads are sent unmasked, by design.
 
+## Findings from the 2026-11-27 audit (OWASP AISVS 1.0, chapter C9)
+
+To audit hoplon yourself, or have a model of your choice do it, `skills/agent-audit` takes the checklist from an
+outside standard (OWASP AISVS 1.0) rather than from this document, which it treats as claims to test.
+
+A first run of that skill covered chapter C9 (orchestration and agentic action) at level 2. The core gate held:
+a missing or wrong digest, silence, a malformed decision and the end of input never approved anything, and
+the sandbox kept its limits.
+
+| # | Severity | Finding | Now |
+| --- | --- | --- | --- |
+| 1 | Medium | **hoplon-tui accepted a card it had cut short.** A card shows 12 lines, each cut to the screen's width, and `y` accepted the rest unseen: the end of a long diff, or the tail of a sandbox command. | Fixed. While a card is cut short, `y` opens it in full instead, and only the next `y` accepts. |
+| 2 | Medium | **Edits `approved-files` applied in hoplon's own config.** After one approved edit to `config.json`, the model's next edit to it applied without asking. | Fixed. An edit to hoplon's config or state, or where coding mode is refused, always asks. |
+| 3 | Low | hoplon-tui escapes fewer hidden characters than hoplon, and a sandbox command or a scoped command's arguments aren't flagged for them. | Open. |
+| 4 | Low | No token or spend budget; `max_steps` counts steps per decision, and `config.json` isn't blessed. | Open. |
+| 5 | Low | Tools a wrapper registers aren't checked against their schema (hoplon-tui registers none). | Open. |
+| 6 | Low | A stop during a reply waits for the next piece of it, up to the endpoint's timeout. | Open. |
+| 7 | Low | Scoped commands have time and output limits, but no CPU, memory or disk limits. | Open. |
+
+The rest are design choices AISVS asks more of: one model context both reads untrusted text and calls tools,
+there is no per-agent identity, and the audit log isn't tamper-evident (already listed above).
+
 ## What stays your job
 
 - Read a proposed command before running it, and a proposed diff before accepting it.

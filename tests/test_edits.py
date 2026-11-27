@@ -197,5 +197,29 @@ class TestProfileAndRepl(T.Tmp):
         self.assertEqual(eng.edits, "ask")
 
 
+
+class TestOwnPlaces(unittest.TestCase):
+    """An approved file never makes an edit in hoplon's own config or state, or where coding mode is refused, apply
+    without asking: the model could raise its own limits or turn things on there (found by an AISVS C9 audit)."""
+
+    def test_own_places_always_ask(self):
+        import tempfile
+        from unittest import mock
+        tmp = os.path.realpath(tempfile.mkdtemp(prefix="hoplon-own-"))
+        cfg_home, state, home = (os.path.join(tmp, d) for d in ("cfg", "state", "home"))
+        for d in (cfg_home + "/hoplon", state + "/hoplon", home + "/.ssh", home + "/proj"):
+            os.makedirs(d)
+        os.symlink(cfg_home + "/hoplon", home + "/proj/link")
+        env = {"XDG_CONFIG_HOME": cfg_home, "XDG_STATE_HOME": state, "HOME": home}
+        with mock.patch.dict(os.environ, env):
+            eng = type("E", (), {"cfg": type("C", (), {"home": os.path.join(tmp, "other")})()})()
+            own = lambda p: T.G.Engine.own_place(eng, p)        # noqa: E731
+            for path in (cfg_home + "/hoplon/config.json", cfg_home + "/hoplon/blessed.json",
+                         state + "/hoplon/audit.log", tmp + "/other/config.json", home + "/.ssh/config",
+                         home + "/.bashrc", home + "/proj/link/config.json"):
+                self.assertTrue(own(path), path)
+            self.assertFalse(own(home + "/proj/a.txt"))
+
+
 if __name__ == "__main__":
     unittest.main()
