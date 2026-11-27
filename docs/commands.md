@@ -9,20 +9,30 @@ refuses it again if any file in it changes. Then `--commands slurm`, `default_co
 message from a wrapper turns it on.
 
 Each enabled command is a tool for the model, named `slurm__queue_user`. Every command says what it does:
-`"access": "read"` (it only looks) runs without asking, like an automatic read in coding mode: you see what ran
-and its output, and the audit log records it. `"access": "write"` (it changes something) asks every time, like a
+`"access": "read"` (it only looks) runs without asking if it also uses no network (below), like an automatic read in coding mode: you see what ran
+and its output, and the audit log records it. `read` is what the set says, not something hoplon can check: it
+controls which program runs with which arguments, not what that program does. Bless a set only when you know
+its read commands really only look (`squeue` does; a script you haven't read might not). `"access": "write"` (it changes something) asks every time, like a
 write, unless you let it run without asking: after you accept a set, blessing asks you about each write
-command, and the answer is kept with the blessing (`auto`), so a changed set asks again. Every run is logged as
+command (and each one that uses the network or runs as another user), and the answer is kept with the blessing (`auto`), so a changed set asks again. Every run is logged as
 `trusted_run` either way. You (a hoplon-tui pane, through the `run` message)
 can run the same commands with the same checks and limits. You decided once, at blessing time, exactly these
 commands with exactly these inputs.
 
+Every command also says where it connects over the network: `"network": "none"`, a list of destinations
+(`["the Slurm controller, slurmctld"]`, `["db.example.org:5432"]`), or `"any"`. There is no default. A read
+command that uses the network asks every time, as a write does, because what it sends leaves this machine
+directly, not through the endpoint you blessed; blessing lists it under NETWORK with its destinations, and
+you can let it run without asking there. Like `read`, the declaration is the set's word: hoplon shows it and
+asks, but doesn't stop the program connecting elsewhere. A command with a `host` parameter can't say `"none"`,
+and a list must include every host the parameter allows.
+
 ```json
 {"name": "slurm", "description": "Slurm cluster status", "search": ["/usr/bin", "/opt/slurm/bin"], "env": ["SLURM_CONF"],
  "commands": {"queue_user": {"describe": "jobs of one user", "argv": ["squeue", "-h", "-u", "{user}"],
-   "params": {"user": {"pattern": "^[a-z_][a-z0-9_-]{0,31}$"}}, "access": "read", "min_interval": 5, "cache": 15},
+   "params": {"user": {"pattern": "^[a-z_][a-z0-9_-]{0,31}$"}}, "access": "read", "network": ["the Slurm controller, slurmctld"], "min_interval": 5, "cache": 15},
   "job_log": {"describe": "the end of a job's log", "argv": ["tail", "-n", "200", "{file}"], "access": "read",
-   "params": {"file": {"path": {"under": ["~/jobs"]}}}}}}
+   "network": "none", "params": {"file": {"path": {"under": ["~/jobs"]}}}}}}
 ```
 
 - `name` is the directory's name (`a-z`, digits, `-`); commands are `a-z`, digits, `_`. Unknown fields anywhere
@@ -47,7 +57,8 @@ commands with exactly these inputs.
   A value that doesn't fit is refused, never cleaned. At most 256 characters, one line, and never starting with
   `-`, whatever the type. One gap is left with paths: the program opens the file after hoplon checks it, so a
   symlink swapped in between can still get past the check. Only the sandbox closes that completely.
-- Per command: `access` (required: `read` or `write`), `timeout` (seconds, 15, at most 120), `max_output` (bytes,
+- Per command: `access` (required: `read` or `write`), `network` (required: `"none"`, a list of at most 16
+  destinations of at most 100 characters each, or `"any"`), `timeout` (seconds, 15, at most 120), `max_output` (bytes,
   65536, at most 1 MiB; more is dropped and the program is killed), `min_interval` (seconds, 2: a call of the
   same command sooner than this after its last real run is refused with "rate limited"), `cache` (seconds, 0:
   the same command with the same values returns its last result, marked cached). hoplon also allows 30 real
@@ -60,8 +71,42 @@ commands with exactly these inputs.
 - `env`: names of environment variables passed on. The program otherwise gets only `PATH` (the `search`
   directories), `LANG=C.UTF-8`, `HOME`, `USER` and `LOGNAME`. `PATH` and `LD_*` can't be listed.
 - The program must be a regular executable file, and neither it nor its directory may be writable by group or
-  others or owned by another user than you or root. hoplon records which file it found at start and refuses to
+  others or owned by another user than you or root. Nor may any directory above it, up to `/`, except that a
+  sticky one such as `/tmp` may be writable, since nobody else can rename what is yours in it. hoplon records which file it found at start and refuses to
   run it if it changed ("restart hoplon").
+
+### Commands that run as root
+
+A command can run as root (or another user) through `sudo`, `doas` or `run0`. This is how the model checks or
+restarts a service on a remote host without a root shell: you allow exactly that command, and nothing else.
+
+```json
+  "restart": {"describe": "restart one web service", "access": "write", "network": "none",
+              "argv": ["sudo", "-n", "/usr/bin/systemctl", "restart", "{unit}"],
+              "params": {"unit": {"enum": ["nginx", "php-fpm"]}}}
+```
+
+- It asks every time, even with `"access": "read"`, and the blessing screen lists it apart, under AS ANOTHER
+  USER. When you bless the set you can let it run without asking, as with a write command.
+- Every approval says it runs AS ROOT (or as the user `-u` names), in the REPL and on hoplon-tui's card. A
+  hoplon-tui pane never runs it.
+- It must never ask for a password, since scoped commands run with no terminal: `sudo` and `doas` need `-n`,
+  `run0` needs `--no-ask-password`. Besides that, only `-u USER` (or `--user`) and sudo's `-H` are accepted, so
+  nothing can start a shell (`-s`, `-i`), edit files (`-e`) or keep your environment (`-E`). The user may be a
+  placeholder. `pkexec`, `su` and `sudoedit` are refused.
+- The program it runs comes next, as an absolute path to the file itself (not a link), so it matches a rule
+  exactly. hoplon checks both `sudo` and that program like any other, and refuses a run if either changed since
+  it started; your rule decides what `sudo` will run.
+- The host needs a rule that allows exactly that command without a password, for example in
+  `/etc/sudoers.d/hoplon` (edit it with `visudo -f`):
+
+  ```
+  alice ALL=(root) NOPASSWD: /usr/bin/systemctl restart nginx, /usr/bin/systemctl restart php-fpm
+  ```
+
+  Write one line per command and value, without wildcards: a `*` in a sudoers rule matches spaces too, so it
+  allows far more than it looks like it does. In remote mode the rule goes on the remote host, where the command
+  runs.
 
 A set may also have a `GUIDE.md` (at most 6000 characters of plain text): when to use which command, what to
 ask the user first, how to read the output. Whenever the set is on, it goes into the model's instructions, under

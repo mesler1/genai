@@ -384,6 +384,29 @@ class TestEndpoints(Tmp):
         with self.assertRaises(G.HoplonError):
             self.prof(params={"model": "other"})
 
+    def test_numbers_and_flags_are_checked_and_named(self):
+        """A wrong type or range is a clear error naming the file and the field, never a raw exception or a
+        silent conversion ("false" was true, True was a context of 1, "nan" was a timeout)."""
+        for field, bad in [("context_limit", "128000"), ("context_limit", True), ("context_limit", 0),
+                           ("context_limit", -5), ("context_limit", 3.5), ("context_limit", 10_000_001),
+                           ("context_limit", None), ("timeout", "60"), ("timeout", False), ("timeout", 0),
+                           ("timeout", 0.5), ("timeout", 3601), ("timeout", float("nan")),
+                           ("timeout", float("inf")), ("timeout", []), ("allow_http", "false"),
+                           ("allow_http", 1), ("params", "temperature=0"), ("params", [1]), ("headers", None),
+                           ("key_file", 5), ("key_file", ""), ("ca_bundle", ["/x"]), ("proxy", 8080),
+                           ("description", 1)]:
+            with self.assertRaises(G.HoplonError, msg=(field, bad)) as cm:
+                self.prof(**{field: bad})
+            self.assertIn(f"x.json: '{field}'", str(cm.exception))
+        ep = self.prof(context_limit=1, timeout=1)
+        self.assertEqual((ep.context_limit, ep.timeout), (1, 1.0))
+        ep = self.prof(context_limit=10_000_000, timeout=3600, allow_http=False, params={}, description="")
+        self.assertEqual((ep.context_limit, ep.timeout, ep.allow_http), (10_000_000, 3600.0, False))
+        self.assertEqual(self.prof(timeout=2.5).timeout, 2.5)
+        with self.assertRaises(G.HoplonError) as cm:
+            self.prof(params={"stream": "false"})
+        self.assertIn("'stream' must be true or false", str(cm.exception))
+
     def test_key_file_mode(self):
         kf = self.path("key")
         with open(kf, "w") as f:

@@ -51,6 +51,26 @@ model, default skills, sampling settings and coding mode:
   endpoint and skills that are blessed on their own. If any file changes, hoplon refuses it until you
   bless it again.
 
+## Endpoint fields
+
+| Field | Required | What it takes |
+| --- | --- | --- |
+| `name` | yes | a non-empty string |
+| `base_url` | yes | an `https` URL, or `http` to this machine; plain HTTP elsewhere needs `allow_http` |
+| `model` | yes | a model name the server lists, or one of `aliases` |
+| `key_env` or `key_file` | no (not both) | a variable name, or a path to a file only you can read |
+| `context_limit` | no, 32000 | a whole number of tokens, from 1 to 10,000,000 |
+| `timeout` | no, 120 | seconds for one request: a number from 1 to 3600 |
+| `allow_http` | no, false | `true` or `false` |
+| `ca_bundle`, `proxy` | no | a non-empty string; `proxy` an http(s) URL |
+| `headers` | no | an object of strings, with no credentials in it |
+| `params` | no | an object of request settings (sampling and the like), never `model`, `messages` or `tools` |
+| `aliases` | no | see below |
+| `description` | no | a string |
+
+A value of the wrong type or out of range is refused with the file and the field named; nothing is converted
+(`"false"` is not false, and `true` is not a number).
+
 ## Model aliases
 
 An endpoint can give its models names of your own:

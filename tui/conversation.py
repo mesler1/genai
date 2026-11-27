@@ -37,6 +37,7 @@ import remote  # noqa: E402
 
 HOPLON = os.environ.get("HOPLON_BIN") or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                                     "hoplon")
+HOST_OS = "this host's OS"     # what a sandbox with no image runs on
 CARD_BODY_LINES = 12
 OUTPUT_LINES = 8               # last lines of a sandboxed run's output shown in its card
 INPUT_MAX_LINES = 8
@@ -373,7 +374,7 @@ class Banner(Block):
                 rows.append((f"this is {h['coding_override']}; --coding-anywhere allowed it", R))
         run = h.get("runner")
         if run and h.get("coding") and not run.get("problem"):
-            rows.append((f"The model runs builds and tests itself in a podman sandbox ({run.get('image')}), on a "
+            rows.append((f"The model runs builds and tests itself in a podman sandbox ({run.get('image') or HOST_OS}), on a "
                          "throwaway copy of the project, " + ("WITH the network: each run asks first." if
                                                              run.get("network") else "offline."), W))
         elif run and run.get("problem"):
@@ -450,6 +451,8 @@ class Card(Block):
         self.ev, self.state, self.detail = ev, "waiting", ""
         self.output = None         # a sandboxed run's output, as the model got it
         self.key = None            # N when Alt+N opens this command's menu
+        self.cut = False           # its last drawing left something out: more lines, or a line too wide
+        self.seen = False          # you viewed it in full; until then, y on a cut card views it instead of accepting
         self.started = None        # time.monotonic() when a sandboxed run started
         self.stoppable = True      # /stop can stop it (in remote mode, only a hoplon that takes the stop message)
         self.shown_secs = None     # the elapsed seconds last drawn
@@ -526,6 +529,10 @@ class Card(Block):
                 out.append((("$ " if i == 0 else "  ") + ln, ""))
         elif k == "trusted":                             # a command set's scoped command: what runs, as hoplon shows it
             out.append(("$ " + command_text(str(ev.get("argv", ""))).replace("\n", " "), ""))
+            if ev.get("as_user"):                       # sudo, doas or run0: it runs with that user's rights
+                out.append((f"▲ runs AS {one_row(str(ev['as_user'])).upper()}, with its rights", R))
+            if ev.get("network"):                       # where its set says it connects: data leaves this machine
+                out.append((f"▲ connects to {one_row(str(ev['network']))}", R))
         if k in RUNS and self.state == "running":
             self.shown_secs = self.elapsed()
             out.append((f"running {self.shown_secs}s · " + ("Ctrl-C (or /stop) stops it" if self.stoppable else
@@ -597,6 +604,7 @@ class Card(Block):
         body = self.body()
         shown = body if len(body) <= CARD_BODY_LINES + 1 else body[:CARD_BODY_LINES]
         rows = [(fit(t, inner), r) for t, r in shown]
+        self.cut = len(shown) < len(body) or any(width(t) > inner for t, _ in shown)
         if len(shown) < len(body):
             rows.append((f"… {len(body) - len(shown)} more lines (v views it all)", Q))
         if self.ev.get("kind") == "command" and self.state == "shown":
@@ -1228,9 +1236,12 @@ class Model:
 
     def decide(self, accept, not_secret=False):
         """not_secret: you allowed a secret-looking read and said it holds none, so hoplon won't ask about it again
-        until the file changes."""
+        until the file changes. An accept of a card whose drawing left something out, which you haven't viewed in
+        full, is refused (False): approving what you couldn't see isn't a review."""
         if not self.pending:
-            return
+            return False
+        if accept and self.pending[0].cut and not self.pending[0].seen:
+            return False
         card = self.pending.pop(0)
         if accept and card.ev.get("kind") == "sandbox":
             card.start(self.can_stop())            # hoplon runs it as soon as it has the answer
@@ -1239,6 +1250,7 @@ class Model:
         card.changed()
         extra = {"not_secret": True} if accept and not_secret and card.ev.get("secret") else {}
         self.send(answer(card, "decision", decision="accept" if accept else "decline", **extra))
+        return True
 
 
 def answer(card, kind, **fields):
@@ -1664,11 +1676,12 @@ class Shell:
 # hoplon as a child process
 
 class Child:
-    def __init__(self, args, remote_info=None):
+    def __init__(self, args, remote_info=None, keep=None):
         """hoplon --json ARGS, here, or (remote_info is remote.json) on the remote host over the ssh master. Remote,
         what hoplon reads first is its own source, then the config line, then the protocol (see remote.py); a
         thread writes it all so a slow or dead ssh can't freeze the screen."""
         self.writes = None
+        self.info, self.keep = remote_info, keep      # remote: where its saved session is kept, here
         if remote_info:
             with open(HOPLON, "rb") as f:
                 source = f.read()
@@ -1711,6 +1724,13 @@ class Child:
                 ev = json.loads(line)
             except ValueError:
                 ev = {"type": "error", "message": f"not JSON from hoplon: {line.strip()[:200]}"}
+            if isinstance(ev, dict) and ev.get("type") == "session_save":
+                if self.keep:             # remote: the host's save of this conversation, kept here
+                    try:
+                        remote.save_session(self.keep, self.info, ev.get("session"))
+                    except OSError as e:
+                        self.events.put({"type": "error", "message": f"could not save the session here: {e}"})
+                continue
             self.events.put(ev)
         self.events.put({"type": "_exit", "code": self.p.wait(), "err": "\n".join(self.err)})
 
@@ -1884,6 +1904,8 @@ class App:
                       ("v", A), (" view it all", "")]]
             if self.plan_review and self.plan_review[0] == c.id:
                 lines[1][-1] = (" press a again to approve automatic runs", "")
+            if c.cut and not c.seen:
+                lines[1][0:2] = [("  It doesn't all fit: ", W), ("y", A), (" views it in full first   ", "")]
             if cmds and "OUTSIDE" in self.where():
                 lines.append([(f"  Commands run {self.where()}, in your shell, as you.", R)])
             return lines, None, "y approve · a review automatic runs · e edit · n or Esc no · v view"
@@ -1899,6 +1921,10 @@ class App:
             if c.ev.get("kind") == "work_plan":
                 lines.append([("  Once approved, each item is coded, tested and committed on the session's branch "
                                "without asking.", Q)])
+            if c.cut and not c.seen:
+                lines.append([("  It doesn't all fit here: ", W), ("y", A), (" or ", ""), ("v", A),
+                              (" views it in full first   ", ""), ("n", A), (" no", "")])
+                return lines, None, "y or v view it in full first · n or Esc decline"
             if c.ev.get("secret"):
                 ep = (self.m.hello or {}).get("endpoint") or {}
                 to = c.ev.get("to") if isinstance(c.ev.get("to"), str) else ep.get("base_url", "the endpoint")
@@ -2007,7 +2033,8 @@ class App:
             return
         if m.pending and m.pending[0].ev.get("kind") == "plan":
             if k in ("y", "Y"):
-                m.decide_plan()
+                if self.ready(m.pending[0]):
+                    m.decide_plan()
             elif k in ("a", "A"):
                 self.review_auto_plan(m.pending[0])
             elif k in ("e", "E"):
@@ -2021,9 +2048,11 @@ class App:
             return
         if m.pending:
             if k in ("y", "Y"):
-                m.decide(True)
+                if self.ready(m.pending[0]):
+                    m.decide(True)
             elif k in ("a", "A") and m.pending[0].ev.get("secret"):
-                m.decide(True, not_secret=True)
+                if self.ready(m.pending[0]):
+                    m.decide(True, not_secret=True)
             elif k in ("n", "N"):
                 m.decide(False)
             elif k in ("v", "V"):
@@ -2632,7 +2661,18 @@ class App:
 
     def view(self, card):
         """Show a proposal in full in a pager: cleaned text, so nothing in it reaches the terminal raw."""
-        return self.view_text(f"{card.id}: {card.title()}\n\n{card.full_text()}\n")
+        ok = self.view_text(f"{card.id}: {card.title()}\n\n{card.full_text()}\n")
+        if ok:
+            card.seen = True
+        return ok
+
+    def ready(self, card):
+        """May y accept this card now? Not while its drawing leaves something out that you haven't viewed: then y
+        views it in full instead, and the next y accepts."""
+        if card.cut and not card.seen:
+            self.view(card)
+            return False
+        return True
 
     def view_text(self, text):
         fd, path = tempfile.mkstemp(prefix="hoplon-preview-", suffix=".txt", dir=self.state_dir)
@@ -2815,9 +2855,9 @@ def parse_args(argv):
             ap.error(f"{name} needs --remote")
     if args.no_save and args.session:
         ap.error("--no-save and -S can't go together: -S keeps the conversation in that session")
+    if args.session is not None and not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", args.session):
+        ap.error("-S needs a session name: letters, digits, '.', '_' and '-', at most 80")
     if args.remote:
-        if args.session:
-            ap.error("--remote can't use -S yet: a saved session would stay on the host hoplon runs on")
         if any(not k or re.search(r"[\x00-\x1f\x7f]", k) for k in args.skill):
             ap.error("-k needs a skill name without control characters")
         why = remote.check_destination(args.remote, args.as_user, args.dir)
@@ -2865,12 +2905,17 @@ def main(argv):
     args = parse_args(argv)
     if args.check:
         save = not args.no_save and (args.session or tui_setting("save_sessions", True, bool))
-        if not args.remote and save:  # a local conversation is kept in a session, so it can be resumed
+        if save:                  # the conversation is kept in a session here, so it can be resumed (remote too)
             where = sessions_dir()
             if not args.session:
                 args.session = fresh_session(where)
                 print(f"new_session={args.session}")
-            print(f"session_file={os.path.join(where, args.session + '.json')}")
+            path = os.path.join(where, args.session + ".json")
+            why = remote.session_problem(path, args.remote, args.as_user) if args.remote else None
+            if why:
+                print(f"hoplon-tui: {why}", file=sys.stderr)
+                return 2
+            print(f"session_file={path}")
         if args.remote:           # what the launcher needs, one per line (values have no newlines: checked)
             for k, v in (("dest", args.remote), ("as", args.as_user), ("dir", args.dir), ("profile", args.profile),
                          ("endpoint", args.endpoint)):
@@ -2890,7 +2935,15 @@ def main(argv):
             print(f"hoplon-tui: --remote needs the launcher (hoplon-tui) to set up the connection first: {e}",
                   file=sys.stderr)
             return 2
-    child = Child(hoplon_args(args), info)
+    keep = None
+    if info and args.session:     # kept here, never on the host: hoplon there gets it in the config line
+        keep = os.path.join(sessions_dir(), args.session + ".json")
+        sess, why = remote.session_for(keep, info, args.allow_session_endpoint_change)
+        if why:
+            print(f"hoplon-tui: {why}", file=sys.stderr)
+            return 2
+        info["config"]["session"] = sess
+    child = Child(hoplon_args(args), info, keep)
     try:
         chosen = ["files"] * args.files + ["panel"] * args.no_panel
         curses.wrapper(lambda scr: App(scr, child, Shell.from_env(), chosen).run())

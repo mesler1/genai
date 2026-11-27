@@ -55,11 +55,21 @@ profile can instead give it a sandbox, where it runs them itself and fixes what 
   "name": "coder-py",
   "endpoint": "work-llm",
   "coding": true,
-  "sandbox": {"image": "localhost/myproject-dev:latest"}
+  "sandbox": {}
 }
 ```
 
-The model then has a `run_in_sandbox` tool. Each command runs in a rootless podman container:
+With no `image`, as here, runs use **this host's OS**: the container's root is an empty tree with your
+`/usr` and `/etc` mounted read-only (and `/bin`, `/lib` and the like as your system has them), so the
+model's builds and tests use the compilers, interpreters and libraries already installed here. There is
+nothing to pull or build. Anything your user can read under `/usr` and `/etc` can be read in the run;
+nothing else of the host is there: not your home directory, `/opt`, `/var`, `/srv` or `/mnt`.
+
+To run in a container image instead, name it: `"sandbox": {"image": "localhost/myproject-dev:latest"}`.
+Use that when the project needs tools or a system the host doesn't have.
+
+(Step by step, with hoplon-tui: [Sandboxed coding](hoplon-tui.md#sandboxed-coding).) The model then has a
+`run_in_sandbox` tool. Each command runs in a rootless podman container:
 
 - **On a throwaway copy of the project.** The working directory is mounted at `/work` as an
   overlay: the command can write anything, and every change is discarded when it ends. The only
@@ -72,8 +82,8 @@ The model then has a `run_in_sandbox` tool. Each command runs in a rootless podm
   of them really is empty, and refuses to run it if one isn't. Virtual environments (directories
   with a `pyvenv.cfg`) and `node_modules` aren't scanned. Your home directory, `/tmp` and `/run`
   are not in the sandbox at all; its `HOME` is its own `/tmp`.
-- **Offline.** `--network=none`, and no proxy variables. Nothing can be downloaded, so the image
-  must already have the project's tools and dependencies, or the project a virtual environment.
+- **Offline.** `--network=none`, and no proxy variables. Nothing can be downloaded, so the host (or the
+  image) must already have the project's tools and dependencies, or the project a virtual environment.
 - **Limited.** A time limit (`timeout`, default 300 s), a 1 GB `/tmp`, a read-only root, no
   capabilities and `no-new-privileges`. It also gets memory (`memory`, default `"4g"`) and process
   (`pids`, default 1024) limits where the host delegates cgroups to you. Where it doesn't, such as
@@ -96,7 +106,7 @@ model; it enforces nothing, and the limits above hold whatever it is told.
 changes, marked ⊡ (green) where it is isolated and ▲ where it is live:
 
 - `model's runs`: the model's own builds and tests. `⊡ sandboxed · offline` (or `ONLINE`) with its
-  image, `⊡ RUNNING p3 · 12s` during a run, `can't run: …`, or `none` when the profile has no sandbox
+  image (or `this host's OS`), `⊡ RUNNING p3 · 12s` during a run, `can't run: …`, or `none` when the profile has no sandbox
   and the model's commands are only proposed.
 - `your commands`: the commands you approve, which run in your shell. Usually `▲ this host, no sandbox`.
 - `hoplon itself`: `▲ this host`, the usual way to run it, or `⊡ in the podman sandbox` under
@@ -116,7 +126,7 @@ tmux's status line says `⊡ sandbox` when hoplon itself is sandboxed, `⊡ mode
 only the model's runs are, `▲ no sandbox` otherwise, and `⏵ sandbox p3 12s` during a run. A running card counts its seconds. Ctrl-C on an
 empty input, or `/stop`, stops the run: hoplon-tui sends hoplon the `stop` message, which works in
 remote mode too (an older hoplon without it gets a SIGINT here, and in remote mode its run ends at
-its time limit). `/sandbox` prints all of it, with the image, network and limits.
+its time limit). `/sandbox` prints all of it, with the image or host OS, network and limits.
 
 **The network switch.** `:network on` (or the JSON `network` message) gives the sandbox the
 network for this session; `:network off` takes it away, and a new session starts as the profile
@@ -156,7 +166,7 @@ directory), even with `--coding-anywhere`: the copy would hold everything there,
 don't ask. `run_in_sandbox` is then not offered, and the banner says why. Start hoplon in the
 project's own directory.
 
-The image is used as it is (`--pull=never`); pull or build it yourself. Podman is the only engine
+An image is used as it is (`--pull=never`); pull or build it yourself. Podman is the only engine
 so far (`"engine": "podman"` or `"auto"`).
 
 ## Leftovers

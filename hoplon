@@ -20,6 +20,7 @@ import fnmatch
 import hashlib
 import ipaddress
 import json
+import math
 import os
 import queue
 import re
@@ -40,7 +41,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 PROTOCOL = 1
 STEP_LIMIT = 50                # model steps in a row nobody decides anything in (max_steps)
 READ_CAP = 256 * 1024          # bytes per read_file
@@ -105,6 +106,8 @@ INTRINSICS = ("propose_command", "read_file", "list_dir", "write_file", "edit_fi
 PLAN_STEPS = 30                # steps one plan may have
 ENDPOINT_KEYS = {"name", "base_url", "model", "key_env", "key_file", "context_limit", "timeout",
                  "ca_bundle", "headers", "params", "allow_http", "proxy", "description", "aliases"}
+CONTEXT_LIMIT_MAX = 10_000_000    # tokens: an endpoint's context_limit, from 1
+TIMEOUT_RANGE = (1, 3600)         # seconds: an endpoint's timeout for one request
 ALIAS_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,31}")   # a name you give one of an endpoint's models
 REMOTE_URL = re.compile(r"http://127\.0\.0\.1:([0-9]{1,5})((?:/[A-Za-z0-9._~-]+)*)")
 TOKEN_RE = re.compile(r"[0-9A-Fa-f]{32,128}")
@@ -498,6 +501,33 @@ SECRET_SUFFIXES = (".key", ".p12", ".pfx", ".jks", ".keystore")
 # packages: a pyvenv.cfg written beside a secret can't hide it from the scan, only what is in these.
 VENV_PARTS = {"lib", "lib64", "Lib", "include", "Include", "bin", "Scripts", "share"}
 SCAN_SKIP = {"node_modules", "__pycache__", ".tox", ".nox", ".mypy_cache", ".pytest_cache", ".ruff_cache"}
+# With no image, a run uses this host's OS: an empty root holding only mount points, with these mounted read-only
+# from the host, and the top-level links (/bin -> usr/bin and the like) as the host has them.
+HOST_RO = ("/usr", "/etc")
+HOST_LINKS = ("/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32")
+HOST_OS = "this host's OS (/usr and /etc, read-only)"
+
+
+def host_root(parent):
+    """Make an empty root for a run on this host's OS in parent; returns (root, the podman flags that mount it)."""
+    root = os.path.join(parent, "root")
+    for d in ("proc", "sys", "dev", "run", "tmp", "var/tmp", "work", "fixtures") + tuple(p.lstrip("/") for p in HOST_RO):
+        os.makedirs(os.path.join(root, d), exist_ok=True)
+    flags = [f"--volume={d}:{d}:ro" for d in HOST_RO]
+    for d in HOST_LINKS:
+        if os.path.islink(d):
+            os.symlink(os.readlink(d), root + d)
+        elif os.path.isdir(d):
+            os.makedirs(root + d, exist_ok=True)
+            flags.append(f"--volume={d}:{d}:ro")
+    return root, flags
+
+
+def box_name(conf):
+    """What a sandbox's runs use: its image, or this host's OS."""
+    return conf["image"] or HOST_OS
+
+
 _GUARD_EXIT = 97
 # Runs first inside the container: every hidden path must really be empty, or the command doesn't run.
 _GUARD = ('for p in "$@"; do if [ -d "$p" ]; then [ -z "$(ls -A "$p")" ] || { echo "$HOPLON_GUARD $p"; exit 97; }; '
@@ -653,8 +683,8 @@ class Fixtures:
 
 
 def parse_sandbox(data, path):
-    """A profile's "sandbox" object, checked. The image is required: offline, the project's tools and
-    dependencies have to be in it already."""
+    """A profile's "sandbox" object, checked. Without an image, runs use this host's OS (HOST_RO); with one, the
+    project's tools and dependencies have to be in it already, since runs are offline."""
     if not isinstance(data, dict):
         raise HoplonError(f"{path}: 'sandbox' must be an object", EXIT_PROFILE)
     unknown = set(data) - SANDBOX_KEYS
@@ -666,8 +696,10 @@ def parse_sandbox(data, path):
     if box["engine"] not in ("auto", "podman"):
         raise HoplonError(f"{path}: sandbox 'engine' must be \"auto\" or \"podman\" (apptainer is not supported yet)",
                          EXIT_PROFILE)
-    if not isinstance(box["image"], str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/:@+-]{0,255}", box["image"]):
-        raise HoplonError(f"{path}: sandbox 'image' is required: the container image commands run in", EXIT_PROFILE)
+    if box["image"] is not None and (not isinstance(box["image"], str)
+                                     or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/:@+-]{0,255}", box["image"])):
+        raise HoplonError(f"{path}: sandbox 'image' must be a container image name, or left out to use this host's OS",
+                         EXIT_PROFILE)
     if not isinstance(box["network"], bool):
         raise HoplonError(f"{path}: sandbox 'network' must be true or false", EXIT_PROFILE)
     if type(box["timeout"]) is not int or not 1 <= box["timeout"] <= 3600:
@@ -720,7 +752,7 @@ class Sandbox:
         return None
 
     def info(self):
-        return {"engine": "podman", "image": self.conf["image"], "network": self.network,
+        return {"engine": "podman", "image": self.conf["image"], "uses": box_name(self.conf), "network": self.network,
                 "timeout": self.conf["timeout"], "memory": self.conf.get("memory"), "pids": self.conf.get("pids"),
                 "problem": self.problem()}
 
@@ -777,18 +809,23 @@ class Sandbox:
         except OSError:
             return False
 
-    def argv(self, name, command, files, dirs, empty, guard, fixtures=None):
+    def argv(self, name, command, files, dirs, empty, guard, fixtures=None, host=None):
+        """host: (root, mount flags) from host_root, for a sandbox with no image."""
         net = ["--network=none", "--http-proxy=false"] if not self.network else []
         limits = [f"--memory={self.conf['memory']}", f"--pids-limit={self.conf['pids']}"] if self.limits else []
         mounts = [f"--volume={self.root}:/work:O"]
         mounts += [f"--volume=/dev/null:/work/{f}:ro" for f in files]
         mounts += [f"--volume={empty}:/work/{d}:ro" for d in dirs]
         mounts += [f"--volume={fixtures}:/fixtures:ro"] if fixtures else []
-        return ([self.podman, "--log-level=error", "run", "--rm", f"--name={name}", "--pull=never", "--init",
+        if host:
+            mounts, base, pull = host[1] + mounts, ["--rootfs", host[0]], []
+        else:
+            base, pull = [self.conf["image"]], ["--pull=never"]
+        return ([self.podman, "--log-level=error", "run", "--rm", f"--name={name}"] + pull + ["--init",
                  "--userns=keep-id", f"--user={os.getuid()}:{os.getgid()}", "--read-only", f"--tmpfs=/tmp:rw,size={SANDBOX_TMP},mode=1777",
                  "--cap-drop=all", "--security-opt=no-new-privileges", "--workdir=/work",
                  "--env=HOME=/tmp", f"--env=HOPLON_CMD={command}", f"--env=HOPLON_GUARD={guard}"]
-                + net + limits + mounts + [self.conf["image"], "/bin/sh", "-c", _GUARD, "hoplon-guard"]
+                + net + limits + mounts + base + ["/bin/sh", "-c", _GUARD, "hoplon-guard"]
                 + [f"/work/{p}" for p in files + dirs])
 
     def run(self, command, values=(), cap=OUTPUT_CAP * 8, timeout=None, fixtures=None):
@@ -809,11 +846,13 @@ class Sandbox:
         self.counter += 1
         name = f"hoplon-{os.getpid()}-{self.counter}-{secrets.token_hex(6)}"
         guard = "hoplon-guard-" + secrets.token_hex(6)
-        with tempfile.TemporaryDirectory(prefix="hoplon-empty-") as empty:
+        with tempfile.TemporaryDirectory(prefix="hoplon-empty-") as empty, \
+                tempfile.TemporaryDirectory(prefix="hoplon-root-") as scratch:
+            host = None if self.conf["image"] else host_root(scratch)
             os.chmod(empty, 0o500)
             for attempt in (1, 2):
-                rc, out = self._podman(self.argv(name, command, files, dirs, empty, guard, fixtures), name, cap,
-                                       deadline)
+                rc, out = self._podman(self.argv(name, command, files, dirs, empty, guard, fixtures, host), name,
+                                       cap, deadline)
                 if attempt == 1 and self.limits and rc in (125, 126) and "cgroup" in out:
                     self.limits = False
                     self.notice("this host doesn't let podman limit memory or processes (cgroups aren't delegated "
@@ -829,7 +868,8 @@ class Sandbox:
         if rc == "late":
             return False, None, "", f"not run: the {limit} s time limit was used up before it could start"
         if rc in (125, 126, 127) and out.startswith("Error:"):
-            hint = f" (podman pull {self.conf['image']} first)" if "image not known" in out else ""
+            hint = (f" (podman pull {self.conf['image']} first)" if self.conf["image"] and "image not known" in out
+                    else "")
             return False, None, "", f"the sandbox could not start: {one_line(out.strip())[0]}{hint}"
         return True, rc, out, f"{hidden} secret-looking path{'s' if hidden != 1 else ''} hidden" if hidden else ""
 
@@ -1564,7 +1604,10 @@ def load_skills(cfg, names, notice):
 # Command sets and scoped commands: programs you blessed once, with exactly the inputs they may take
 
 COMMAND_SET_KEYS = {"name", "description", "search", "env", "pane", "commands"}
-COMMAND_KEYS = {"describe", "usage", "argv", "params", "access", "timeout", "max_output", "min_interval", "cache"}
+COMMAND_KEYS = {"describe", "usage", "argv", "params", "access", "network", "timeout", "max_output", "min_interval",
+                "cache"}
+NETWORK_MAX = 16             # destinations one command may declare
+DESTINATION_MAX = 100        # characters of one
 USAGE_MAX = 1200            # characters of a scoped command's usage section, all lines together
 USAGE_LINES = 20
 GUIDE_MAX = 6000            # characters of a command set's GUIDE.md, sent to the model while the set is on
@@ -1573,6 +1616,54 @@ PATH_RULE_KEYS = {"under", "files", "new"}
 HOST_NAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,62})(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}))*")
 SET_NAME = re.compile(r"[a-z][a-z0-9-]{0,30}")
 COMMAND_NAME = re.compile(r"[a-z][a-z0-9_]{0,30}")
+# Programs that run a command as another user (root unless -u says otherwise). A scoped command that starts with one
+# is shown as running as that user, asks every time (reads too) unless you let it run without asking when blessing,
+# and must never ask for a password: it runs with no terminal, so sudoers (or doas.conf, or polkit for run0) has to
+# allow exactly that command without one. Only the options below are accepted, so none can start a shell, edit a
+# file, keep the environment or change directory.
+ESCALATE = {"sudo": {"quiet": ("-n", "--non-interactive"), "user": ("-u", "--user"), "other": ("-H", "--set-home")},
+            "doas": {"quiet": ("-n",), "user": ("-u",), "other": ()},
+            "run0": {"quiet": ("--no-ask-password",), "user": ("-u", "--user"), "other": ()}}
+ESCALATE_NO = ("pkexec", "su", "sudoedit", "runuser")      # can't run without asking for a password, or a shell
+
+
+def escalation(argv, where):
+    """Whom a scoped command's argv runs as, through sudo, doas or run0, and the program it runs: ("root", a user
+    name, or "a user given per call" (a placeholder), the program's absolute path); (None, None) for a plain
+    command. ValueError for what can't run safely here."""
+    prog = os.path.basename(argv[0])
+    if prog in ESCALATE_NO:
+        raise ValueError(f"{where}argv[0]: {prog} can't run here; use sudo -n, with a sudoers rule for exactly this "
+                         "command")
+    if prog not in ESCALATE:
+        return None, None
+    opts, user, quiet, i = ESCALATE[prog], "root", False, 1
+    while i < len(argv) and argv[i].startswith("-"):
+        a = argv[i]
+        i += 1
+        if a == "--":
+            break
+        name, eq, val = a.partition("=")
+        if a in opts["quiet"]:
+            quiet = True
+        elif name in opts["user"]:
+            if not eq:
+                val = argv[i] if i < len(argv) else ""
+                i += 1
+            if not val:
+                raise ValueError(f"{where}argv: {prog} {name} needs a user")
+            user = "a user given per call" if "{" in val else val
+        elif a not in opts["other"]:
+            allowed = ", ".join(opts["quiet"] + opts["user"] + opts["other"])
+            raise ValueError(f"{where}argv: {prog} {a} is not allowed in a scoped command (only {allowed}, each "
+                             "written on its own)")
+    if not quiet:
+        raise ValueError(f"{where}argv: {prog} needs {opts['quiet'][0]}: scoped commands run with no terminal, so it "
+                         "must never ask for a password (allow exactly this command without one)")
+    if i >= len(argv) or not argv[i].startswith("/") or "{" in argv[i]:
+        raise ValueError(f"{where}argv: the program {prog} runs must follow its options as an absolute path, such as "
+                         "/usr/bin/systemctl, so it matches your sudoers rule exactly")
+    return user, argv[i]
 TEMPLATE = re.compile(r"\{\{|\}\}|\{([A-Za-z0-9_]+)\}|[{}]")
 DEFAULT_SEARCH = ("/usr/local/bin", "/usr/bin", "/bin")
 PARAM_CAP = 256                # characters of one parameter value
@@ -1767,7 +1858,9 @@ class TrustedParam:
 def trusted_binary(argv0, search):
     """Where a scoped command's program is: argv[0] if it is a path, else the first search directory that has it.
     The user's PATH is never used. The file and its directory must belong to you or root and not be writable
-    by group or others, or whoever can write there could swap the program. Returns (path, identity)."""
+    by group or others, or whoever can write there could swap the program. So must every directory above it, up
+    to /, except that one with the sticky bit (/tmp) may be writable: nobody else can rename what is yours or
+    root's in it. Returns (path, identity)."""
     paths = [argv0] if os.path.isabs(argv0) else [os.path.join(d, argv0) for d in search]
     path = next((p for p in paths if os.path.exists(p)), None)
     if path is None:
@@ -1781,6 +1874,13 @@ def trusted_binary(argv0, search):
         if s.st_mode & 0o022 or s.st_uid not in (0, os.geteuid()):
             raise HoplonError(f"{p}: writable by group or others, or owned by another user, so the program there "
                              "could be replaced; refused")
+    d = os.path.dirname(real)
+    while d != "/":
+        d = os.path.dirname(d)
+        s = os.stat(d)
+        if s.st_uid not in (0, os.geteuid()) or (s.st_mode & 0o022 and not s.st_mode & stat.S_ISVTX):
+            raise HoplonError(f"{d}, above {real}: writable by group or others, or owned by another user, so the "
+                             "directories below it could be swapped and the program with them; refused")
     return real, (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
 
 
@@ -1799,7 +1899,15 @@ class TrustedCommand:
         if self.access not in ("read", "write"):
             raise ValueError(f'{w}access must be "read" (it only looks) or "write" (it changes something)')
         self.read_only = self.access == "read"
-        self.auto = self.read_only       # a write command too, if the user chose so when blessing (allow_auto)
+        # Where it reaches over the network: "none", "any", or a list of destinations. Like "read", it is the set's
+        # own claim: hoplon shows it at blessing and asks before a command that uses the network, but can't check it.
+        self.network = data.get("network")
+        if not (self.network in ("none", "any") or (
+                isinstance(self.network, list) and 1 <= len(self.network) <= NETWORK_MAX
+                and all(isinstance(d, str) and d.strip() and len(d) <= DESTINATION_MAX and not hidden_found(d)
+                        for d in self.network))):
+            raise ValueError(f'{w}network must be "none" (it never uses the network), a list of where it connects '
+                             f'(hosts, or a short description such as "the Slurm controller"), or "any"')
         self.timeout = _number(data, "timeout", w, 15, 1, 120)
         self.max_output = _number(data, "max_output", w, 65536, 1, 1048576)
         self.min_interval = _number(data, "min_interval", w, 2, 0, 3600)
@@ -1808,22 +1916,49 @@ class TrustedCommand:
         if not isinstance(params, dict) or not all(COMMAND_NAME.fullmatch(k) for k in params):
             raise ValueError(f"{w}params must be an object named by parameter names (a-z, 0-9, _)")
         self.params = {k: TrustedParam(v, f"{w}params.{k}") for k, v in params.items()}
+        for k, p in self.params.items():
+            if p.kind != "host":
+                continue
+            if self.network == "none":
+                raise ValueError(f'{w}network: params.{k} is a host, so it can\'t be "none"')
+            if isinstance(self.network, list) and set(p.rule) - set(self.network):
+                raise ValueError(f"{w}network must list every host params.{k} allows: "
+                                 f"{', '.join(sorted(set(p.rule) - set(self.network)))}")
         if self.read_only and any(p.kind == "path" and p.rule.get("new") for p in self.params.values()):
             raise ValueError(f'{w}params: a path that may be new needs "access": "write"')
         first = self.argv[0]
         if not (re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", first) or (first.startswith("/") and "{" not in first)):
             raise ValueError(f"{w}argv[0] must be a program name without '/' or placeholders, or an absolute path")
         self.parts = [split_template(a, f"{w}argv[{i}]") for i, a in enumerate(self.argv)]
+        # None, or whom it runs as (sudo, doas, run0), and then the program it runs, checked like argv[0]
+        self.as_user, self.target = escalation(self.argv, w)
+        # It runs without asking if it only reads, as you, with no network; anything else only if you chose so when
+        # blessing (allow_auto).
+        self.auto = self.plain()
         used = {text for parts in self.parts[1:] for is_param, text in parts if is_param}
         if used - set(self.params):
             raise ValueError(f"{w}argv uses undeclared placeholder(s): {', '.join(sorted(used - set(self.params)))}")
         if set(self.params) - used:
             raise ValueError(f"{w}params not used in argv: {', '.join(sorted(set(self.params) - used))}")
         self.tool = f"{cset.replace('-', '_')}__{name}"        # at most 31 + 2 + 31 characters
-        self.binary = self.identity = None
+        self.binary = self.identity = self.target_identity = None
+
+    def plain(self):
+        """Does it run without asking unless you choose otherwise: a read, as you, that uses no network?"""
+        return self.read_only and not self.as_user and self.network == "none"
+
+    def reaches(self):
+        """Where it connects, as shown to people: "", "ANY host", or the destinations."""
+        return ("" if self.network == "none" else "ANY host" if self.network == "any" else
+                ", ".join(one_line(d)[0] for d in self.network))
 
     def resolve(self):
         self.binary, self.identity = trusted_binary(self.argv[0], self.search)
+        if self.target:                 # what sudo runs: your sudoers rule allows it, and hoplon checks it too
+            real, self.target_identity = trusted_binary(self.target, [])
+            if real != self.target:
+                raise HoplonError(f"{self.target} is a link to {real}: name the program itself, so the sudoers "
+                                 "rule and hoplon mean the same file")
 
     def changed(self):
         """Why the program may not run now, or None. It must be the very file found at load time."""
@@ -1833,6 +1968,13 @@ class TrustedCommand:
             return "the program is gone since hoplon started; restart hoplon"
         if (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns) != self.identity:
             return "the program changed since hoplon started; restart hoplon"
+        if self.target:
+            try:
+                st = os.stat(self.target)
+            except OSError:
+                return f"{self.target} is gone since hoplon started; restart hoplon"
+            if (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns) != self.target_identity:
+                return f"{self.target} changed since hoplon started; restart hoplon"
         return None
 
     def check(self, args):
@@ -1870,8 +2012,11 @@ class TrustedCommand:
         return env
 
     def schema(self, host):
-        how = ("read-only" if self.read_only else "changes something; runs without asking, as the user chose"
-               if self.auto else "changes something; the user is asked first")
+        how = ("read-only" if self.read_only else "changes something") + \
+            (f"; runs as {self.as_user}" if self.as_user else "") + \
+            (f"; connects to {self.reaches()}" if self.reaches() else "") + \
+            ("" if self.auto and self.plain() else
+             "; runs without asking, as the user chose" if self.auto else "; the user is asked first")
         props = {k: p.schema() for k, p in self.params.items()}
         text = f"{self.describe} (runs `{self.shown()}` on {host}; {how})".strip()
         if self.usage:
@@ -1881,7 +2026,8 @@ class TrustedCommand:
     def info(self):
         return {"name": self.name, "describe": self.describe, "usage": self.usage,
                 "params": {k: p.rules() for k, p in self.params.items()},
-                "access": self.access, "auto": self.auto, "argv": self.argv}
+                "access": self.access, "auto": self.auto, "argv": self.argv, "as": self.as_user,
+                "network": self.network}
 
 
 def read_guide(raw):
@@ -1954,13 +2100,24 @@ class CommandSet:
         return {c.tool: c for c in self.commands.values()}
 
     def allow_auto(self, names):
-        """The write commands the user chose, when blessing, to run without asking; read commands always do."""
+        """The commands the user chose, when blessing, to run without asking (writes, any that use the network, and any
+        run as another user); reads that run as you with no network always do."""
         names = set(names) if isinstance(names, list) else set()
         for c in self.commands.values():
-            c.auto = c.read_only or c.name in names
+            c.auto = c.plain() or c.name in names
 
     def writes(self):
-        return [c for c in self.commands.values() if not c.read_only]
+        return [c for c in self.commands.values() if not c.read_only and not c.as_user and c.network == "none"]
+
+    def networked(self):
+        return [c for c in self.commands.values() if c.network != "none" and not c.as_user]
+
+    def escalated(self):
+        return [c for c in self.commands.values() if c.as_user]
+
+    def askers(self):
+        """The commands that ask every time unless the user chooses otherwise when blessing."""
+        return [c for c in self.commands.values() if not c.plain()]
 
     def resolve(self):
         """Find every command's program now, refusing the command set if one can't be trusted. A program that isn't
@@ -1990,9 +2147,15 @@ class CommandSet:
         lines.append(f"  search:   {', '.join(one_line(d)[0] for d in c0.search)} (your PATH is never used)")
         lines.append(f"  env:      {', '.join(c0.env_names) or 'none'} passed on, besides PATH, LANG, HOME, USER "
                      "and LOGNAME")
-        groups = (("read: these only look, and run without asking", [c for c in self.commands.values() if c.read_only]),
+        groups = (("read: the set says these only look, and they run without asking (hoplon can't check that: "
+                   "make sure each one only looks)",
+                   [c for c in self.commands.values() if c.plain()]),
                   ("write: these change something, and ask every time unless you choose otherwise below",
-                   self.writes()))
+                   self.writes()),
+                  ("[!] NETWORK: these connect to other machines, and ask every time, reads too, unless you choose "
+                   "otherwise below", self.networked()),
+                  ("[!] AS ANOTHER USER (sudo, doas, run0): these ask every time, reads too, unless you choose "
+                   "otherwise below", self.escalated()))
         for title, cmds in groups:
             if not cmds:
                 continue
@@ -2001,16 +2164,29 @@ class CommandSet:
         if self.guide:
             lines.append("  guide (GUIDE.md, sent to the model whenever the set is on):")
             lines += [f"    | {one_line(ln)[0]}" for ln in self.guide.splitlines()]
-        lines.append("  [!] these commands run on this host as you, with no shell, and the read ones without "
-                     "asking: their output goes to the model and the endpoint like any file the model reads")
+        lines.append("  [!] these commands run on this host as you, with no shell, and the read ones that use no "
+                     "network without asking: their output goes to the model and the endpoint like any file the model reads")
+        lines.append("  [!] 'read' and 'write' are the set's own labels: hoplon checks which program runs and with "
+                     "what arguments, not what it does. A 'read' command that changes something runs without "
+                     "asking, live, whatever mode you are in")
+        if self.networked() or any(c.network != "none" for c in self.escalated()):
+            lines.append("  [!] the network a command declares is the set's own claim too: a command runs on this host "
+                         "with your network, so it can reach anything you can. What it sends there leaves "
+                         "this machine without going through the endpoint you blessed")
+        if self.escalated():
+            lines.append("  [!] the ones marked AS ANOTHER USER run with that user's rights (root can read and change "
+                         "anything); allow exactly these commands, with -n, in sudoers or doas.conf, and nothing more")
         return "\n".join(lines)
 
     def command_lines(self, cmds):
         lines = []
         for c in cmds:
-            flag = "runs without asking" if c.read_only else "[asks every time]"
+            flag = (f"[runs as {c.as_user}, {c.access}, asks every time]" if c.as_user else
+                    f"[{c.access}, asks every time]" if c.network != "none" else
+                    "runs without asking" if c.read_only else "[asks every time]")
             lines.append(f"  command {one_line(c.name)[0]}: {one_line(c.describe)[0]}  ({flag})")
             lines.append(f"    runs:    {one_line(c.shown())[0]}")
+            lines.append(f"    network: {'[!] ' + c.reaches() if c.reaches() else 'none (the set says)'}")
             for k, p in c.params.items():
                 lines.append(f"    {k}: {p.kind} {one_line(json.dumps(p.rule))[0]}  {one_line(p.describe)[0]}".rstrip())
             if c.usage:
@@ -2136,16 +2312,34 @@ class Endpoint:
         if "key_env" in data and "key_file" in data:
             raise HoplonError(f"{path}: give key_env or key_file, not both", EXIT_PROFILE)
         self.key_env, self.key_file = data.get("key_env"), data.get("key_file")
+        for k in ("key_file", "ca_bundle", "proxy"):
+            if k in data and not (isinstance(data[k], str) and data[k]):
+                raise HoplonError(f"{path}: '{k}' must be a non-empty string", EXIT_PROFILE)
+        if not isinstance(data.get("description", ""), str):
+            raise HoplonError(f"{path}: 'description' must be a string", EXIT_PROFILE)
         if self.key_env is not None and not (isinstance(self.key_env, str) and ENV_NAME_RE.fullmatch(self.key_env)):
             raise HoplonError(f"{path}: 'key_env' must be a plain variable name (letters, digits, underscore)",
                              EXIT_PROFILE)
-        self.context_limit = int(data.get("context_limit", 32000))
+        self.context_limit = data.get("context_limit", 32000)
+        if type(self.context_limit) is not int or not 1 <= self.context_limit <= CONTEXT_LIMIT_MAX:
+            raise HoplonError(f"{path}: 'context_limit' must be a whole number of tokens from 1 to "
+                             f"{CONTEXT_LIMIT_MAX:,}", EXIT_PROFILE)
         self.blessed_limit = self.context_limit     # for a model whose size the server doesn't say, an alias's too
-        self.timeout = float(data.get("timeout", 120))
+        self.timeout = data.get("timeout", 120)
+        if type(self.timeout) not in (int, float) or not (math.isfinite(self.timeout) and
+                                                          TIMEOUT_RANGE[0] <= self.timeout <= TIMEOUT_RANGE[1]):
+            raise HoplonError(f"{path}: 'timeout' must be a number of seconds from {TIMEOUT_RANGE[0]} to "
+                             f"{TIMEOUT_RANGE[1]}", EXIT_PROFILE)
+        self.timeout = float(self.timeout)
         self.ca_bundle = data.get("ca_bundle")
-        self.headers = data.get("headers", {}) or {}
-        self.params = dict(data.get("params", {}) or {})
-        self.allow_http = bool(data.get("allow_http", False))
+        self.headers = data.get("headers", {})
+        self.params = data.get("params", {})
+        if not isinstance(self.params, dict):
+            raise HoplonError(f"{path}: 'params' must be an object of request settings", EXIT_PROFILE)
+        self.params = dict(self.params)
+        self.allow_http = data.get("allow_http", False)
+        if type(self.allow_http) is not bool:
+            raise HoplonError(f"{path}: 'allow_http' must be true or false", EXIT_PROFILE)
         self.proxy = data.get("proxy")
         self.token = None       # remote mode: the session token the key proxy requires (see remote_config)
         if not isinstance(self.headers, dict) or not all(isinstance(v, str) for v in self.headers.values()):
@@ -2156,6 +2350,8 @@ class Endpoint:
         for k in ("model", "messages", "tools"):
             if k in self.params:
                 raise HoplonError(f"{path}: params may not set '{k}'", EXIT_PROFILE)
+        if type(self.params.get("stream", True)) is not bool:
+            raise HoplonError(f"{path}: params' 'stream' must be true or false", EXIT_PROFILE)
         u = urllib.parse.urlsplit(self.base_url)
         if u.scheme not in ("https", "http") or not u.hostname:
             raise HoplonError(f"{path}: base_url must be an http(s) URL", EXIT_PROFILE)
@@ -2323,6 +2519,8 @@ class Profile:
         for k in ("model", "messages", "tools"):
             if k in self.params:
                 raise HoplonError(f"{path}: params may not set '{k}'", EXIT_PROFILE)
+        if type(self.params.get("stream", True)) is not bool:
+            raise HoplonError(f"{path}: params' 'stream' must be true or false", EXIT_PROFILE)
         if not isinstance(self.coding, bool):
             raise HoplonError(f"{path}: 'coding' must be true or false", EXIT_PROFILE)
         self.edits = data.get("edits", "ask")
@@ -2379,7 +2577,7 @@ class Profile:
                          "it apply without asking, for the rest of the session")
         if self.sandbox:
             b = self.sandbox
-            lines.append(f"  sandbox:  podman, image {one(b['image'])}, {b['timeout']} s limit: in coding mode the model "
+            lines.append(f"  sandbox:  podman, {'image ' + one(b['image']) if b['image'] else HOST_OS}, {b['timeout']} s limit: in coding mode the model "
                          "runs commands on a throwaway copy of the project, without asking")
             if b["network"]:
                 lines.append("  [!] the sandbox starts with the network ON: code the model writes could send your "
@@ -2554,7 +2752,8 @@ def remote_config(line, audit):
     if not m or not 0 < int(m.group(1)) < 65536:
         raise bad("base_url must be http://127.0.0.1:PORT, optionally with a path")
     offered = {"skills": remote_items(msg.get("skills"), "skill", bad),
-               "command_sets": remote_items(msg.get("command_sets"), "command_set", bad)}
+               "command_sets": remote_items(msg.get("command_sets"), "command_set", bad),
+               "session": remote_session(msg.get("session"), bad)}
     endpoint.token = token
     digest = lambda o: hash_bytes(json.dumps(o, sort_keys=True).encode())
     audit.log("remote_config", endpoint=endpoint.name, model=endpoint.model, endpoint_sha256=digest(ep),
@@ -2562,6 +2761,32 @@ def remote_config(line, audit):
               skills={n: s.hash for n, s in offered["skills"].items()},
               command_sets={n: p.hash for n, p in offered["command_sets"].items()})
     return endpoint, persona, offered
+
+
+def remote_session(sess, bad):
+    """The session hoplon-tui keeps for this conversation on the user's machine, or None (not saved): {"name", "data"},
+    data None for a new one. Checked for shape; the user's machine checked that it was this host's."""
+    if sess is None:
+        return None
+    if not isinstance(sess, dict) or set(sess) - {"name", "data"} or not isinstance(sess.get("name"), str) \
+            or not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", sess["name"]):
+        raise bad("'session' must be {name, data}, with a session name")
+    data = sess.get("data")
+    if data is None:
+        return {"name": sess["name"], "data": None}
+    ok = (isinstance(data, dict) and isinstance(data.get("coding", False), bool)
+          and isinstance(data.get("cwd", ""), str)
+          and isinstance(data.get("skills", []), list) and all(isinstance(x, str) for x in data.get("skills", []))
+          and isinstance(data.get("created", ""), str)
+          and all(isinstance(data.get(k, []), list) and all(isinstance(m, dict) for m in data.get(k, []))
+                  for k in ("messages", "history")))
+    if not ok:
+        raise bad("'session.data' is not a saved session")
+    messages = data.get("messages", [])
+    return {"name": sess["name"], "data": {"coding": data.get("coding", False), "cwd": data.get("cwd") or os.getcwd(),
+                                           "skills": data.get("skills", []), "messages": messages,
+                                           "history": data.get("history", list(messages)),
+                                           "created": data.get("created") or now()}}
 
 
 # Endpoint fields that never travel to a remote host: where the key is, the proxy (the key proxy uses the endpoint's
@@ -2610,6 +2835,7 @@ def export_remote(cfg, profile_name, endpoint_name, skills=(), command_sets=()):
                   skills={s["name"]: s["hash"] for s in skills}, command_sets={p["name"]: p["hash"] for p in sets})
     return {"endpoint": {k: v for k, v in endpoint.data.items() if k not in REMOTE_STRIP},
             "profile": persona.data if persona else None, "endpoint_name": endpoint.name, "base_path": path,
+            "destination_id": endpoint.destination_id(),
             "skills": skills, "command_sets": sets}
 
 
@@ -2714,11 +2940,13 @@ def bless(cfg, path, ask):
     if not ask(question):
         print("Not blessed.")
         return False
-    if os.path.isdir(path) and cset and cset.writes():
-        print("Write commands ask you every time. You can let some of them run without asking; "
-              "every run is still logged as trusted_run.")
-        entry["auto"] = [c.name for c in cset.writes()
-                         if ask(f"Let the model run {one_line(c.name)[0]} ({one_line(c.shown())[0]}) without asking you?")]
+    if os.path.isdir(path) and cset and cset.askers():
+        print("Write commands, commands that use the network, and commands that run as another user ask you every "
+              "time. You can let some of them run without asking; every run is still logged as trusted_run.")
+        entry["auto"] = [c.name for c in cset.askers()
+                         if ask(f"Let the model run {one_line(c.name)[0]} ({one_line(c.shown())[0]})"
+                                + (f" AS {one_line(c.as_user)[0].upper()}" if c.as_user else "")
+                                + (f", CONNECTING TO {c.reaches()}," if c.reaches() else "") + " without asking you?")]
     entry["blessed_at"] = now()
     cfg.set_blessed(path, entry)
     cfg.audit.log("bless", path=path, kind=entry["kind"], hash=h, **({"auto": entry["auto"]} if "auto" in entry else {}))
@@ -3631,6 +3859,7 @@ class Session:
         self.resumed = False
         self.held = None     # during a work session: {"coding", "messages"} as they were, saved in place of the
                              # live ones, so a session resumed after a crash is the one from before it
+        self.relay = None    # remote mode: where a save goes instead of a file (to hoplon-tui, which keeps it)
 
     @classmethod
     def open(cls, cfg, sid):
@@ -3640,6 +3869,12 @@ class Session:
             raise HoplonError(f"bad session name '{sid}'", EXIT_USAGE)
         s = cls(cfg, sid)
         data = read_state_json(s.path)
+        if data and data.get("remote"):
+            where = data["remote"] if isinstance(data["remote"], dict) else {}
+            dest = one_line(str(where.get("dest", "?")))[0]
+            raise HoplonError(f"session '{sid}' ran on {dest}, through hoplon-tui: resume it there with "
+                             f"hoplon-tui --remote {dest} -S {sid}. Its conversation never runs here.",
+                             EXIT_USAGE, "remote_session")
         if data:
             s.resumed = True
             if "endpoint" in data:
@@ -3684,13 +3919,28 @@ class Session:
         self.messages.pop()
         self.history.pop()
 
+    def resume_from(self, name, data):
+        """Remote mode: the session hoplon-tui keeps on the user's machine, sent in the config line (data None: a new
+        one). Nothing of it is written on this host; every save goes back through relay."""
+        self.id = name
+        if data is None:
+            return
+        self.resumed = True
+        self.coding, self.cwd, self.skills = data["coding"], data["cwd"], list(data["skills"])
+        self.messages, self.history = data["messages"], data["history"]
+        self.created = data["created"]
+        self.close_dangling()
+
     def save(self):
-        if not self.path:
+        if not self.path and not self.relay:
             return
         held = self.held or {"coding": self.coding, "messages": self.messages}
         data = {"id": self.id, "endpoint": self.endpoint, "profile": self.profile, "coding": held["coding"],
                 "cwd": self.cwd, "destination_id": self.destination_id, "skills": self.skills, "created": self.created,
                 "updated": now(), "messages": held["messages"], "history": self.history}
+        if self.relay:
+            self.relay(data)
+            return
         write_private(self.path, json.dumps(data, ensure_ascii=False) + "\n")
 
 
@@ -3705,7 +3955,9 @@ def list_sessions(cfg):
             d = read_state_json(os.path.join(cfg.sessions, n), {}) or {}
             first = next((m.get("content") for m in d.get("history", []) if m.get("role") == "user"), "") or ""
             ep, prof = (d.get("endpoint"), d.get("profile")) if "endpoint" in d else (d.get("profile"), None)
+            remote = d.get("remote") if isinstance(d.get("remote"), dict) else None
             out.append({"id": n[:-5], "endpoint": ep, "profile": prof, "updated": d.get("updated"),
+                        "remote": str(remote.get("dest", "?")) if remote else None,
                         "coding": d.get("coding", False), "messages": len(d.get("history", [])),
                         "first": first.strip().splitlines()[0][:80] if first.strip() else ""})
     return out
@@ -4176,6 +4428,16 @@ class Engine:
         except ValueError:
             return None
 
+    def own_place(self, path):
+        """Is this file where an edit must always ask: hoplon's own config or state (whatever it says about
+        approved files), or a place coding mode is refused, such as ~/.ssh or your home directory itself?"""
+        real = os.path.realpath(path)
+        for root in (self.cfg.home, config_home(), os.path.join(state_home(), "hoplon")):
+            root = os.path.realpath(root)
+            if real == root or real.startswith(root.rstrip("/") + "/"):
+                return True
+        return coding_refusal(os.path.dirname(real)) is not None
+
     def auto_edit(self, p):
         """Would this edit or write apply without asking? Only with edits "approved-files", for a file already in the
         approved set, and never for a new file, a hidden or secret-looking one, or a whole replacement."""
@@ -4183,6 +4445,8 @@ class Engine:
             return False
         key = self.file_key(p.fields.get("path"))
         if key is None or key not in self.approved_files or is_hidden(key.split("/")):
+            return False
+        if self.own_place(os.path.join(self.wd.root, key)):
             return False
         f = p.fields
         if p.kind == "write" and (not f.get("exists") or f.get("undiffable")):
@@ -4952,7 +5216,9 @@ class Engine:
         cmd = self.trusted[name]
         values = cmd.check(args)
         p = Proposal(pid, "trusted", call_id, set=cmd.set, command=cmd.name, params=values,
-                     argv=cmd.shown(values), access=cmd.access, reason=cmd.describe, _cmd=cmd)
+                     argv=cmd.shown(values), access=cmd.access, reason=cmd.describe, _cmd=cmd,
+                     **({"as_user": cmd.as_user} if cmd.as_user else {}),
+                     **({"network": cmd.reaches()} if cmd.reaches() else {}))
         p.auto = cmd.auto
         return p
 
@@ -5516,6 +5782,9 @@ class Engine:
         if not cmd:
             raise HoplonError(f"no command {one_line(str(cset))[0]}.{one_line(str(command))[0]} in an enabled command set",
                              EXIT_USAGE, "unknown_command")
+        if cmd.as_user and not cmd.auto:
+            raise HoplonError(f"{one_line(cset)[0]}.{one_line(command)[0]} runs as {cmd.as_user}, so it asks every time: "
+                             "it can't be run from here", EXIT_USAGE, "asks")
         try:
             values = cmd.check(params)
         except ValueError as e:
@@ -5795,7 +6064,9 @@ class TtyUI(PlainUI):
         if p.kind == "trusted":
             f = p.fields
             args = ", ".join(f"{k}={v}" for k, v in f["params"].items())
-            eprint(f"  \u21b3 [{p.id}] {tagged(p.kind, f)}{one_line(f['set'])[0]}.{one_line(f['command'])[0]}({show_exact(args)}): "
+            who = (f" AS {one_line(f['as_user'])[0].upper()}" if f.get("as_user") else "") + \
+                (f", connecting to {one_line(f['network'])[0]}" if f.get("network") else "")
+            eprint(f"  \u21b3 [{p.id}] {tagged(p.kind, f)}{one_line(f['set'])[0]}.{one_line(f['command'])[0]}({show_exact(args)}){who}: "
                    f"{show_exact(f['argv'])}")
         elif p.kind == "sandbox":
             eprint(f"  [{p.id}] {tagged(p.kind, p.fields)}sandbox, offline: {one_line(p.fields['reason'])[0]}\n    $ {show_exact(p.fields['command'])}")
@@ -5845,7 +6116,10 @@ class TtyUI(PlainUI):
                         "It works on a throwaway copy of the project, but it could send what it reads anywhere.")
             elif p.kind == "trusted":
                 head = (f"Run {one_line(f['set'])[0]}.{one_line(f['command'])[0]} (a scoped command that "
-                        f"changes something):\n    $ {show_exact(f['argv'])}")
+                        + ("its set says only reads" if f.get("access") == "read" else "changes something")
+                        + (f", AS {one_line(f['as_user'])[0].upper()}" if f.get("as_user") else "")
+                        + (f", CONNECTING TO {one_line(f['network'])[0]}" if f.get("network") else "")
+                        + f"):\n    $ {show_exact(f['argv'])}")
             elif p.kind == "plan":
                 self.out.write(f"\n\033[1m[{p.id}] plan\033[0m — {one_line(f['goal'])[0]}\n{margin(plan_steps(f['steps']))}\n"
                                "Planned reads won't ask again; a planned command proposed exactly as shown is "
@@ -6536,7 +6810,7 @@ class Repl:
             return f"the profile's sandbox can't run here: {problem}"
         state = ("the model runs commands there itself, without asking" if self.e.can_run() else
                  "it is used in coding mode")
-        return (f"podman sandbox ({one_line(b.conf['image'])[0]}), network {'ON: each run asks' if b.network else 'off'}"
+        return (f"podman sandbox ({one_line(box_name(b.conf))[0]}), network {'ON: each run asks' if b.network else 'off'}"
                 f"; {state}")
 
     def run(self):
@@ -7832,7 +8106,8 @@ def main(argv=None):
                 for r in rows:
                     print(f"{one_line(r['id'])[0]:28} {one_line(r['endpoint'] or '-')[0]:12} "
                           f"{one_line(r['profile'] or '-')[0]:12} {one_line(r['updated'] or '')[0]:26} "
-                          f"{one_line(r['first'])[0]}")
+                          + (f"[on {one_line(r['remote'])[0]}] " if r.get("remote") else "")
+                          + f"{one_line(r['first'])[0]}")
             return EXIT_OK
 
         session = Session.open(cfg, args.session)
@@ -7841,12 +8116,16 @@ def main(argv=None):
         offered = None
         if args.config_stdin:
             endpoint, persona, offered = remote_config(sys.stdin.readline(), cfg.audit)
+            if offered["session"]:
+                session.resume_from(offered["session"]["name"], offered["session"]["data"])
         else:
             pname = args.profile or (session.profile if session.resumed else cfg.default_profile)
             persona = select_named(cfg, "profile", pname) if pname else None
             endpoint = select_endpoint(cfg, args.endpoint or (persona.endpoint if persona else None)
                                        or session.endpoint or cfg.default_endpoint)
         destination_id = endpoint.destination_id()
+        if args.config_stdin:           # hoplon-tui checked the real endpoint against the session, on your machine
+            session.destination_id = destination_id
         if session.messages and session.destination_id != destination_id:
             reason = ("has a different destination" if session.destination_id else
                       "was saved before its destination was recorded")
@@ -7884,6 +8163,8 @@ def main(argv=None):
         prompt = " ".join(args.prompt) if args.prompt else None
         if args.json:
             ui = JsonUI()
+            if offered and offered["session"]:
+                session.relay = lambda data: ui.emit({"type": "session_save", "session": data})
         elif sys.stdin.isatty() and sys.stdout.isatty():
             ui = TtyUI()
         else:

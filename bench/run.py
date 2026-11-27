@@ -96,7 +96,7 @@ def sandbox_of(profile, endpoint, hoplon, env):
     podman = shutil.which("podman", path=env.get("PATH"))
     if not podman:
         raise BenchError("podman is not on PATH, for the checks")
-    return podman, sb["image"], sb.get("memory") or "4g", sb.get("pids") or 1024
+    return podman, sb.get("image"), sb.get("memory") or "4g", sb.get("pids") or 1024
 
 
 class Session:
@@ -233,19 +233,44 @@ def drive(s, task_text, nudges, limit, grace=GRACE):
     return r
 
 
+def host_root(parent):
+    """An empty root for a check on this host's OS, as hoplon's host_root makes one: (root, mount flags)."""
+    root = os.path.join(parent, "root")
+    for d in ("proc", "sys", "dev", "run", "tmp", "var/tmp", "work", "bench", "usr", "etc"):
+        os.makedirs(os.path.join(root, d), exist_ok=True)
+    flags = ["--volume=/usr:/usr:ro", "--volume=/etc:/etc:ro"]
+    for d in ("/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32"):
+        if os.path.islink(d):
+            os.symlink(os.readlink(d), root + d)
+        elif os.path.isdir(d):
+            os.makedirs(root + d, exist_ok=True)
+            flags.append(f"--volume={d}:{d}:ro")
+    return root, flags
+
+
 def check(sandbox, task_dir, root, branch, env, timeout=600):
-    """Run the task's check.sh on the session's branch, in the sandbox image, offline and confined as hoplon's own
-    sandbox is: the code it runs is the model's. (passed, the end of its output)."""
+    """As run_check, in a scratch root on this host's OS when the profile's sandbox has no image."""
+    if sandbox[1]:
+        return run_check(sandbox, task_dir, root, branch, env, timeout)
+    with tempfile.TemporaryDirectory(prefix="hoplon-root-") as scratch:
+        return run_check(sandbox, task_dir, root, branch, env, timeout, host_root(scratch))
+
+
+def run_check(sandbox, task_dir, root, branch, env, timeout=600, host=None):
+    """Run the task's check.sh on the session's branch, in the sandbox image (or this host's OS), offline and confined
+    as hoplon's own sandbox is: the code it runs is the model's. (passed, the end of its output)."""
     if not branch:
         return False, "no branch: the session changed nothing"
     podman, image, memory, pids = sandbox
     git(root, "checkout", "-q", branch)
     name = f"hoplon-bench-check-{os.getpid()}-{int(time.monotonic() * 1000)}"
-    args = [podman, "--log-level=error", "run", "--rm", f"--name={name}", "--pull=never", "--init",
+    base = ["--rootfs", host[0]] if host else [image]
+    pull = [] if host else ["--pull=never"]
+    args = [podman, "--log-level=error", "run", "--rm", f"--name={name}"] + pull + ["--init",
             "--network=none", "--http-proxy=false", "--cap-drop=all", "--security-opt=no-new-privileges",
             f"--memory={memory}", f"--pids-limit={pids}", "--read-only", "--tmpfs=/tmp:rw,size=1g,mode=1777",
             "--env=HOME=/tmp", "--env=BENCH=/bench", f"--volume={task_dir}:/bench:ro", f"--volume={root}:/work:O",
-            "--workdir=/work", image, "/bin/sh", "-c", 'sh "$BENCH/check.sh" 2>&1', "bench-check"]
+            "--workdir=/work"] + (host[1] if host else []) + base + ["/bin/sh", "-c", 'sh "$BENCH/check.sh" 2>&1', "bench-check"]
     p = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
     tail = bytearray()
 

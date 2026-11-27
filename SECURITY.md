@@ -18,7 +18,10 @@ recognised agent-security concerns to those choices.
   one opt-in exception is a profile's sandbox: in coding mode the model may run commands in an
   offline container, on a throwaway copy of the project, with secret files hidden (section 5).
 - **The model has no way out of the machine by itself.** There is no fetch tool, no rendered
-  links or images, and one network destination: the endpoint you reviewed.
+  links or images, and one network destination: the endpoint you reviewed. That is the baseline, with
+  no command set on. A command set you enable adds what its scoped commands reach (section 4): each
+  declares where it connects, the blessing screen shows it, and a command that uses the network asks
+  every time unless you let it run without asking.
 - **What you see is what runs.** Model text is escaped before it reaches the terminal, and an
   approval is bound to the state of the file you looked at.
 - **Nothing is trusted because of where it sits.** Endpoints, personas and skills are used only
@@ -76,7 +79,7 @@ advice is to remove one of the three, or put a human in front of it.
 - hoplon removes the third leg from the model's reach. The model cannot make a request, and
   nothing it writes is rendered: no Markdown, no images, no clickable links (OSC 8 hyperlink
   sequences are escaped like any other control sequence).
-- The only network destination is the blessed endpoint. Redirects are refused and nothing more
+- hoplon's own only network destination is the blessed endpoint. Redirects are refused and nothing more
   is sent. `OPENAI_BASE_URL` and the proxy environment variables are ignored.
 - Switching models (`"model": "auto"`, `:model`, hoplon-tui's `/model`, a profile's `model`) stays on
   that server: only a model it lists, or an alias in the blessed endpoint file, can be chosen, and every
@@ -85,7 +88,8 @@ advice is to remove one of the three, or put a human in front of it.
   `._:/@+=-` is left out rather than cleaned, the list is capped at 1 MB and 200 names, and
   hoplon-tui checks each name again before it shows it in a tmux menu (whose item names tmux
   expands as formats). Each menu item sends back only its position, never the name.
-- Anything else that leaves the machine goes through a command you chose to run.
+- Anything else that leaves the machine goes through a command you chose to run, or a scoped command
+  of a set you enabled, whose network you saw when you blessed it (section 4).
 - A sandboxed run (section 5) has no network unless you switch it on for the session, and then
   each run asks first. Its output goes to the endpoint, like a file the model reads, after the
   same masking; files that look like secrets are hidden from it.
@@ -139,20 +143,38 @@ whole of what the model and the user's panes can run.
   close that race, and only the sandbox does. Don't give a `path` under a directory that others can write to.
 - **Fixed programs.** The program is found only in the command set's `search` directories (or by an absolute path),
   never through your `PATH`. It must be a regular executable file that neither group nor others can write, as
-  must its directory, owned by you or root. hoplon records the file it found and refuses to run it if it was
+  must its directory and every directory above it (a sticky one like `/tmp` excepted), owned by you or root. hoplon records the file it found and refuses to run it if it was
   replaced afterwards.
 - **Minimal environment.** The program gets `PATH` (the search directories), `LANG`, `HOME`, `USER`, `LOGNAME`
   and the variables the command set lists; `PATH` and `LD_*` can't be listed. Standard input is empty.
 - **Limits.** A time limit (at most 120 s), an output cap (at most 1 MiB, then the program is killed), its own
   process group (killed whole), at least `min_interval` seconds between real runs of one command, a cache so a
   repeated question is answered from the last result, and 30 real runs a minute across all command sets.
-- **Auto-run versus asking.** Each command must say `"access": "read"` or `"write"`; there is no default. Read
+- **Auto-run versus asking.** Each command must say `"access": "read"` or `"write"`; there is no default. That
+  is the set author's claim, and hoplon can't check it: it checks which program runs and with what arguments,
+  never what the program does. A `read` command that changes something still runs without asking, live, as
+  you, whatever mode the session is in. Blessing is where you check the claim. Read
   commands run without asking, and the blessing screen lists them apart from the write commands. A write command
   asks, in the normal approval flow, each time, unless you let it run without asking: blessing asks about each
   one, after you accept the set, and the answer is kept with the blessing, so it lapses when the set changes. The
   model never sets this: it can write a command set, but not bless one. Commands that run without asking work only
   where someone can see what runs (not in plain, non-interactive mode), like automatic reads. In remote mode the
   answers go with the set from your machine.
+- **Network.** Each command must also say `"network"`: `"none"`, a list of where it connects (hosts, or a
+  short description such as "the Slurm controller"), or `"any"`; there is no default. A command with a `host`
+  parameter can't say `"none"`, and a list must include every host the parameter allows. Like `read`, it is
+  the set author's claim: the command runs on this host with your network, and hoplon doesn't confine it.
+  What it sends goes straight from this machine, not through the endpoint. So a command that uses the
+  network asks every time, reads too, unless you let it run without asking when blessing; the blessing
+  screen lists it apart, under NETWORK, with its destinations, and every approval says where it connects.
+  Enforcing `"none"` (a network namespace, where the host allows one) is a possible later step.
+- **Commands run as root.** A command whose program is `sudo`, `doas` or `run0` runs as root (or the user `-u`
+  names). It asks every time, reads included, unless you let it run without asking when blessing; the blessing
+  screen lists it apart, every approval says AS ROOT, and a hoplon-tui pane never runs it. It must say it never asks for a password (`-n`, or `--no-ask-password`); only `-u` and sudo's
+  `-H` are accepted besides, so no option can start a shell, edit a file or keep the environment; and the program
+  it runs must follow as an absolute path. `pkexec`, `su` and `sudoedit` are refused. hoplon checks the escalating
+  program and the program it runs like any other, by its real path; your sudoers (or doas.conf) rule should
+  allow exactly those commands. Placeholders still can't start with `-`, so the model can't add options to sudo.
 - **Audit.** Each run (or refusal) is logged as `trusted_run`: command set, command, the validated values, who asked
   (`model` or `user`), exit code, time, bytes, whether it was cached or rate limited, and the program's path.
   Output is masked for the endpoint key and secret patterns, cut, and escaped wherever it is shown.
@@ -227,6 +249,9 @@ in between.
   - It never runs where coding mode is refused (section 7), and `--coding-anywhere` doesn't
     change that: the overlay would copy your whole home directory, or a credential directory,
     into a container that runs commands without asking.
+  - With no `image`, the root is an empty tree made for the run, with only the host's `/usr` and `/etc`
+    (and top-level `/bin`, `/lib` and the like) mounted read-only, as in `sandbox/run`: no home
+    directory, `/opt`, `/var` or `/run`. With an `image`, that image, never pulled.
   - The project is a copy-on-write overlay (`-v DIR:/work:O`). Whatever the command writes,
     including `.git`, build files and test configuration, is discarded with the container, so it
     can't leave behind something you later run on the host. Real changes are only the edits and
@@ -333,7 +358,8 @@ can read under `/usr` and `/etc`, and under anything a sandbox hook mounted.
 For sandboxed runs: a container shares the host's kernel, so it holds against a model that is
 wrong or has been steered by what it read, not against a kernel exploit. Detecting secrets by name
 and content is a heuristic; a secret in an unusual form in a non-hidden file can be read and sent
-to the endpoint, as it could by `read_file` in coding mode. Virtual environments and
+to the endpoint, as it could by `read_file` in coding mode. A run on the host's OS can read whatever your
+user can read under `/usr` and `/etc`. Virtual environments and
 `node_modules` are not scanned. Overlay writes go to podman's storage and are not size-limited
 until the run ends. Without delegated cgroups, only the time limit and `/tmp`'s size bound a run.
 
@@ -525,8 +551,11 @@ path, never `PATH`; owned by the user or root, not writable by others), so the S
 cluster. The program that runs is whatever is installed there, and a command whose program is missing there is
 left out. Root on the remote host can use the session's token while the
 tunnel is up, and can read that session's prompts, replies and files, which are on that host anyway. It cannot
-read the key, which was never sent. Everything else (coding-mode refusals, the sandbox, the audit log, sessions)
-works for the user hoplon runs as. As root, the REPL banner warns that proposed commands would run as root.
+read the key, which was never sent. Saved sessions stay on your machine: hoplon on the host keeps the conversation
+in memory and sends each save back to hoplon-tui, which writes it here, marked with the host and user. A session is
+only sent back to that host as that user, never a local one or another host's, and plain `hoplon -S` won't resume a
+remote session locally. Everything else (coding-mode refusals, the sandbox, the audit log) works for the user hoplon
+runs as. As root, the REPL banner warns that proposed commands would run as root.
 
 How hoplon-tui sets it up (`hoplon-tui --remote`), and what each part is for:
 
@@ -692,6 +721,28 @@ Still open:
 - The audit log is not tamper-evident. Anything running as you can edit it.
 - Files you attach with `-f` and files the model reads are sent unmasked, by design.
 
+## Findings from the 2026-11-27 audit (OWASP AISVS 1.0, chapter C9)
+
+To audit hoplon yourself, or have a model of your choice do it, `skills/agent-audit` takes the checklist from an
+outside standard (OWASP AISVS 1.0) rather than from this document, which it treats as claims to test.
+
+A first run of that skill covered chapter C9 (orchestration and agentic action) at level 2. The core gate held:
+a missing or wrong digest, silence, a malformed decision and the end of input never approved anything, and
+the sandbox kept its limits.
+
+| # | Severity | Finding | Now |
+| --- | --- | --- | --- |
+| 1 | Medium | **hoplon-tui accepted a card it had cut short.** A card shows 12 lines, each cut to the screen's width, and `y` accepted the rest unseen: the end of a long diff, or the tail of a sandbox command. | Fixed. While a card is cut short, `y` opens it in full instead, and only the next `y` accepts. |
+| 2 | Medium | **Edits `approved-files` applied in hoplon's own config.** After one approved edit to `config.json`, the model's next edit to it applied without asking. | Fixed. An edit to hoplon's config or state, or where coding mode is refused, always asks. |
+| 3 | Low | hoplon-tui escapes fewer hidden characters than hoplon, and a sandbox command or a scoped command's arguments aren't flagged for them. | Open. |
+| 4 | Low | No token or spend budget; `max_steps` counts steps per decision, and `config.json` isn't blessed. | Open. |
+| 5 | Low | Tools a wrapper registers aren't checked against their schema (hoplon-tui registers none). | Open. |
+| 6 | Low | A stop during a reply waits for the next piece of it, up to the endpoint's timeout. | Open. |
+| 7 | Low | Scoped commands have time and output limits, but no CPU, memory or disk limits. | Open. |
+
+The rest are design choices AISVS asks more of: one model context both reads untrusted text and calls tools,
+there is no per-agent identity, and the audit log isn't tamper-evident (already listed above).
+
 ## What stays your job
 
 - Read a proposed command before running it, and a proposed diff before accepting it.
@@ -711,11 +762,11 @@ the hoplon version (`hoplon --version`), what you did and what you saw.
 
 Standards and frameworks
 
-- OWASP Top 10 for LLM Applications 2025: <https://hoplon.owasp.org/llm-top-10/>
+- OWASP Top 10 for LLM Applications 2025: <https://genai.owasp.org/llm-top-10/>
 - OWASP Top 10 for Agentic Applications 2026 (announced 9 December 2025):
-  <https://hoplon.owasp.org/2025/12/09/owasp-top-10-for-agentic-applications-the-benchmark-for-agentic-security-in-the-age-of-autonomous-ai/>
+  <https://genai.owasp.org/2025/12/09/owasp-top-10-for-agentic-applications-the-benchmark-for-agentic-security-in-the-age-of-autonomous-ai/>
 - OWASP, Agentic AI: Threats and Mitigations, v1.0, February 2025:
-  <https://hoplon.owasp.org/resource/agentic-ai-threats-and-mitigations/>
+  <https://genai.owasp.org/resource/agentic-ai-threats-and-mitigations/>
 - NIST AI 100-2e2025, Adversarial Machine Learning: A Taxonomy and Terminology of Attacks and
   Mitigations: <https://nvlpubs.nist.gov/nistpubs/ai/NIST.AI.100-2e2025.pdf>
 - NIST AI 600-1, AI Risk Management Framework: Generative AI Profile, July 2024:

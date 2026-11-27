@@ -161,14 +161,14 @@ class RemoteCase(Tmp):
         info["python"] = sys.executable          # no PATH lookup of "python3" in the test
         return info
 
-    def child(self, info, args=()):
+    def child(self, info, args=(), keep=None):
         """hoplon started the remote way, with its own empty home (the remote host's), and no ssh."""
         self.remote_home = self.path("remote-home")
         env = dict(os.environ, XDG_CONFIG_HOME=self.remote_home)
         for k in ("REMOTE_TEST_KEY", "HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"):
             env.pop(k, None)
         with mock.patch.dict(os.environ, env, clear=True):
-            c = C.Child(list(args), info)
+            c = C.Child(list(args), info, keep)
         self.addCleanup(c.close)
         return c
 
@@ -222,6 +222,61 @@ class TestEndToEnd(RemoteCase):
         self.assertNotIn(KEY, blob)
         self.assertEqual(os.stat(os.path.join(self.state, "remote.json")).st_mode & 0o777, 0o600)
 
+    def test_a_saved_session_is_kept_here_and_resumed_on_the_same_host(self):
+        """The conversation is saved on this machine, marked with the host, and sent back to it on resume: the
+        remote host's hoplon home never holds it."""
+        keep = self.path("local-sessions", "tui-abc234.json")
+        info = self.write_info()
+        sess, why = remote.session_for(keep, info)
+        self.assertEqual((sess, why), ({"name": "tui-abc234", "data": None}, None))
+        info["config"]["session"] = sess
+        c = self.child(info, keep=keep)
+        self.until(c, "hello")
+        c.send({"type": "user", "text": "FIRST-QUESTION"})
+        self.until(c, "done")
+        c.close()
+        self.assertFalse(any(e["type"] == "session_save" for e in c.events.queue))   # kept, not shown
+        with open(keep) as f:
+            saved = json.load(f)
+        self.assertEqual(os.stat(keep).st_mode & 0o777, 0o600)
+        self.assertEqual(saved["remote"], {"dest": "testhost", "as": None, "dir": self.workdir})
+        self.assertEqual(saved["destination_id"], info["destination_id"])
+        self.assertIsNotNone(info["destination_id"])
+        self.assertEqual([m.get("content") for m in saved["history"]],
+                         ["FIRST-QUESTION", "hello from the remote side"])
+        self.assertEqual(os.listdir(os.path.join(self.remote_home, "hoplon", "sessions")), [])
+        for root, _, files in os.walk(self.remote_home):
+            for name in files:
+                with open(os.path.join(root, name), errors="replace") as f:
+                    self.assertNotIn("FIRST-QUESTION", f.read(), name)
+
+        self.api.turns.append(reply("second"))
+        info = self.write_info()
+        sess, why = remote.session_for(keep, info)
+        self.assertIsNone(why)
+        info["config"]["session"] = sess
+        c = self.child(info, keep=keep)
+        hello, _ = self.until(c, "hello")
+        self.assertEqual((hello["session"], hello["resumed"]), ("tui-abc234", True))
+        c.send({"type": "user", "text": "SECOND-QUESTION"})
+        self.until(c, "done")
+        c.close()
+        self.assertIn("FIRST-QUESTION", json.dumps(self.api.requests[-1]))
+
+    def test_a_session_goes_only_to_the_host_it_came_from(self):
+        info = self.write_info()
+        keep = self.path("tui-local.json")
+        write_json(keep, {"id": "tui-local", "messages": [{"role": "user", "content": "x"}]})
+        self.assertIn("a conversation from this machine", remote.session_for(keep, info)[1])
+        write_json(keep, {"id": "tui-local", "remote": {"dest": "otherhost", "as": None, "dir": None}})
+        self.assertIn("ran on otherhost: resume it there", remote.session_for(keep, info)[1])
+        write_json(keep, {"id": "tui-local", "remote": {"dest": "testhost", "as": "root", "dir": None}})
+        self.assertIn("ran on testhost as root", remote.session_for(keep, info)[1])
+        write_json(keep, {"id": "tui-local", "remote": {"dest": "testhost", "as": None, "dir": None},
+                          "destination_id": "other", "messages": [{"role": "user", "content": "x"}]})
+        self.assertIn("another endpoint", remote.session_for(keep, info)[1])
+        self.assertIsNone(remote.session_for(keep, info, allow_change=True)[1])
+
     def test_the_config_has_no_key_proxy_or_headers_and_points_at_the_tunnel(self):
         cfg = self.write_info()["config"]
         self.assertEqual(cfg["endpoint"]["base_url"], f"http://127.0.0.1:{self.fwd.port}/v1")
@@ -265,9 +320,9 @@ class TestCommandSetsAndSkills(RemoteCase):
         os.makedirs(pdir)
         with open(os.path.join(pdir, "commands.json"), "w") as f:
             json.dump({"name": "rp", "description": "remote command set", "search": [self.bin],
-                       "commands": {"who": {"describe": "who", "argv": ["whoq", "{user}"], "access": "read",
+                       "commands": {"who": {"describe": "who", "argv": ["whoq", "{user}"], "access": "read", "network": "none",
                                             "params": {"user": {"pattern": "[a-z]+"}}, "min_interval": 0},
-                                    "gone": {"describe": "not installed", "argv": ["nosuchprogq"], "access": "read"}}},
+                                    "gone": {"describe": "not installed", "argv": ["nosuchprogq"], "access": "read", "network": "none"}}},
                       f)
         sdir = os.path.join(self.home, "skills", "rs")
         os.makedirs(sdir)
@@ -341,8 +396,12 @@ class TestOptions(unittest.TestCase):
         rc, out, _ = self.check("--remote", "me@host", "--dir", "/srv/x", "--as", "svc", "-p", "coder", "--coding",
                                 "--", "-J", "bastion", "-p", "2222")
         self.assertEqual(rc, 0)
-        self.assertEqual(out.splitlines(), ["dest=me@host", "as=svc", "dir=/srv/x", "profile=coder", "endpoint=",
-                                            "ssh=-J", "ssh=bastion", "ssh=-p", "ssh=2222"])
+        lines = out.splitlines()
+        self.assertEqual([ln.split("=", 1)[0] for ln in lines[:2]], ["new_session", "session_file"])   # kept here
+        self.assertEqual(lines[2:], ["dest=me@host", "as=svc", "dir=/srv/x", "profile=coder", "endpoint=",
+                                     "ssh=-J", "ssh=bastion", "ssh=-p", "ssh=2222"])
+        rc, out, _ = self.check("--remote", "me@host", "--no-save")
+        self.assertFalse([ln for ln in out.splitlines() if ln.startswith("session")])
 
     def test_without_remote_only_the_session_is_printed(self):
         rc, out, err = self.check("--coding")
@@ -353,7 +412,7 @@ class TestOptions(unittest.TestCase):
     def test_mistakes_are_refused(self):
         for args, why in ((["--dir", "/x"], "--dir needs --remote"), (["--as", "u"], "--as needs --remote"),
                           (["--", "-J", "b"], "needs --remote"),
-                          (["--remote", "h", "-S", "x"], "can't use -S"),
+                          (["--remote", "h", "-S", "../x"], "-S needs a session name"),
                           (["--remote", "h", "-k", "a\nb"], "without control characters"),
                           (["--remote=-oProxyCommand=x"], "--remote needs a host"),
                           (["--remote", "h", "--as", "a b"], "not a user name"),

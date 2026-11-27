@@ -15,13 +15,63 @@ Resume this conversation: hoplon-tui -S tui-k7f3qa
 ```
 
 It prints that only once something was said, so there is a session to resume. `hoplon --list-sessions`
-lists them all. Not yet with `--remote`.
+lists them all.
+
+With `--remote` it works the same way, and the session is kept here, on your machine, not on the host: hoplon
+there gets the saved conversation when it starts and sends every save back, and hoplon-tui writes it here. The
+resume command it prints includes `--remote`. A remote session is marked with the host and user it ran as, and is
+only ever sent back to that host as that user: hoplon-tui refuses to resume a local session on a host, or one host's
+session on another, and plain `hoplon -S` refuses to resume a remote one here, so a conversation never reaches a
+machine it didn't come from. `hoplon --list-sessions` shows where each remote one ran.
 
 `--no-save` keeps nothing of the conversation on disk: no session is written, and nothing is printed
 to resume. `{"save_sessions": false}` in `~/.config/hoplon/tui.json` makes that the default; `-S NAME`
 still saves to the session you name.
 
-## Another host from hoplon-tui
+## Sandboxed coding
+
+`--coding` alone lets the model read and edit the project, but every build or test is only proposed: you
+run it. To let the model run them itself, in a container, give it a profile with a sandbox:
+
+You need rootless podman. No image: by default the runs use this host's own OS, with `/usr` and `/etc`
+read-only, so the tools you have installed are the ones the tests use.
+
+1. **A profile with a sandbox**, in `~/.config/hoplon/profiles/coder-box.json`:
+
+   ```json
+   {
+     "name": "coder-box",
+     "endpoint": "work-llm",
+     "coding": true,
+     "sandbox": {}
+   }
+   ```
+
+   `"image"` runs in a container image instead, for tools the host doesn't have; the runs are offline and
+   never pull, so pull or build it first. `timeout`, `memory`, `pids` and `network` are optional; see
+   [Sandboxed runs](sandbox.md#sandboxed-runs).
+2. **Bless it:** `hoplon --bless ~/.config/hoplon/profiles/coder-box.json`. It shows the coding grant and
+   what the sandbox runs on.
+3. **Start it in the project's directory**, not your home directory (the sandbox is refused there):
+
+   ```bash
+   cd ~/src/myproject
+   hoplon-tui -p coder-box
+   ```
+
+The info panel's WHERE section then says `model's runs ⊡ sandboxed · offline` with `this host's OS` (or the image), and tmux's
+status line says `⊡ model's runs sandboxed`. If it says `can't run:` instead, the rest of the line says
+why (no podman, or a directory where coding mode is refused); a missing image is reported on the first run.
+`/sandbox` shows what it runs on, the network and the limits.
+
+The model's runs then happen on a throwaway copy of the project, offline and without files that look
+like secrets, and don't ask: you see each command, its exit code and output. Edits to your files still
+ask. `/network on` gives the sandbox the network for this session, and then every run asks. `/stop` (or
+Ctrl-C on an empty input) stops a run. Commands the model proposes for your shell still run there, live,
+and ask as always. `/work` goes one step further: a work session changes a copy on its own branch, and you
+review one diff at the end.
+
+
 
 In hoplon-tui's shell pane, connect with `hoplon-ssh` instead of `ssh`:
 
@@ -59,7 +109,7 @@ What happens, before tmux starts (so a password or second factor is asked for in
    `default_commands`, plus `-k`) go with their files, if they are blessed here; one that isn't is left out, with a
    message. On the host they are checked against the hashes blessed here, the command sets' programs are looked for there
    (a command whose program is missing there is left out, as locally), and nothing blessed only on the host can be
-   used. So the Slurm command set's commands run on the cluster. `-S` is not available with `--remote` yet.
+   used. So the Slurm command set's commands run on the cluster.
 2. An ssh master connection (`ssh -M -S STATE/cm -fN`, then the host's checks: Python 3.10 or newer as the target user,
    `sudo -n` for `--as`, the directory) whose control socket lives in hoplon-tui's private 0700 state directory.
 3. `tui/keyproxy.py` starts here on a Unix socket, with a random token on its stdin.

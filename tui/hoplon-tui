@@ -44,10 +44,19 @@ while IFS= read -r line; do
     endpoint=*) r_endpoint=${line#endpoint=} ;;
     skill=*) r_skills+=("${line#skill=}") ;;
     ssh=*) ssh_opts+=("${line#ssh=}") ;;
-    new_session=*) set -- "$@" -S "${line#new_session=}" ;;
+    new_session=*) new_session=${line#new_session=} ;;
     session_file=*) session_file=${line#session_file=} ;;
   esac
 done <<<"$chk"
+if [ -n "${new_session:-}" ]; then        # -S NAME goes before a lone --, which starts ssh's options
+  args=() seen=0
+  for a in "$@"; do
+    if [ "$a" = -- ] && [ $seen = 0 ]; then args+=(-S "$new_session"); seen=1; fi
+    args+=("$a")
+  done
+  [ $seen = 1 ] || args+=(-S "$new_session")
+  set -- "${args[@]}"
+fi
 panel=1
 files=0
 for a in "$@"; do

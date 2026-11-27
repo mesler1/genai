@@ -15,13 +15,15 @@ You are helping the user turn commands they run regularly into a hoplon **comman
       "argv": ["tail", "-n", "200", "{file}"],
       "params": {"file": {"path": {"under": ["~/jobs/logs"]}, "describe": "a log file"}},
       "access": "read",
+      "network": "none",
       "usage": ["Logs are named JOBID.out and JOBID.err."]
     },
     "cancel": {
       "describe": "cancel one of my jobs",
       "argv": ["scancel", "{id}"],
       "params": {"id": {"int": [1, 9999999999], "describe": "a job id"}},
-      "access": "write"
+      "access": "write",
+      "network": ["the Slurm controller"]
     }
   }
 }
@@ -34,6 +36,7 @@ The directory's name must be the set's `name` (`a-z`, digits, `-`); command name
 | `argv` | The program (a name found in `search`, never through `PATH`, or an absolute path), then its arguments. `{name}` is a blank; it may be part of an argument (`--user={user}`). Every blank needs a param and every param must be used. |
 | `params` | One type per blank (below), all required. Optional `describe`. |
 | `access` | Required. `read` if the command only looks; `write` if it changes anything at all (cancels, deletes, writes a file, sends something). |
+| `network` | Required. `"none"` if the program never connects anywhere; a list of where it connects (`["the Slurm controller"]`, `["db.example.org"]`); `"any"` if it can reach anywhere (a `host` parameter, a URL). A command with a `host` parameter can't be `"none"`, and a list must include its hosts. |
 | `usage` | Optional, up to 20 short lines the model gets with the command every time: what the arguments mean, how to read the output. |
 | `timeout`, `max_output`, `min_interval`, `cache` | Optional limits: seconds, bytes, seconds between real runs, seconds a result is reused. |
 | `env` | Optional names of environment variables to pass on (for example `SLURM_CONF`). |
@@ -52,7 +55,7 @@ Fix everything that doesn't need to vary: flags, output formats, time windows. A
 
 ## Read or write
 
-Suggest `access` for each command and say why. When in doubt, it is `write`. Write commands ask the user every time; when blessing, the user may let some of them run without asking. Don't suggest that yourself unless they ask.
+Suggest `access` and `network` for each command and say why. When in doubt, `access` is `write`, and `network` is not `"none"`: a cluster tool, a database client or anything that talks to a daemon on another machine uses the network. A command that uses the network asks every time, reads too. Write commands ask the user every time; when blessing, the user may let some of them run without asking. Don't suggest that yourself unless they ask.
 
 ## The guide
 
