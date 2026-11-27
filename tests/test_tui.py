@@ -523,6 +523,17 @@ class TestModel(unittest.TestCase):
         self.assertIn("p1 · ▲ runs live · slurm · down_nodes · read-only", text)
         self.assertIn("$ sinfo -R -h", text)
         self.assertIn("│ cn042|down*\\x1b[2J", text)                     # output escaped, as everywhere
+        self.assertNotIn("runs AS", text)
+
+    def test_a_scoped_command_run_as_root_says_so_on_its_card(self):
+        m = C.Model()
+        self.hello(m)
+        m.submit("nginx?")
+        m.handle({"type": "proposal", "id": "p1", "kind": "trusted", "set": "ops", "command": "status",
+                  "access": "read", "argv": "sudo -n /usr/bin/systemctl status nginx", "as_user": "root\x1b[2J"})
+        text = text_of(m.cards["p1"], 80)
+        self.assertIn("$ sudo -n /usr/bin/systemctl status nginx", text)
+        self.assertIn("▲ runs AS ROOT\\X1B[2J, with its rights", text)
 
     def test_messages_typed_while_busy_are_queued(self):
         m = C.Model()
@@ -1259,7 +1270,9 @@ class TestCommandsFeature(unittest.TestCase):
     ROWS = [{"name": "slurm", "description": "cluster", "enabled": True, "blessed": True, "status": "blessed",
              "pane": "slurm.py", "dir": "/opt/hoplon/commands/slurm",
              "commands": [{"name": "queue", "describe": "the queue", "access": "read", "params": {}},
-                          {"name": "cancel", "describe": "cancel a job", "access": "write", "params": {}}]},
+                          {"name": "cancel", "describe": "cancel a job", "access": "write", "params": {}},
+                          {"name": "drain", "describe": "nodes, as root", "access": "read", "as": "root",
+                           "params": {}}]},
             {"name": "off", "description": "not on", "enabled": False, "blessed": True, "pane": None, "dir": "/x",
              "commands": [{"name": "x", "access": "read"}]}]
 
@@ -1303,6 +1316,7 @@ class TestCommandsFeature(unittest.TestCase):
         self.assertEqual(len(m.panes), 1)
         m.panes.clear()
         for role, msg, why in (("commands:slurm", {"type": "run", "id": 2, "command": "cancel"}, "only read-only"),
+                               ("commands:slurm", {"type": "run", "id": 6, "command": "drain"}, "run as you"),
                                ("commands:slurm", {"type": "run", "id": 3, "command": "x"}, "no such command"),
                                ("commands:slurm", {"type": "run", "id": 4, "command": "queue", "params": {"a": 1}},
                                 "no such command")):

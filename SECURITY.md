@@ -153,6 +153,14 @@ whole of what the model and the user's panes can run.
   model never sets this: it can write a command set, but not bless one. Commands that run without asking work only
   where someone can see what runs (not in plain, non-interactive mode), like automatic reads. In remote mode the
   answers go with the set from your machine.
+- **Commands run as root.** A command whose program is `sudo`, `doas` or `run0` runs as root (or the user `-u`
+  names). It asks every time, reads included, unless you let it run without asking when blessing; the blessing
+  screen lists it apart, every approval says AS ROOT, and a hoplon-tui pane can't run it unless you let it run
+  without asking. It must say it never asks for a password (`-n`, or `--no-ask-password`); only `-u` and sudo's
+  `-H` are accepted besides, so no option can start a shell, edit a file or keep the environment; and the program
+  it runs must follow as an absolute path. `pkexec`, `su` and `sudoedit` are refused. hoplon checks the escalating
+  program like any other; what it then runs is limited by your sudoers (or doas.conf) rule, which should allow
+  exactly those commands. Placeholders still can't start with `-`, so the model can't add options to sudo.
 - **Audit.** Each run (or refusal) is logged as `trusted_run`: command set, command, the validated values, who asked
   (`model` or `user`), exit code, time, bytes, whether it was cached or rate limited, and the program's path.
   Output is masked for the endpoint key and secret patterns, cut, and escaped wherever it is shown.
@@ -711,11 +719,11 @@ the hoplon version (`hoplon --version`), what you did and what you saw.
 
 Standards and frameworks
 
-- OWASP Top 10 for LLM Applications 2025: <https://hoplon.owasp.org/llm-top-10/>
+- OWASP Top 10 for LLM Applications 2025: <https://genai.owasp.org/llm-top-10/>
 - OWASP Top 10 for Agentic Applications 2026 (announced 9 December 2025):
-  <https://hoplon.owasp.org/2025/12/09/owasp-top-10-for-agentic-applications-the-benchmark-for-agentic-security-in-the-age-of-autonomous-ai/>
+  <https://genai.owasp.org/2025/12/09/owasp-top-10-for-agentic-applications-the-benchmark-for-agentic-security-in-the-age-of-autonomous-ai/>
 - OWASP, Agentic AI: Threats and Mitigations, v1.0, February 2025:
-  <https://hoplon.owasp.org/resource/agentic-ai-threats-and-mitigations/>
+  <https://genai.owasp.org/resource/agentic-ai-threats-and-mitigations/>
 - NIST AI 100-2e2025, Adversarial Machine Learning: A Taxonomy and Terminology of Attacks and
   Mitigations: <https://nvlpubs.nist.gov/nistpubs/ai/NIST.AI.100-2e2025.pdf>
 - NIST AI 600-1, AI Risk Management Framework: Generative AI Profile, July 2024:

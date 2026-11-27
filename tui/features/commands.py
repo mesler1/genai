@@ -144,9 +144,9 @@ class CommandSets(Feature):
                     isinstance(k, str) and isinstance(v, str) for k, v in params.items()):
                 m.panes.append((role, {"type": "ran", "id": msg.get("id"), "error": "no such command"}))
                 return
-            if spec.get("access") != "read":
+            if spec.get("access") != "read" or spec.get("as"):
                 m.panes.append((role, {"type": "ran", "id": msg.get("id"),
-                                       "error": "only read-only commands run from a pane"}))
+                                       "error": "only read-only commands that run as you run from a pane"}))
                 return
             self.n += 1
             rid = f"cs{self.n}"

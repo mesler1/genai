@@ -148,6 +148,37 @@ class TestManifest(CommandSetBase):
             self.manifest["commands"]["queue"]["argv"] = argv
             self.refused(why)
 
+    def test_sudo_doas_and_run0_are_seen_and_checked(self):
+        """A command run through sudo, doas or run0 runs as another user: it must never ask for a password, may use
+        only a few options, and names its program by absolute path, so a sudoers rule can match it exactly."""
+        ok = [(["sudo", "-n", "/usr/bin/systemctl", "restart", "nginx"], "root"),
+              (["sudo", "--non-interactive", "-u", "www", "/usr/bin/id"], "www"),
+              (["sudo", "-n", "--user=www", "-H", "/usr/bin/id"], "www"),
+              (["sudo", "-n", "-u", "{user}", "/usr/bin/id"], "a user given per call"),
+              (["doas", "-n", "/usr/bin/id"], "root"),
+              (["run0", "--no-ask-password", "/usr/bin/id"], "root"),
+              (["sudo", "-n", "--", "/usr/bin/id"], "root"),
+              (["fakeq", "sudo"], None)]
+        for argv, who in ok:
+            self.assertEqual(G.escalation(argv, ""), who, argv)
+        for argv, why in [(["sudo", "/usr/bin/id"], "needs -n"), (["doas", "/usr/bin/id"], "needs -n"),
+                          (["sudo", "-n", "-s"], "-s is not allowed"), (["sudo", "-ns", "/usr/bin/id"], "-ns"),
+                          (["sudo", "-n", "-E", "/usr/bin/id"], "-E is not allowed"),
+                          (["sudo", "-n", "-i"], "-i is not allowed"), (["sudo", "-n", "-e", "/etc/x"], "-e"),
+                          (["sudo", "-n", "id"], "absolute path"), (["sudo", "-n"], "absolute path"),
+                          (["sudo", "-n", "{user}"], "absolute path"), (["sudo", "-n", "-u"], "needs a user"),
+                          (["pkexec", "/usr/bin/id"], "pkexec can't run here"), (["su", "-c", "id"], "su can't"),
+                          (["sudoedit", "/etc/x"], "sudoedit can't")]:
+            with self.assertRaises(ValueError, msg=argv) as e:
+                G.escalation(argv, "")
+            self.assertIn(why, str(e.exception))
+
+    def test_a_sudo_command_without_n_refuses_the_set(self):
+        self.manifest["commands"]["queue"] = {"describe": "who", "argv": ["fakeq", "/usr/bin/id"], "access": "read"}
+        self.manifest["commands"]["queue"]["argv"][0] = "sudo"
+        program(os.path.join(self.bin, "sudo"), "exit 0\n")
+        self.refused("needs -n")
+
     def test_unused_param_and_literal_braces(self):
         self.manifest["commands"]["queue"]["argv"] = ["fakeq", "{user}"]
         self.refused("not used in argv: fmt")
@@ -544,6 +575,53 @@ class TestBlessing(CommandSetBase):
         with mock.patch.object(sys, "stdout", io.StringIO()):     # declined: nothing is recorded, nothing more asked
             self.assertFalse(G.bless(self.cfg, self.dir, lambda q: False))
 
+    def sudo_set(self):
+        program(os.path.join(self.bin, "sudo"), f'for a in "$@"; do printf "ARG:%s\\n" "$a"; done >> {self.log}\n'
+                f'echo "---" >> {self.log}\necho "as root: $*"\n')
+        self.manifest["commands"]["status"] = {"describe": "a service's state", "access": "read", "min_interval": 0,
+                                               "argv": ["sudo", "-n", "/usr/bin/systemctl", "status", "{unit}"],
+                                               "params": {"unit": {"enum": ["nginx", "cron"]}}}
+        write_json(os.path.join(self.dir, "commands.json"), self.manifest)
+
+    def test_a_command_run_as_root_is_listed_apart_and_asks_even_to_read(self):
+        self.sudo_set()
+        asked, out = [], io.StringIO()
+        answers = iter([True, False, False])               # the set; kill: no; status: no
+        with mock.patch.object(sys, "stdout", out):
+            self.assertTrue(G.bless(self.cfg, self.dir, lambda q: asked.append(q) or next(answers)))
+        text = out.getvalue()
+        self.assertIn("[!] AS ANOTHER USER (sudo, doas, run0)", text)
+        self.assertLess(text.index("AS ANOTHER USER"), text.index("command status:"))
+        self.assertIn("[runs as root, read, asks every time]", text)
+        self.assertIn("allow exactly these commands, with -n, in sudoers", text)
+        self.assertEqual(len(asked), 3)
+        self.assertIn("Let the model run status (sudo -n /usr/bin/systemctl status {unit}) AS ROOT without asking",
+                      asked[2])
+        eng, _ = self.engine()
+        status = eng.trusted["fake__status"]
+        self.assertEqual((status.as_user, status.auto), ("root", False))
+        self.assertIn("read-only; runs as root; the user is asked first",
+                      status.schema("h")["function"]["description"])
+        row = [c for c in G.command_set_rows(self.cfg, ["fake"])[0]["commands"] if c["name"] == "status"][0]
+        self.assertEqual((row["as"], row["auto"]), ("root", False))
+        self.assertIsNone([c for c in G.command_set_rows(self.cfg, ["fake"])[0]["commands"]
+                           if c["name"] == "queue"][0]["as"])
+        with self.assertRaises(G.HoplonError) as e:                # a pane can't run it either
+            eng.run_user("fake", "status", {"unit": "nginx"})
+        self.assertIn("runs as root, so it asks every time", str(e.exception))
+
+    def test_a_command_run_as_root_may_be_let_run_when_blessing(self):
+        self.sudo_set()
+        with mock.patch.object(sys, "stdout", io.StringIO()):
+            G.bless(self.cfg, self.dir, lambda q: True)
+        self.assertEqual(sorted(self.cfg.blessed()[self.dir]["auto"]), ["kill", "status"])
+        eng, _ = self.engine()
+        self.assertTrue(eng.trusted["fake__status"].auto)
+        self.assertIn("runs as root; runs without asking, as the user chose",
+                      eng.trusted["fake__status"].schema("h")["function"]["description"])
+        r = eng.run_user("fake", "status", {"unit": "cron"})
+        self.assertEqual(r["output"], "as root: -n /usr/bin/systemctl status cron\n")
+
     def test_the_guide_goes_to_the_model_while_the_set_is_on(self):
         with open(os.path.join(self.dir, "GUIDE.md"), "w") as f:
             f.write("Use queue before job.\n")
@@ -656,6 +734,22 @@ class TestRunning(CommandSetBase):
         p, told = self.model("fake__kill", id="5")
         self.assertEqual((p.decision, self.calls()[0]["args"]), ("accept", ["kill", "5"]))
         self.assertTrue(told.startswith("exit 3"))
+
+    def test_a_read_run_as_root_asks_and_says_so(self):
+        program(os.path.join(self.bin, "sudo"), 'echo "as root: $*"\n')
+        self.manifest["commands"]["status"] = {"describe": "a service's state", "access": "read", "min_interval": 0,
+                                               "argv": ["sudo", "-n", "/usr/bin/systemctl", "status", "{unit}"],
+                                               "params": {"unit": {"enum": ["nginx"]}}}
+        write_json(os.path.join(self.home, "commands", "fake", "commands.json"), self.manifest)
+        bless_set(self.home, os.path.join(self.home, "commands", "fake"))
+        self.eng.set_command_set("fake", True)
+        p, told = self.model("fake__status", unit="nginx")
+        self.assertEqual((p.kind, p.auto, p.decision, told), ("trusted", False, "decline", "declined by the user"))
+        self.assertEqual(p.event()["as_user"], "root")
+        self.assertNotIn("as_user", self.model("fake__queue", user="a", fmt="short")[0].event())
+        self.ui.answer = "accept"
+        p, told = self.model("fake__status", unit="nginx")
+        self.assertIn("as root: -n /usr/bin/systemctl status nginx", told)
 
     def test_plain_ui_offers_nothing(self):
         self.eng.ui = G.PlainUI()

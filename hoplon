@@ -1573,6 +1573,53 @@ PATH_RULE_KEYS = {"under", "files", "new"}
 HOST_NAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,62})(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}))*")
 SET_NAME = re.compile(r"[a-z][a-z0-9-]{0,30}")
 COMMAND_NAME = re.compile(r"[a-z][a-z0-9_]{0,30}")
+# Programs that run a command as another user (root unless -u says otherwise). A scoped command that starts with one
+# is shown as running as that user, asks every time (reads too) unless you let it run without asking when blessing,
+# and must never ask for a password: it runs with no terminal, so sudoers (or doas.conf, or polkit for run0) has to
+# allow exactly that command without one. Only the options below are accepted, so none can start a shell, edit a
+# file, keep the environment or change directory.
+ESCALATE = {"sudo": {"quiet": ("-n", "--non-interactive"), "user": ("-u", "--user"), "other": ("-H", "--set-home")},
+            "doas": {"quiet": ("-n",), "user": ("-u",), "other": ()},
+            "run0": {"quiet": ("--no-ask-password",), "user": ("-u", "--user"), "other": ()}}
+ESCALATE_NO = ("pkexec", "su", "sudoedit", "runuser")      # can't run without asking for a password, or a shell
+
+
+def escalation(argv, where):
+    """Whom a scoped command's argv runs as, through sudo, doas or run0: "root", a user name, or "a user given per
+    call" (a placeholder); None for a plain command. ValueError for what can't run safely here."""
+    prog = os.path.basename(argv[0])
+    if prog in ESCALATE_NO:
+        raise ValueError(f"{where}argv[0]: {prog} can't run here; use sudo -n, with a sudoers rule for exactly this "
+                         "command")
+    if prog not in ESCALATE:
+        return None
+    opts, user, quiet, i = ESCALATE[prog], "root", False, 1
+    while i < len(argv) and argv[i].startswith("-"):
+        a = argv[i]
+        i += 1
+        if a == "--":
+            break
+        name, eq, val = a.partition("=")
+        if a in opts["quiet"]:
+            quiet = True
+        elif name in opts["user"]:
+            if not eq:
+                val = argv[i] if i < len(argv) else ""
+                i += 1
+            if not val:
+                raise ValueError(f"{where}argv: {prog} {name} needs a user")
+            user = "a user given per call" if "{" in val else val
+        elif a not in opts["other"]:
+            allowed = ", ".join(opts["quiet"] + opts["user"] + opts["other"])
+            raise ValueError(f"{where}argv: {prog} {a} is not allowed in a scoped command (only {allowed}, each "
+                             "written on its own)")
+    if not quiet:
+        raise ValueError(f"{where}argv: {prog} needs {opts['quiet'][0]}: scoped commands run with no terminal, so it "
+                         "must never ask for a password (allow exactly this command without one)")
+    if i >= len(argv) or not argv[i].startswith("/") or "{" in argv[i]:
+        raise ValueError(f"{where}argv: the program {prog} runs must follow its options as an absolute path, such as "
+                         "/usr/bin/systemctl, so it matches your sudoers rule exactly")
+    return user
 TEMPLATE = re.compile(r"\{\{|\}\}|\{([A-Za-z0-9_]+)\}|[{}]")
 DEFAULT_SEARCH = ("/usr/local/bin", "/usr/bin", "/bin")
 PARAM_CAP = 256                # characters of one parameter value
@@ -1799,7 +1846,6 @@ class TrustedCommand:
         if self.access not in ("read", "write"):
             raise ValueError(f'{w}access must be "read" (it only looks) or "write" (it changes something)')
         self.read_only = self.access == "read"
-        self.auto = self.read_only       # a write command too, if the user chose so when blessing (allow_auto)
         self.timeout = _number(data, "timeout", w, 15, 1, 120)
         self.max_output = _number(data, "max_output", w, 65536, 1, 1048576)
         self.min_interval = _number(data, "min_interval", w, 2, 0, 3600)
@@ -1814,6 +1860,9 @@ class TrustedCommand:
         if not (re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", first) or (first.startswith("/") and "{" not in first)):
             raise ValueError(f"{w}argv[0] must be a program name without '/' or placeholders, or an absolute path")
         self.parts = [split_template(a, f"{w}argv[{i}]") for i, a in enumerate(self.argv)]
+        self.as_user = escalation(self.argv, w)     # None, or whom it runs as (sudo, doas, run0)
+        # It runs without asking if it only reads as you; anything else only if you chose so when blessing (allow_auto).
+        self.auto = self.read_only and not self.as_user
         used = {text for parts in self.parts[1:] for is_param, text in parts if is_param}
         if used - set(self.params):
             raise ValueError(f"{w}argv uses undeclared placeholder(s): {', '.join(sorted(used - set(self.params)))}")
@@ -1870,8 +1919,10 @@ class TrustedCommand:
         return env
 
     def schema(self, host):
-        how = ("read-only" if self.read_only else "changes something; runs without asking, as the user chose"
-               if self.auto else "changes something; the user is asked first")
+        how = ("read-only" if self.read_only else "changes something") + \
+            (f"; runs as {self.as_user}" if self.as_user else "") + \
+            ("" if self.auto and self.read_only and not self.as_user else
+             "; runs without asking, as the user chose" if self.auto else "; the user is asked first")
         props = {k: p.schema() for k, p in self.params.items()}
         text = f"{self.describe} (runs `{self.shown()}` on {host}; {how})".strip()
         if self.usage:
@@ -1881,7 +1932,7 @@ class TrustedCommand:
     def info(self):
         return {"name": self.name, "describe": self.describe, "usage": self.usage,
                 "params": {k: p.rules() for k, p in self.params.items()},
-                "access": self.access, "auto": self.auto, "argv": self.argv}
+                "access": self.access, "auto": self.auto, "argv": self.argv, "as": self.as_user}
 
 
 def read_guide(raw):
@@ -1954,13 +2005,21 @@ class CommandSet:
         return {c.tool: c for c in self.commands.values()}
 
     def allow_auto(self, names):
-        """The write commands the user chose, when blessing, to run without asking; read commands always do."""
+        """The commands the user chose, when blessing, to run without asking (writes, and any run as another user);
+        read commands that run as you always do."""
         names = set(names) if isinstance(names, list) else set()
         for c in self.commands.values():
-            c.auto = c.read_only or c.name in names
+            c.auto = (c.read_only and not c.as_user) or c.name in names
 
     def writes(self):
-        return [c for c in self.commands.values() if not c.read_only]
+        return [c for c in self.commands.values() if not c.read_only and not c.as_user]
+
+    def escalated(self):
+        return [c for c in self.commands.values() if c.as_user]
+
+    def askers(self):
+        """The commands that ask every time unless the user chooses otherwise when blessing."""
+        return [c for c in self.commands.values() if not c.read_only or c.as_user]
 
     def resolve(self):
         """Find every command's program now, refusing the command set if one can't be trusted. A program that isn't
@@ -1990,9 +2049,12 @@ class CommandSet:
         lines.append(f"  search:   {', '.join(one_line(d)[0] for d in c0.search)} (your PATH is never used)")
         lines.append(f"  env:      {', '.join(c0.env_names) or 'none'} passed on, besides PATH, LANG, HOME, USER "
                      "and LOGNAME")
-        groups = (("read: these only look, and run without asking", [c for c in self.commands.values() if c.read_only]),
+        groups = (("read: these only look, and run without asking",
+                   [c for c in self.commands.values() if c.read_only and not c.as_user]),
                   ("write: these change something, and ask every time unless you choose otherwise below",
-                   self.writes()))
+                   self.writes()),
+                  ("[!] AS ANOTHER USER (sudo, doas, run0): these ask every time, reads too, unless you choose "
+                   "otherwise below", self.escalated()))
         for title, cmds in groups:
             if not cmds:
                 continue
@@ -2003,12 +2065,16 @@ class CommandSet:
             lines += [f"    | {one_line(ln)[0]}" for ln in self.guide.splitlines()]
         lines.append("  [!] these commands run on this host as you, with no shell, and the read ones without "
                      "asking: their output goes to the model and the endpoint like any file the model reads")
+        if self.escalated():
+            lines.append("  [!] the ones marked AS ANOTHER USER run with that user's rights (root can read and change "
+                         "anything); allow exactly these commands, with -n, in sudoers or doas.conf, and nothing more")
         return "\n".join(lines)
 
     def command_lines(self, cmds):
         lines = []
         for c in cmds:
-            flag = "runs without asking" if c.read_only else "[asks every time]"
+            flag = (f"[runs as {c.as_user}, {c.access}, asks every time]" if c.as_user else
+                    "runs without asking" if c.read_only else "[asks every time]")
             lines.append(f"  command {one_line(c.name)[0]}: {one_line(c.describe)[0]}  ({flag})")
             lines.append(f"    runs:    {one_line(c.shown())[0]}")
             for k, p in c.params.items():
@@ -2714,11 +2780,12 @@ def bless(cfg, path, ask):
     if not ask(question):
         print("Not blessed.")
         return False
-    if os.path.isdir(path) and cset and cset.writes():
-        print("Write commands ask you every time. You can let some of them run without asking; "
-              "every run is still logged as trusted_run.")
-        entry["auto"] = [c.name for c in cset.writes()
-                         if ask(f"Let the model run {one_line(c.name)[0]} ({one_line(c.shown())[0]}) without asking you?")]
+    if os.path.isdir(path) and cset and cset.askers():
+        print("Write commands, and commands that run as another user, ask you every time. You can let some of them "
+              "run without asking; every run is still logged as trusted_run.")
+        entry["auto"] = [c.name for c in cset.askers()
+                         if ask(f"Let the model run {one_line(c.name)[0]} ({one_line(c.shown())[0]})"
+                                + (f" AS {one_line(c.as_user)[0].upper()}" if c.as_user else "") + " without asking you?")]
     entry["blessed_at"] = now()
     cfg.set_blessed(path, entry)
     cfg.audit.log("bless", path=path, kind=entry["kind"], hash=h, **({"auto": entry["auto"]} if "auto" in entry else {}))
@@ -4952,7 +5019,8 @@ class Engine:
         cmd = self.trusted[name]
         values = cmd.check(args)
         p = Proposal(pid, "trusted", call_id, set=cmd.set, command=cmd.name, params=values,
-                     argv=cmd.shown(values), access=cmd.access, reason=cmd.describe, _cmd=cmd)
+                     argv=cmd.shown(values), access=cmd.access, reason=cmd.describe, _cmd=cmd,
+                     **({"as_user": cmd.as_user} if cmd.as_user else {}))
         p.auto = cmd.auto
         return p
 
@@ -5516,6 +5584,9 @@ class Engine:
         if not cmd:
             raise HoplonError(f"no command {one_line(str(cset))[0]}.{one_line(str(command))[0]} in an enabled command set",
                              EXIT_USAGE, "unknown_command")
+        if cmd.as_user and not cmd.auto:
+            raise HoplonError(f"{one_line(cset)[0]}.{one_line(command)[0]} runs as {cmd.as_user}, so it asks every time: "
+                             "it can't be run from here", EXIT_USAGE, "asks")
         try:
             values = cmd.check(params)
         except ValueError as e:
@@ -5795,7 +5866,8 @@ class TtyUI(PlainUI):
         if p.kind == "trusted":
             f = p.fields
             args = ", ".join(f"{k}={v}" for k, v in f["params"].items())
-            eprint(f"  \u21b3 [{p.id}] {tagged(p.kind, f)}{one_line(f['set'])[0]}.{one_line(f['command'])[0]}({show_exact(args)}): "
+            who = f" AS {one_line(f['as_user'])[0].upper()}" if f.get("as_user") else ""
+            eprint(f"  \u21b3 [{p.id}] {tagged(p.kind, f)}{one_line(f['set'])[0]}.{one_line(f['command'])[0]}({show_exact(args)}){who}: "
                    f"{show_exact(f['argv'])}")
         elif p.kind == "sandbox":
             eprint(f"  [{p.id}] {tagged(p.kind, p.fields)}sandbox, offline: {one_line(p.fields['reason'])[0]}\n    $ {show_exact(p.fields['command'])}")
@@ -5845,7 +5917,9 @@ class TtyUI(PlainUI):
                         "It works on a throwaway copy of the project, but it could send what it reads anywhere.")
             elif p.kind == "trusted":
                 head = (f"Run {one_line(f['set'])[0]}.{one_line(f['command'])[0]} (a scoped command that "
-                        f"changes something):\n    $ {show_exact(f['argv'])}")
+                        + ("only reads" if f.get("access") == "read" else "changes something")
+                        + (f", AS {one_line(f['as_user'])[0].upper()}" if f.get("as_user") else "")
+                        + f"):\n    $ {show_exact(f['argv'])}")
             elif p.kind == "plan":
                 self.out.write(f"\n\033[1m[{p.id}] plan\033[0m — {one_line(f['goal'])[0]}\n{margin(plan_steps(f['steps']))}\n"
                                "Planned reads won't ask again; a planned command proposed exactly as shown is "

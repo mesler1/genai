@@ -63,6 +63,38 @@ commands with exactly these inputs.
   others or owned by another user than you or root. hoplon records which file it found at start and refuses to
   run it if it changed ("restart hoplon").
 
+### Commands that run as root
+
+A command can run as root (or another user) through `sudo`, `doas` or `run0`. This is how the model checks or
+restarts a service on a remote host without a root shell: you allow exactly that command, and nothing else.
+
+```json
+  "restart": {"describe": "restart one web service", "access": "write",
+              "argv": ["sudo", "-n", "/usr/bin/systemctl", "restart", "{unit}"],
+              "params": {"unit": {"enum": ["nginx", "php-fpm"]}}}
+```
+
+- It asks every time, even with `"access": "read"`, and the blessing screen lists it apart, under AS ANOTHER
+  USER. When you bless the set you can let it run without asking, as with a write command.
+- Every approval says it runs AS ROOT (or as the user `-u` names), in the REPL and on hoplon-tui's card. A
+  hoplon-tui pane can't run it, unless you let it run without asking.
+- It must never ask for a password, since scoped commands run with no terminal: `sudo` and `doas` need `-n`,
+  `run0` needs `--no-ask-password`. Besides that, only `-u USER` (or `--user`) and sudo's `-H` are accepted, so
+  nothing can start a shell (`-s`, `-i`), edit files (`-e`) or keep your environment (`-E`). The user may be a
+  placeholder. `pkexec`, `su` and `sudoedit` are refused.
+- The program it runs comes next, as an absolute path, so it matches a rule exactly. hoplon checks `sudo`
+  itself like any program; what `sudo` then runs is checked by your rule, not by hoplon.
+- The host needs a rule that allows exactly that command without a password, for example in
+  `/etc/sudoers.d/hoplon` (edit it with `visudo -f`):
+
+  ```
+  alice ALL=(root) NOPASSWD: /usr/bin/systemctl restart nginx, /usr/bin/systemctl restart php-fpm
+  ```
+
+  Write one line per command and value, without wildcards: a `*` in a sudoers rule matches spaces too, so it
+  allows far more than it looks like it does. In remote mode the rule goes on the remote host, where the command
+  runs.
+
 A set may also have a `GUIDE.md` (at most 6000 characters of plain text): when to use which command, what to
 ask the user first, how to read the output. Whenever the set is on, it goes into the model's instructions, under
 "# Command set: NAME", so the commands never arrive without it, and the blessing screen shows it in full. Keep
