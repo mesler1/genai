@@ -21,16 +21,16 @@ CMDS = {
     "queue": {"describe": "jobs of one user", "argv": ["fakeq", "-u", "{user}", "--fmt={fmt}"],
               "params": {"user": {"pattern": "^[a-z_][a-z0-9_-]{0,31}$", "describe": "a user name"},
                          "fmt": {"enum": ["short", "long"]}},
-              "read_only": True, "min_interval": 0},
+              "access": "read", "min_interval": 0},
     "job": {"describe": "one job", "argv": ["fakeq", "job", "{id}"],
-            "params": {"id": {"int": [1, 99999]}}, "read_only": True, "min_interval": 0},
+            "params": {"id": {"int": [1, 99999]}}, "access": "read", "min_interval": 0},
     "kill": {"describe": "stops a job", "argv": ["fakeq", "kill", "{id}"],
-             "params": {"id": {"int": [1, 99999]}}, "min_interval": 0},
-    "slow": {"describe": "never ends", "argv": ["slowq"], "read_only": True, "timeout": 1, "min_interval": 0},
-    "big": {"describe": "too much output", "argv": ["bigq"], "read_only": True, "max_output": 1000, "min_interval": 0},
-    "leak": {"describe": "prints a secret", "argv": ["leakq"], "read_only": True, "min_interval": 0},
-    "cached": {"describe": "cached", "argv": ["fakeq", "cached"], "read_only": True, "cache": 60, "min_interval": 0},
-    "paced": {"describe": "paced", "argv": ["fakeq", "paced"], "read_only": True, "min_interval": 30},
+             "params": {"id": {"int": [1, 99999]}}, "access": "write", "min_interval": 0},
+    "slow": {"describe": "never ends", "argv": ["slowq"], "access": "read", "timeout": 1, "min_interval": 0},
+    "big": {"describe": "too much output", "argv": ["bigq"], "access": "read", "max_output": 1000, "min_interval": 0},
+    "leak": {"describe": "prints a secret", "argv": ["leakq"], "access": "read", "min_interval": 0},
+    "cached": {"describe": "cached", "argv": ["fakeq", "cached"], "access": "read", "cache": 60, "min_interval": 0},
+    "paced": {"describe": "paced", "argv": ["fakeq", "paced"], "access": "read", "min_interval": 30},
 }
 
 
@@ -187,8 +187,11 @@ class TestManifest(CommandSetBase):
             self.manifest["commands"]["queue"][key] = bad
             self.refused(key)
         self.setUp()
-        self.manifest["commands"]["queue"]["read_only"] = "yes"
-        self.refused("read_only")
+        self.manifest["commands"]["queue"]["access"] = "yes"
+        self.refused("access must be")
+        self.setUp()
+        del self.manifest["commands"]["queue"]["access"]
+        self.refused("access must be")
         self.setUp()
         self.refused("search", search=["relative/dir"])
         self.refused("search", search=[])
@@ -200,9 +203,9 @@ class TestManifest(CommandSetBase):
 
     def test_defaults(self):
         c = self.load().commands["slow"]
-        self.manifest["commands"]["x"] = {"argv": ["fakeq"]}
+        self.manifest["commands"]["x"] = {"argv": ["fakeq"], "access": "write"}
         x = self.load().commands["x"]
-        self.assertEqual((x.read_only, x.timeout, x.max_output, x.min_interval, x.cache), (False, 15, 65536, 2, 0))
+        self.assertEqual((x.auto, x.timeout, x.max_output, x.min_interval, x.cache), (False, 15, 65536, 2, 0))
         self.assertEqual(c.timeout, 1)
 
     def test_pane_is_reported(self):
@@ -279,13 +282,13 @@ class TestBinary(CommandSetBase):
         other = self.path("elsewhere")
         os.mkdir(other, 0o755)
         program(os.path.join(other, "nothere"), "true\n")
-        self.manifest["commands"]["x"] = {"argv": ["nothere"]}
+        self.manifest["commands"]["x"] = {"argv": ["nothere"], "access": "read"}
         pl = self.load()
         with mock.patch.dict(os.environ, {"PATH": other}):
             self.assertEqual(pl.resolve(), ["x"])          # not installed here: only its command is left out
         self.assertNotIn("x", pl.commands)
         self.assertIn("queue", pl.commands)
-        self.manifest["commands"] = {"x": {"argv": ["nothere"]}}
+        self.manifest["commands"] = {"x": {"argv": ["nothere"], "access": "read"}}
         with self.assertRaises(G.HoplonError) as cm:
             self.load().resolve()
         self.assertIn("none of its programs", str(cm.exception))
@@ -308,7 +311,7 @@ class TestBinary(CommandSetBase):
         self.assertIn("not an executable", str(cm.exception))
 
     def test_absolute_argv0(self):
-        self.manifest["commands"] = {"x": {"argv": [os.path.join(self.bin, "fakeq")], "read_only": True}}
+        self.manifest["commands"] = {"x": {"argv": [os.path.join(self.bin, "fakeq")], "access": "read"}}
         pl = self.load()
         pl.resolve()
         self.assertTrue(pl.commands["x"].binary.endswith("/fakeq"))
@@ -418,6 +421,36 @@ class TestBlessing(CommandSetBase):
         self.assertEqual(self.cfg.blessed()[self.dir]["kind"], "command_set")
         self.assertEqual(G.command_set_status(self.cfg, G.find_command_sets(self.cfg)["fake"]), "blessed")
 
+    def test_reads_and_writes_are_listed_apart_and_a_write_may_be_let_run(self):
+        asked, out = [], io.StringIO()
+        with mock.patch.object(sys, "stdout", out):
+            self.assertTrue(G.bless(self.cfg, self.dir, lambda q: asked.append(q) or True))
+        text = out.getvalue()
+        reads, writes = text.index("read: these only look"), text.index("write: these change something")
+        self.assertLess(reads, text.index("command queue:"))
+        self.assertLess(text.index("command queue:"), writes)
+        self.assertLess(writes, text.index("command kill:"))
+        self.assertEqual(len(asked), 2)                       # the set, then its one write command
+        self.assertIn("Let the model run kill (fakeq kill {id}) without asking you?", asked[1])
+        self.assertEqual(self.cfg.blessed()[self.dir]["auto"], ["kill"])
+        eng, _ = self.engine()
+        kill = eng.trusted["fake__kill"]
+        self.assertTrue(kill.auto)
+        self.assertIn("runs without asking, as the user chose", kill.schema("h")["function"]["description"])
+        self.assertEqual(G.command_set_rows(self.cfg, ["fake"])[0]["commands"][2]["name"], "kill")
+
+    def test_a_write_asks_unless_the_user_said_otherwise(self):
+        answers = iter([True, False])
+        with mock.patch.object(sys, "stdout", io.StringIO()):
+            G.bless(self.cfg, self.dir, lambda q: next(answers))
+        self.assertEqual(self.cfg.blessed()[self.dir]["auto"], [])
+        eng, _ = self.engine()
+        self.assertFalse(eng.trusted["fake__kill"].auto)
+        self.assertTrue(eng.trusted["fake__queue"].auto)
+        self.assertIn("the user is asked first", eng.trusted["fake__kill"].schema("h")["function"]["description"])
+        with mock.patch.object(sys, "stdout", io.StringIO()):     # declined: nothing is recorded, nothing more asked
+            self.assertFalse(G.bless(self.cfg, self.dir, lambda q: False))
+
     def test_bless_refuses_a_bad_manifest(self):
         self.manifest["commands"]["queue"]["argv"] = ["fakeq", "{nope}"]
         write_json(os.path.join(self.dir, "commands.json"), self.manifest)
@@ -477,9 +510,9 @@ class TestRunning(CommandSetBase):
         self.assertEqual((p.kind, p.auto, p.decision), ("trusted", True, "accept"))
         self.assertEqual(self.ui.autos, [p])
         self.assertEqual(p.event()["argv"], "fakeq -u alice --fmt=long")
-        self.assertEqual({k: v for k, v in p.event().items() if k in ("set", "command", "params", "read_only")},
+        self.assertEqual({k: v for k, v in p.event().items() if k in ("set", "command", "params", "access")},
                          {"set": "fake", "command": "queue", "params": {"user": "alice", "fmt": "long"},
-                          "read_only": True})
+                          "access": "read"})
         self.assertTrue(told.startswith("exit 3. Output:\nresult -u alice --fmt=long\n[stderr]\nwarning"), told)
         self.assertEqual(self.calls()[0]["args"], ["-u", "alice", "--fmt=long"])
         self.assertEqual(self.ui.results[0][1:3][0], "error")          # exit 3
@@ -682,7 +715,7 @@ class TestJson(CommandSetBase):
             self.assertEqual((row["name"], row["enabled"], row["blessed"], row["pane"], row["dir"]),
                              ("fake", True, True, None, os.path.join(self.home, "commands", "fake")))
             queue = next(c for c in row["commands"] if c["name"] == "queue")
-            self.assertEqual(queue["read_only"], True)
+            self.assertEqual((queue["access"], queue["auto"]), ("read", True))
             self.assertEqual(queue["argv"], ["fakeq", "-u", "{user}", "--fmt={fmt}"])
             self.assertEqual(queue["params"]["fmt"], {"enum": ["short", "long"], "describe": ""})
             g.send({"type": "command_sets"})
@@ -731,7 +764,7 @@ class TestJson(CommandSetBase):
             g = self.start(api)
             g.send({"type": "user", "text": "stop it"})
             p = g.until("proposal")
-            self.assertEqual((p["kind"], p.get("auto"), p["read_only"]), ("trusted", None, False))
+            self.assertEqual((p["kind"], p.get("auto"), p["access"]), ("trusted", None, "write"))
             self.assertEqual(self.calls(), [])
             g.send({"type": "decision", "id": p["id"], "digest": p["digest"], "decision": "accept"})
             self.assertEqual(g.until("result")["exit"], 3)

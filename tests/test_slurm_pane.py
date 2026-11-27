@@ -128,7 +128,7 @@ class TestManifest(unittest.TestCase):
             data = json.load(f)
         self.assertEqual(data["pane"], "slurm.py")
         for name in ("nodes", "partitions", "queue", "node", "job"):
-            self.assertTrue(data["commands"][name]["read_only"], name)
+            self.assertEqual(data["commands"][name]["access"], "read", name)
 
 
 if __name__ == "__main__":

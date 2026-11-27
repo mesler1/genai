@@ -8,34 +8,34 @@
     "down_nodes": {
       "describe": "nodes that are down, drained or failing, with reasons (node|state|reason|user|time)",
       "argv": ["sinfo", "-R", "-h", "-o", "%N|%T|%E|%u|%H"],
-      "read_only": true, "cache": 30
+      "access": "read", "cache": 30
     },
     "nodes": {
       "describe": "every node: node|partition|state|cpus allocated/idle/other/total|memory MB|reason",
       "argv": ["sinfo", "-N", "-h", "-o", "%N|%P|%T|%C|%m|%E"],
-      "read_only": true, "min_interval": 5, "cache": 30
+      "access": "read", "min_interval": 5, "cache": 30
     },
     "partitions": {
       "describe": "partition summary: partition|availability|time limit|nodes total|nodes allocated/idle/other/total|cpus allocated/idle/other/total",
       "argv": ["sinfo", "-s", "-h", "-o", "%P|%a|%l|%D|%F|%C"],
-      "read_only": true, "cache": 30
+      "access": "read", "cache": 30
     },
     "queue": {
       "describe": "all jobs in the queue: job|partition|name|user|state|time|nodes|reason or nodes",
       "argv": ["squeue", "-h", "-o", "%i|%P|%j|%u|%T|%M|%D|%R"],
-      "read_only": true, "min_interval": 5, "cache": 15
+      "access": "read", "min_interval": 5, "cache": 15
     },
     "queue_user": {
       "describe": "jobs of one user: job|partition|name|state|time|nodes|reason or nodes",
       "argv": ["squeue", "-h", "-u", "{user}", "-o", "%i|%P|%j|%T|%M|%D|%R"],
       "params": {"user": {"pattern": "^[a-z_][a-z0-9_-]{0,31}$", "describe": "a user name"}},
-      "read_only": true, "min_interval": 5, "cache": 15
+      "access": "read", "min_interval": 5, "cache": 15
     },
     "queue_partition": {
       "describe": "jobs in one partition: job|name|user|state|time|nodes|reason or nodes",
       "argv": ["squeue", "-h", "-p", "{partition}", "-o", "%i|%j|%u|%T|%M|%D|%R"],
       "params": {"partition": {"pattern": "^[A-Za-z0-9_.][A-Za-z0-9_.-]{0,63}$", "describe": "a partition name"}},
-      "read_only": true, "min_interval": 5, "cache": 15
+      "access": "read", "min_interval": 5, "cache": 15
     },
     "job": {
       "describe": "details of one job (scontrol show job)",
@@ -44,13 +44,13 @@
                 "TimeLimit, NumCPUs, MinMemoryNode or MinMemoryCPU, and StdOut give what was asked for and where its log is."],
       "argv": ["scontrol", "show", "job", "{id}"],
       "params": {"id": {"pattern": "^[0-9]{1,10}(_[0-9]{1,6})?$", "describe": "a job id, or array_task"}},
-      "read_only": true
+      "access": "read"
     },
     "node": {
       "describe": "details of one node (scontrol show node)",
       "argv": ["scontrol", "show", "node", "{name}"],
       "params": {"name": {"pattern": "^[A-Za-z0-9_.][A-Za-z0-9_.-]{0,63}$", "describe": "a node name"}},
-      "read_only": true
+      "access": "read"
     },
     "jobs_history_user": {
       "describe": "jobs of one user in the last day, from accounting: job|name|partition|state|exit code|elapsed|start|end|nodes",
@@ -59,7 +59,7 @@
                 "An empty answer means no jobs in the last day, or an unknown user: it is not an error."],
       "argv": ["sacct", "-u", "{user}", "-X", "-S", "now-1day", "-P", "--format=JobID,JobName,Partition,State,ExitCode,Elapsed,Start,End,NodeList"],
       "params": {"user": {"pattern": "^[a-z_][a-z0-9_-]{0,31}$", "describe": "a user name"}},
-      "read_only": true, "min_interval": 5, "cache": 30
+      "access": "read", "min_interval": 5, "cache": 30
     }
   }
 }

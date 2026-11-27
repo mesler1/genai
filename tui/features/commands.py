@@ -117,7 +117,7 @@ class CommandSets(Feature):
         for r in on:
             for cmd in r.get("commands") or []:
                 if isinstance(cmd, dict):
-                    how = "read-only" if cmd.get("read_only") else "asks"
+                    how = "read" if cmd.get("access") == "read" else "write, runs without asking" if cmd.get("auto") else "write, asks"
                     m.note(f"  {self.core.clean(str(r.get('name')))}: {self.core.clean(str(cmd.get('name')))} "
                            f"({how}) {self.core.clean(str(cmd.get('describe', '')))}")
 
@@ -144,7 +144,7 @@ class CommandSets(Feature):
                     isinstance(k, str) and isinstance(v, str) for k, v in params.items()):
                 m.panes.append((role, {"type": "ran", "id": msg.get("id"), "error": "no such command"}))
                 return
-            if not spec.get("read_only"):
+            if spec.get("access") != "read":
                 m.panes.append((role, {"type": "ran", "id": msg.get("id"),
                                        "error": "only read-only commands run from a pane"}))
                 return

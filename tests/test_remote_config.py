@@ -89,7 +89,7 @@ class TestRemoteConfigExport(Tmp):
         self.item(home, "skill", "unblessed", {"SKILL.md": "# U\n"})
         b = self.item(home, "skill", "b", {"SKILL.md": "# B\n"})
         pl = self.item(home, "command_set", "pl", {"commands.json": json.dumps(
-            {"name": "pl", "commands": {"x": {"describe": "x", "argv": ["true"], "read_only": True}}})})
+            {"name": "pl", "commands": {"x": {"describe": "x", "argv": ["true"], "access": "read"}}})})
         for kind, d in (("skill", a), ("skill", b), ("command_set", pl)):
             self.bless_dir(home, kind, d)
         with open(os.path.join(home, "config.json"), "w") as f:
@@ -104,6 +104,7 @@ class TestRemoteConfigExport(Tmp):
         self.assertEqual(base64.b64decode(sa["files"]["notes.txt"]), b"more")
         self.assertEqual(sa["hash"], G.hash_skill(a)[0])
         self.assertEqual(out["command_sets"][0]["hash"], G.hash_skill(pl)[0])
+        self.assertEqual(out["command_sets"][0]["auto"], [])
         with open(os.path.join(home, "audit.log")) as f:
             rec = [json.loads(x) for x in f if "remote_config_export" in x][-1]
         self.assertEqual(rec["skills"], {"a": sa["hash"], "b": out["skills"][1]["hash"]})
@@ -133,10 +134,16 @@ class TestRemoteConfigLine(Tmp):
         return G.remote_config(self.line(**extra), G.Audit(self.path("audit.log")))
 
     def test_items_are_made_from_the_bytes_sent(self):
-        plug = {"commands.json": json.dumps({"name": "pl", "commands": {"x": {"describe": "d", "argv": ["true"]}}})}
+        plug = {"commands.json": json.dumps({"name": "pl", "commands": {"x": {"describe": "d", "argv": ["true"], "access": "read"}}})}
         _, _, offered = self.parse(skills=[self.entry("s", {"SKILL.md": "# S\nbody"})], command_sets=[self.entry("pl", plug)])
         self.assertEqual(offered["skills"]["s"].text(), "# S\nbody")
         self.assertEqual(list(offered["command_sets"]["pl"].commands), ["x"])
+        wplug = {"commands.json": json.dumps({"name": "w", "commands": {
+            "x": {"describe": "d", "argv": ["true"], "access": "write"},
+            "y": {"describe": "d", "argv": ["true"], "access": "write"}}})}
+        _, _, got = self.parse(command_sets=[dict(self.entry("w", wplug), auto=["x"])])
+        self.assertEqual((got["command_sets"]["w"].commands["x"].auto, got["command_sets"]["w"].commands["y"].auto),
+                         (True, False))
         self.assertEqual(self.parse()[2], {"skills": {}, "command_sets": {}})
         with open(self.path("audit.log")) as f:
             rec = json.loads(f.readline())
@@ -153,6 +160,8 @@ class TestRemoteConfigLine(Tmp):
                            ({"skills": [self.entry("s", {"README": "x"})]}, "no SKILL.md"),
                            ({"skills": [dict(good, extra=1)]}, "exactly"),
                            ({"skills": {"s": good}}, "must be a list"),
+                           ({"command_sets": [dict(badname, auto="x")]}, "'auto' must be a list"),
+                           ({"skills": [dict(good, auto=[])]}, "exactly"),
                            ({"command_sets": [badname]}, "command set 'pl'")):
             with self.assertRaises(G.HoplonError) as e:
                 self.parse(**extra)

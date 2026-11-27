@@ -4,20 +4,23 @@ A command set is a directory with a `commands.json` (and, for hoplon-tui, option
 **scoped commands**: narrow, shell-free programs with named inputs, such as `squeue -h -u {user}`. They are never
 code loaded into hoplon: hoplon runs each one as a separate program, with exactly the inputs you allowed. You
 bless the whole directory once, like a skill (`hoplon --bless commands/slurm` shows every command, what each
-input may be, which program it would run, and which ones ask every time), and hoplon refuses it again if any
-file in it changes. Then `--commands slurm`, `default_commands`, a profile's `commands`, or a `command_set`
+input may be, which program it would run, with the read commands and the write commands listed apart), and hoplon
+refuses it again if any file in it changes. Then `--commands slurm`, `default_commands`, a profile's `commands`, or a `command_set`
 message from a wrapper turns it on.
 
-Each enabled command is a tool for the model, named `slurm__queue_user`. A command marked `"read_only": true`
-runs without asking, like an automatic read in coding mode: you see what ran and its output, and the audit log
-records it. Any other command asks every time, like a write. You (a hoplon-tui pane, through the `run` message)
+Each enabled command is a tool for the model, named `slurm__queue_user`. Every command says what it does:
+`"access": "read"` (it only looks) runs without asking, like an automatic read in coding mode: you see what ran
+and its output, and the audit log records it. `"access": "write"` (it changes something) asks every time, like a
+write, unless you let it run without asking: after you accept a set, blessing asks you about each write
+command, and the answer is kept with the blessing (`auto`), so a changed set asks again. Every run is logged as
+`trusted_run` either way. You (a hoplon-tui pane, through the `run` message)
 can run the same commands with the same checks and limits. You decided once, at blessing time, exactly these
 commands with exactly these inputs.
 
 ```json
 {"name": "slurm", "description": "Slurm cluster status", "search": ["/usr/bin", "/opt/slurm/bin"], "env": ["SLURM_CONF"],
  "commands": {"queue_user": {"describe": "jobs of one user", "argv": ["squeue", "-h", "-u", "{user}"],
-   "params": {"user": {"pattern": "^[a-z_][a-z0-9_-]{0,31}$"}}, "read_only": true, "min_interval": 5, "cache": 15}}}
+   "params": {"user": {"pattern": "^[a-z_][a-z0-9_-]{0,31}$"}}, "access": "read", "min_interval": 5, "cache": 15}}}
 ```
 
 - `name` is the directory's name (`a-z`, digits, `-`); commands are `a-z`, digits, `_`. Unknown fields anywhere
@@ -29,7 +32,7 @@ commands with exactly these inputs.
 - `params` (all required): `pattern` (a regular expression the whole value must match; one that matches the
   empty string is refused), `enum` (a list), or `int` (`[min, max]`); optional `describe`. A value that doesn't
   fit is refused, never cleaned. At most 256 characters, one line, whatever the pattern says.
-- Per command: `read_only` (default `false`), `timeout` (seconds, 15, at most 120), `max_output` (bytes,
+- Per command: `access` (required: `read` or `write`), `timeout` (seconds, 15, at most 120), `max_output` (bytes,
   65536, at most 1 MiB; more is dropped and the program is killed), `min_interval` (seconds, 2: a call of the
   same command sooner than this after its last real run is refused with "rate limited"), `cache` (seconds, 0:
   the same command with the same values returns its last result, marked cached). hoplon also allows 30 real

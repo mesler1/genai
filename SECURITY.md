@@ -140,9 +140,13 @@ range). Together they are the whole of what the model and the user's panes can r
 - **Limits.** A time limit (at most 120 s), an output cap (at most 1 MiB, then the program is killed), its own
   process group (killed whole), at least `min_interval` seconds between real runs of one command, a cache so a
   repeated question is answered from the last result, and 30 real runs a minute across all command sets.
-- **Auto-run versus asking.** Only commands the command set marks `read_only` run without asking, and the blessing
-  screen lists them separately; they work only where someone can see what runs (not in plain, non-interactive
-  mode), like automatic reads. Every other command asks, in the normal approval flow, each time.
+- **Auto-run versus asking.** Each command must say `"access": "read"` or `"write"`; there is no default. Read
+  commands run without asking, and the blessing screen lists them apart from the write commands. A write command
+  asks, in the normal approval flow, each time, unless you let it run without asking: blessing asks about each
+  one, after you accept the set, and the answer is kept with the blessing, so it lapses when the set changes. The
+  model never sets this: it can write a command set, but not bless one. Commands that run without asking work only
+  where someone can see what runs (not in plain, non-interactive mode), like automatic reads. In remote mode the
+  answers go with the set from your machine.
 - **Audit.** Each run (or refusal) is logged as `trusted_run`: command set, command, the validated values, who asked
   (`model` or `user`), exit code, time, bytes, whether it was cached or rate limited, and the program's path.
   Output is masked for the endpoint key and secret patterns, cut, and escaped wherever it is shown.

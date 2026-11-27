@@ -481,7 +481,7 @@ class TestModel(unittest.TestCase):
         self.hello(m)
         m.submit("nodes?")
         m.handle({"type": "proposal", "id": "p1", "kind": "trusted", "auto": True, "set": "slurm",
-                  "command": "down_nodes", "read_only": True, "argv": "sinfo -R -h", "reason": "down nodes"})
+                  "command": "down_nodes", "access": "read", "argv": "sinfo -R -h", "reason": "down nodes"})
         card = m.cards["p1"]
         self.assertEqual(card.state, "running")
         m.handle({"type": "result", "id": "p1", "status": "ok", "output": "cn042|down*\x1b[2J", "exit": 0})
@@ -1224,10 +1224,10 @@ class TestWorkFeature(unittest.TestCase):
 class TestCommandsFeature(unittest.TestCase):
     ROWS = [{"name": "slurm", "description": "cluster", "enabled": True, "blessed": True, "status": "blessed",
              "pane": "slurm.py", "dir": "/opt/hoplon/commands/slurm",
-             "commands": [{"name": "queue", "describe": "the queue", "read_only": True, "params": {}},
-                          {"name": "cancel", "describe": "cancel a job", "read_only": False, "params": {}}]},
+             "commands": [{"name": "queue", "describe": "the queue", "access": "read", "params": {}},
+                          {"name": "cancel", "describe": "cancel a job", "access": "write", "params": {}}]},
             {"name": "off", "description": "not on", "enabled": False, "blessed": True, "pane": None, "dir": "/x",
-             "commands": [{"name": "x", "read_only": True}]}]
+             "commands": [{"name": "x", "access": "read"}]}]
 
     def model(self, remote=False):
         m = C.Model()
@@ -1292,8 +1292,8 @@ class TestCommandsFeature(unittest.TestCase):
         m = self.model()
         m.submit("/help")
         text = "\n".join(text_of(b, 200) for b in m.blocks)
-        self.assertIn("slurm: queue (read-only) the queue", text)
-        self.assertIn("slurm: cancel (asks) cancel a job", text)
+        self.assertIn("slurm: queue (read) the queue", text)
+        self.assertIn("slurm: cancel (write, asks) cancel a job", text)
         self.assertNotIn("off: x", text)
         PANEL = load("panel", os.path.join(REPO, "tui", "panel.py"))
         lines, _ = PANEL.view(m.snapshot(), 50, None)

@@ -481,7 +481,7 @@ class Card(Block):
                                                            if isinstance(ev.get("names"), list)),
                 "sandbox": f"sandbox · {'ONLINE' if ev.get('network') else 'offline'}",
                 "trusted": f"{row(ev.get('set', '?'))} · {row(ev.get('command', '?'))}"
-                           + (" · read-only" if ev.get("read_only") else ""),
+                           + (" · read-only" if ev.get("access") == "read" else ""),
                 "plan": f"plan · {count(ev.get('steps'))} steps",
                 "work_plan": f"work plan · {count(ev.get('items'))} items",
                 "finish": f"finish item {row(ev.get('n', '?'))}: {row(ev.get('summary', ''))}",

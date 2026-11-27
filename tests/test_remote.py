@@ -265,9 +265,9 @@ class TestCommandSetsAndSkills(RemoteCase):
         os.makedirs(pdir)
         with open(os.path.join(pdir, "commands.json"), "w") as f:
             json.dump({"name": "rp", "description": "remote command set", "search": [self.bin],
-                       "commands": {"who": {"describe": "who", "argv": ["whoq", "{user}"], "read_only": True,
+                       "commands": {"who": {"describe": "who", "argv": ["whoq", "{user}"], "access": "read",
                                             "params": {"user": {"pattern": "[a-z]+"}}, "min_interval": 0},
-                                    "gone": {"describe": "not installed", "argv": ["nosuchprogq"], "read_only": True}}},
+                                    "gone": {"describe": "not installed", "argv": ["nosuchprogq"], "access": "read"}}},
                       f)
         sdir = os.path.join(self.home, "skills", "rs")
         os.makedirs(sdir)

@@ -1563,7 +1563,7 @@ def load_skills(cfg, names, notice):
 # Command sets and scoped commands: programs you blessed once, with exactly the inputs they may take
 
 COMMAND_SET_KEYS = {"name", "description", "search", "env", "pane", "commands"}
-COMMAND_KEYS = {"describe", "usage", "argv", "params", "read_only", "timeout", "max_output", "min_interval", "cache"}
+COMMAND_KEYS = {"describe", "usage", "argv", "params", "access", "timeout", "max_output", "min_interval", "cache"}
 USAGE_MAX = 1200            # characters of a scoped command's usage section, all lines together
 USAGE_LINES = 20
 PARAM_KEYS = {"pattern", "enum", "int", "describe"}
@@ -1739,9 +1739,11 @@ class TrustedCommand:
         self.describe = _text(data, "describe", w)
         self.usage = _usage(data.get("usage", []), w + "usage")
         self.argv = _strings(data.get("argv"), w + "argv")
-        self.read_only = data.get("read_only", False)
-        if not isinstance(self.read_only, bool):
-            raise ValueError(f"{w}read_only must be true or false")
+        self.access = data.get("access")
+        if self.access not in ("read", "write"):
+            raise ValueError(f'{w}access must be "read" (it only looks) or "write" (it changes something)')
+        self.read_only = self.access == "read"
+        self.auto = self.read_only       # a write command too, if the user chose so when blessing (allow_auto)
         self.timeout = _number(data, "timeout", w, 15, 1, 120)
         self.max_output = _number(data, "max_output", w, 65536, 1, 1048576)
         self.min_interval = _number(data, "min_interval", w, 2, 0, 3600)
@@ -1810,7 +1812,8 @@ class TrustedCommand:
         return env
 
     def schema(self, host):
-        how = "read-only" if self.read_only else "the user is asked first"
+        how = ("read-only" if self.read_only else "changes something; runs without asking, as the user chose"
+               if self.auto else "changes something; the user is asked first")
         props = {k: p.schema() for k, p in self.params.items()}
         text = f"{self.describe} (runs `{self.shown()}` on {host}; {how})".strip()
         if self.usage:
@@ -1820,7 +1823,7 @@ class TrustedCommand:
     def info(self):
         return {"name": self.name, "describe": self.describe, "usage": self.usage,
                 "params": {k: p.rules() for k, p in self.params.items()},
-                "read_only": self.read_only, "argv": self.argv}
+                "access": self.access, "auto": self.auto, "argv": self.argv}
 
 
 class CommandSet:
@@ -1871,6 +1874,15 @@ class CommandSet:
     def tools(self):
         return {c.tool: c for c in self.commands.values()}
 
+    def allow_auto(self, names):
+        """The write commands the user chose, when blessing, to run without asking; read commands always do."""
+        names = set(names) if isinstance(names, list) else set()
+        for c in self.commands.values():
+            c.auto = c.read_only or c.name in names
+
+    def writes(self):
+        return [c for c in self.commands.values() if not c.read_only]
+
     def resolve(self):
         """Find every command's program now, refusing the command set if one can't be trusted. A program that isn't
         installed here (a cluster without accounting has no sacct) only leaves out its commands; the names of
@@ -1899,8 +1911,22 @@ class CommandSet:
         lines.append(f"  search:   {', '.join(one_line(d)[0] for d in c0.search)} (your PATH is never used)")
         lines.append(f"  env:      {', '.join(c0.env_names) or 'none'} passed on, besides PATH, LANG, HOME, USER "
                      "and LOGNAME")
-        for c in self.commands.values():
-            flag = "read-only: runs without asking" if c.read_only else "[asks every time]"
+        groups = (("read: these only look, and run without asking", [c for c in self.commands.values() if c.read_only]),
+                  ("write: these change something, and ask every time unless you choose otherwise below",
+                   self.writes()))
+        for title, cmds in groups:
+            if not cmds:
+                continue
+            lines.append(f"  {title}")
+            lines += self.command_lines(cmds)
+        lines.append("  [!] these commands run on this host as you, with no shell, and the read ones without "
+                     "asking: their output goes to the model and the endpoint like any file the model reads")
+        return "\n".join(lines)
+
+    def command_lines(self, cmds):
+        lines = []
+        for c in cmds:
+            flag = "runs without asking" if c.read_only else "[asks every time]"
             lines.append(f"  command {one_line(c.name)[0]}: {one_line(c.describe)[0]}  ({flag})")
             lines.append(f"    runs:    {one_line(c.shown())[0]}")
             for k, p in c.params.items():
@@ -1914,9 +1940,7 @@ class CommandSet:
                 lines.append(f"    program: {one_line(trusted_binary(c.argv[0], c.search)[0])[0]}")
             except (HoplonError, OSError) as e:
                 lines.append(f"    program: [!] {one_line(str(e))[0]} (the command set can't be used until this is fixed)")
-        lines.append("  [!] these commands run on this host as you, with no shell, and the read-only ones without "
-                     "asking: their output goes to the model and the endpoint like any file the model reads")
-        return "\n".join(lines)
+        return lines
 
 
 def find_command_sets(cfg):
@@ -2331,8 +2355,12 @@ def remote_items(raw, kind, bad):
         raise bad(f"'{kind}s' must be a list")
     out = {}
     for item in raw:
-        if not isinstance(item, dict) or set(item) != {"name", "hash", "files"}:
-            raise bad(f"each {kind} must have exactly 'name', 'hash' and 'files'")
+        keys = {"name", "hash", "files"} | ({"auto"} if kind == "command_set" else set())
+        if not isinstance(item, dict) or not {"name", "hash", "files"} <= set(item) <= keys:
+            raise bad(f"each {kind} must have exactly 'name', 'hash' and 'files'"
+                      + (" (and optionally 'auto')" if kind == "command_set" else ""))
+        if not isinstance(item.get("auto", []), list) or not all(isinstance(x, str) for x in item.get("auto", [])):
+            raise bad(f"{kind} '{one_line(str(item['name']))[0]}': 'auto' must be a list of command names")
         name, files = item["name"], item["files"]
         if (not isinstance(name, str) or not NAME_RE.fullmatch(name) or name in out
                 or (kind == "skill" and not SKILL_NAME.fullmatch(name))):
@@ -2363,6 +2391,7 @@ def remote_items(raw, kind, bad):
             out[name] = CommandSet(name, label, data)
             if out[name].error:
                 raise bad(f"command set '{name}': {out[name].error}")
+            out[name].allow_auto(item.get("auto", []))
     return out
 
 
@@ -2428,6 +2457,8 @@ def export_items(cfg, kind, names):
             continue
         out.append({"name": n, "hash": item.hash,
                     "files": {rel: base64.b64encode(b).decode() for rel, b in sorted(item.files.items())}})
+        if kind == "command_set":
+            out[-1]["auto"] = cfg.blessed().get(item.path, {}).get("auto", [])
     return out
 
 
@@ -2555,9 +2586,14 @@ def bless(cfg, path, ask):
     if not ask(question):
         print("Not blessed.")
         return False
+    if os.path.isdir(path) and cset and cset.writes():
+        print("Write commands ask you every time. You can let some of them run without asking; "
+              "every run is still logged as trusted_run.")
+        entry["auto"] = [c.name for c in cset.writes()
+                         if ask(f"Let the model run {one_line(c.name)[0]} ({one_line(c.shown())[0]}) without asking you?")]
     entry["blessed_at"] = now()
     cfg.set_blessed(path, entry)
-    cfg.audit.log("bless", path=path, kind=entry["kind"], hash=h)
+    cfg.audit.log("bless", path=path, kind=entry["kind"], hash=h, **({"auto": entry["auto"]} if "auto" in entry else {}))
     print("Blessed.")
     return True
 
@@ -3193,7 +3229,7 @@ Before you propose a plan or a work plan, and when a request clearly needs one, 
 TRUSTED_RULES = """
 
 # Scoped commands
-- Some tools (named set__command, for example slurm__queue) run a fixed, read-only program on this host for the user and give you its output, for cluster status and the like. They run without asking and the user sees what ran. Use them rather than proposing an equivalent command with propose_command. A tool that says the user is asked first waits for their approval."""
+- Some tools (named set__command, for example slurm__queue) run a fixed program on this host for the user and give you its output, for cluster status and the like. The read-only ones run without asking, and the user sees what ran. Use them rather than proposing an equivalent command with propose_command. A tool that changes something says so: it waits for the user's approval, unless its description says the user let it run without asking."""
 
 # Added to the system prompt while coding mode is on, so the model knows what that changes.
 CODING_RULES = """
@@ -3932,6 +3968,8 @@ class Engine:
             if clash:
                 raise HoplonError(f"command set '{name}': a registered tool already has the name {clash[0]}", EXIT_USAGE,
                                  "bad_commands")
+            if self.offered is None:
+                pl.allow_auto(self.cfg.blessed().get(pl.path, {}).get("auto", []))
             missing = pl.resolve()
             if missing:
                 self.ui.notice(f"command set '{name}': {', '.join(missing)} left out, as the program isn't installed here")
@@ -4767,8 +4805,8 @@ class Engine:
         cmd = self.trusted[name]
         values = cmd.check(args)
         p = Proposal(pid, "trusted", call_id, set=cmd.set, command=cmd.name, params=values,
-                     argv=cmd.shown(values), read_only=cmd.read_only, reason=cmd.describe, _cmd=cmd)
-        p.auto = cmd.read_only
+                     argv=cmd.shown(values), access=cmd.access, reason=cmd.describe, _cmd=cmd)
+        p.auto = cmd.auto
         return p
 
     def search_proposal(self, pid, call_id, args, reason, name="search_files"):
@@ -5659,8 +5697,8 @@ class TtyUI(PlainUI):
                 head = (f"Run in the sandbox, with the network ON:\n    $ {show_exact(f['command'])}\n"
                         "It works on a throwaway copy of the project, but it could send what it reads anywhere.")
             elif p.kind == "trusted":
-                head = (f"Run {one_line(f['set'])[0]}.{one_line(f['command'])[0]} (a scoped command that asks "
-                        f"every time):\n    $ {show_exact(f['argv'])}")
+                head = (f"Run {one_line(f['set'])[0]}.{one_line(f['command'])[0]} (a scoped command that "
+                        f"changes something):\n    $ {show_exact(f['argv'])}")
             elif p.kind == "plan":
                 self.out.write(f"\n\033[1m[{p.id}] plan\033[0m — {one_line(f['goal'])[0]}\n{margin(plan_steps(f['steps']))}\n"
                                "Planned reads won't ask again; a planned command proposed exactly as shown is "
