@@ -73,6 +73,7 @@ hoplon-tui -e work-llm -p coder              # the same in tmux panes, beside yo
   the live test
 - [hoplon-tui](docs/hoplon-tui.md): the terminal UI, another host over ssh, remote mode, the file tree
 - [Work sessions](docs/work-sessions.md): the model plans, codes, tests and commits on a branch of its own
+- [Benchmark tasks](bench/README.md): fixed work-session tasks, to check a prompt or model change against real runs
 - [Sandbox](docs/sandbox.md): running hoplon in a container, and the model's own sandboxed builds and tests
 - [Command sets and scoped commands](docs/commands.md): narrow commands you approve once
 - [Hooks](docs/hooks.md): your own programs at fixed points ([HOOKS.md](HOOKS.md) has the design)
