@@ -6675,6 +6675,344 @@ def review_output(engine, source, lead, text, title):
 
 
 # --------------------------------------------------------------------------
+# Commands both front ends have
+#
+# One row per command that the REPL (:NAME) and the JSON protocol ({"type": NAME}) both offer. A row turns REPL
+# words into the JSON message's fields, checks the fields once for both, does it, and gives the JSON reply; the REPL
+# prints the same reply as text. Where hoplon-tui asks the user itself (deleting samples, cleaning leftovers,
+# approving samples), the REPL's `ask` step asks and fills in what the wrapper would have sent.
+
+class Front:
+    """Who is asking: the REPL (source ":NAME") or the wrapper, whether this is remote mode, and the problems an
+    action reported while still replying (error(text, kind)), which the front end shows with the reply."""
+    def __init__(self, repl, name="", remote=False):
+        self.repl, self.remote, self.problems = repl, remote, []
+        self.source = f":{name}" if repl else "wrapper"
+
+    def error(self, text, kind):
+        self.problems.append((text, kind))
+
+
+class FrontCommand:
+    """name: the REPL's :NAME and the JSON message's type. words: REPL text after :NAME -> the message's fields, or
+    None if it isn't one of the forms. check: fields -> True if well formed. act: (engine, fields, front) -> the
+    reply's fields, or None for no reply. show: (engine, fields, reply) -> the REPL's lines. usage: the REPL's
+    forms; bad: the JSON error when check fails. reply: the reply's type, when it isn't the name. ask: REPL only,
+    (engine, fields) -> fields, or None to stop: it asks what hoplon-tui asks before sending. partial: the REPL
+    shows the reply even when the action reported a problem, and both front ends show the problem after the reply,
+    not before."""
+    def __init__(self, name, words, check, act, show, usage, bad="", reply="", ask=None, partial=False):
+        self.name, self.words, self.check, self.act, self.show = name, words, check, act, show
+        self.usage, self.bad, self.reply, self.ask, self.partial = usage, bad, reply or name, ask, partial
+
+
+def on_off(text, empty=None):
+    return {"on": {"on": True}, "off": {"on": False}, "": empty}.get(text)
+
+
+def context_now(e):
+    return {"used": e.used(), "limit": e.active()[0].context_limit}
+
+
+def coding_act(e, m, front):
+    try:
+        e.set_coding(m["on"], front.source)
+        e.session.save()
+    except HoplonError as err:
+        front.error(str(err), "coding_refused")
+    return {"on": e.session.coding, "coding_from": e.coding_from,
+            "coding_override": e.coding_override if e.session.coding else None}
+
+
+def edits_act(e, m, front):
+    if m.get("reset"):
+        e.reset_approved_files(":edits reset" if front.repl else front.source)
+    if m.get("mode") is not None:
+        e.set_edits(m["mode"], front.source)
+    return e.edits_info()
+
+
+def edits_show(e, m, r):
+    return [f"edits: {r['mode']}" + ("" if r["mode"] == "ask" else "; applied without asking: "
+                                     + (", ".join(one_line(f)[0] for f in r["files"]) or "none yet"))]
+
+
+def network_act(e, m, front):
+    try:
+        if m.get("on") is not None:
+            e.set_network(m["on"], front.source)
+    except HoplonError as err:
+        front.error(str(err), err.kind)
+    return {"runner": e.box.info() if e.box else None, "available": e.can_run()}
+
+
+def box_line(e):
+    """The profile's sandbox in a line: what it runs on, its network, and whether the model runs commands there."""
+    b = e.box
+    problem = b.problem()
+    if problem:
+        return f"the profile's sandbox can't run here: {problem}"
+    state = "the model runs commands there itself, without asking" if e.can_run() else "it is used in coding mode"
+    return (f"podman sandbox ({one_line(box_name(b.conf))[0]}), network {'ON: each run asks' if b.network else 'off'}"
+            f"; {state}")
+
+
+def fixtures_words(text):
+    words = shlex.split(text) if text else []
+    what = words[0] if words else None
+    if what not in (None, "add", "use", "drop", "clear"):
+        return None
+    m = {"action": what} if what else {}
+    if what == "add":
+        m.update(paths=words[1:], cwd=os.getcwd())
+    elif len(words) > 1:
+        return None
+    return m
+
+
+def fixtures_check(m):
+    action, paths, digest = m.get("action"), m.get("paths") or [], m.get("digest")
+    return not (action not in (None, "add", "use", "drop", "clear") or not isinstance(paths, list)
+                or not all(isinstance(x, str) and x for x in paths) or (action == "add") != bool(paths)
+                or (action == "use" and not isinstance(digest, str)) or not isinstance(m.get("cwd", ""), str))
+
+
+def fixtures_ask(e, m):
+    if m.get("action") == "clear" and not ask_yes("Delete the samples folder and everything in it?"):
+        return None
+    if m.get("action") == "use":
+        info = e.fixtures_info()
+        print("\n".join(fixtures_lines(info)))
+        if not info["files"] or any(r["flag"] for r in info["files"]) or not ask_yes(FIXTURES_ASK):
+            print("Not approved." if info["files"] else "Nothing to approve.")
+            return None
+        m = dict(m, digest=info["digest"])
+    return m
+
+
+def fixtures_act(e, m, front):
+    action = m.get("action")
+    try:
+        if action:
+            return e.fixtures_action(action, front.source, m.get("paths") or [], m.get("cwd"), m.get("digest"))
+    except (HoplonError, OSError) as err:
+        front.error(f"fixtures: {err}", getattr(err, "kind", None) or "fixtures")
+    return e.fixtures_info()
+
+
+def fixtures_lines(info):
+    out = [f"samples folder: {info['dir']}" + (f"  ({info['problem']})" if info["problem"] else "")]
+    for r in info["files"]:
+        out.append(f"  {'✗' if r['flag'] else '·'} {show_exact(r['name'])}  {r['size']} bytes"
+                   + (f"  — can't be used: {r['flag']}" if r["flag"] else ""))
+    if not info["files"]:
+        out.append("  empty: :fixtures add FILE… copies files in")
+    out.append("approved: the model's sandboxed runs see them read-only at /fixtures" if info["approved"] else
+               "not approved: :fixtures use checks them and asks")
+    return out
+
+
+def leftovers_ask(e, m):
+    if m.get("action") != "clean":
+        return m
+    items = leftovers(e.cfg, [e.wd.root])
+    print("\n".join(leftover_lines(items, ":leftovers clean")))
+    safe = [i["id"] for i in items if i["safe"]]
+    if not safe:
+        return None
+    if not ask_yes(f"Remove the {len(safe)} stale one{'s' if len(safe) != 1 else ''} marked ✗ (not those marked !)?"):
+        print("Nothing removed.")
+        return None
+    return dict(m, ids=safe)
+
+
+def leftovers_act(e, m, front):
+    done = clean_leftovers(e.cfg, m["ids"], e.audit, front.source) if m.get("action") else {}
+    return {"items": leftovers(e.cfg, [e.wd.root]), **done}
+
+
+def leftovers_show(e, m, r):
+    if not m.get("action"):
+        return leftover_lines(r["items"], ":leftovers clean")
+    return [f"Removed {len(r['removed'])}." + "".join(f"\n  couldn't remove {f['id']}: {show_exact(f['error'])}"
+                                                     for f in r["failed"])]
+
+
+def named_on_off(text):
+    name, _, state = text.partition(" ")
+    got = on_off(state.strip())
+    return dict(got, name=name) if name and got else None
+
+
+def switch(what, key, sent, turn, rows):
+    """Switch a skill or command set on or off, and reply with the listing. In remote mode only what the user's own
+    machine sent can be used: anything else is refused here, before the engine."""
+    def act(e, m, front):
+        if front.remote and m["name"] not in e.offered[key]:
+            front.error(f"{what} '{one_line(m['name'])[0]}' wasn't sent from your machine: in remote mode, only the "
+                        f"{what}s hoplon-tui sent ({sent}) can be used", "remote")
+        else:
+            try:
+                turn(e, m["name"], m["on"])
+            except HoplonError as err:
+                front.error(str(err), err.kind)
+        return {key: rows(e)}
+    return act
+
+
+def turn_skill(e, name, on):
+    e.set_skill(name, on)
+    e.session.save()
+
+
+def command_set_lines(rows):
+    out = []
+    for r in rows:
+        out.append(f"{'*' if r['active'] else ' '} {one_line(r['name'])[0]:20} {r['status']:10} "
+                   f"{one_line(r['description'])[0]}")
+        path = one_line(shlex.quote(r["path"]))[0]
+        out.append("    " + (path if r["blessed"] else f"to bless: hoplon --bless {path}"))
+    return out or ["no command sets found"]
+
+
+def models_act(e, m, front):
+    listed, err = choosable_models(e)
+    reply = None
+    if listed or e.endpoint.aliases or not err:      # the aliases, even when the server lists nothing
+        reply = {"current": e.endpoint.model, "aliases": e.endpoint.aliases,
+                 "models": [{"id": mid, "context": n} for mid, n in listed]}
+    if err:
+        front.error(f"could not list the server's models: {err}" if front.repl else err, "models")
+    return reply
+
+
+def models_show(e, m, r):
+    ep, out = e.endpoint, []
+    for k in sorted(r["aliases"]):
+        out.append(f" {'*' if r['aliases'][k] == r['current'] else ' '} {k}  ({r['aliases'][k]}, an alias)")
+    for row in r["models"]:
+        mark = "*" if row["id"] == r["current"] and not ep.alias_of() else " "
+        out.append(f" {mark} {row['id']}" + (f"  ({row['context']} tokens)" if row["context"] else ""))
+    return out
+
+
+def model_act(e, m, front):
+    e.set_model(m["model"], front.source)
+    return {"endpoint": e.endpoint.info(), "context": {"used": e.used(), "limit": e.endpoint.context_limit}}
+
+
+def compact_act(e, m, front):
+    edit = (lambda s: edit_text(s, "Compaction summary", "what the model keeps of older turns", "drop the summary")) \
+        if m.get("edit") and front.repl else None
+    r = e.compact(edit_summary=edit)
+    return {"pruned": r["pruned"], "before": r["before"], "after": r["after"], "summary": r["summary"]}
+
+
+def compact_show(e, m, r):
+    out = [f"pruned {r['pruned']} items: {r['before']} -> {r['after']} tokens (estimated)"]
+    if r["summary"]:
+        out.append(f"\nSummary of older turns (sent instead of them):\n{show_exact(r['summary'])}\n")
+    return out
+
+
+def nothing(text):
+    return {} if not text else None
+
+
+FRONT_COMMANDS = {c.name: c for c in [
+    FrontCommand("coding", on_off, lambda m: isinstance(m.get("on"), bool), coding_act,
+                 lambda e, m, r: [f"coding mode is {'ON' if r['on'] else 'off'}"],
+                 ":coding on|off", "coding needs 'on': true or false"),
+    FrontCommand("edits", lambda t: {"": {}, "reset": {"reset": True}}.get(t, {"mode": t} if t in EDITS_MODES else None),
+                 lambda m: (m.get("mode") is None or m["mode"] in EDITS_MODES)
+                 and (m.get("reset") is None or isinstance(m["reset"], bool)),
+                 edits_act, edits_show, ":edits, :edits ask, :edits approved-files or :edits reset",
+                 "edits takes 'mode': \"ask\" or \"approved-files\", and/or 'reset': true"),
+    FrontCommand("network", lambda t: on_off(t, {}), lambda m: m.get("on") is None or isinstance(m["on"], bool),
+                 network_act, lambda e, m, r: [box_line(e) if e.box else "no sandbox: the profile has no 'sandbox'"],
+                 ":network, :network on or :network off", "network needs 'on': true or false, or nothing to ask"),
+    FrontCommand("fixtures", fixtures_words, fixtures_check, fixtures_act, lambda e, m, r: fixtures_lines(r),
+                 ":fixtures, :fixtures add FILE…, :fixtures use, :fixtures drop or :fixtures clear",
+                 "fixtures takes 'action' (add with 'paths' and 'cwd', use with the listing's 'digest', drop or "
+                 "clear), or nothing to list", ask=fixtures_ask),
+    FrontCommand("leftovers", lambda t: {"": {}, "clean": {"action": "clean"}}.get(t),
+                 lambda m: m.get("action") in (None, "clean") and isinstance(m.get("ids") or [], list)
+                 and all(isinstance(x, str) and x for x in m.get("ids") or [])
+                 and (m.get("action") == "clean") == bool(m.get("ids")),
+                 leftovers_act, leftovers_show, ":leftovers or :leftovers clean",
+                 "leftovers takes nothing to list, or 'action': 'clean' with the listing's 'ids'", ask=leftovers_ask),
+    FrontCommand("skills", nothing, lambda m: True, lambda e, m, front: {"skills": e.skill_rows()},
+                 lambda e, m, r: skill_lines(r["skills"], mark=True) or ["no skills found"], ":skills", ""),
+    FrontCommand("skill", named_on_off, lambda m: isinstance(m.get("name"), str) and isinstance(m.get("on"), bool),
+                 switch("skill", "skills", "the profile's, default_skills and -k", turn_skill,
+                        lambda e: e.skill_rows()),
+                 lambda e, m, r: [f"skill {one_line(m['name'])[0]} is {'on' if m['on'] else 'off'} from your next "
+                                  "message"],
+                 ":skill NAME on|off", "skill needs 'name' and 'on': true or false", reply="skills"),
+    FrontCommand("command_sets", nothing, lambda m: True,
+                 lambda e, m, front: {"command_sets": e.command_set_rows()},
+                 lambda e, m, r: command_set_lines(r["command_sets"]), ":command_sets", ""),
+    FrontCommand("command_set", named_on_off,
+                 lambda m: isinstance(m.get("name"), str) and isinstance(m.get("on"), bool),
+                 switch("command set", "command_sets", "the profile's and default_commands",
+                        lambda e, name, on: e.set_command_set(name, on), lambda e: e.command_set_rows()),
+                 lambda e, m, r: [f"command set {one_line(m['name'])[0]} is {'on' if m['on'] else 'off'} from your "
+                                  "next message"],
+                 ":command_set NAME on|off", "command_set needs 'name' and 'on': true or false",
+                 reply="command_sets"),
+    FrontCommand("models", nothing, lambda m: True, models_act, models_show, ":models", partial=True),
+    FrontCommand("model", lambda t: {"model": t} if t else None, lambda m: isinstance(m.get("model"), str),
+                 model_act, lambda e, m, r: [f"model: {one_line(e.endpoint.shown_model())[0]} from your next message"],
+                 ":model NAME (:model alone shows it)", "model needs 'model': a name from the models message"),
+    FrontCommand("clear", nothing, lambda m: True,
+                 lambda e, m, front: {"dropped": e.clear(), "context": context_now(e)},
+                 lambda e, m, r: [f"context cleared: the model starts over ({r['dropped']} messages dropped; "
+                                  f"{'the saved session keeps them' if e.session.path else 'they were not saved'})"],
+                 ":clear", "", reply="cleared"),
+    FrontCommand("compact", lambda t: {"": {}, "-e": {"edit": True}}.get(t), lambda m: True, compact_act,
+                 compact_show, ":compact or :compact -e", "", reply="compacted"),
+]}
+
+
+def json_command(c, engine, ui, msg, remote):
+    """One of the shared commands, from the JSON protocol: check it, do it, reply."""
+    if not c.check(msg):
+        ui.error(c.bad, "bad_message")
+        return
+    front = Front(False, remote=remote)
+    try:
+        reply = c.act(engine, msg, front)
+    except HoplonError as err:
+        ui.error(str(err), err.kind)
+        return
+    for text, kind in front.problems if not c.partial else ():
+        ui.error(text, kind)
+    if reply is not None:
+        ui.emit({"type": c.reply, **reply})
+    for text, kind in front.problems if c.partial else ():
+        ui.error(text, kind)
+
+
+def repl_command(c, engine, text):
+    """One of the shared commands, from the REPL: the same check and action as JSON, printed for a person. A problem
+    is printed instead of the state, unless the row shows both."""
+    m = c.words(text)
+    if m is not None and c.ask:
+        m = c.ask(engine, m)
+        if m is None:
+            return
+    if m is None or not c.check(m):
+        print(f"usage: {c.usage}")
+        return
+    front = Front(True, c.name)
+    reply = c.act(engine, m, front)
+    if reply is not None and (c.partial or not front.problems):
+        print("\n".join(c.show(engine, m, reply)))
+    for text, _ in front.problems:
+        print(f"hoplon: {exact(text)[0]}", file=sys.stderr if c.partial else sys.stdout)
+
+
+# --------------------------------------------------------------------------
 # REPL
 
 HELP = """Type a message; a line with only '..' sends it (Ctrl-D also sends).
@@ -6700,6 +7038,8 @@ Commands (on an empty buffer):
   :clear          start over: the model forgets this conversation (the saved session keeps it)
   :skills         list skills, marking the ones in use
   :skill NAME on|off  use a blessed skill from the next message on, or stop using it
+  :command_sets   list command sets, marking the ones in use
+  :command_set NAME on|off  offer a blessed command set's scoped commands from the next message on, or stop
   :bless PATH     bless a skill, endpoint or profile
   :sandbox        where hoplon and your commands run: in a sandbox or on this host
   :help           this text            :quit         leave"""
@@ -6814,7 +7154,7 @@ class Repl:
                 print(f"  [!] this is {self.e.coding_override}; --coding-anywhere allowed it")
         print(f"sandbox: commands you :run or :sh execute {where_runs(self.e.sandbox)}")
         if self.e.box:
-            print("  " + self.box_line())
+            print("  " + box_line(self.e))
         if self.e.notifier:
             print("  " + HOOK_BANNER.format(short_path(self.e.notifier.path)))
         print("Type :help for commands. A line with only '..' sends.")
@@ -6840,17 +7180,7 @@ class Repl:
         else:
             print("  sandbox/run hoplon runs hoplon in a podman sandbox instead (see docs/sandbox.md)")
         if self.e.box:
-            print("  profile sandbox: " + self.box_line())
-
-    def box_line(self):
-        b = self.e.box
-        problem = b.problem()
-        if problem:
-            return f"the profile's sandbox can't run here: {problem}"
-        state = ("the model runs commands there itself, without asking" if self.e.can_run() else
-                 "it is used in coding mode")
-        return (f"podman sandbox ({one_line(box_name(b.conf))[0]}), network {'ON: each run asks' if b.network else 'off'}"
-                f"; {state}")
+            print("  profile sandbox: " + box_line(self.e))
 
     def run(self):
         try:
@@ -6962,7 +7292,9 @@ class Repl:
         cmd, _, arg = line[1:].partition(" ")
         arg = arg.strip()
         try:
-            if cmd in ("q", "quit", "exit"):
+            if cmd in FRONT_COMMANDS and not (cmd == "model" and not arg):
+                repl_command(FRONT_COMMANDS[cmd], self.e, arg)
+            elif cmd in ("q", "quit", "exit"):
                 return "quit"
             elif cmd == "help":
                 print(HELP)
@@ -6987,24 +7319,6 @@ class Repl:
                     print(show_exact(plan_text(self.e.plan)))
             elif cmd == "work":
                 self.do_work(arg)
-            elif cmd == "coding":
-                self.e.set_coding(arg == "on")
-                self.e.session.save()
-                print(f"coding mode is {'ON' if self.e.session.coding else 'off'}")
-            elif cmd == "edits":
-                if arg == "reset":
-                    self.e.reset_approved_files()
-                elif arg in EDITS_MODES:
-                    self.e.set_edits(arg)
-                elif arg:
-                    print("usage: :edits, :edits ask, :edits approved-files or :edits reset")
-                info = self.e.edits_info()
-                print(f"edits: {info['mode']}" + ("" if info["mode"] == "ask" else
-                      "; applied without asking: " + (", ".join(one_line(f)[0] for f in info["files"]) or "none yet")))
-            elif cmd == "fixtures":
-                self.do_fixtures(arg)
-            elif cmd == "leftovers":
-                self.do_leftovers(arg)
             elif cmd == "alerts":
                 if arg in ("on", "off"):
                     self.e.set_alerts(arg == "on", ":alerts")
@@ -7013,53 +7327,15 @@ class Repl:
                     return None
                 print(f"alerts: {'on' if self.e.alerts else 'off'}" + ("" if self.e.notifier else
                       " (there is no notify hook, so there is nothing to hear either way)"))
-            elif cmd == "network":
-                if arg in ("on", "off"):
-                    self.e.set_network(arg == "on")
-                if not self.e.box:
-                    print("no sandbox: the profile has no 'sandbox'")
-                else:
-                    print(self.box_line())
-            elif cmd == "compact":
-                self.do_compact(arg == "-e")
-            elif cmd == "clear":
-                n = self.e.clear()
-                print(f"context cleared: the model starts over ({n} messages dropped; "
-                      f"{'the saved session keeps them' if self.e.session.path else 'they were not saved'})")
-            elif cmd == "models":
-                ep = self.e.endpoint
-                for k in sorted(ep.aliases):
-                    mark = "*" if ep.aliases[k] == ep.model else " "
-                    print(f" {mark} {k}  ({ep.aliases[k]}, an alias)")
-                listed, err = choosable_models(self.e)
-                for mid, n in listed:
-                    mark = "*" if mid == ep.model and not ep.alias_of() else " "
-                    print(f" {mark} {mid}" + (f"  ({n} tokens)" if n else ""))
-                if err:
-                    print(f"hoplon: could not list the server's models: {one_line(err)[0]}", file=sys.stderr)
             elif cmd == "model":
-                if not arg:
-                    print(f"model: {one_line(self.e.endpoint.shown_model())[0]} (:models lists the others, "
-                          ":model NAME switches)")
-                else:
-                    print(f"model: {self.e.set_model(arg, ':model')} from your next message")
+                print(f"model: {one_line(self.e.endpoint.shown_model())[0]} (:models lists the others, "
+                      ":model NAME switches)")
             elif cmd == "raw":
                 self.do_raw(arg)
             elif cmd == "system":
                 self.do_system()
             elif cmd == "context":
                 print(f"context: {self.e.used()}/{self.e.active()[0].context_limit} tokens (estimated)")
-            elif cmd == "skills":
-                print("\n".join(skill_lines(skill_rows(self.e.cfg, [s.name for s in self.e.skills]), mark=True)))
-            elif cmd == "skill":
-                name, _, state = arg.partition(" ")
-                if not name or state.strip() not in ("on", "off"):
-                    print("usage: :skill NAME on|off")
-                else:
-                    self.e.set_skill(name, state.strip() == "on")
-                    self.e.session.save()
-                    print(f"skill {one_line(name)[0]} is {'on' if state.strip() == 'on' else 'off'} "
-                          "from your next message")
             elif cmd == "bless":
                 if bless(self.e.cfg, arg, ask_yes):
                     self.e.reload_skills()
@@ -7142,61 +7418,6 @@ class Repl:
         if kept:
             self.send("", self.attachments + [("the output of my :sh session, as I reviewed it", kept)])
 
-    def do_fixtures(self, arg):
-        words = shlex.split(arg) if arg else []
-        what = words[0] if words else ""
-        if what not in ("", "add", "use", "drop", "clear") or (what == "add") != (len(words) > 1):
-            print("usage: :fixtures, :fixtures add FILE…, :fixtures use, :fixtures drop or :fixtures clear")
-            return
-        if what == "clear" and not ask_yes("Delete the samples folder and everything in it?"):
-            return
-        if what == "use":
-            info = self.e.fixtures_info()
-            self.print_fixtures(info)
-            if not info["files"] or any(r["flag"] for r in info["files"]) or not ask_yes(FIXTURES_ASK):
-                print("Not approved." if info["files"] else "Nothing to approve.")
-                return
-            info = self.e.fixtures_action("use", ":fixtures", digest=info["digest"])
-        elif what:
-            info = self.e.fixtures_action(what, ":fixtures", words[1:], os.getcwd())
-        else:
-            info = self.e.fixtures_info()
-        self.print_fixtures(info)
-
-    def do_leftovers(self, arg):
-        if arg not in ("", "clean"):
-            print("usage: :leftovers or :leftovers clean")
-            return
-        items = leftovers(self.e.cfg, [self.e.wd.root])
-        print("\n".join(leftover_lines(items, ":leftovers clean")))
-        safe = [i for i in items if i["safe"]]
-        if arg != "clean" or not safe:
-            return
-        if not ask_yes(f"Remove the {len(safe)} stale one{'s' if len(safe) != 1 else ''} marked ✗ (not those marked !)?"):
-            print("Nothing removed.")
-            return
-        done = clean_leftovers(self.e.cfg, [i["id"] for i in safe], self.e.audit, ":leftovers")
-        print(f"Removed {len(done['removed'])}." + "".join(f"\n  couldn't remove {f['id']}: {show_exact(f['error'])}"
-                                                        for f in done["failed"]))
-
-    @staticmethod
-    def print_fixtures(info):
-        print(f"samples folder: {info['dir']}" + (f"  ({info['problem']})" if info["problem"] else ""))
-        for r in info["files"]:
-            print(f"  {'✗' if r['flag'] else '·'} {show_exact(r['name'])}  {r['size']} bytes"
-                  + (f"  — can't be used: {r['flag']}" if r["flag"] else ""))
-        if not info["files"]:
-            print("  empty: :fixtures add FILE… copies files in")
-        print("approved: the model's sandboxed runs see them read-only at /fixtures" if info["approved"] else
-              "not approved: :fixtures use checks them and asks")
-
-    def do_compact(self, edit):
-        report = self.e.compact(
-            edit_summary=(lambda s: edit_text(s, "Compaction summary", "what the model keeps of older turns",
-                                              "drop the summary")) if edit else None)
-        print(f"pruned {report['pruned']} items: {report['before']} -> {report['after']} tokens (estimated)")
-        if report["summary"]:
-            print(f"\nSummary of older turns (sent instead of them):\n{show_exact(report['summary'])}\n")
 
 
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]|\r")
@@ -7355,7 +7576,9 @@ def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()
         if msg is None:
             return EXIT_OK
         t = msg.get("type")
-        if t == "user":
+        if t in FRONT_COMMANDS:
+            json_command(FRONT_COMMANDS[t], engine, ui, msg, remote)
+        elif t == "user":
             text = msg.get("text")
             if not isinstance(text, str):
                 ui.error("user message needs 'text'", "bad_message")
@@ -7384,132 +7607,10 @@ def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()
                 ui.emit({"type": "registered", "tools": names})
             except HoplonError as err:
                 ui.error(str(err), "bad_tools")
-        elif t == "compact":
-            try:
-                r = engine.compact()
-                ui.emit({"type": "compacted", "pruned": r["pruned"], "before": r["before"], "after": r["after"],
-                         "summary": r["summary"]})
-            except HoplonError as err:
-                ui.error(str(err), err.kind)
-        elif t == "models":
-            listed, err = choosable_models(engine)
-            if listed or engine.endpoint.aliases or not err:    # the aliases, even when the server lists nothing
-                ui.emit({"type": "models", "current": engine.endpoint.model, "aliases": engine.endpoint.aliases,
-                         "models": [{"id": mid, "context": n} for mid, n in listed]})
-            if err:
-                ui.error(err, "models")
-        elif t == "model":
-            name = msg.get("model")
-            if not isinstance(name, str):
-                ui.error("model needs 'model': a name from the models message", "bad_message")
-                continue
-            try:
-                engine.set_model(name, "wrapper")
-                ui.emit({"type": "model", "endpoint": engine.endpoint.info(),
-                         "context": {"used": engine.used(), "limit": engine.endpoint.context_limit}})
-            except HoplonError as err:
-                ui.error(str(err), err.kind)
         elif t == "stop":
             ui.error("nothing is running", "not_running")
         elif t == "halt":
             pass            # a stop that came as a turn ended
-        elif t == "clear":
-            n = engine.clear()
-            ui.emit({"type": "cleared", "dropped": n, "context": {"used": engine.used(),
-                                                                   "limit": engine.active()[0].context_limit}})
-        elif t == "coding":
-            on = msg.get("on")
-            if not isinstance(on, bool):
-                ui.error("coding needs 'on': true or false", "bad_message")
-                continue
-            try:
-                engine.set_coding(on, "wrapper")
-                engine.session.save()
-            except HoplonError as err:
-                ui.error(str(err), "coding_refused")
-            ui.emit({"type": "coding", "on": engine.session.coding, "coding_from": engine.coding_from,
-                     "coding_override": engine.coding_override if engine.session.coding else None})
-        elif t == "edits":
-            mode, reset = msg.get("mode"), msg.get("reset")
-            if (mode is not None and mode not in EDITS_MODES) or (reset is not None and not isinstance(reset, bool)):
-                ui.error("edits takes 'mode': \"ask\" or \"approved-files\", and/or 'reset': true", "bad_message")
-                continue
-            if reset:
-                engine.reset_approved_files("wrapper")
-            if mode is not None:
-                engine.set_edits(mode, "wrapper")
-            ui.emit({"type": "edits", **engine.edits_info()})
-        elif t == "fixtures":
-            action, paths, digest = msg.get("action"), msg.get("paths") or [], msg.get("digest")
-            if action not in (None, "add", "use", "drop", "clear") or not isinstance(paths, list) \
-                    or not all(isinstance(x, str) and x for x in paths) or (action == "add") != bool(paths) \
-                    or (action == "use" and not isinstance(digest, str)) or not isinstance(msg.get("cwd", ""), str):
-                ui.error("fixtures takes 'action' (add with 'paths' and 'cwd', use with the listing's 'digest', drop "
-                         "or clear), or nothing to list", "bad_message")
-                continue
-            try:
-                info = engine.fixtures_action(action, "wrapper", paths, msg.get("cwd"), digest) if action \
-                    else engine.fixtures_info()
-            except (HoplonError, OSError) as err:
-                ui.error(f"fixtures: {err}", getattr(err, "kind", None) or "fixtures")
-                info = engine.fixtures_info()
-            ui.emit({"type": "fixtures", **info})
-        elif t == "leftovers":
-            action, ids = msg.get("action"), msg.get("ids") or []
-            if action not in (None, "clean") or not isinstance(ids, list) \
-                    or not all(isinstance(x, str) and x for x in ids) or (action == "clean") != bool(ids):
-                ui.error("leftovers takes nothing to list, or 'action': 'clean' with the listing's 'ids'",
-                         "bad_message")
-                continue
-            done = clean_leftovers(engine.cfg, ids, engine.audit, "wrapper") if action else {}
-            ui.emit({"type": "leftovers", "items": leftovers(engine.cfg, [engine.wd.root]), **done})
-        elif t == "network":
-            on = msg.get("on")
-            if on is not None and not isinstance(on, bool):
-                ui.error("network needs 'on': true or false, or nothing to ask", "bad_message")
-                continue
-            try:
-                if on is not None:
-                    engine.set_network(on, "wrapper")
-            except HoplonError as err:
-                ui.error(str(err), err.kind)
-            ui.emit({"type": "network", "runner": engine.box.info() if engine.box else None,
-                     "available": engine.can_run()})
-        elif t == "skills":
-            ui.emit({"type": "skills", "skills": engine.skill_rows()})
-        elif t == "skill":
-            name, on = msg.get("name"), msg.get("on")
-            if not isinstance(name, str) or not isinstance(on, bool):
-                ui.error("skill needs 'name' and 'on': true or false", "bad_message")
-                continue
-            if remote and name not in engine.offered["skills"]:   # only what the user's own machine vouched for
-                ui.error(f"skill '{one_line(name)[0]}' wasn't sent from your machine: in remote mode, only the "
-                         "skills hoplon-tui sent (the profile's, default_skills and -k) can be used", "remote")
-                ui.emit({"type": "skills", "skills": engine.skill_rows()})
-                continue
-            try:
-                engine.set_skill(name, on)
-                engine.session.save()
-            except HoplonError as err:
-                ui.error(str(err), err.kind)
-            ui.emit({"type": "skills", "skills": engine.skill_rows()})
-        elif t == "command_sets":
-            ui.emit({"type": "command_sets", "command_sets": engine.command_set_rows()})
-        elif t == "command_set":
-            name, on = msg.get("name"), msg.get("on")
-            if not isinstance(name, str) or not isinstance(on, bool):
-                ui.error("command_set needs 'name' and 'on': true or false", "bad_message")
-                continue
-            if remote and name not in engine.offered["command_sets"]:  # only what the user's own machine vouched for
-                ui.error(f"command set '{one_line(name)[0]}' wasn't sent from your machine: in remote mode, only the "
-                         "command sets hoplon-tui sent (the profile's and default_commands) can be used", "remote")
-                ui.emit({"type": "command_sets", "command_sets": engine.command_set_rows()})
-                continue
-            try:
-                engine.set_command_set(name, on)
-            except HoplonError as err:
-                ui.error(str(err), err.kind)
-            ui.emit({"type": "command_sets", "command_sets": engine.command_set_rows()})
         elif t == "run":
             rid = msg.get("id")
             if type(rid) not in (int, str):

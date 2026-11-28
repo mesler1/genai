@@ -200,3 +200,38 @@ class TestGate(Guard):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestFrontCommands(unittest.TestCase):
+    """The commands both front ends have are one table: each is checked and done in one place."""
+
+    # A form of each command as the REPL takes it. Its fields must be ones the JSON check accepts, so the two
+    # front ends can't drift into taking different things.
+    FORMS = {"coding": "on", "edits": "reset", "network": "", "fixtures": "add a.txt", "leftovers": "",
+             "skills": "", "skill": "x on", "command_sets": "", "command_set": "x off", "models": "",
+             "model": "m", "clear": "", "compact": "-e"}
+
+    def test_each_repl_form_is_a_message_json_accepts(self):
+        self.assertEqual(sorted(self.FORMS), sorted(G.FRONT_COMMANDS))
+        for name, c in G.FRONT_COMMANDS.items():
+            with self.subTest(command=name):
+                m = c.words(self.FORMS[name])
+                self.assertIsNotNone(m)
+                self.assertTrue(c.check(m), m)
+                if name != "model":         # any word names a model
+                    self.assertIsNone(c.words("no such form at all"))
+
+    def test_neither_front_end_handles_a_shared_command_itself(self):
+        with open(G.__file__) as f:
+            src = f.read()
+        repl = src[src.index("    def command(self, line):"):src.index("    def do_attach(self, path):")]
+        js = src[src.index("def run_json("):src.index("# Main\n")]
+        for name in G.FRONT_COMMANDS:
+            with self.subTest(command=name):
+                self.assertNotIn(f't == "{name}"', js)
+                if name != "model":         # :model alone shows the model, which is the REPL's own
+                    self.assertNotIn(f'cmd == "{name}"', repl)
+        self.assertIn("if t in FRONT_COMMANDS:", js)
+        self.assertIn("if cmd in FRONT_COMMANDS", repl)
+        self.assertIn("json_command(FRONT_COMMANDS[t]", js)
+        self.assertIn("repl_command(FRONT_COMMANDS[cmd]", repl)
