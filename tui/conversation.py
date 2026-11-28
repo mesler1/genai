@@ -12,6 +12,7 @@ Standard library only; Python 3.10 or newer.
 
 import argparse
 import curses
+import hashlib
 import json
 import locale
 import os
@@ -1675,16 +1676,22 @@ class Shell:
 # --------------------------------------------------------------------------
 # hoplon as a child process
 
+def bundle():
+    """hoplon as the one script remote mode sends: what `hoplon --bundle` writes."""
+    cmd = [HOPLON] if os.environ.get("HOPLON_BIN") else [sys.executable, HOPLON]
+    return subprocess.run(cmd + ["--bundle"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True).stdout
+
+
 class Child:
     def __init__(self, args, remote_info=None, keep=None):
         """hoplon --json ARGS, here, or (remote_info is remote.json) on the remote host over the ssh master. Remote,
         what hoplon reads first is its own source, then the config line, then the protocol (see remote.py); a
         thread writes it all so a slow or dead ssh can't freeze the screen."""
-        self.writes = None
+        self.writes = self.sent = None
         self.info, self.keep = remote_info, keep      # remote: where its saved session is kept, here
         if remote_info:
-            with open(HOPLON, "rb") as f:
-                source = f.read()
+            source = bundle()
+            self.sent = "sha256:" + hashlib.sha256(source).hexdigest()
             cmd = remote_info["ssh"] + [remote.bootstrap_command(remote_info, len(source), args)]
             args = []
             self.writes = queue.Queue()
@@ -1731,6 +1738,11 @@ class Child:
                     except OSError as e:
                         self.events.put({"type": "error", "message": f"could not save the session here: {e}"})
                 continue
+            if self.sent and isinstance(ev, dict) and ev.get("type") == "hello" and ev.get("bundle") != self.sent:
+                self.events.put({"type": "error", "message": f"hoplon on the remote host says it is running "
+                                 f"{str(ev.get('bundle'))[:80]}, not the bundle sent, {self.sent}: ending it"})
+                self.p.kill()
+                break
             self.events.put(ev)
         self.events.put({"type": "_exit", "code": self.p.wait(), "err": "\n".join(self.err)})
 

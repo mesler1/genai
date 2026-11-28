@@ -988,7 +988,7 @@ class TestEndToEnd(Tmp):
             g = self.start(api, "--coding")
             files = {"src/a.py": "one\nneedle here\n", "src/b.txt": "needle in text\n", "top.md": "x" * 300 + "needle\n",
                      ".hidden/c.py": "needle\n", "src/keys.py": "needle\nAPI_KEY=sk-abcdefghijklmnopqrstuvwx1234\n",
-                     "bin.dat": "needle\0"}
+                     "bin.dat": "needle\0", "src/server.key": "needle\n", "certs/id_rsa": "needle\n"}
             for name, text in files.items():
                 os.makedirs(os.path.dirname(self.path("wd", name)) or self.wd, exist_ok=True)
                 with open(os.path.join(self.wd, name), "w") as f:
@@ -1005,6 +1005,8 @@ class TestEndToEnd(Tmp):
             self.assertIn("(skipped 1 file binary, large or unreadable)", tools[0])
             self.assertIn("(skipped 1 file looking like secrets)", tools[0])
             self.assertNotIn("hidden", tools[0])
+            self.assertNotIn("server.key", tools[0])          # named like a secret: never searched without asking
+            self.assertNotIn("id_rsa", tools[0])
             self.assertNotIn("link/", tools[0])
             self.assertEqual(tools[1], "src/a.py:2: needle here\n(skipped 1 file looking like secrets)")
             self.assertIn("hidden directories are not searched", tools[2])

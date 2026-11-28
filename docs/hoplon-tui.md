@@ -117,7 +117,8 @@ What happens, before tmux starts (so a password or second factor is asked for in
 5. The conversation pane runs hoplon there over the same connection: a short Python program reads hoplon's own source
    from stdin (it is too big for a command line), runs it, and hoplon then reads a config line (the endpoint, whose
    `base_url` is that loopback port, the profile and the token) and the usual protocol. Nothing is installed or
-   left on the host, and it is always the same hoplon version as yours.
+   left on the host, and it is always the same hoplon version as yours. What is sent is `hoplon --bundle`; the
+   program hashes it as it arrives, and the conversation ends unless hoplon there names that same sha256.
 
 The proxy accepts only `GET /v1/models` and `POST /v1/chat/completions` with the token, adds the key and the
 endpoint's headers, and sends the request on through the endpoint's own TLS and proxy settings. On exit the proxy,

@@ -71,7 +71,8 @@ as if they do (the sha256 of each text, and where it was); remove an entry to be
 ## Files
 
 ```
-hoplon                      the client (one file)
+hoplon                      the client: a launcher that runs the parts below as one script
+hoplon_core/                the client's parts; gate.py decides what runs (see AUDIT.md)
 profiles/coder.json        example persona with coding mode
 skills/hoplon-endpoint/     helps you write an endpoint
 skills/hoplon-profile/      helps you write a profile (persona)

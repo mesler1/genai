@@ -212,6 +212,7 @@ class TestRunColours(unittest.TestCase):
         eng = types.SimpleNamespace(commands=[p], sandbox=None, audit=G.Audit(os.path.join(tmp, "audit.log")),
                                     secrets=lambda: [], share=lambda *a: None, user_turn=lambda *a: None,
                                     ui=G.PlainUI())
+        eng.run_shell = lambda *a: G.Engine.run_shell(eng, *a)
 
         def edit(text, title, what, cancel):
             bufs.append(text)

@@ -181,4 +181,4 @@ A small example front end over `--json`, to show that UI features belong there.
   is then plainly the wrapper author's choice.
 - **Tools from a file.** New tools come only from a wrapper over `--json`.
 - **Commands at session start.** Use your shell: `hoplon -f <(git status)`.
-- **Code loaded into hoplon.** No plugins, no imports. hoplon stays one file.
+- **Code loaded into hoplon.** No plugins, no imports. hoplon runs only its own parts.

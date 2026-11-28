@@ -192,7 +192,9 @@ out of process, in a tmux pane of its own: never inside the conversation pane, w
 (and, in remote mode, the ssh control socket and the key proxy's token). Its socket role, `commands:NAME`, may only
 run its own command set's read-only commands through hoplon (with hoplon's checks, cache and rate limits), put text in
 the input box, where you see it before anything is sent, and offer text that opens in your editor before it can
-go with a message. It can't answer a question, approve anything, or run a command that would ask. As for every
+go with a message. It can't answer a question or approve anything, and it can't run a write or a command run as another
+user. It can run read-only commands that use the network, which ask when the model calls them: those ask because the
+model would choose the values, and in a pane the pane chooses them, which you blessed. As for every
 pane, the boundary is your user account: another program running as you could connect in that role, as it could
 drive tmux. hoplon-tui starts the pane from the directory hoplon reported; it isn't re-hashed at that moment.
 
@@ -409,8 +411,16 @@ safe and prompts are rare enough to be read.
   wrapper that can read the digest can approve anything, and it runs as you anyway.
 - Every kind of proposal is one row of a table (`PROPOSAL_KINDS`), and `perform` runs a kind's
   handler only after an accept, except for commands (shown, never run) and kinds the wrapper
-  answers itself. `tests/test_invariants.py` checks this, and the audit and end-of-input rules
-  above, over every row.
+  answers itself. Each row names the request it makes of the gate (`GATE_REQUESTS`: a sandboxed
+  run, a scoped command, an edit, or what goes to the model), or none, and the only rules that may
+  approve it without asking (`AUTO_RULES`, such as `offline_run` or `approved_file`). One function,
+  `Gate.standing`, answers whether a proposal is already approved and by which rule, every
+  standing approval included (an approved plan, approved files, a blessing, a work session); it
+  is called once for each proposal, and only `Gate.grant` acts on its answer, refusing a rule
+  the kind doesn't list; each approval
+  by a rule is logged as a `decision` with `by` naming the rule, the same record your own decisions
+  get. `tests/test_invariants.py` checks all of this, and the audit and end-of-input rules above,
+  over every row, and that nothing else in hoplon makes a proposal automatic.
 - An edit that cannot be previewed is not applied.
 - An overwrite that cannot be shown as a diff (the existing file is binary or too large) shows
   the whole new content instead, says the file is replaced entirely, and says when it will stay
@@ -428,8 +438,8 @@ safe and prompts are rare enough to be read.
     to `ask` empties it, and declining any edit to a file takes that file out.
   - New files, hidden files, a file or new text that looks like a secret (including the endpoint
     key), and a whole replacement of a file that can't be diffed always ask.
-  - Each one is still shown with its diff, written to the audit log (`auto_edit`, and `file_op`
-    with `approved_file`), and bound to the file's state when it was proposed, like any write.
+  - Each one is still shown with its diff, written to the audit log (a `decision` by
+    `approved_file`, and `file_op` with `approved_file`), and bound to the file's state when it was proposed, like any write.
     The model can't change a file's mode, so that can't happen behind it either.
   - It is independent of plans: approving a plan adds no files to the set (a planned edit you
     then approve counts like any other), and the set doesn't approve plan steps.
@@ -575,6 +585,11 @@ How hoplon-tui sets it up (`hoplon-tui --remote`), and what each part is for:
   only the two allowed requests are ever forwarded (see `tui/keyproxy.py`).
 - hoplon's source goes to the host on stdin, not as a file: the remote command is a fixed Python bootstrap that reads
   exactly N bytes and executes them, so the host can't have a different or older hoplon than the one you have here.
+  What is sent is `hoplon --bundle`: the parts in `hoplon_core/` joined into one script, in a fixed order, the same
+  bytes for the same files. It is what runs here too: the `hoplon` script only builds it and runs it. The bootstrap
+  hashes the bytes as it receives them; hoplon there names that sha256 in its `hello` and in its audit log's `start`,
+  and hoplon-tui ends it unless the hash is that of exactly what it sent. Every `start` record carries `bundle`, the
+  hash of the hoplon that ran, so it can be checked against the source you audited (`hoplon --bundle` prints it).
 - The shell pane is `hoplon-ssh` over the same master, with the same handshake and key as always (see 7); with `--as`,
   `sudo -n -H -u USER` starts its bash, and `--dir` is where it starts. `--as` takes only a user that `sudo -n`
   accepts without a password, which the launcher checks first.
@@ -616,7 +631,9 @@ descriptions that changed after approval.
   `messages` or `tools`.
 - A skill is prompt text only. It cannot add a tool or turn on coding mode. Extra tools can be
   registered only by a wrapper over JSON, never from a file.
-- hoplon is one file with no dependencies outside the Python standard library.
+- hoplon is the `hoplon` launcher and the parts in `hoplon_core/`, with no dependencies outside the Python standard
+  library. `hoplon_core/gate.py` alone decides whether anything happens; [AUDIT.md](AUDIT.md) maps each claim here
+  to the code that keeps it and the test that shows it.
 - Hooks ([HOOKS.md](HOOKS.md)) are programs of yours that run without asking each time, so
   they are kept narrow. A hook is never read from the working directory. The notify hook is a single
   file in `~/.config/hoplon/hooks`, blessed like an endpoint, and checked before every run: a
@@ -678,7 +695,7 @@ stall hoplon.
 ### 12. Logging and accountability
 
 *NCSC guidance; LLM06.* `~/.config/hoplon/audit.log` records, one JSON object per line: session
-start, every proposal and decision, every file operation and its outcome, each `:run` and its
+start, every proposal and decision (an automatic one with `by`, the rule that approved it), every file operation and its outcome, each `:run` and its
 exit status, each time output was shared, blessings, coding-mode changes, tool registrations
 and compactions. It records what was proposed and decided, not file contents or command text.
 

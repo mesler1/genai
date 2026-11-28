@@ -9,7 +9,8 @@ The conversation pane (conversation.py) calls bootstrap_command() and runs hoplo
 without putting hoplon's source in the command line, which is limited to 128 KiB. A short Python program on the
 remote host reads the source from stdin first (exactly N bytes), runs it, and leaves the rest of stdin to hoplon:
 the config line, then the usual protocol. The remote hoplon is always the same version as the local one, and
-nothing is installed or left on that host.
+nothing is installed or left on that host. What is sent is `hoplon --bundle`, and the conversation pane ends hoplon
+there unless its hello names the sha256 of exactly that.
 
 A saved conversation stays on your machine too, in hoplon's sessions directory here, marked with the host and user
 it ran as. session_for() reads it into the config line when you resume; hoplon there keeps it only in memory and
@@ -31,9 +32,10 @@ USER_RE = re.compile(r"[A-Za-z0-9_.][A-Za-z0-9_.@-]*")
 PYTHON_RE = re.compile(r"python3(?:\.[0-9]+)?")
 
 # Read N bytes of source from stdin and run it as __main__ (hoplon finds its own options in sys.argv, and reads the
-# rest of stdin as protocol lines: sys.stdin shares its buffer with sys.stdin.buffer, so nothing is swallowed).
-BOOTSTRAP = ('import sys;n=int(sys.argv[1]);del sys.argv[1];'
-             'exec(compile(sys.stdin.buffer.read(n),"hoplon","exec"),globals())')
+# rest of stdin as protocol lines: sys.stdin shares its buffer with sys.stdin.buffer, so nothing is swallowed). The
+# bytes are hashed as received, and hoplon reports that hash (BUNDLE_SHA256) in its hello and its audit log.
+BOOTSTRAP = ('import sys,hashlib;n=int(sys.argv[1]);del sys.argv[1];s=sys.stdin.buffer.read(n);'
+             'BUNDLE_SHA256="sha256:"+hashlib.sha256(s).hexdigest();exec(compile(s,"hoplon","exec"),globals())')
 
 
 def check_destination(dest, as_user, directory):
