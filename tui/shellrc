@@ -45,8 +45,26 @@ HISTCONTROL=${HISTCONTROL//ignoreboth/ignorespace}
 HISTCONTROL=${HISTCONTROL//ignoredups/}
 HISTCONTROL=${HISTCONTROL//erasedups/}
 
+# A command hoplon-tui ran from a card gets a line above its output: yellow when it starts a container, red when it
+# runs live on this machine. hoplon-tui leaves the words in a pane option just before typing the command; this takes
+# them once, checks them, and prints the line before the start marker, so it is not part of the recorded output.
+__hoplon_mark() {
+  local m line w
+  [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ] || return 0
+  m=$(tmux display -p -t "$TMUX_PANE" '#{pane_width} #{@hoplon_mark}' 2>/dev/null) || return 0
+  w=${m%% *} m=${m#* }                      # the pane's width now: $COLUMNS may be from before a resize
+  [ -n "$m" ] || return 0
+  tmux set -pu -t "$TMUX_PANE" @hoplon_mark 2>/dev/null
+  [[ $m =~ ^(sandbox|live)\ [A-Za-z0-9\ ./_,-]{0,80}$ ]] || return 0
+  [[ $w =~ ^[0-9]{1,4}$ ]] || w=80
+  line="── ${m} "
+  while [ "${#line}" -lt "$w" ]; do line+="─"; done
+  if [ "${m%% *}" = sandbox ]; then printf '\e[1;33m%s\e[0m\n' "$line" >&2
+  else printf '\e[1;31m%s\e[0m\n' "$line" >&2
+  fi
+}
 # A command starts: bash prints PS0 after you press Enter and before the command runs.
-[ -n "$__hoplon_nonce" ] && PS0="${PS0:-}"$'\e]6973;'"$__hoplon_nonce"$';S\a'
+[ -n "$__hoplon_nonce" ] && PS0='$(__hoplon_mark)'"${PS0:-}"$'\e]6973;'"$__hoplon_nonce"$';S\a'
 # Continuation prompts accept bracketed input too, but must not receive a proposed command.
 [ -n "$__hoplon_nonce" ] && PS2='\['$'\e]6973;'"$__hoplon_nonce"$';P\a''\]'"${PS2:-}"
 # The next prompt: the exit code, whether a new history entry was made, the command line (base64),

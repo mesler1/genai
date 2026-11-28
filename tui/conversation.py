@@ -107,6 +107,51 @@ def command_text(command):
     return clean(command.replace("\t", "⇥"))
 
 
+# Programs that start a container, and the subcommands that do it (podman ps doesn't).
+CONTAINER_RUNS = {name: {"run", "exec", "start", "attach", "compose"} for name in ("podman", "docker", "nerdctl")}
+CONTAINER_RUNS.update({name: {"run", "exec", "shell", "instance"} for name in ("apptainer", "singularity")})
+_PREFIXES = {"sudo", "exec", "time", "command", "nohup", "nice"}       # what comes before the program it runs
+MARK_ID = re.compile(r"[A-Za-z0-9_-]{1,16}")
+
+
+def run_mark(command, shell_where=None):
+    """Where a command you run from a card goes: ("sandbox", what) if the shell pane is in a sandbox, or if every
+    part of the command starts a container (or is a cd); otherwise ("live", "this machine"). From the command line
+    only: a script that starts podman itself is "live", which is the safe way to be wrong."""
+    if (shell_where or "").startswith("inside"):
+        return "sandbox", "the shell pane is in a sandbox"
+    try:
+        lex = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        tokens = list(lex)
+    except ValueError:
+        return "live", "this machine"
+    segments, cur = [], []
+    for t in tokens + [";"]:
+        if t and all(c in ";&|()\n" for c in t):
+            if cur:
+                segments.append(cur)
+            cur = []
+        else:
+            cur.append(t)
+    tools = []
+    for seg in segments:
+        while seg and (re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", seg[0]) or seg[0] in _PREFIXES):
+            seg = seg[1:]
+        if not seg or seg[0] == "cd":
+            continue
+        name, rest = os.path.basename(seg[0]), [w for w in seg[1:] if not w.startswith("-")]
+        if name in CONTAINER_RUNS and rest and rest[0] in CONTAINER_RUNS[name]:
+            tools.append(f"{name} {rest[0]}")
+        elif seg[0].endswith("sandbox/run"):
+            tools.append("sandbox/run" + (f" {rest[0]}" if rest and re.fullmatch(r"[a-z]{1,12}", rest[0]) else ""))
+        else:
+            return "live", "this machine"
+    if not tools:
+        return "live", "this machine"
+    return "sandbox", ", ".join(dict.fromkeys(tools))
+
+
 def unsafe_chars(command):
     """Control, bidi and invisible characters: clean() shows them as escapes, so the command shown would not be
     the command typed. Such a command is never sent to the shell pane."""
@@ -1604,6 +1649,15 @@ class Shell:
                 raise Busy("the shell changed before Enter")
             self.tmux("send-keys", "-t", self.pane, "Enter", check=True)
 
+    def mark(self, text):
+        """The line the shell pane prints before the next command's output (shellrc's __hoplon_mark), or None to
+        take it back. Only letters, digits, spaces and . / _ , - get there; shellrc checks that again."""
+        if text is None:
+            self.tmux("set", "-pu", "-t", self.pane, "@hoplon_mark")
+        else:
+            self.tmux("set", "-p", "-t", self.pane, "@hoplon_mark", re.sub(r"[^A-Za-z0-9 ./_,-]", "", text)[:80],
+                      check=True)
+
     def lines(self, upto=None):
         """The pane's history and screen as logical lines, to the cursor's line, or to row upto counted from the
         oldest line of history."""
@@ -2499,13 +2553,20 @@ class App:
 
     def start_run(self, card, command, context):
         done = self.rec.done
+        kind, what = run_mark(command, self.m.shell_where)
+        cid = card.id if MARK_ID.fullmatch(str(card.id)) else ""
         try:
+            if not (self.shell.remote_prompt and self.shell.remote_prompt()):    # a shell on another host can't see it
+                self.shell.show()                        # first, so the line is drawn as wide as the pane you see
+                self.shell.mark(f"{kind} {what} {cid}".rstrip())     # yellow sandbox, or red live, above its output
             self.shell.type(command, expected=context)
         except Busy as e:
+            self.shell_unmark()
             self.m.note(f"{card.id} not run: the shell pane is busy ({e}). /shell shows it; when it is back at its "
                         f"prompt, /run {card.id} again.", R)
             return
         except (OSError, subprocess.SubprocessError) as e:
+            self.shell_unmark()
             self.m.note(f"{card.id} not run: tmux failed ({e})", R)
             return
         self.shell.show()                                # so the command can be watched as it runs
@@ -2514,6 +2575,12 @@ class App:
         self.m.number_commands()
         card.changed()
         self.running = {"card": card, "command": command, "done": done}
+
+    def shell_unmark(self):
+        try:
+            self.shell.mark(None)
+        except (OSError, subprocess.SubprocessError):
+            pass
 
     def poll_run(self):
         """Has the command from /run finished? Then offer to share its output."""

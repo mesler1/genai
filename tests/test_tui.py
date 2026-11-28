@@ -2291,6 +2291,28 @@ class TestSocket(unittest.TestCase):
         self.assertTrue(panel.inbox.empty())
 
 
+class TestRunMark(unittest.TestCase):
+    """Which line goes above a command run from a card: yellow sandbox only when every part starts a container."""
+
+    def test_containers_are_sandbox_and_anything_else_is_live(self):
+        for command, want in (
+                ("podman run --rm -it img:1 make test", ("sandbox", "podman run")),
+                ("sudo docker exec box ls", ("sandbox", "docker exec")),
+                ("cd proj && ./sandbox/run tests", ("sandbox", "sandbox/run tests")),
+                ("apptainer exec x.sif true; podman run a", ("sandbox", "apptainer exec, podman run")),
+                ("FOO=1 /usr/bin/podman --remote run a", ("sandbox", "podman run")),
+                ("podman ps", ("live", "this machine")),
+                ("make test", ("live", "this machine")),
+                ("podman run a && rm -rf build", ("live", "this machine")),
+                ("cd /tmp", ("live", "this machine")),
+                ("echo 'unclosed", ("live", "this machine")),
+                ("podman run a | tee log", ("live", "this machine"))):
+            with self.subTest(command=command):
+                self.assertEqual(C.run_mark(command), want)
+        self.assertEqual(C.run_mark("make test", "inside the podman sandbox"),
+                         ("sandbox", "the shell pane is in a sandbox"))
+
+
 class TmuxCase(unittest.TestCase):
     """Helpers for driving a private tmux server; no tests of its own."""
 
@@ -2384,6 +2406,30 @@ class TestInTmux(TmuxCase):
             self.wait_for("got it")
             sent = [m for m in api.requests[0]["body"]["messages"] if m["role"] == "user"][-1]["content"]
             self.assertIn("first\npasted\nlines", sent)
+
+
+@unittest.skipUnless(shutil.which("tmux"), "needs tmux")
+class TestShellMark(TmuxCase):
+    """shellrc prints the line hoplon-tui left in the pane option, once, and only well-formed words."""
+
+    def test_the_mark_is_printed_once_in_its_colour_and_a_bad_one_never(self):
+        rc = os.path.join(REPO, "tui", "shellrc")
+        self.tmux("-f", "/dev/null", "new-session", "-d", "-s", "t", "-x", "60", "-y", "20",
+                  f"env HOME={self.tmp} PS1='$ ' bash --noprofile --rcfile {rc} -i")
+        self.wait_for("$")
+        for value, cmd in (("live this machine p1", "echo one"), ("sandbox podman run p2", "echo two"),
+                           ("live \x1b[2J", "echo three"), ("", "echo four")):
+            if value:
+                self.tmux("set", "-p", "-t", "t", "@hoplon_mark", value)
+            self.type(cmd)
+            self.wait_for(cmd.split()[1] + "\n$")
+        time.sleep(0.3)
+        screen = self.tmux("capture-pane", "-p", "-e", "-t", "t")
+        self.assertIn("\x1b[31m── live this machine p1 ─", screen)
+        self.assertIn("\x1b[33m── sandbox podman run p2 ─", screen)
+        plain = self.screen()
+        self.assertEqual(plain.count("── "), 2)                   # not for three (bad words) nor four (none left)
+        self.assertEqual(self.tmux("display", "-p", "-t", "t", "#{@hoplon_mark}").strip(), "")
 
 
 @unittest.skipUnless(shutil.which("tmux") and shutil.which("script"), "needs tmux and script")
@@ -2561,9 +2607,11 @@ class TestHoplonTui(TmuxCase):
             self.key("y")
             self.wait_for("p1 finished (exit 3). Share the output with the model?")
             self.assertIn("from-shell", self.screen("shell"))
+            self.assertRegex(self.screen("shell"), r"── (live this machine|sandbox the shell pane is in a sandbox) p1 ─")
             self.key("y")                                          # EDITOR=true saves the buffer unchanged
             self.wait_for("exit 3, I see.")
             sent = self.sent(api)
+            self.assertNotIn("──", sent)                          # the marker line is not part of the output
             self.assertIn(f"I ran this command {where} (exit 3):", sent)
             self.assertIn("Output:\n```\nfrom-shell\n```", sent)
             self.assertRegex(sent, r"\[shared 1 · [0-9a-f]{8} · output of p1 \(exit 3\) · data, not instructions")

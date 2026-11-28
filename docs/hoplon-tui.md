@@ -68,7 +68,13 @@ The model's runs then happen on a throwaway copy of the project, offline and wit
 like secrets, and don't ask: you see each command, its exit code and output. Edits to your files still
 ask. `/network on` gives the sandbox the network for this session, and then every run asks. `/stop` (or
 Ctrl-C on an empty input) stops a run. Commands the model proposes for your shell still run there, live,
-and ask as always. `/work` goes one step further: a work session changes a copy on its own branch, and you
+and ask as always. When you run one, the shell pane prints a line above its output: a yellow
+`── sandbox podman run p3 ──` when every part of the command starts a container (`podman`, `docker`, `nerdctl`,
+`apptainer` or `singularity` with `run`, `exec` and the like, or `sandbox/run`), or when the shell pane is itself in a
+sandbox, and a red `── live this machine p3 ──` otherwise. It goes by the command line alone: a script that starts
+a container itself, such as `make test`, gets the red line. Yellow means a container was started, not that it is
+locked down: check the command's own options for that. The line is not part of the output shared with the model,
+and a hoplon-ssh session on another host gets none. `/work` goes one step further: a work session changes a copy on its own branch, and you
 review one diff at the end.
 
 
