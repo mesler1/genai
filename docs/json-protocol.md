@@ -5,7 +5,8 @@
 still enforces its own rules: blessing, coding-mode refusals, masking. Text from the model
 arrives as it is, so the wrapper must escape it before it displays it.
 
-hoplon's first line is `hello`. It has `protocol` (1), `version`, `features`, `endpoint` (`name`, `base_url`, `model`, and `alias`: the endpoint's name for that model, or `null`),
+hoplon's first line is `hello`. It has `protocol` (1), `version`, `bundle` (the sha256 of the hoplon that is running,
+as `hoplon --bundle` prints it; in remote mode, of the bytes the host received), `features`, `endpoint` (`name`, `base_url`, `model`, and `alias`: the endpoint's name for that model, or `null`),
 `profile` (its `name` and `description`, and its `layout` when it sets one), `session`, `resumed`, `coding`, `coding_from`, `coding_override`, `cwd`, `sandbox`,
 `runner` (the profile's sandbox for `run_in_sandbox`: `engine`, `image` (`null` for this host's OS),
 `uses` (the image, or a description of the host OS), `network`, `timeout`, `memory`, `pids` and `problem`, or `null`), the active `skills` and `command_sets`, and the model's `tools`. Check `features` before you use a message added

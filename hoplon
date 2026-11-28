@@ -7523,7 +7523,8 @@ def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()
             raise KeyboardInterrupt
     signal.signal(signal.SIGINT, on_sigint)
     user, uid = whoami()
-    ui.emit({"type": "hello", "protocol": PROTOCOL, "version": VERSION,
+    ran = running_bundle()
+    ui.emit({"type": "hello", "protocol": PROTOCOL, "version": VERSION, "bundle": ran,
              "host": socket.gethostname(), "user": user, "uid": uid, "remote": remote,
              "features": ["proposals", "decisions", "attach", "register_tools", "compact", "context", "coding",
                           "fixtures", "leftovers",
@@ -7542,7 +7543,7 @@ def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()
              "skills": [s.name for s in engine.skills],
              "command_sets": [p.name for p in engine.command_sets],
              "tools": list(INTRINSICS)})
-    engine.audit.log("start", mode="json", endpoint=engine.endpoint.info(),
+    engine.audit.log("start", mode="json", bundle=ran, endpoint=engine.endpoint.info(),
                      profile=engine.profile.name if engine.profile else None, session=engine.session.id,
                      sandbox=engine.sandbox)
     for n in after_hello:
@@ -7664,6 +7665,57 @@ def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()
             ui.error(f"no pending proposal {msg.get('id')!r}", "unknown_id")
         else:
             ui.error(f"unknown message type '{t}'", "unknown_type")
+
+
+# --------------------------------------------------------------------------
+# The bundle: hoplon as one script, for remote mode
+
+BUNDLE_PACKAGE = "hoplon_core"      # the package beside this script, once hoplon is split into parts
+BUNDLE_LOADER = '''
+import importlib.abc as _abc, importlib.util as _util, sys as _sys
+class _Bundled(_abc.MetaPathFinder, _abc.Loader):
+    """Imports the bundled modules from _BUNDLED, and nothing else."""
+    def find_spec(self, name, path, target=None):
+        if name in _BUNDLED:
+            return _util.spec_from_loader(name, self, is_package="." not in name)
+    def create_module(self, spec):
+        return None
+    def exec_module(self, module):
+        exec(compile(_BUNDLED[module.__name__], "<bundle>/" + module.__name__, "exec"), module.__dict__)
+_sys.meta_path.insert(0, _Bundled())
+'''
+
+
+def bundle(script=None):
+    """hoplon as one script: remote mode sends this over ssh and runs it, so the source that was audited is the source
+    that runs. Deterministic: the same files give the same bytes, whatever their order on disk or their times. While
+    hoplon is one file, the bundle is that file. Once it has a package beside it (BUNDLE_PACKAGE), its modules go in
+    first, sorted by name, each as a string the script imports from."""
+    script = script or os.path.abspath(__file__)
+    with open(script, "rb") as f:
+        main = f.read()
+    pkg = os.path.join(os.path.dirname(script), BUNDLE_PACKAGE)
+    if not os.path.isdir(pkg):
+        return main
+    mods = {}
+    for name in sorted(os.listdir(pkg)):
+        if name.endswith(".py"):
+            with open(os.path.join(pkg, name), encoding="utf-8") as f:
+                mods[BUNDLE_PACKAGE if name == "__init__.py" else f"{BUNDLE_PACKAGE}.{name[:-3]}"] = f.read()
+    head, _, body = main.partition(b"\n") if main.startswith(b"#!") else (b"", b"", main)
+    table = "_BUNDLED = {\n" + "".join(f"    {k!r}: {v!r},\n" for k, v in sorted(mods.items())) + "}\n"
+    return (head + b"\n" if head else b"") + (table + BUNDLE_LOADER).encode() + b"\n" + body
+
+
+def bundle_digest(data):
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def running_bundle():
+    """The digest of the bundle that is running: the one remote mode's bootstrap hashed as it received it, or the one
+    the files here make."""
+    sent = globals().get("BUNDLE_SHA256")
+    return sent if isinstance(sent, str) else bundle_digest(bundle())
 
 
 # --------------------------------------------------------------------------
@@ -8193,12 +8245,20 @@ def parse_args(argv):
                          "how to remove it (with --json: as JSON)")
     ap.add_argument("--clean-stale", action="store_true",
                     help="remove the stale leftovers that can be removed safely, after showing them and asking")
+    ap.add_argument("--bundle", action="store_true",
+                    help="write hoplon as the one script remote mode sends to stdout, and its sha256 to stderr")
     ap.add_argument("--version", action="version", version=f"hoplon {VERSION} (protocol {PROTOCOL})")
     return ap.parse_args(argv)
 
 
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    if args.bundle:
+        data = bundle()
+        sys.stdout.buffer.write(data)
+        sys.stdout.flush()
+        eprint(bundle_digest(data))
+        return EXIT_OK
     try:
         if args.config_stdin and not args.json:
             raise HoplonError("--config-stdin needs --json", EXIT_USAGE)
@@ -8334,7 +8394,8 @@ def main(argv=None):
                 return run_json(engine, ui, prompt, attachments, args.config_stdin, after_hello)
             finally:
                 engine.leave_work()
-        cfg.audit.log("start", mode="repl" if prompt is None else "oneshot", endpoint=endpoint.info(),
+        cfg.audit.log("start", mode="repl" if prompt is None else "oneshot", bundle=running_bundle(),
+                      endpoint=endpoint.info(),
                       profile=persona.name if persona else None,
                       session=session.id, sandbox=engine.sandbox)
         if prompt is None:

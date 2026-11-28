@@ -7,6 +7,7 @@ tests/remote_sshd.sh and is skipped without it.
 """
 
 import base64
+import hashlib
 import importlib.machinery
 import importlib.util
 import json
@@ -28,7 +29,7 @@ REPO = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(REPO, "tui"))
 from fakeapi import FakeAPI, call, reply  # noqa: E402
-from test_hoplon import Tmp, bless_path, make_home, write_json  # noqa: E402
+from test_hoplon import G, Tmp, bless_path, make_home, write_json  # noqa: E402
 import test_hoplon  # noqa: E402
 import test_tui  # noqa: E402
 
@@ -301,6 +302,62 @@ class TestEndToEnd(RemoteCase):
         cmd = remote.bootstrap_command(info, len(src), []).replace(" --json --config-stdin", " one two")
         r = subprocess.run(["sh", "-c", cmd], input=src + b"first line\nsecond\n", capture_output=True)
         self.assertEqual(r.stdout.decode().strip(), "first line ['one', 'two']", r.stderr)
+
+
+class TestBundle(RemoteCase):
+    """Remote mode sends `hoplon --bundle`, the remote host hashes what it receives before running it, and hello names
+    that hash: the source that was audited is the source that ran."""
+
+    def test_hello_names_the_bundle_that_was_sent(self):
+        c = self.child(self.write_info())
+        hello, seen = self.until(c, "hello")
+        self.assertEqual(hello["type"], "hello", seen)
+        with open(os.path.join(REPO, "hoplon"), "rb") as f:
+            whole = f.read()
+        self.assertEqual(C.bundle(), whole)         # while hoplon is one file, the bundle is that file
+        self.assertEqual(hello["bundle"], "sha256:" + hashlib.sha256(whole).hexdigest())
+        self.assertEqual(hello["bundle"], c.sent)
+
+    def test_a_host_that_runs_something_else_is_ended(self):
+        lying = remote.BOOTSTRAP.replace('BUNDLE_SHA256="sha256:"+hashlib.sha256(s).hexdigest()',
+                                         'BUNDLE_SHA256="sha256:" + "0" * 64')
+        self.assertNotEqual(lying, remote.BOOTSTRAP)
+        with mock.patch.object(remote, "BOOTSTRAP", lying):
+            c = self.child(self.write_info())
+            ev, seen = self.until(c, "hello", "error")
+        self.assertEqual(ev["type"], "error", seen)
+        self.assertIn("not the bundle sent", ev["message"])
+        self.assertNotIn("hello", [e["type"] for e in seen])
+        ev, _ = self.until(c, "_exit")
+        self.assertEqual(ev["type"], "_exit")
+
+
+class TestBundler(Tmp):
+    """Once hoplon has a package beside it, the bundle carries its modules: the same files give the same bytes, and
+    the bundle runs as the files do."""
+
+    def make(self, where, order):
+        os.makedirs(os.path.join(where, "hoplon_core"))
+        files = {"hoplon": "#!/usr/bin/env python3\nimport hoplon_core.b as b\nprint(b.WORD, __name__)\n",
+                 "hoplon_core/__init__.py": "", "hoplon_core/a.py": "WORD = 'gate'\n",
+                 "hoplon_core/b.py": "from hoplon_core.a import WORD\n"}
+        for name in order:
+            with open(os.path.join(where, name), "w") as f:
+                f.write(files[name])
+        return os.path.join(where, "hoplon")
+
+    def test_the_same_files_make_the_same_bundle_and_it_runs(self):
+        one = self.make(self.path("one"), ["hoplon", "hoplon_core/__init__.py", "hoplon_core/a.py", "hoplon_core/b.py"])
+        two = self.make(self.path("two"), ["hoplon_core/b.py", "hoplon_core/a.py", "hoplon_core/__init__.py", "hoplon"])
+        os.utime(os.path.join(self.path("two"), "hoplon_core", "a.py"), (1, 1))
+        data = G.bundle(one)
+        self.assertEqual(data, G.bundle(two))
+        self.assertTrue(data.startswith(b"#!/usr/bin/env python3\n"))
+        direct = subprocess.run([sys.executable, one], capture_output=True, text=True)
+        cmd = remote.bootstrap_command({"python": sys.executable}, len(data), []).replace(" --json --config-stdin", "")
+        sent = subprocess.run(["sh", "-c", cmd], input=data, capture_output=True, cwd=self.tmp)
+        self.assertEqual(direct.stdout, "gate __main__\n", direct.stderr)
+        self.assertEqual(sent.stdout.decode(), direct.stdout, sent.stderr)
 
 
 class TestCommandSetsAndSkills(RemoteCase):

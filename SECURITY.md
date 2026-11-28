@@ -583,6 +583,10 @@ How hoplon-tui sets it up (`hoplon-tui --remote`), and what each part is for:
   only the two allowed requests are ever forwarded (see `tui/keyproxy.py`).
 - hoplon's source goes to the host on stdin, not as a file: the remote command is a fixed Python bootstrap that reads
   exactly N bytes and executes them, so the host can't have a different or older hoplon than the one you have here.
+  What is sent is `hoplon --bundle`: hoplon as one script, the same bytes for the same files. The bootstrap hashes
+  the bytes as it receives them; hoplon there names that sha256 in its `hello` and in its audit log's `start`, and
+  hoplon-tui ends it unless the hash is that of exactly what it sent. Every `start` record carries `bundle`, the
+  hash of the hoplon that ran, so it can be checked against the source you audited (`hoplon --bundle` prints it).
 - The shell pane is `hoplon-ssh` over the same master, with the same handshake and key as always (see 7); with `--as`,
   `sudo -n -H -u USER` starts its bash, and `--dir` is where it starts. `--as` takes only a user that `sudo -n`
   accepts without a password, which the launcher checks first.
