@@ -379,13 +379,15 @@ _KEY_END = re.compile(r"-----END [A-Z0-9 ]*PRIVATE KEY-----")
 
 def _code_not_secret(m):
     """An unquoted value that is plainly code, not a secret: a call or an index (token.strip(), get_token()), or a
-    variable of the same name (token = token, self.api_key = api_key). A quoted value is never excused."""
+    variable of the same name (token = token, self.api_key = api_key, and in C or JavaScript token = ++state.token;).
+    A quoted value is never excused."""
     prefix, value = m.group(1), m.group(3)
     if prefix.endswith(("'", '"')):
         return False
     if any(c in value for c in "()[]{}") or m.string[m.end():m.end() + 1] in ("(", "["):
         return True
     name = re.match(r"[\w.-]*", prefix).group(0).lower()
+    value = value.lstrip("+-!*&").rstrip(";,")       # an operator before the name, a statement's end after it
     return value.lower().rsplit(".", 1)[-1] == name.rsplit(".", 1)[-1]
 
 
