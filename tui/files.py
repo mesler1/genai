@@ -23,7 +23,7 @@ from ipc import Client
 STATE = os.environ.get("HOPLON_TUI_STATE", "")
 MAX_ENTRIES = 2000
 KINDS = ("file", "dir", "symlink", "other")
-HINT = "↑↓ move · →← open/close · Enter view · a attach · i insert path · . hidden · r refresh"
+HINT = "↑↓ move · →← open/close · Enter view · a attach · i insert path · s not secret · . hidden · r refresh"
 
 
 def human(n):
@@ -282,6 +282,10 @@ class Tree:
             return self.file_action(cur, "attach")
         elif k == "i":
             return [{"type": "insert", "path": cur["path"]}]
+        elif k == "s":
+            if cur["e"]["kind"] == "file" and cur["e"]["secret"]:
+                return [{"type": "not_secret", "path": cur["path"]}]
+            self.note = "only a file marked ⚠ can be marked as holding no secrets"
         return []
 
     def click(self, index, w=80):

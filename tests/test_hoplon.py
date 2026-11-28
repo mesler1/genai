@@ -1301,6 +1301,38 @@ class TestEndToEnd(Tmp):
         self.assertEqual([v["path"] for v in saved.values()], [path])
         self.assertEqual([a["path"] for a in self.audit() if a["event"] == "not_secret"], [path])
 
+    def test_you_can_mark_a_file_yourself_once_you_have_seen_it(self):
+        with FakeAPI([]) as api:
+            g = self.start(api)
+            for name, text in (("notes.txt", "password = hunter2xyz\n"), ("plain.txt", "hello\n"),
+                               ("deploy.key", "password = hunter2xyz\n")):
+                with open(os.path.join(self.wd, name), "w") as f:
+                    f.write(text)
+            g.send({"type": "read", "path": "notes.txt"})
+            seen = g.until("file")
+            self.assertTrue(seen["secret"])
+            self.assertEqual(seen["sha256"], G.text_digest("password = hunter2xyz\n"))
+            for path, why in (("notes.txt", "changed since you looked"), ("plain.txt", "nothing in it looks"),
+                              ("deploy.key", "its name says"), ("../x", "'..' is not allowed")):
+                with self.subTest(path=path):
+                    sha = "0" * 64 if path == "notes.txt" else seen["sha256"]
+                    g.send({"type": "not_secret", "marks": [{"path": path, "sha256": sha}]})
+                    self.assertEqual(g.until("not_secret")["marked"], [])
+                    err = g.until("error")
+                    self.assertEqual(err["code"], "not_secret")
+                    self.assertIn(why, err["message"])
+            g.send({"type": "not_secret", "marks": [{"path": "notes.txt"}]})
+            self.assertEqual(g.until("error")["code"], "bad_message")
+            g.send({"type": "not_secret", "marks": [{"path": "notes.txt", "sha256": seen["sha256"]}]})
+            self.assertEqual(g.until("not_secret")["marked"], [{"path": "notes.txt", "sha256": seen["sha256"]}])
+            g.send({"type": "files", "path": "."})
+            rows = {r["name"]: r for r in g.until("files")["entries"]}
+            self.assertFalse(rows["notes.txt"]["secret"])
+            self.assertTrue(rows["deploy.key"]["hidden"])
+            g.close()
+        marks = [a for a in self.audit() if a["event"] == "not_secret"]
+        self.assertEqual([(a["path"], a["source"]) for a in marks], [(os.path.join(self.wd, "notes.txt"), "wrapper")])
+
     def test_the_endpoint_key_is_never_excused(self):
         e = types.SimpleNamespace(secrets=lambda: ["KEY12345678"], cfg=types.SimpleNamespace(not_secret=dict))
         text = "x = KEY12345678\n"

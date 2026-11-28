@@ -1,6 +1,8 @@
 """Tests for where coding mode is allowed, secret-looking files in coding mode, and what the model
 may learn about the disk before an approval. Run: python3 -m unittest discover -s tests"""
 
+import contextlib
+import io
 import json
 import os
 import sys
@@ -232,6 +234,24 @@ class TestSecrets(Guard):
         with mock.patch.object(G, "ask_yes", return_value=True):
             _, told = self.run_call(eng, "read_file", path="conf.txt", reason="r")
         self.assertIn("api_key=", told)
+
+    def test_not_secret_in_the_repl_shows_each_file_and_marks_only_a_yes(self):
+        eng, _ = self.engine(self.proj, session_coding=True)
+        out, answers = io.StringIO(), iter([False, True])
+        with mock.patch.object(G.os, "getcwd", return_value=self.proj), contextlib.redirect_stdout(out), \
+                mock.patch.object(G, "ask_yes", side_effect=lambda q: next(answers)):
+            G.repl_command(G.FRONT_COMMANDS["not_secret"], eng, "key.txt conf.txt notes.txt ../elsewhere")
+        shown = out.getvalue()
+        self.assertIn("1 | api_key=abcdef1234567890abcdef", shown)               # the lines it took for secrets
+        self.assertIn("notes.txt: hoplon doesn't take it for a secret, skipped", shown)
+        self.assertIn("../elsewhere: not in the project, skipped", shown)
+        self.assertIn("conf.txt: marked as holding no secrets", shown)
+        self.assertEqual([v["path"] for v in eng.cfg.not_secret().values()], [os.path.join(self.proj, "conf.txt")])
+        out = io.StringIO()
+        with mock.patch.object(G.os, "getcwd", return_value=self.proj), contextlib.redirect_stdout(out), \
+                mock.patch.object(G, "ask_yes", return_value=False):
+            G.repl_command(G.FRONT_COMMANDS["not_secret"], eng, "key.txt")
+        self.assertIn("Nothing marked.", out.getvalue())
 
     def test_ordinary_file_is_read_without_asking(self):
         eng, ui = self.engine(self.proj, session_coding=True)

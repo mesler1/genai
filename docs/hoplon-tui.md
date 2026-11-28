@@ -145,6 +145,13 @@ remembers that exact text in `~/.config/hoplon/not-secret.json` and won't ask ab
 it in searches or hide it from sandboxed runs, until the file changes. A file holding the endpoint's
 key always asks. Remove an entry from that file, or the file, to be asked again.
 
+You don't have to wait for the model to read a file. In the files pane, a file hoplon thinks holds
+secrets is marked ⚠; `s` on it shows it in the pager, then asks whether it holds no real secrets. Say
+`y` and hoplon marks the text you saw, refusing if the file changed in between. That is the way to let
+a project's test fixtures, full of fake keys, into the sandbox. A name that is a secret by definition
+(`.env`, `id_rsa`, `*.key`) can't be marked. A sandboxed run's card says how many files your list let
+through.
+
 ## The right column
 
 The info panel sits on the right, and `/panel` shows or hides that column. A command set's pane (`/commands NAME pane`)
@@ -159,7 +166,8 @@ column (it keeps running; the same command brings it back).
 with it shown, as does a profile whose `layout` says `"files": "shown"`; see
 [endpoints-and-profiles.md](endpoints-and-profiles.md)). Move with the arrow keys; Right or Enter opens a directory and Left closes it; `.`
 shows or hides hidden files and `r` refreshes. On a file, Enter views it in the pager, `a` attaches it
-to your next message and `i` puts its path in the input box. A `⚠` marks a file hoplon thinks holds
+to your next message, `i` puts its path in the input box and, on a file marked `⚠`, `s` marks it as
+holding no secrets once you've seen it ([above](#files-that-look-like-secrets)). A `⚠` marks a file hoplon thinks holds
 secrets, `⚿` one the model would have to ask about first, and `↪` a symlink, which is not followed.
 
 Browsing sends nothing to the model. Listings and files come through hoplon, which applies its usual

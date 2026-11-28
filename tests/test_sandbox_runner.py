@@ -162,8 +162,13 @@ class TestMasks(FakePodman):
         root = self.project({"conf/settings.ini": text, ".env": "X=1\n"})
         box = G.Sandbox(conf(), root, print)
         self.assertEqual(box.masks(), ([".env", "conf/settings.ini"], []))
+        self.assertEqual(box.let_through, [])
         box.excused = lambda: {G.text_digest(text): {}}
         self.assertEqual(box.masks(), ([".env"], []))              # a secret name still hides
+        self.assertEqual(box.let_through, ["conf/settings.ini"])
+        self.assertEqual(box.mask_note(1), "1 secret-looking path hidden, 1 let through by your not-secret list")
+        box.let_through = []
+        self.assertEqual((box.mask_note(2), box.mask_note(0)), ("2 secret-looking paths hidden", ""))
 
     def test_the_endpoint_key_is_a_secret_too(self):
         root = self.project({"notes.txt": "the key is abcdef0123456789xyz\n"})
@@ -319,6 +324,20 @@ class TestSandboxLoop(FakePodman):
         events = {e["event"] for e in self.audit()}
         self.assertTrue({"sandbox_exit"} <= events)
         self.assertFalse(any("cat a.txt" in json.dumps(e) for e in self.audit()))   # commands by fingerprint only
+
+    def test_a_run_names_the_files_your_list_let_through(self):
+        text = "password = hunter2hunter2\n"
+        with FakeAPI([call("run_in_sandbox", command="true", reason="t"), reply("ok")]) as api:
+            g = self.start(api, {"image": "img:1"})
+            self.project({"conf.ini": text})        # the fake podman hides nothing, so nothing else may need it
+            write_json(os.path.join(self.home, "not-secret.json"), {G.text_digest(text): {"path": "conf.ini"}})
+            g.send({"type": "user", "text": "x"})
+            r = g.until("result")
+            self.assertIn("1 let through by your not-secret list", r["detail"])
+            g.until("done")
+            g.close()
+        exits = [e for e in self.audit() if e["event"] == "sandbox_exit"]
+        self.assertEqual(exits[0]["let_through"], ["conf.ini"])
 
     def test_not_offered_outside_coding_mode(self):
         with FakeAPI([call("run_in_sandbox", command="true", reason="t"), reply("ok")]) as api:

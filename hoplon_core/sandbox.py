@@ -284,6 +284,7 @@ class Sandbox:
         self.limits = True                  # False once the host refused memory and process limits
         self.cache = {}                     # (path, identity) -> (looks secret, digest, holds a value)
         self.excused = dict                 # -> the not-secret digests (Config.not_secret), set by the Engine
+        self.let_through = []               # set by masks()
         self.counter = 0
 
     def problem(self):
@@ -305,8 +306,10 @@ class Sandbox:
     def masks(self, values=()):
         """Files and directories to hide in the sandbox, relative to the project: secret-looking names, and
         files whose contents look like secrets. Dependency caches and a virtual environment's packages (VENV_PARTS)
-        are not scanned; a .git directory only has its config checked. Raises HoplonError if the project is too big to check."""
+        are not scanned; a .git directory only has its config checked. Raises HoplonError if the project is too big to check.
+        Sets let_through: the files that look like secrets but that you marked as holding none (Config.not_secret)."""
         files, dirs, seen, venvs = [], [], 0, set()
+        self.let_through = []
         stack = [""]
         while stack:
             rel = stack.pop()
@@ -328,19 +331,19 @@ class Sandbox:
                         if secret_name(e.name):
                             dirs.append(r)
                         elif e.name == ".git":
-                            if self.secret_file(os.path.join(e.path, "config"), values):
+                            if self.secret_file(os.path.join(e.path, "config"), values, r + "/config"):
                                 files.append(r + "/config")
                         elif e.name not in SCAN_SKIP and not (e.name in VENV_PARTS and rel in venvs):
                             stack.append(r)
                             if is_plain_file(os.path.join(e.path, "pyvenv.cfg")):
                                 venvs.add(r)
-                    elif e.is_file() and (secret_name(e.name) or self.secret_file(e.path, values)):
+                    elif e.is_file() and (secret_name(e.name) or self.secret_file(e.path, values, r)):
                         files.append(r)
                 except OSError:
                     continue
         return files, dirs
 
-    def secret_file(self, path, values):
+    def secret_file(self, path, values, rel=None):
         try:
             st = os.stat(path, follow_symlinks=False)
             if not stat.S_ISREG(st.st_mode):
@@ -351,7 +354,12 @@ class Sandbox:
                     text = f.read(READ_CAP).decode("utf-8", "replace")
                 self.cache[key] = (looks_secret(text), text_digest(text), any(v and v in text for v in values))
             looks, digest, holds = self.cache[key]
-            return holds or (looks and digest not in self.excused())
+            if holds or not looks:
+                return holds
+            if digest in self.excused():
+                self.let_through.append(rel or path)
+                return False
+            return True
         except OSError:
             return False
 
@@ -417,7 +425,14 @@ class Sandbox:
             hint = (f" (podman pull {self.conf['image']} first)" if self.conf["image"] and "image not known" in out
                     else "")
             return False, None, "", f"the sandbox could not start: {one_line(out.strip())[0]}{hint}"
-        return True, rc, out, f"{hidden} secret-looking path{'s' if hidden != 1 else ''} hidden" if hidden else ""
+        return True, rc, out, self.mask_note(hidden)
+
+    def mask_note(self, hidden):
+        """What the run hid, and what your not-secret list let through: for the card and the model."""
+        let = len(self.let_through)
+        parts = ([f"{hidden} secret-looking path{'s' if hidden != 1 else ''} hidden"] if hidden else []) \
+            + ([f"{let} let through by your not-secret list"] if let else [])
+        return ", ".join(parts)
 
     def _podman(self, argv, name, cap, deadline=None):
         chunks, size, proc = [], [0], None

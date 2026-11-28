@@ -690,6 +690,11 @@ class Model:
                         "question": clean(str(ev.get("ask") or "Use these samples for this job?"))}
         elif kind == "fixtures_clear":
             self.ask = {"kind": kind, "question": "Delete the samples folder and everything in it?"}
+        elif kind == "not_secret" and isinstance(ev, dict) and isinstance(ev.get("path"), str) \
+                and isinstance(ev.get("sha256"), str):
+            self.ask = {"kind": kind, "path": ev["path"], "sha256": ev["sha256"],
+                        "question": f"Does {clean(ev['path'])} hold no real secrets? Then the sandbox stops hiding it "
+                                    "and reads of it stop asking, until it changes."}
         elif kind == "leftovers_clean" and isinstance(ev, dict) and isinstance(ev.get("ids"), list) and ev["ids"]:
             n = len(ev["ids"])
             self.ask = {"kind": kind, "ids": [i for i in ev["ids"] if isinstance(i, str)],
@@ -1896,8 +1901,9 @@ class App:
                 lines.append([("  It doesn't all fit here: ", W), ("y", A), (" or ", ""), ("v", A),
                               (" view it in full first   ", ""), ("e", A), (" edit   ", ""), ("n", A), (" cancel", "")])
                 return lines, None, "y or v view the whole command first · e edit · n or Esc cancel"
-            if ask["kind"] in ("fixtures_use", "fixtures_clear", "leftovers_clean"):
-                yes = {"fixtures_use": "use them", "fixtures_clear": "delete it"}.get(ask["kind"], "remove them")
+            if ask["kind"] in ("fixtures_use", "fixtures_clear", "leftovers_clean", "not_secret"):
+                yes = {"fixtures_use": "use them", "fixtures_clear": "delete it",
+                       "not_secret": "it holds none"}.get(ask["kind"], "remove them")
                 return ([[(ask["question"], A)], [("  y", A), (f" {yes}   ", ""), ("n", A), (" no", "")]], None,
                         f"y {yes} · n or Esc no")
             lines = [[(ask["question"], A)],
@@ -2435,6 +2441,12 @@ class App:
             elif k in ("n", "\x1b"):
                 m.ask = None
                 m.note(f"{card.id}: not run")
+        elif ask["kind"] == "not_secret":
+            m.ask = None
+            if k == "y":
+                m.send({"type": "not_secret", "marks": [{"path": ask["path"], "sha256": ask["sha256"]}]})
+            else:
+                m.note(f"{clean(ask['path'])}: not marked")
         elif ask["kind"] == "leftovers_clean":
             m.ask = None
             if k == "y":

@@ -1,5 +1,6 @@
 """/files: the working directory as a tree beside the conversation (tui/files.py), and what it can ask for: a listing,
-a file in the pager, a file attached to your next message, or its path in the input box.
+a file in the pager, a file attached to your next message, its path in the input box, or a file marked ⚠ shown to you
+and, if you say so, marked as holding no secrets (the core asks; hoplon refuses it if the file changed since).
 
 The files pane never reads the disk. Listings and files come from hoplon, which applies its own checks (inside the
 directory, nothing that holds credentials without a warning), and nothing reaches the model but an attachment you have
@@ -21,8 +22,9 @@ class Files(Feature):
     commands = {"/files": "show or hide the file tree on the left"}
     needs = "files"
     cant = "list files"
-    events = ("files", "file")
-    requests = {"list": ("files",), "view": ("files",), "attach": ("files",), "insert": ("files",)}
+    events = ("files", "file", "not_secret")
+    requests = {"list": ("files",), "view": ("files",), "attach": ("files",), "insert": ("files",),
+                "not_secret": ("files",)}
     actions = ("files", "file", "insert")
 
     def __init__(self):
@@ -48,6 +50,8 @@ class Files(Feature):
                 m.send({"type": "files", "path": path})
             else:
                 m.panes.append(("files", {"type": "unavailable", "reason": "this hoplon can't list files"}))
+        elif kind == "not_secret" and "not_secret" not in features:
+            m.note("this hoplon can't mark files as holding no secrets", self.core.R)
         elif "read" in features:
             self.reading.append((path, kind))
             m.send({"type": "read", "path": path})
@@ -56,7 +60,14 @@ class Files(Feature):
 
     def event(self, m, ev):
         path = ev.get("path")
-        if ev.get("type") == "files":
+        if ev.get("type") == "not_secret":
+            for x in ev.get("marked") if isinstance(ev.get("marked"), list) else []:
+                if isinstance(x, dict) and isinstance(x.get("path"), str):
+                    m.note(f"{self.core.clean(x['path'])}: marked as holding no secrets, until it changes")
+                    parent = x["path"].rsplit("/", 1)[0] if "/" in x["path"] else "."
+                    self.listing.append(parent)          # so the tree drops its ⚠
+                    m.send({"type": "files", "path": parent})
+        elif ev.get("type") == "files":
             if path in self.listing:             # an answer to something we asked for, and only that
                 self.listing.remove(path)
                 m.panes.append(("files", {"type": "listing", "path": path, "entries": ev.get("entries"),
@@ -94,6 +105,13 @@ class Files(Feature):
                 app.shell.tmux("select-pane", "-t", app.prompt)
         elif action[1] == "view":
             self.view(app, action[2])
+        elif action[1] == "not_secret":
+            ev = action[2]
+            if not ev.get("secret") or not isinstance(ev.get("sha256"), str):
+                app.m.note(f"{self.core.clean(str(ev.get('path')))}: hoplon doesn't take it for a secret now")
+                return
+            self.view(app, ev)                          # you see it first, then the core asks
+            app.m.ask_approval("not_secret", ev)
         else:
             self.attach(app, action[2])
 

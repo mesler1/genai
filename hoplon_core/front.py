@@ -712,6 +712,72 @@ def fixtures_lines(info):
     return out
 
 
+NOT_SECRET_LINES = 12      # lines shown per file before :not_secret asks
+
+
+def not_secret_words(text):
+    """:not_secret PATH…: paths from where you are, globs expanded here (each file is still shown and asked about)."""
+    out = []
+    for w in shlex.split(text) if text else []:
+        out += sorted(glob.glob(w, recursive=True)) if glob.has_magic(w) else [w]
+    return {"marks": [{"path": p, "sha256": ""} for p in out], "cwd": os.getcwd()} if out else None
+
+
+def not_secret_check(m):
+    marks = m.get("marks")
+    return (isinstance(marks, list) and bool(marks) and len(marks) <= SANDBOX_MASKS
+            and all(isinstance(x, dict) and isinstance(x.get("path"), str) and isinstance(x.get("sha256"), str)
+                    for x in marks))
+
+
+def not_secret_ask(e, m):
+    """Show the lines that look secret in each file, and ask about each; only the files you say y to are sent, each
+    with the hash of the text you saw."""
+    marks = []
+    for p in (x["path"] for x in m["marks"]):
+        rel = os.path.relpath(os.path.join(m["cwd"], p), e.wd.root)
+        if rel.startswith(".."):
+            print(f"{show_exact(p)}: not in the project, skipped")
+            continue
+        try:
+            _, size, secret, counts, _ = e.view(rel)            # the same checks, and an audit record
+            text = e.wd.read(rel)                               # your own terminal: the real lines, to judge them
+        except (ValueError, OSError) as err:
+            print(f"{show_exact(rel)}: {err}, skipped")
+            continue
+        if not secret:
+            print(f"{show_exact(rel)}: hoplon doesn't take it for a secret, skipped")
+            continue
+        lines = text.splitlines()
+        found = [(i, ln) for i, ln in enumerate(lines, 1) if looks_secret(ln)] \
+            or list(enumerate(lines, 1))                        # a secret over several lines, such as a key
+        print(f"\n{show_exact(rel)} · {size} bytes · " + ", ".join(f"{n} {k}" for k, n in counts.items()))
+        for i, ln in found[:NOT_SECRET_LINES]:
+            print(f"  {i:>5} | {show_exact(ln.strip())[:200]}")
+        if len(found) > NOT_SECRET_LINES:
+            print(f"        … and {len(found) - NOT_SECRET_LINES} more lines")
+        if ask_yes("Holds no real secrets? (it will ask again if the file changes)"):
+            marks.append({"path": rel, "sha256": text_digest(text)})
+    if not marks:
+        print("Nothing marked.")
+        return None
+    return {"marks": marks}
+
+
+def not_secret_act(e, m, front):
+    marked = []
+    for x in m["marks"]:
+        try:
+            marked.append(e.mark_not_secret(x["path"], x["sha256"], front.source))
+        except HoplonError as err:
+            front.error(str(err), err.kind)
+    return {"marked": marked}
+
+
+def not_secret_show(e, m, r):
+    return [f"{show_exact(x['path'])}: marked as holding no secrets, until it changes" for x in r["marked"]]
+
+
 def leftovers_ask(e, m):
     if m.get("action") != "clean":
         return m
@@ -841,6 +907,9 @@ FRONT_COMMANDS = {c.name: c for c in [
                  and (m.get("action") == "clean") == bool(m.get("ids")),
                  leftovers_act, leftovers_show, ":leftovers or :leftovers clean",
                  "leftovers takes nothing to list, or 'action': 'clean' with the listing's 'ids'", ask=leftovers_ask),
+    FrontCommand("not_secret", not_secret_words, not_secret_check, not_secret_act, not_secret_show,
+                 ":not_secret PATH…", "not_secret needs 'marks': a list of {'path', 'sha256'} from file events",
+                 ask=not_secret_ask, partial=True),
     FrontCommand("skills", nothing, lambda m: True, lambda e, m, front: {"skills": e.skill_rows()},
                  lambda e, m, r: skill_lines(r["skills"], mark=True) or ["no skills found"], ":skills", ""),
     FrontCommand("skill", named_on_off, lambda m: isinstance(m.get("name"), str) and isinstance(m.get("on"), bool),
@@ -923,6 +992,8 @@ Commands (on an empty buffer):
   :coding on|off  let the model read and list files here without asking
   :network [on|off]  the sandbox's network, for this session (on: each sandboxed run asks)
   :fixtures [add FILE…|use|drop|clear]  real samples, read-only at /fixtures in sandboxed runs once you approve them
+  :not_secret PATH…  shows each file that looks secret and asks: y marks it as holding none, so the sandbox
+                  stops hiding it and reads stop asking, until the file changes
   :alerts [on|off]  whether the notify hook runs when hoplon waits for you
   :leftovers [clean]  what hoplon made for sandboxes and jobs that is still there, what is stale, how to remove it
   :edits [ask|approved-files|reset]  approved-files: a further edit to a file you approved applies without asking
@@ -1356,7 +1427,7 @@ def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()
     ui.emit({"type": "hello", "protocol": PROTOCOL, "version": VERSION, "bundle": ran,
              "host": socket.gethostname(), "user": user, "uid": uid, "remote": remote,
              "features": ["proposals", "decisions", "attach", "register_tools", "compact", "context", "coding",
-                          "fixtures", "leftovers",
+                          "fixtures", "leftovers", "not_secret",
                           "set_coding", "skills", "files", "read", "trace", "system", "plan", "network", "clear",
                           "models", "command_sets", "interrupt", "edits", "stop", "digest", "work", "halt", "progress"],
              "endpoint": engine.endpoint.info(),
@@ -1478,9 +1549,9 @@ def run_json(engine, ui, first_prompt, attachments, remote=False, after_hello=()
                 ui.error("read needs 'path' as a string", "bad_message")
                 continue
             try:
-                text, size, secret, counts = engine.view(path)
+                text, size, secret, counts, digest = engine.view(path)
                 ui.emit({"type": "file", "path": path, "text": text, "size": size, "secret": secret,
-                         "redacted": counts})
+                         "redacted": counts, "sha256": digest})
             except (ValueError, OSError) as err:
                 ui.error(f"cannot read {path}: {err}", "bad_path", path=path)
         elif t in ("trace", "system"):

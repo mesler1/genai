@@ -645,7 +645,7 @@ class Gate:
         secret = self.secret_text(text)
         shown, counts = redact(text, self.secrets())
         self.audit.log("user_read", path=path, chars=len(text), secret=secret)
-        return shown, len(text.encode()), secret, counts
+        return shown, len(text.encode()), secret, counts, text_digest(text)
 
     def standing(self, p):
         """The one place that answers "is this already approved, and by what?": the rule (AUTO_RULES) that approves
@@ -716,6 +716,37 @@ class Gate:
         self.cfg.set_not_secret(digest, where)
         self.audit.log("not_secret", path=where, sha256=digest)
         self.ui.notice(f"{path}: you said it holds no secrets, so it won't ask again until the file changes")
+
+    def mark_not_secret(self, path, sha256, source):
+        """You said this file holds no secrets, from your own command (:not_secret, or hoplon-tui's files pane), not
+        the model's. sha256 is of the text you looked at: if the file has changed since, nothing is marked. Only a
+        file caught by its contents can be marked: never a name that is a secret by definition (.env, id_rsa, *.key),
+        never anything in .git, never a file holding the endpoint key. Raises HoplonError (kind not_secret)."""
+        def no(why):
+            raise HoplonError(f"{show_exact(path)} not marked: {why}", kind="not_secret")
+        try:
+            parts = split_rel(path)
+        except ValueError as err:
+            no(str(err))
+        if any(secret_name(p) for p in parts):
+            no("its name says it holds secrets, so the sandbox always hides it")
+        if ".git" in parts:
+            no("files in .git can't be marked")
+        try:
+            text = self.wd.read("/".join(parts))
+        except (ValueError, OSError) as err:
+            no(str(err))
+        if any(k and k in text for k in self.secrets()):
+            no("it holds the endpoint's key")
+        if not looks_secret(text):
+            no("nothing in it looks like a secret, so there is nothing to mark")
+        digest = text_digest(text)
+        if digest != sha256:
+            no("it changed since you looked at it; look again")
+        where = os.path.join(self.wd.root, *parts)
+        self.cfg.set_not_secret(digest, where)
+        self.audit.log("not_secret", path=where, sha256=digest, source=source)
+        return {"path": "/".join(parts), "sha256": digest}
 
     def read_allowed(self, parts):
         """Would reading this path be allowed without asking? (coding mode, not hidden)"""
@@ -971,7 +1002,8 @@ class Gate:
             except HoplonError as e:
                 ran, rc, out, note = False, None, "", str(e)
             out = clip(redact(out, self.secrets())[0])
-            self.audit.log("work_test", id=p.id, item=n, exit=rc, ran=ran)
+            let = self.box.let_through if ran and isinstance(getattr(self.box, "let_through", None), list) else []
+            self.audit.log("work_test", id=p.id, item=n, exit=rc, ran=ran, **({"let_through": let} if let else {}))
             if not ran or rc != 0:
                 why = f"the test command could not run: {note}" if not ran else \
                     (f"the test command failed (exit {rc})" if rc is not None else f"the test command was {note}")
@@ -1095,8 +1127,9 @@ class Gate:
         secs = time.monotonic() - started
         out, counts = redact(out, self.secrets())
         out = clip(out)
+        let = self.box.let_through if ran and isinstance(getattr(self.box, "let_through", None), list) else []
         self.audit.log("sandbox_exit", id=p.id, exit=rc, network=p.fields["network"], seconds=round(secs, 1),
-                       chars=len(out), redacted=counts, note=note)
+                       chars=len(out), redacted=counts, note=note, **({"let_through": let} if let else {}))
         if not ran:
             self.ui.result(p, "error", f"not run: {note}", output="", exit=None)
             return f"error: not run: {note}"

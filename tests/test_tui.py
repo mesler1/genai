@@ -1922,7 +1922,7 @@ class TestFeatures(unittest.TestCase):
         self.assertEqual([f.name for f in m.features], [f.name for f in on])
         self.assertEqual(list(m.commands())[-14:], ["/model", "/copy", "/decline", "/raw", "/system", "/files", "/sandbox", "/edits", "/commands", "/work", "/fixtures", "/leftovers", "/alerts", "/shared"])
         self.assertEqual(C.feature_requests(on), {"menu": {"model", "models", "copy", "raw", "system"},
-                          "files": {"list", "view", "attach", "insert"}, "pipe": {"piped"}})
+                          "files": {"list", "view", "attach", "insert", "not_secret"}, "pipe": {"piped"}})
 
     def test_environment_disables_a_feature(self):
         m, warning = self.model(self.environ(HOPLON_TUI_DISABLE="copy, model"))
@@ -2067,6 +2067,50 @@ class TestFilesFeature(unittest.TestCase):
         m.handle({"type": "file", "path": "README.md", "text": "hi", "size": 2, "secret": False, "redacted": {}})
         m.handle({"type": "file", "path": "other", "text": "hi", "size": 2, "secret": False, "redacted": {}})
         self.assertEqual([a[:2] for a in m.actions], [("file", "attach"), ("file", "view")])
+
+    def test_marking_a_file_shows_it_then_asks_then_sends_the_hash_you_saw(self):
+        m = self.model(features=["files", "read", "not_secret"])
+        m.request({"type": "not_secret", "path": "conf/a.ini"}, "files")
+        self.assertEqual(m.outbox, [{"type": "read", "path": "conf/a.ini"}])
+        ev = {"type": "file", "path": "conf/a.ini", "text": "password = x\n", "size": 13, "secret": True,
+              "redacted": {"secret assignment": 1}, "sha256": "h1"}
+        m.handle(ev)
+        self.assertEqual(m.actions, [("file", "not_secret", ev)])
+        app = mock.Mock()
+        app.m = m
+        m.outbox.clear()
+        m.feature("files").action(app, m.actions[0])
+        self.assertIn("password = x", app.view_text.call_args[0][0])            # you see it first
+        self.assertEqual((m.ask["kind"], m.ask["path"], m.ask["sha256"]), ("not_secret", "conf/a.ini", "h1"))
+        self.assertEqual(m.outbox, [])
+        import types
+        C.App.answer(types.SimpleNamespace(m=m), "y")
+        self.assertEqual(m.outbox, [{"type": "not_secret", "marks": [{"path": "conf/a.ini", "sha256": "h1"}]}])
+        self.assertIsNone(m.ask)
+        m.outbox.clear()
+        m.handle({"type": "not_secret", "marked": [{"path": "conf/a.ini", "sha256": "h1"}]})
+        self.assertIn("conf/a.ini: marked as holding no secrets", text_of(m.blocks[-1]))
+        self.assertEqual(m.outbox, [{"type": "files", "path": "conf"}])           # the tree drops its ⚠
+
+    def test_a_file_that_no_longer_looks_secret_is_not_asked_about_and_n_marks_nothing(self):
+        m = self.model(features=["files", "read", "not_secret"])
+        app = mock.Mock()
+        app.m = m
+        m.feature("files").action(app, ("file", "not_secret", {"path": "a", "secret": False, "sha256": "h"}))
+        self.assertIsNone(m.ask)
+        m.feature("files").action(app, ("file", "not_secret", {"path": "a", "secret": True, "sha256": "h",
+                                                               "text": ""}))
+        m.outbox.clear()
+        import types
+        C.App.answer(types.SimpleNamespace(m=m), "n")
+        self.assertEqual(m.outbox, [])
+        self.assertIn("a: not marked", text_of(m.blocks[-1]))
+
+    def test_an_older_hoplon_cant_mark_files(self):
+        m = self.model(features=["files", "read"])
+        m.request({"type": "not_secret", "path": "a"}, "files")
+        self.assertEqual(m.outbox, [])
+        self.assertIn("can't mark files", text_of(m.blocks[-1]))
 
     def test_view_shows_cleaned_text_with_a_warning_for_secrets(self):
         app, feature = mock.Mock(), self.model().feature("files")

@@ -31,6 +31,8 @@ touch the system, and each part uses only the parts before it.
 | A file that looks secret is not read automatically | `gate.py: Gate.read_now` | `test_coding_guard.TestSecrets.test_secret_looking_file_needs_approval` |
 | "No secrets" is kept by sha256 and lapses on change | `gate.py: Gate.secret_text`<br>`config.py: Config.set_not_secret` | `test_hoplon.TestEndToEnd.test_a_file_you_say_holds_no_secrets_reads_without_asking_until_it_changes` |
 | A file holding the endpoint key is never excused | `gate.py: Gate.secret_text` | `test_hoplon.TestEndToEnd.test_the_endpoint_key_is_never_excused` |
+| You mark a file yourself only as you saw it, never a secret name | `gate.py: Gate.mark_not_secret` | `test_hoplon.TestEndToEnd.test_you_can_mark_a_file_yourself_once_you_have_seen_it` |
+| A run names the files your list let through | `sandbox.py: Sandbox.secret_file`<br>`gate.py: Gate.run_sandboxed` | `test_sandbox_runner.TestSandboxLoop.test_a_run_names_the_files_your_list_let_through` |
 | An automatic search skips secret-named files | `files.py: Workdir.walk`<br>`gate.py: Gate.search` | `test_hoplon.TestEndToEnd.test_search_files_in_coding_mode` |
 
 ## 3. Excessive agency and tool misuse
