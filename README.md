@@ -2,10 +2,11 @@
 
 A coding agent for power users who want full control over everything it does.
 
-**Zero dependencies.** The core is a single Python file, about 6,300 lines, using only the standard
-library. There's nothing to `pip install` and nothing pulled in. Your own agent can audit it in
-minutes before you run it. All it needs is Python 3.10 or newer. The terminal UI is optional and
-adds tmux 3.2 or newer.
+**Zero dependencies.** A small Python program, a few modules and about 8,500 lines, using only the
+standard library. There's nothing to `pip install` and nothing pulled in. `hoplon_core/gate.py` alone
+decides what runs, so that's the file to read first, and your own agent can read all of it before you
+run it ([AUDIT.md](AUDIT.md) maps each security claim to its code and test). All it needs is Python
+3.10 or newer. The terminal UI is optional and adds tmux 3.2 or newer.
 
 - **Zero defaults.** No endpoint is built in, so nothing is sent anywhere until you name one and
   approve it.
