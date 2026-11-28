@@ -412,7 +412,10 @@ safe and prompts are rare enough to be read.
   answers itself. Each row names the request it makes of the gate (`GATE_REQUESTS`: a sandboxed
   run, a scoped command, an edit, or what goes to the model), or none, and the only rules that may
   approve it without asking (`AUTO_RULES`, such as `offline_run` or `approved_file`). One function,
-  `Engine.grant`, makes a proposal automatic, and refuses a rule its kind doesn't list; each approval
+  `Engine.standing`, answers whether a proposal is already approved and by which rule, every
+  standing approval included (an approved plan, approved files, a blessing, a work session); it
+  is called once for each proposal, and only `Engine.grant` acts on its answer, refusing a rule
+  the kind doesn't list; each approval
   by a rule is logged as a `decision` with `by` naming the rule, the same record your own decisions
   get. `tests/test_invariants.py` checks all of this, and the audit and end-of-input rules above,
   over every row, and that nothing else in hoplon makes a proposal automatic.

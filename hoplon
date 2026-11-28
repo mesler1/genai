@@ -5109,8 +5109,6 @@ class Engine:
             raise ValueError("command is required")
         p = Proposal(pid, "sandbox", call_id, command=cmd, reason=reason, network=self.box.network,
                      image=self.box.conf["image"])
-        if not self.box.network:
-            self.grant(p, "offline_run")
         return p
 
     def build_read(self, pid, call_id, args, reason, name):
@@ -5122,12 +5120,7 @@ class Engine:
         if kind == "read":
             st = self.wd.stat(path)
             p.fields["size"] = st.st_size if st else None
-        if self.read_allowed(parts):
-            if kind == "read":
-                self.prepare_auto_read(p, "coding_read")
-            else:
-                self.grant(p, "coding_read")
-        elif kind == "read" and any(secret_name(x) for x in parts):    # named like one: warned as content would be
+        if not self.read_allowed(parts) and kind == "read" and any(secret_name(x) for x in parts):    # named like one: warned as content would be
             p.fields["secret"] = True
             p.fields["to"] = to = self.active()[0].base_url
             self.ui.notice(f"{path} is named like a file that holds secrets, so reading it needs your OK; allowing "
@@ -5221,7 +5214,6 @@ class Engine:
             raise ValueError("n (the item's number) and summary are required")
         p = Proposal(pid, "finish", call_id, n=n, summary=one_line(summary)[0][:200], reason=summary,
                      test=self.work.test, notes=plain_text(notes or "").strip()[:WORK_NOTES_MAX])
-        self.grant(p, "work_step")
         return p
 
     def build_retry(self, pid, call_id, args, reason, name):
@@ -5234,7 +5226,6 @@ class Engine:
         if n != w.current:
             raise ValueError(f"item {n} is not the one under review: that is item {w.current}")
         p = Proposal(pid, "retry", call_id, n=n, hint=plain_text(hint).strip()[:WORK_NOTES_MAX], reason=hint)
-        self.grant(p, "work_step")
         return p
 
     def build_external(self, pid, call_id, args, reason, name):
@@ -5247,8 +5238,6 @@ class Engine:
                      argv=cmd.shown(values), access=cmd.access, reason=cmd.describe, _cmd=cmd,
                      **({"as_user": cmd.as_user} if cmd.as_user else {}),
                      **({"network": cmd.reaches()} if cmd.reaches() else {}))
-        if cmd.auto:
-            self.grant(p, "plain_command" if cmd.plain() else "blessed_auto")
         return p
 
     def search_proposal(self, pid, call_id, args, reason, name="search_files"):
@@ -5267,9 +5256,7 @@ class Engine:
             fields["glob"] = glob
         if args.get("ignore_case") is True:
             fields["ignore_case"] = True
-        p = Proposal(pid, "search", call_id, **fields)
-        self.grant(p, "coding_read")
-        return p
+        return Proposal(pid, "search", call_id, **fields)
 
     def search(self, p):
         """Run an automatic search_files: (what the model gets, a note for the user)."""
@@ -5344,31 +5331,63 @@ class Engine:
         self.audit.log("user_read", path=path, chars=len(text), secret=secret)
         return shown, len(text.encode()), secret, counts
 
+    def standing(self, p):
+        """The one place that answers "is this already approved, and by what?": the rule (AUTO_RULES) that approves
+        p without asking, or None, and p asks. decide() calls it once for each proposal, after match_plan has held
+        the proposal to an approved plan. SECURITY.md describes each rule.
+
+        offline_run: a sandboxed run with the network off. coding_read: in coding mode, a read, listing or search
+        that isn't hidden. plan_read: a read or listing an approved plan names. plain_command and blessed_auto: a
+        scoped command its set, or your blessing, lets run. work_copy: an edit in a work session's copy.
+        approved_file: with edits approved-files, a further edit to a file you approved one for. work_step: a work
+        session's own finish or retry. A read is read now, so a file that looks secret asks even so."""
+        k, f = p.kind, p.fields
+        if k == "sandbox":
+            return None if f["network"] else "offline_run"
+        if k == "search":
+            return "coding_read"
+        if k in ("finish", "retry"):
+            return "work_step"
+        if k == "trusted":
+            cmd = f["_cmd"]
+            return None if not cmd.auto else "plain_command" if cmd.plain() else "blessed_auto"
+        if k in ("read", "list"):
+            parts = split_rel(f["path"]) if f["path"] not in (".", "./", "") else []
+            rule = ("coding_read" if self.read_allowed(parts) else
+                    "plan_read" if f.get("plan_step") and not is_hidden(parts) else None)
+            return rule if rule and (k == "list" or self.read_now(p)) else None
+        if k in ("edit", "write"):
+            if self.work:
+                return "work_copy" if self.work_edit(p) else None
+            return "approved_file" if self.auto_edit(p) else None
+        return None
+
     def grant(self, p, rule):
         """Approve p without asking, by one of the rules its kind allows (Kind.rules). decide() logs each one."""
         if rule not in PROPOSAL_KINDS[p.kind].rules:
             raise RuntimeError(f"rule {rule!r} may not approve a {p.kind} proposal")
         p.auto, p.rule = True, rule
 
-    def prepare_auto_read(self, proposal, rule):
-        """Read the file now, so what is sent is exactly what was checked for secrets, and approve it by rule. A read
-        that fails (a missing, binary or oversized file) is approved too and reports its error: there is nothing secret
-        to ask about."""
+    def read_now(self, proposal):
+        """Read a file that a rule would let the model read, so what is sent is exactly what was checked for secrets.
+        False if it looks secret, so it asks. A read that fails (a missing, binary or oversized file) is approved
+        too and reports its error: there is nothing secret to ask about."""
         path = proposal.fields["path"]
+        if proposal.fields.get("secret"):       # named like a file that holds secrets
+            return False
         try:
             text = self.wd.read(path)
         except (ValueError, OSError) as e:
             proposal.fields["_read_error"] = e
-            self.grant(proposal, rule)
-            return
+            return True
         if self.secret_text(text):
             proposal.fields["secret"] = True
             proposal.fields["to"] = to = self.active()[0].base_url     # where it goes: a planner may be elsewhere
             self.ui.notice(f"{path} looks like it contains secrets, so reading it needs your OK; allowing sends it "
                            f"to {to}")
-            return
+            return False
         proposal.fields["_read_text"] = text
-        self.grant(proposal, rule)
+        return True
 
     def remember_not_secret(self, path, text):
         """You said this file holds no secrets: don't ask about this exact text again. Not when it holds the endpoint
@@ -5390,6 +5409,13 @@ class Engine:
         for p in props:
             if not p.error:
                 self.match_plan(p)
+                if p.kind in ("edit", "write") and self.work:
+                    p.fields["in_copy"] = True      # it lands in the copy, asked or not: the card says so
+                rule = self.standing(p)
+                if rule:
+                    self.grant(p, rule)
+                    if rule in ("work_copy", "approved_file"):
+                        p.fields["work" if rule == "work_copy" else "approved_file"] = True
         for p in props:
             p.decision = None
             if p.error:
@@ -5404,15 +5430,6 @@ class Engine:
                 rec["steps"] = [audit_step(st) for st in p.fields["steps"]]
             self.audit.log("proposal", **rec)
         live = [p for p in props if not p.error]
-        for p in live:
-            if p.kind in ("edit", "write") and self.work:
-                p.fields["in_copy"] = True      # it lands in the copy, asked or not: the card says so
-            if p.kind in ("edit", "write") and not p.auto and self.work_edit(p):
-                self.grant(p, "work_copy")
-                p.fields["work"] = True
-            elif p.kind in ("edit", "write") and not p.auto and not self.work and self.auto_edit(p):
-                self.grant(p, "approved_file")
-                p.fields["approved_file"] = True
         for p in live:
             if p.auto:          # every approval by a rule, in the same record a user's decision gets
                 self.audit.log("decision", id=p.id, decision="accept", by=p.rule)
@@ -5455,9 +5472,10 @@ class Engine:
                 self.adopt_plan(p)
 
     def match_plan(self, p):
-        """Hold a proposal to the approved plan. A planned read needs no approval (unless the file is hidden or
-        looks secret); a planned command, word for word as approved, is marked preapproved, for the wrapper to run
-        without asking again; a planned edit or write is labelled, and still asks. A command, edit or write the
+        """Hold a proposal to the approved plan. A planned read is labelled with its step, and standing() approves it
+        (unless the file is hidden or looks secret); a planned command, word for word as approved, is marked
+        preapproved, for the wrapper to run without asking again; a planned edit or write is labelled, and still
+        asks. A command, edit or write the
         plan doesn't name is flagged off_plan. Each approved command step is preapproved once; proposed again, it is
         marked plan_repeat and asks. hoplon still runs nothing itself."""
         if not self.plan or p.kind not in ("command", "read", "list", "edit", "write"):
@@ -5486,17 +5504,6 @@ class Engine:
             p.fields["preapproved"] = True
             p.fields["plan_id"] = self.plan["id"]
             hit["status"] = "done"
-        elif p.kind in ("read", "list") and not p.auto:
-            parts = split_rel(p.fields["path"]) if hit["_where"] else []
-            if is_hidden(parts):
-                return
-            if p.kind == "read":
-                if not p.fields.get("secret"):
-                    self.prepare_auto_read(p, "plan_read")
-                if not p.auto:
-                    return
-            else:
-                self.grant(p, "plan_read")
         self.audit.log("plan_match", id=p.id, step=hit["n"], kind=p.kind)
         self.ui.plan(self.plan)
 

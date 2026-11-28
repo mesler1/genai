@@ -75,6 +75,19 @@ class TestTable(unittest.TestCase):
         self.assertEqual(hits, [])
         self.assertIn("self.auto = False", src)          # a Proposal starts asking
 
+    def test_standing_is_the_one_place_a_rule_approves(self):
+        # grant() is called once, in decide, with what standing() answered; and standing() names every rule.
+        with open(G.__file__) as f:
+            src = f.read()
+        self.assertEqual(src.count("self.grant("), 1)
+        decide = src[src.index("    def decide(self, props):"):src.index("    def match_plan(self, p):")]
+        self.assertIn("rule = self.standing(p)\n                if rule:\n                    self.grant(p, rule)", decide)
+        standing = src[src.index("    def standing(self, p):"):src.index("    def grant(self, p, rule):")]
+        code = standing[standing.index('"""', standing.index('"""') + 3) + 3:]      # after the docstring
+        for rule in G.AUTO_RULES:
+            with self.subTest(rule=rule):
+                self.assertIn(f'"{rule}"', code)
+
     def test_a_tool_not_in_the_table_is_invalid(self):
         eng = mock.Mock(external={}, counter=0)
         eng.trusted_tools.return_value = {}
@@ -122,8 +135,7 @@ class TestGate(Guard):
         records = self.logged(eng)
         props = [(proposal(k.name, n), rule) for n, (k, rule) in
                  enumerate(((k, r) for k in G.PROPOSAL_KINDS.values() for r in k.rules), 1)]
-        for p, rule in props:
-            eng.grant(p, rule)
+        rules = {p.id: rule for p, rule in props}
         seen = []
 
         def show_auto(p):
@@ -133,7 +145,8 @@ class TestGate(Guard):
             self.assertIn(("decision", p.id, "accept", p.rule),
                           [(e, f.get("id"), f.get("decision"), f.get("by")) for e, f in records])
         ui.show_auto = show_auto
-        eng.decide([p for p, _ in props])
+        with mock.patch.object(eng, "standing", lambda p: rules[p.id]):     # decide grants what standing answers
+            eng.decide([p for p, _ in props])
         self.assertEqual(seen, [p.id for p, _ in props])
         self.assertTrue(all(p.decision == "accept" and p.rule == rule for p, rule in props))
 
@@ -155,7 +168,8 @@ class TestGate(Guard):
         props = [proposal(k.name, n) for n, k in enumerate(asking, 1)]
         with mock.patch("sys.stdin", io.StringIO("")), mock.patch("sys.stdout", io.StringIO()), \
                 mock.patch("sys.stderr", io.StringIO()):
-            eng.decide(props)
+            with mock.patch.object(eng, "standing", lambda p: None):     # none is approved by a rule
+                eng.decide(props)
         for p in props:
             with self.subTest(kind=p.kind):
                 self.assertEqual(p.decision, "decline")
@@ -165,7 +179,8 @@ class TestGate(Guard):
         records = self.logged(eng)
         props = [proposal(k, n) for n, k in enumerate(G.PROPOSAL_KINDS, 1)]
         ui.decide = lambda pending: None
-        eng.decide(props)
+        with mock.patch.object(eng, "standing", lambda p: None):     # none is approved by a rule
+            eng.decide(props)
         self.assertEqual(sorted(f["id"] for e, f in records if e == "proposal"), sorted(p.id for p in props))
 
     def test_end_of_input_declines_every_kind_that_asks(self):
@@ -175,7 +190,8 @@ class TestGate(Guard):
         eng.ui = ui
         asking = [k for k in G.PROPOSAL_KINDS.values() if not k.shown]
         props = [proposal(k.name, n) for n, k in enumerate(asking, 1)]
-        eng.decide(props)
+        with mock.patch.object(eng, "standing", lambda p: None):     # none is approved by a rule
+            eng.decide(props)
         for p in props:
             with self.subTest(kind=p.kind):
                 if p.kind == "external":

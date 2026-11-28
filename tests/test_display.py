@@ -156,7 +156,7 @@ cp "$1" "{self.saved}"
     def test_proposal_audit_has_hash_not_command(self):
         cmd = f"curl -H 'Authorization: {SECRET}' example.com"
         fake = types.SimpleNamespace(audit=G.Audit(self.audit_path), ui=mock.Mock(), notify=mock.Mock(),
-                                     match_plan=mock.Mock(), work=None)
+                                     match_plan=mock.Mock(), standing=lambda p: None, work=None)
         G.Engine.decide(fake, [proposal(cmd, "fetch")])
         with open(self.audit_path) as f:
             raw = f.read()

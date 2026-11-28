@@ -200,6 +200,7 @@ class TestSecrets(Guard):
         eng, _ = self.engine(self.proj, session_coding=True)
         call = {"id": "c1", "function": {"name": "read_file", "arguments": '{"path": "notes.txt"}'}}
         proposal = eng.make_proposal(call)
+        eng.decide([proposal])
         self.assertTrue(proposal.auto)
         with open(os.path.join(self.proj, "notes.txt"), "w") as f:
             f.write("token=example-new-token")
