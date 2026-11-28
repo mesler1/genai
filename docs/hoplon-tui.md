@@ -74,7 +74,12 @@ and ask as always. When you run one, the shell pane prints a line above its outp
 sandbox, and a red `── live this machine p3 ──` otherwise. It goes by the command line alone: a script that starts
 a container itself, such as `make test`, gets the red line. Yellow means a container was started, not that it is
 locked down: check the command's own options for that. The line is not part of the output shared with the model,
-and a hoplon-ssh session on another host gets none. `/work` goes one step further: a work session changes a copy on its own branch, and you
+and a hoplon-ssh session on another host gets none.
+
+A container started any other way, by a command you typed or a script such as `make test`, shows in tmux's status
+line instead: while `podman`, `docker`, `nerdctl`, `apptainer` or `singularity` is among the shell pane's foreground
+processes, it says `⏵ podman in your shell · Ctrl-C there`. Ctrl-C in the shell pane stops it; `/stop` stops only
+the model's own sandboxed runs. This too is only for a shell pane on this host. `/work` goes one step further: a work session changes a copy on its own branch, and you
 review one diff at the end.
 
 

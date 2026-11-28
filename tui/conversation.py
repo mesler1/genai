@@ -111,6 +111,36 @@ def command_text(command):
 CONTAINER_RUNS = {name: {"run", "exec", "start", "attach", "compose"} for name in ("podman", "docker", "nerdctl")}
 CONTAINER_RUNS.update({name: {"run", "exec", "shell", "instance"} for name in ("apptainer", "singularity")})
 _PREFIXES = {"sudo", "exec", "time", "command", "nohup", "nice"}       # what comes before the program it runs
+def foreground_container(shell_pid, proc="/proc"):
+    """The container tool (one of CONTAINER_RUNS) among the shell's foreground processes, or None: what the
+    shell pane is running now, such as a script or make that started podman. Only a fixed name comes back."""
+    def stat(pid):
+        with open(f"{proc}/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()             # after "(comm)": state ppid pgrp session tty tpgid
+    try:
+        fields = stat(shell_pid)
+        pgrp, tpgid = int(fields[2]), int(fields[5])
+    except (OSError, ValueError, IndexError):
+        return None
+    if tpgid <= 0 or tpgid == pgrp:                               # the shell itself is in front: at its prompt
+        return None
+    try:
+        pids = [d for d in os.listdir(proc) if d.isdigit()]
+    except OSError:
+        return None
+    for pid in pids:
+        try:
+            if int(stat(pid)[2]) != tpgid:
+                continue
+            with open(f"{proc}/{pid}/comm") as f:
+                name = f.read().strip()
+        except (OSError, ValueError, IndexError):
+            continue
+        if name in CONTAINER_RUNS:
+            return name
+    return None
+
+
 MARK_ID = re.compile(r"[A-Za-z0-9_-]{1,16}")
 
 
@@ -688,6 +718,7 @@ class Model:
         self.quit = False
         self.shell = False         # a shell pane is there (inside hoplon-tui)
         self.shell_where = None
+        self.shell_container = None  # the container tool the shell pane is running now (foreground_container)
         self.skills = None         # hoplon's skill list, once asked for
         self.show_skills = False   # print the next skill list in the conversation (the user typed /skills)
         self.ask = None            # a question of ours in place of the input box: run or share
@@ -1008,6 +1039,13 @@ class Model:
         return f"{palette.tmux('brass', bold=True)}▲ LIVE: your shell on {host}{how}#[default]{hints}"
 
     def sandbox_status(self):
+        box = ""
+        if self.shell_container in CONTAINER_RUNS:                 # a fixed name: safe in a tmux format
+            box = (f" {palette.band('brass', bold=True)}⏵ {self.shell_container} in your shell · Ctrl-C there"
+                   f"#[default] │")
+        return box + self.model_sandbox_status()
+
+    def model_sandbox_status(self):
         card = self.running_card()
         if card and PROPOSAL_ID.fullmatch(card.id):
             return f" {palette.band('patina', bold=True)}⏵ sandbox {card.id} {card.elapsed()}s#[default] │"
@@ -1896,6 +1934,7 @@ class App:
         self.last_total = 0
         self.ctrl_c = 0.0
         self.status = None         # the sandbox part of tmux's status line, as last set
+        self.container_at = 0.0    # when the shell pane's foreground was last looked at for a container
         self.header = None         # the header's information (tmux_header), as last set
         self.shell_title = None    # the shell pane's title, as last set
         self.paste = None          # text of a bracketed paste in progress
@@ -2626,6 +2665,17 @@ class App:
                         f"{n} line{'s' if n != 1 else ''} · {ago(c.ended)}", "" if c.rc == 0 else W)
         self.m.note("/share N reviews one, then sends it; so does a click on it in the info panel")
 
+    def shell_container(self):
+        """The container tool running in front in the shell pane on this host, or None (none on another host:
+        its processes aren't here)."""
+        if self.shell.remote_prompt and self.shell.remote_prompt():
+            return None
+        try:
+            (pid, _), _ = self.shell.context()
+        except (Busy, OSError, subprocess.SubprocessError):
+            return None
+        return foreground_container(pid)
+
     def recent(self):
         """The info panel's COMMANDS: the latest first, with what a click shares."""
         rows = [{"n": c.n, "cmd": clean(label(c)), "rc": c.rc, "lines": c.lines(), "ago": ago(c.ended),
@@ -2896,6 +2946,9 @@ class App:
         card = self.m.running_card()
         if card and card.shown_secs != card.elapsed():
             card.changed()                             # its elapsed time, once a second
+        if self.shell and time.monotonic() - self.container_at >= 1:
+            self.container_at = time.monotonic()
+            self.m.shell_container = self.shell_container()
         if self.shell:
             status = self.m.tmux_status()
             if status != self.status:

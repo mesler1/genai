@@ -2313,6 +2313,40 @@ class TestRunMark(unittest.TestCase):
                          ("sandbox", "the shell pane is in a sandbox"))
 
 
+class TestShellContainer(unittest.TestCase):
+    """The status line says when the shell pane is running a container tool in front, found through /proc."""
+
+    def proc(self, procs):
+        root = tempfile.mkdtemp(prefix="hoplon-proc-")
+        self.addCleanup(shutil.rmtree, root, True)
+        for pid, (comm, pgrp, tpgid) in procs.items():
+            os.makedirs(os.path.join(root, str(pid)))
+            with open(os.path.join(root, str(pid), "stat"), "w") as f:
+                f.write(f"{pid} ({comm}) S 1 {pgrp} {pgrp} 34816 {tpgid} 0 0\n")
+            with open(os.path.join(root, str(pid), "comm"), "w") as f:
+                f.write(comm + "\n")
+        return root
+
+    def test_a_container_tool_in_the_shells_foreground_group_is_found(self):
+        root = self.proc({10: ("bash", 10, 20), 20: ("make", 20, 20), 21: ("podman", 20, 20),
+                          30: ("docker", 30, 30)})                     # docker: another group, not in front
+        self.assertEqual(C.foreground_container(10, root), "podman")
+        root = self.proc({10: ("bash", 10, 20), 20: ("make", 20, 20), 30: ("docker", 30, 30)})
+        self.assertIsNone(C.foreground_container(10, root))
+        root = self.proc({10: ("bash", 10, 10), 11: ("podman", 10, 10)})    # the shell at its prompt
+        self.assertIsNone(C.foreground_container(10, root))
+        self.assertIsNone(C.foreground_container(99, root))                 # gone
+
+    def test_the_status_line_names_it_and_how_to_stop_it(self):
+        m = C.Model()
+        m.hello = {"type": "hello"}
+        self.assertNotIn("in your shell", m.tmux_status())
+        m.shell_container = "podman"
+        self.assertRegex(m.tmux_status(), r"⏵ podman in your shell · Ctrl-C there.*▲ no sandbox")
+        m.shell_container = "evil#[fg=red]"                                  # never a name of its own
+        self.assertNotIn("in your shell", m.tmux_status())
+
+
 class TmuxCase(unittest.TestCase):
     """Helpers for driving a private tmux server; no tests of its own."""
 
@@ -2584,6 +2618,26 @@ class TestHoplonTui(TmuxCase):
             self.assertTrue(any("kill" in ln for ln in open(log)))
             self.assertIn("⊡ model's runs sandboxed", self.tmux("show", "-gv", "@hoplon_sandbox"))
             self.assertNotIn("hoplon exited", self.screen())
+
+    def test_a_container_started_from_the_shell_pane_shows_in_the_status_line(self):
+        path = os.path.join(self.tmp, "test-bin")
+        os.mkdir(path)
+        for name, body in (("less", "exit 0"), ("podman", "sleep 30"), ("runner", "podman run img")):
+            with open(os.path.join(path, name), "w") as f:
+                f.write(f"#!/bin/sh\n{body}\n")
+            os.chmod(os.path.join(path, name), 0o700)
+        with FakeAPI([reply("hi")]) as api:
+            self.start(api, path=path)
+            self.shell("runner")                                      # a script that starts podman itself
+            end = time.time() + 5
+            while "podman in your shell" not in self.tmux("show", "-gv", "@hoplon_sandbox") and time.time() < end:
+                time.sleep(0.1)
+            self.assertIn("⏵ podman in your shell · Ctrl-C there", self.tmux("show", "-gv", "@hoplon_sandbox"))
+            self.tmux("send-keys", "-t", self.panes()["shell"], "C-c")
+            end = time.time() + 5
+            while "in your shell" in self.tmux("show", "-gv", "@hoplon_sandbox") and time.time() < end:
+                time.sleep(0.1)
+            self.assertNotIn("in your shell", self.tmux("show", "-gv", "@hoplon_sandbox"))
 
     def test_starts_with_no_arguments(self):
         with FakeAPI([reply("hello")]) as api:
