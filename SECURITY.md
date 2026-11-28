@@ -192,7 +192,9 @@ out of process, in a tmux pane of its own: never inside the conversation pane, w
 (and, in remote mode, the ssh control socket and the key proxy's token). Its socket role, `commands:NAME`, may only
 run its own command set's read-only commands through hoplon (with hoplon's checks, cache and rate limits), put text in
 the input box, where you see it before anything is sent, and offer text that opens in your editor before it can
-go with a message. It can't answer a question, approve anything, or run a command that would ask. As for every
+go with a message. It can't answer a question or approve anything, and it can't run a write or a command run as another
+user. It can run read-only commands that use the network, which ask when the model calls them: those ask because the
+model would choose the values, and in a pane the pane chooses them, which you blessed. As for every
 pane, the boundary is your user account: another program running as you could connect in that role, as it could
 drive tmux. hoplon-tui starts the pane from the directory hoplon reported; it isn't re-hashed at that moment.
 
@@ -412,9 +414,9 @@ safe and prompts are rare enough to be read.
   answers itself. Each row names the request it makes of the gate (`GATE_REQUESTS`: a sandboxed
   run, a scoped command, an edit, or what goes to the model), or none, and the only rules that may
   approve it without asking (`AUTO_RULES`, such as `offline_run` or `approved_file`). One function,
-  `Engine.standing`, answers whether a proposal is already approved and by which rule, every
+  `Gate.standing`, answers whether a proposal is already approved and by which rule, every
   standing approval included (an approved plan, approved files, a blessing, a work session); it
-  is called once for each proposal, and only `Engine.grant` acts on its answer, refusing a rule
+  is called once for each proposal, and only `Gate.grant` acts on its answer, refusing a rule
   the kind doesn't list; each approval
   by a rule is logged as a `decision` with `by` naming the rule, the same record your own decisions
   get. `tests/test_invariants.py` checks all of this, and the audit and end-of-input rules above,
@@ -583,9 +585,10 @@ How hoplon-tui sets it up (`hoplon-tui --remote`), and what each part is for:
   only the two allowed requests are ever forwarded (see `tui/keyproxy.py`).
 - hoplon's source goes to the host on stdin, not as a file: the remote command is a fixed Python bootstrap that reads
   exactly N bytes and executes them, so the host can't have a different or older hoplon than the one you have here.
-  What is sent is `hoplon --bundle`: hoplon as one script, the same bytes for the same files. The bootstrap hashes
-  the bytes as it receives them; hoplon there names that sha256 in its `hello` and in its audit log's `start`, and
-  hoplon-tui ends it unless the hash is that of exactly what it sent. Every `start` record carries `bundle`, the
+  What is sent is `hoplon --bundle`: the parts in `hoplon_core/` joined into one script, in a fixed order, the same
+  bytes for the same files. It is what runs here too: the `hoplon` script only builds it and runs it. The bootstrap
+  hashes the bytes as it receives them; hoplon there names that sha256 in its `hello` and in its audit log's `start`,
+  and hoplon-tui ends it unless the hash is that of exactly what it sent. Every `start` record carries `bundle`, the
   hash of the hoplon that ran, so it can be checked against the source you audited (`hoplon --bundle` prints it).
 - The shell pane is `hoplon-ssh` over the same master, with the same handshake and key as always (see 7); with `--as`,
   `sudo -n -H -u USER` starts its bash, and `--dir` is where it starts. `--as` takes only a user that `sudo -n`
@@ -628,7 +631,9 @@ descriptions that changed after approval.
   `messages` or `tools`.
 - A skill is prompt text only. It cannot add a tool or turn on coding mode. Extra tools can be
   registered only by a wrapper over JSON, never from a file.
-- hoplon is one file with no dependencies outside the Python standard library.
+- hoplon is the `hoplon` launcher and the parts in `hoplon_core/`, with no dependencies outside the Python standard
+  library. `hoplon_core/gate.py` alone decides whether anything happens; [AUDIT.md](AUDIT.md) maps each claim here
+  to the code that keeps it and the test that shows it.
 - Hooks ([HOOKS.md](HOOKS.md)) are programs of yours that run without asking each time, so
   they are kept narrow. A hook is never read from the working directory. The notify hook is a single
   file in `~/.config/hoplon/hooks`, blessed like an endpoint, and checked before every run: a

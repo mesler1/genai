@@ -96,7 +96,7 @@ cp "$1" "{self.saved}"
         self.sent = []
         self.engine = types.SimpleNamespace(
             commands=[proposal("echo out")], sandbox=None, audit=G.Audit(self.audit_path), ui=G.PlainUI(),
-            share=lambda *a: G.Engine.share(self.engine, *a),
+            share=lambda *a: G.Engine.share(self.engine, *a), run_shell=lambda *a: G.Engine.run_shell(self.engine, *a),
             user_turn=lambda text, att: self.sent.append((text, att)))
         self.repl = G.Repl(self.engine)
         p = mock.patch.dict(os.environ, {"EDITOR": ed, "VISUAL": ed, "SHELL": "/bin/sh"})

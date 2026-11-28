@@ -312,11 +312,11 @@ class TestBundle(RemoteCase):
         c = self.child(self.write_info())
         hello, seen = self.until(c, "hello")
         self.assertEqual(hello["type"], "hello", seen)
-        with open(os.path.join(REPO, "hoplon"), "rb") as f:
-            whole = f.read()
-        self.assertEqual(C.bundle(), whole)         # while hoplon is one file, the bundle is that file
-        self.assertEqual(hello["bundle"], "sha256:" + hashlib.sha256(whole).hexdigest())
+        sent = C.bundle()
+        self.assertEqual(sent, G.bundle())          # what `hoplon --bundle` writes, built from hoplon_core/
+        self.assertEqual(hello["bundle"], "sha256:" + hashlib.sha256(sent).hexdigest())
         self.assertEqual(hello["bundle"], c.sent)
+        self.assertEqual(hello["bundle"], G.BUNDLE_SHA256)     # and the same as hoplon runs here
 
     def test_a_host_that_runs_something_else_is_ended(self):
         lying = remote.BOOTSTRAP.replace('BUNDLE_SHA256="sha256:"+hashlib.sha256(s).hexdigest()',
@@ -333,31 +333,39 @@ class TestBundle(RemoteCase):
 
 
 class TestBundler(Tmp):
-    """Once hoplon has a package beside it, the bundle carries its modules: the same files give the same bytes, and
-    the bundle runs as the files do."""
+    """The bundle is the parts of hoplon_core/, in PARTS order, run in one namespace: the same files give the same
+    bytes, and the bundle runs the same here and sent through the bootstrap."""
 
-    def make(self, where, order):
-        os.makedirs(os.path.join(where, "hoplon_core"))
-        files = {"hoplon": "#!/usr/bin/env python3\nimport hoplon_core.b as b\nprint(b.WORD, __name__)\n",
-                 "hoplon_core/__init__.py": "", "hoplon_core/a.py": "WORD = 'gate'\n",
-                 "hoplon_core/b.py": "from hoplon_core.a import WORD\n"}
-        for name in order:
-            with open(os.path.join(where, name), "w") as f:
-                f.write(files[name])
-        return os.path.join(where, "hoplon")
+    def make(self, where, touch=None):
+        os.makedirs(where)
+        for n, name in enumerate(G.PARTS):
+            with open(os.path.join(where, f"{name}.py"), "w") as f:
+                f.write(f"STEP_{n} = {n}\n" + (f"TOTAL = STEP_{n - 1} + {n}\n" if n else "")
+                        + ("print(TOTAL, __name__)\n" if name == G.PARTS[-1] else ""))
+        if touch:
+            os.utime(os.path.join(where, f"{touch}.py"), (1, 1))
+        return where
 
     def test_the_same_files_make_the_same_bundle_and_it_runs(self):
-        one = self.make(self.path("one"), ["hoplon", "hoplon_core/__init__.py", "hoplon_core/a.py", "hoplon_core/b.py"])
-        two = self.make(self.path("two"), ["hoplon_core/b.py", "hoplon_core/a.py", "hoplon_core/__init__.py", "hoplon"])
-        os.utime(os.path.join(self.path("two"), "hoplon_core", "a.py"), (1, 1))
-        data = G.bundle(one)
-        self.assertEqual(data, G.bundle(two))
-        self.assertTrue(data.startswith(b"#!/usr/bin/env python3\n"))
-        direct = subprocess.run([sys.executable, one], capture_output=True, text=True)
+        data = G.bundle(self.make(self.path("one")))
+        self.assertEqual(data, G.bundle(self.make(self.path("two"), touch=G.PARTS[0])))
+        n = len(G.PARTS) - 1
         cmd = remote.bootstrap_command({"python": sys.executable}, len(data), []).replace(" --json --config-stdin", "")
         sent = subprocess.run(["sh", "-c", cmd], input=data, capture_output=True, cwd=self.tmp)
-        self.assertEqual(direct.stdout, "gate __main__\n", direct.stderr)
-        self.assertEqual(sent.stdout.decode(), direct.stdout, sent.stderr)
+        self.assertEqual(sent.stdout.decode(), f"{2 * n - 1} __main__\n", sent.stderr)
+
+    def test_a_traceback_names_the_part(self):
+        root = self.make(self.path("one"))
+        with open(os.path.join(root, "gate.py"), "a") as f:
+            f.write("raise RuntimeError('in the gate')\n")
+        data = G.bundle(root)
+        r = subprocess.run([sys.executable, "-c", data.decode()], capture_output=True, text=True)
+        self.assertIn('File "hoplon_core/gate.py", line 3', r.stderr)
+
+    def test_hoplon_bundle_writes_it_and_its_hash(self):
+        r = subprocess.run([sys.executable, os.path.join(REPO, "hoplon"), "--bundle"], capture_output=True)
+        self.assertEqual(r.stdout, G.bundle())
+        self.assertEqual(r.stderr.decode().strip(), G.bundle_digest(r.stdout))
 
 
 class TestCommandSetsAndSkills(RemoteCase):

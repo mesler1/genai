@@ -23,6 +23,16 @@ def proposal(kind, n=1):
                       exists=False, lines=1, content="x\n", diff="", size=1, set="s", argv="true", access="read")
 
 
+def source(*parts):
+    """hoplon's source: the parts it is joined from (hoplon_core/), all of them unless named."""
+    root = os.path.join(os.path.dirname(os.path.abspath(G.__file__)), "hoplon_core")
+    out = []
+    for name in parts or G.PARTS:
+        with open(os.path.join(root, f"{name}.py")) as f:
+            out.append(f.read())
+    return "\n".join(out)
+
+
 class TestTable(unittest.TestCase):
     def test_every_tool_hoplon_offers_has_a_kind(self):
         offered = [t["function"]["name"] for t in G.TOOLS + [G.SEARCH_TOOL, G.RUN_TOOL, G.WORK_PLAN_TOOL, G.FINISH_TOOL, G.RETRY_TOOL,
@@ -52,7 +62,7 @@ class TestTable(unittest.TestCase):
         for name, (what, handler) in G.GATE_REQUESTS.items():
             with self.subTest(request=name):
                 cls, meth = handler.split(".")
-                self.assertTrue(callable(getattr(getattr(G, cls), meth, None)), handler)
+                self.assertTrue(callable(vars(getattr(G, cls)).get(meth)), handler)     # its own, not inherited
                 self.assertTrue(what)
 
     def test_every_rule_is_known_and_used(self):
@@ -66,8 +76,7 @@ class TestTable(unittest.TestCase):
 
     def test_only_grant_makes_a_proposal_automatic(self):
         # Anywhere else, setting .auto on a proposal would be an approval no rule accounts for and no record says.
-        with open(G.__file__) as f:
-            src = f.read()
+        src = source()
         grant = re.search(r"\n    def grant\(self, p, rule\):\n(?:        .*\n|\n)+", src).group(0)
         rest = src.replace(grant, "")
         hits = [m.group(0) for m in re.finditer(r"\b(\w+)\.auto\s*(?:,[^=\n]*)?=(?!=)[^\n]*", rest)
@@ -77,8 +86,7 @@ class TestTable(unittest.TestCase):
 
     def test_standing_is_the_one_place_a_rule_approves(self):
         # grant() is called once, in decide, with what standing() answered; and standing() names every rule.
-        with open(G.__file__) as f:
-            src = f.read()
+        src = source()
         self.assertEqual(src.count("self.grant("), 1)
         decide = src[src.index("    def decide(self, props):"):src.index("    def match_plan(self, p):")]
         self.assertIn("rule = self.standing(p)\n                if rule:\n                    self.grant(p, rule)", decide)
@@ -238,10 +246,9 @@ class TestFrontCommands(unittest.TestCase):
                     self.assertIsNone(c.words("no such form at all"))
 
     def test_neither_front_end_handles_a_shared_command_itself(self):
-        with open(G.__file__) as f:
-            src = f.read()
+        src = source()
         repl = src[src.index("    def command(self, line):"):src.index("    def do_attach(self, path):")]
-        js = src[src.index("def run_json("):src.index("# Main\n")]
+        js = src[src.index("def run_json("):src.index("def running_bundle(")]
         for name in G.FRONT_COMMANDS:
             with self.subTest(command=name):
                 self.assertNotIn(f't == "{name}"', js)

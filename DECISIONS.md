@@ -61,7 +61,7 @@ tests:
 | --- | --- |
 | What a hook may do | Observe, or set up the sandbox's environment. A hook cannot approve a proposal, add a tool, run something at start, or loosen the sandbox. Those belong in a wrapper over `--json`, where they are plainly the wrapper author's choice. |
 | Where hooks live | Only in directories you own: `~/.config/hoplon/hooks` and the sandbox's state directory. Never the working directory, so a cloned repository can't bring one. |
-| No code loaded into hoplon | A hook is a separate program with a small fixed input and a small fixed set of answers. hoplon stays one file with no plugins. |
+| No code loaded into hoplon | A hook is a separate program with a small fixed input and a small fixed set of answers. hoplon runs only its own parts, with no plugins. |
 | Sandbox hooks | Programs in `~/.local/share/hoplon-sandbox/hooks`, run by `sandbox/run` before the container starts. They can ask for three things: `ro DIR`, `path NAME`, `env NAME`. Their output is parsed line by line, never evaluated, and an unknown line stops the sandbox from starting. |
 | Search paths from a hook | Only entries that are absolute and lie under a read-only mount are kept. Empty and relative entries are dropped, because to the loader they mean the current directory, and in the sandbox that is the writable `/work`. |
 | Variables a hook may not pass | `HOME`, `XDG_CONFIG_HOME`, `HOPLON_SANDBOX`, `PATH` and `PYTHONPATH` (except filtered, through `path`), and every `LD_` name except `LD_LIBRARY_PATH` through `path`. So `LD_PRELOAD` can't be passed. |
