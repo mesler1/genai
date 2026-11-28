@@ -31,7 +31,7 @@ touch the system, and each part uses only the parts before it.
 | A file that looks secret is not read automatically | `gate.py: Gate.read_now` | `test_coding_guard.TestSecrets.test_secret_looking_file_needs_approval` |
 | "No secrets" is kept by sha256 and lapses on change | `gate.py: Gate.secret_text`<br>`config.py: Config.set_not_secret` | `test_hoplon.TestEndToEnd.test_a_file_you_say_holds_no_secrets_reads_without_asking_until_it_changes` |
 | A file holding the endpoint key is never excused | `gate.py: Gate.secret_text` | `test_hoplon.TestEndToEnd.test_the_endpoint_key_is_never_excused` |
-| An automatic search skips secret-named files | `files.py: Workdir.walk`<br>`gate.py: Gate.search` | none |
+| An automatic search skips secret-named files | `files.py: Workdir.walk`<br>`gate.py: Gate.search` | `test_hoplon.TestEndToEnd.test_search_files_in_coding_mode` |
 
 ## 3. Excessive agency and tool misuse
 
@@ -224,7 +224,6 @@ touch the system, and each part uses only the parts before it.
 
 - 1: Each share is logged by size and sha256
 - 2: Odd model names are left out, the list is capped
-- 2: An automatic search skips secret-named files
 - 3: New files get no execute bit
 - 3: A run you ask for won't run a root command that asks
 - 4: Credentials in `base_url` are refused

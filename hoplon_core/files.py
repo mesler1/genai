@@ -172,7 +172,8 @@ class Workdir:
         return sorted(out), False
 
     def walk(self, path):
-        """The regular files under a directory, as relative paths, in order. Hidden names and symlinks are skipped
+        """The regular files under a directory, as relative paths, in order. Hidden names (is_hidden: dot names and
+        names like a secret's) and symlinks are skipped
         (never followed), and directories are opened one component at a time like everything else here.
         A path naming one regular file gives just that file, unless its name is hidden."""
         start = split_rel(path) if path not in ("", ".", "./") else []
@@ -191,7 +192,7 @@ class Workdir:
                     try:
                         with os.scandir(fd) as it:
                             entries = sorted((e.name, e.stat(follow_symlinks=False).st_mode) for e in it
-                                             if not e.name.startswith("."))
+                                             if not is_hidden([e.name]))
                     except OSError:
                         entries = []
                     subdirs = [name for name, mode in entries if stat.S_ISDIR(mode)]
