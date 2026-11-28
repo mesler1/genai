@@ -66,7 +66,9 @@ suggestion's answer, or with your next message. The system prompt stays the same
 keep using what it has cached. Switching a skill off takes its text out of the conversation again.
 
 `not-secret.json`, next to `config.json`, holds the files you said hold no secrets though they look
-as if they do (the sha256 of each text, and where it was); remove an entry to be asked again.
+as if they do (the sha256 of each text, and where it was); remove an entry to be asked again. You
+add to it by answering `a` on a read card, with `:not_secret PATH…`, or with `s` in hoplon-tui's files
+pane.
 
 ## Files
 

@@ -157,6 +157,16 @@ class TreeTests(unittest.TestCase):
         self.assertEqual(t.key("a"), [])  # a directory can't be attached
         self.assertTrue(t.note)
 
+    def test_s_asks_to_mark_only_a_file_marked_secret(self):
+        t = loaded([ent("d", "dir", size=None), ent("plain"), ent("warned", secret=True)])
+        self.assertEqual(t.key("s"), [])                      # a directory
+        self.assertIn("⚠", t.note)
+        t.key("j")
+        self.assertEqual(t.key("s"), [])                      # a file hoplon doesn't take for a secret
+        t.key("j")
+        self.assertEqual(t.key("s"), [{"type": "not_secret", "path": "warned"}])
+        self.assertEqual(t.note, "")
+
     def test_movement(self):
         t = loaded([ent(f"f{i:02}") for i in range(30)])
         t.page = 10

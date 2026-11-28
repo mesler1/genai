@@ -233,7 +233,7 @@ class TestFrontCommands(unittest.TestCase):
     # front ends can't drift into taking different things.
     FORMS = {"coding": "on", "edits": "reset", "network": "", "fixtures": "add a.txt", "leftovers": "",
              "skills": "", "skill": "x on", "command_sets": "", "command_set": "x off", "models": "",
-             "model": "m", "clear": "", "compact": "-e"}
+             "model": "m", "clear": "", "compact": "-e", "not_secret": "a.txt"}
 
     def test_each_repl_form_is_a_message_json_accepts(self):
         self.assertEqual(sorted(self.FORMS), sorted(G.FRONT_COMMANDS))
@@ -242,7 +242,7 @@ class TestFrontCommands(unittest.TestCase):
                 m = c.words(self.FORMS[name])
                 self.assertIsNotNone(m)
                 self.assertTrue(c.check(m), m)
-                if name != "model":         # any word names a model
+                if name not in ("model", "not_secret"):         # any word names a model, or a file
                     self.assertIsNone(c.words("no such form at all"))
 
     def test_neither_front_end_handles_a_shared_command_itself(self):

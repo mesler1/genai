@@ -101,7 +101,12 @@ that looks like it holds secrets still asks), so treat the directory as shared w
 endpoint. When you allow such a read and say the file holds no secrets after all, hoplon
 remembers the sha256 of that text (`not-secret.json`, and a `not_secret` event in the audit log):
 that text no longer asks, is searched and is not hidden in the sandbox; any change asks again. A
-file holding the endpoint key is never excused.
+file holding the endpoint key is never excused. You can also mark a file yourself, with
+`:not_secret` or `s` in hoplon-tui's files pane; the model can't. Only a file caught by its
+contents can be marked: never a name that is a secret by definition (`.env`, `id_rsa`, `*.key`),
+nor anything in `.git`. Each mark carries the sha256 of the text you were shown, and is refused if
+the file has changed since. A sandboxed run says how many files your list let through, and its
+audit record (`sandbox_exit`, or `work_test`) names them.
 
 ### 3. Excessive agency and tool misuse
 
